@@ -345,7 +345,7 @@ func TestCredentialLimits(t *testing.T) {
 		}
 	}
 	rc := defaultRelayConfig()
-	rc.Authorize = func(c, _ []byte) (wire.AuthResult, error) {
+	rc.Authorize = func(_, _ []byte, _ bool) (wire.AuthResult, error) {
 		return wire.AuthResult{IPv4: lease, Prefix4: 16, TunMTU: 1280}, nil
 	}
 	n := newNetwork(t, 16, rc, ClientConfig{Credential: bytes.Repeat([]byte{'x'}, MaxCredentialLen)})

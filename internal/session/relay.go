@@ -12,10 +12,12 @@ import (
 	"github.com/laneshetron/arc/internal/wire"
 )
 
-// Authorizer validates a client credential and returns the session
-// configuration to send in AUTH_RESULT, including the leased address. A
-// non-nil error or a nonzero Status rejects the client.
-type Authorizer func(credential, clientStatic []byte) (wire.AuthResult, error)
+// Authorizer validates a client credential. On first authentication it
+// returns the session configuration to send in AUTH_RESULT, including the
+// leased address. On a refresh (§9.4) only the verdict matters: the session
+// keeps its configuration, so an Authorizer that leases addresses must not
+// lease another. A non-nil error or a nonzero Status rejects the client.
+type Authorizer func(credential, clientStatic []byte, refresh bool) (wire.AuthResult, error)
 
 // RelayConfig configures a relay endpoint.
 type RelayConfig struct {
@@ -419,7 +421,7 @@ func (s *RelaySession) onAuth(now time.Time, credential []byte) bool {
 		s.conn.queue(s.result) // duplicate AUTH: repeat the answer
 		return true
 	}
-	result, err := r.cfg.Authorize(credential, s.clientStatic)
+	result, err := r.cfg.Authorize(credential, s.clientStatic, s.state == StateActive)
 	if err != nil || result.Status != 0 {
 		failure := wire.AuthResult{Status: uint8(wire.CodeAuthFailed)}
 		s.conn.transmit(now, s.conn.path(0), []wire.Frame{failure, wire.CloseFrame{Code: wire.CodeAuthFailed}})
