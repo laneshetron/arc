@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"io"
 	"net/netip"
+	"slices"
 	"time"
 
 	"github.com/laneshetron/arc/internal/crypto"
@@ -68,6 +69,7 @@ type RelayStats struct {
 	RespRetransmits   uint64
 	ResetsSent        uint64
 	SpoofedDropped    uint64
+	Migrations        uint64 // validated address changes on existing paths
 }
 
 type initKey struct {
@@ -81,7 +83,8 @@ type initKey struct {
 type Relay struct {
 	cfg      RelayConfig
 	cookies  *crypto.CookieGenerator
-	sessions map[wire.CID]*RelaySession
+	sessions map[wire.CID]*RelaySession // every live relay CID, all paths
+	live     []*RelaySession            // each live session once, oldest first
 	inits    map[initKey]*RelaySession
 	pending  int
 
@@ -98,13 +101,14 @@ type RelaySession struct {
 	relay        *Relay
 	state        State
 	conn         *conn
-	addr         netip.AddrPort
 	clientStatic []byte
 	credential   []byte
 	result       wire.AuthResult
 	created      time.Time
 	resp         []byte
 	initKey      initKey
+	nextPathID   uint32
+	lastUplink   *path // where the client most recently sent from
 }
 
 func NewRelay(cfg RelayConfig, now time.Time) *Relay {
@@ -136,7 +140,7 @@ func NewRelay(cfg RelayConfig, now time.Time) *Relay {
 func (r *Relay) Stats() RelayStats { return r.stats }
 
 // Sessions returns the number of live sessions, including pending ones.
-func (r *Relay) Sessions() int { return len(r.sessions) }
+func (r *Relay) Sessions() int { return len(r.live) }
 
 // HandlePacket processes one packet received from a client address.
 func (r *Relay) HandlePacket(now time.Time, from netip.AddrPort, b []byte) {
@@ -190,14 +194,21 @@ func (r *Relay) handleInit(now time.Time, from netip.AddrPort, b []byte) {
 	s := &RelaySession{
 		relay:        r,
 		state:        StateAuthenticating,
-		addr:         from,
 		clientStatic: res.ClientStatic,
 		created:      now,
 		resp:         res.Resp.Append(nil),
 		initKey:      key,
+		nextPathID:   1,
 	}
-	s.conn = newConn(res.Keys, newPath(0, relayCID, init.SenderCID, now), now, s.emit)
+	s.conn = newConn(res.Keys, now)
+	s.conn.primary, s.conn.emit = s.primary, s.emit
+	p0 := newPath(0, relayCID, init.SenderCID, now)
+	// The handshake round trip validated the client's address.
+	p0.joined, p0.validated, p0.addr = true, true, from
+	s.conn.addPath(p0)
+	s.lastUplink = p0
 	r.sessions[relayCID] = s
+	r.live = append(r.live, s)
 	r.inits[key] = s
 	r.pending++
 	r.out = append(r.out, RelayDatagram{Addr: from, Data: s.resp})
@@ -226,7 +237,8 @@ func (r *Relay) handleData(now time.Time, from netip.AddrPort, b []byte) {
 		r.maybeReset(now, from, h.DestCID, len(b))
 		return
 	}
-	frames, err := s.conn.open(now, s.conn.path0, h, aad, ct)
+	p := s.conn.byCID[h.DestCID]
+	frames, err := s.conn.open(now, p, h, aad, ct)
 	if err == ErrIntegrityLimit {
 		r.closeSession(now, s, err, false)
 		return
@@ -234,8 +246,8 @@ func (r *Relay) handleData(now time.Time, from netip.AddrPort, b []byte) {
 	if err != nil {
 		return
 	}
-	// The downlink stays on the validated address. Validating a changed
-	// address (NAT rebinding, §14.5) arrives with multipath support.
+	s.onAddress(now, p, from, len(b))
+
 	for _, f := range frames {
 		switch f := f.(type) {
 		case wire.Auth:
@@ -252,12 +264,134 @@ func (r *Relay) handleData(now time.Time, from netip.AddrPort, b []byte) {
 					s.deliver(pkt, false)
 				}
 			}
+		case wire.PathJoin:
+			if !s.onJoin(now, p, f) {
+				return
+			}
+		case wire.PathChallenge:
+			s.conn.transmit(now, p, []wire.Frame{wire.PathResponse{Data: f.Data}})
+		case wire.PathResponse:
+			s.onResponse(now, p, from, f)
+		case wire.PathAbandon:
+			if q := s.conn.path(f.PathID); q != nil && q.joined && s.joinedPaths() > 1 {
+				s.removePath(q)
+			}
 		case wire.CloseFrame:
 			r.closeSession(now, s, &PeerClosedError{Code: f.Code}, false)
 			return
 		}
 	}
 	s.conn.flush(now)
+}
+
+// onAddress tracks where an authenticated packet came from. A new path
+// learns its address; a validated path seeing a new address starts
+// validating it without moving the downlink (§14.5).
+func (s *RelaySession) onAddress(now time.Time, p *path, from netip.AddrPort, n int) {
+	if p.joined && p.validated {
+		s.lastUplink = p
+	}
+	switch {
+	case !p.validated:
+		if p.addr != from {
+			p.addr, p.recvBytes, p.sentBytes = from, 0, 0
+		}
+		p.recvBytes += n
+	case from == p.addr:
+		return
+	case p.candActive && from == p.cand:
+		p.candRecv += n
+		if now.Sub(p.candSentAt) >= p.rtt.pto() {
+			s.challengeCandidate(now, p)
+		}
+	default:
+		p.cand, p.candActive, p.candRecv, p.candSent = from, true, n, 0
+		if _, err := io.ReadFull(s.relay.cfg.Rand, p.candChallenge[:]); err != nil {
+			p.candActive = false
+			return
+		}
+		s.challengeCandidate(now, p)
+	}
+}
+
+func (s *RelaySession) challengeCandidate(now time.Time, p *path) {
+	p.candSentAt = now
+	s.conn.transmitTo(now, p, []wire.Frame{wire.PathChallenge{Data: p.candChallenge}}, true)
+}
+
+// onJoin handles PATH_JOIN on a slot path and reports whether the session
+// survives.
+func (s *RelaySession) onJoin(now time.Time, p *path, f wire.PathJoin) bool {
+	if p.id == 0 || s.state != StateActive {
+		return true
+	}
+	if p.joined {
+		if p.remoteCID != f.CID {
+			s.conn.queue(wire.PathAbandon{PathID: p.id, Code: wire.CodeProtocolViolation})
+			s.removePath(p)
+		}
+		return true // a retransmitted JOIN; the challenge is already pending
+	}
+	if _, err := io.ReadFull(s.relay.cfg.Rand, p.challenge[:]); err != nil {
+		return true
+	}
+	p.remoteCID, p.joined = f.CID, true
+	p.control = append(p.control, wire.PathChallenge{Data: p.challenge})
+	s.issueSlots()
+	return true
+}
+
+func (s *RelaySession) onResponse(now time.Time, p *path, from netip.AddrPort, f wire.PathResponse) {
+	switch {
+	case !p.validated && p.joined && f.Data == p.challenge && from == p.addr:
+		p.validated = true
+		p.control = slices.DeleteFunc(p.control, pathBound)
+		s.conn.probe(now, p)
+	case p.candActive && f.Data == p.candChallenge && from == p.cand:
+		p.addr, p.candActive = from, false
+		s.relay.stats.Migrations++
+	}
+}
+
+// issueSlots keeps spare NEW_PATH slots outstanding (§14.3).
+func (s *RelaySession) issueSlots() {
+	r := s.relay
+	spare := 0
+	for _, p := range s.conn.paths {
+		if !p.joined {
+			spare++
+		}
+	}
+	for spare < spareSlots && len(s.conn.paths) < maxPaths {
+		cid, ok := r.newCID()
+		if !ok {
+			return
+		}
+		p := newPath(s.nextPathID, cid, wire.CID{}, time.Time{})
+		s.nextPathID++
+		token := crypto.ResetToken(r.cfg.ResetSecret, cid)
+		s.conn.addPath(p)
+		r.sessions[cid] = s
+		s.conn.queue(wire.NewPath{PathID: p.id, CID: cid, ResetToken: token})
+		spare++
+	}
+}
+
+func (s *RelaySession) removePath(p *path) {
+	s.conn.removePath(p)
+	delete(s.relay.sessions, p.localCID)
+	if s.lastUplink == p {
+		s.lastUplink = nil
+	}
+}
+
+// primary picks the downlink path: the path the client most recently sent
+// on while it is healthy, otherwise the best healthy path (§15.2).
+func (s *RelaySession) primary(now time.Time) *path {
+	if s.lastUplink != nil && s.lastUplink.healthy(now, s.conn.keepalive) {
+		return s.lastUplink
+	}
+	return s.conn.bestPath(now)
 }
 
 // maybeReset answers a DATA packet for an unknown CID with a rate-limited
@@ -288,7 +422,7 @@ func (s *RelaySession) onAuth(now time.Time, credential []byte) bool {
 	result, err := r.cfg.Authorize(credential, s.clientStatic)
 	if err != nil || result.Status != 0 {
 		failure := wire.AuthResult{Status: uint8(wire.CodeAuthFailed)}
-		s.conn.transmit(now, s.conn.path0, []wire.Frame{failure, wire.CloseFrame{Code: wire.CodeAuthFailed}})
+		s.conn.transmit(now, s.conn.path(0), []wire.Frame{failure, wire.CloseFrame{Code: wire.CodeAuthFailed}})
 		r.closeSession(now, s, ErrAuthFailed, false)
 		return false
 	}
@@ -301,6 +435,12 @@ func (s *RelaySession) onAuth(now time.Time, credential []byte) bool {
 	s.state = StateActive
 	r.leavePending(s)
 	s.conn.queue(result)
+	s.conn.probeSize = int(result.TunMTU) + dataOverhead
+	if result.KeepaliveMS > 0 {
+		s.conn.keepalive = time.Duration(result.KeepaliveMS) * time.Millisecond
+	}
+	s.conn.probe(now, s.conn.path(0))
+	s.issueSlots()
 	r.events = append(r.events, SessionEstablished{Session: s})
 	return true
 }
@@ -333,23 +473,57 @@ func (r *Relay) closeSession(now time.Time, s *RelaySession, err error, notify b
 		return
 	}
 	if notify {
-		s.conn.transmit(now, s.conn.path0, []wire.Frame{wire.CloseFrame{Code: wire.CodeNoError}})
+		if p := s.primary(now); p != nil {
+			s.conn.transmit(now, p, []wire.Frame{wire.CloseFrame{Code: wire.CodeNoError}})
+		}
 	}
 	r.leavePending(s)
-	delete(r.sessions, s.conn.path0.localCID)
+	for _, p := range s.conn.paths {
+		delete(r.sessions, p.localCID)
+	}
+	r.live = slices.DeleteFunc(r.live, func(q *RelaySession) bool { return q == s })
 	s.state = StateClosed
 	r.events = append(r.events, SessionClosed{Session: s, Err: err})
 }
 
-func (s *RelaySession) emit(_ *path, b []byte) {
-	s.relay.out = append(s.relay.out, RelayDatagram{Addr: s.addr, Data: b})
+// emit sends a packet to the path's address, or to its candidate address,
+// enforcing the 3x anti-amplification limit toward any address that has
+// not been validated (§14.4).
+func (s *RelaySession) emit(p *path, b []byte, toCandidate bool) {
+	to := p.addr
+	switch {
+	case toCandidate:
+		if p.candSent+len(b) > amplificationFactor*p.candRecv {
+			s.conn.stats.AmplificationDrops++
+			return
+		}
+		p.candSent += len(b)
+		to = p.cand
+	case !p.validated:
+		if p.sentBytes+len(b) > amplificationFactor*p.recvBytes {
+			s.conn.stats.AmplificationDrops++
+			return
+		}
+		p.sentBytes += len(b)
+	}
+	s.relay.out = append(s.relay.out, RelayDatagram{Addr: to, Data: b})
 }
 
 func (s *RelaySession) State() State            { return s.state }
 func (s *RelaySession) Config() wire.AuthResult { return s.result }
 func (s *RelaySession) ClientStatic() []byte    { return s.clientStatic }
-func (s *RelaySession) Addr() netip.AddrPort    { return s.addr }
 func (s *RelaySession) Stats() Stats            { return s.conn.stats }
+
+// Paths describes the session's joined paths.
+func (s *RelaySession) Paths(now time.Time) []PathInfo { return s.conn.pathInfo(now) }
+
+// Addr returns the client address of the current downlink path.
+func (s *RelaySession) Addr(now time.Time) netip.AddrPort {
+	if p := s.primary(now); p != nil {
+		return p.addr
+	}
+	return netip.AddrPort{}
+}
 
 // SendIP tunnels one IP packet to the client. The packet is copied.
 func (s *RelaySession) SendIP(now time.Time, pkt []byte) error {
@@ -364,8 +538,7 @@ func (s *RelaySession) SendIP(now time.Time, pkt []byte) error {
 	if err := wire.ValidateIPPacket(pkt); err != nil {
 		return err
 	}
-	s.conn.sendIP(now, pkt)
-	return nil
+	return s.conn.sendIP(now, pkt)
 }
 
 // Close ends the session, telling the client.
@@ -373,26 +546,48 @@ func (s *RelaySession) Close(now time.Time) { s.relay.closeSession(now, s, ErrCl
 
 // Tick runs expired timers for every session.
 func (r *Relay) Tick(now time.Time) {
-	for _, s := range r.sessions {
+	for _, s := range slices.Clone(r.live) {
 		switch {
 		case s.state == StateAuthenticating && !now.Before(s.created.Add(HandshakeTimeout)):
 			r.closeSession(now, s, ErrAuthFailed, false)
-		case !now.Before(s.conn.path0.lastRecv.Add(r.cfg.IdleTimeout)):
+		case !now.Before(s.conn.lastRecv().Add(r.cfg.IdleTimeout)):
 			r.closeSession(now, s, ErrIdleTimeout, false)
 		default:
+			for _, p := range slices.Clone(s.conn.paths) {
+				if p.joined && !now.Before(p.lastRecv.Add(PathTimeout)) && s.joinedPaths() > 1 {
+					s.removePath(p)
+				}
+			}
 			s.conn.onTimers(now)
 		}
 	}
+}
+
+func (s *RelaySession) joinedPaths() int {
+	n := 0
+	for _, p := range s.conn.paths {
+		if p.joined {
+			n++
+		}
+	}
+	return n
 }
 
 // NextDeadline returns when Tick should next be called, or zero if no
 // timer is pending.
 func (r *Relay) NextDeadline() time.Time {
 	var d time.Time
-	for _, s := range r.sessions {
-		d = earliest(d, s.conn.nextDeadline(), s.conn.path0.lastRecv.Add(r.cfg.IdleTimeout))
+	for _, s := range r.live {
+		d = earliest(d, s.conn.nextDeadline(), s.conn.lastRecv().Add(r.cfg.IdleTimeout))
 		if s.state == StateAuthenticating {
 			d = earliest(d, s.created.Add(HandshakeTimeout))
+		}
+		if s.joinedPaths() > 1 {
+			for _, p := range s.conn.paths {
+				if p.joined {
+					d = earliest(d, p.lastRecv.Add(PathTimeout))
+				}
+			}
 		}
 	}
 	return d

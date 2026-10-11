@@ -542,7 +542,7 @@ Path 0 carries the handshake. Its CIDs come from the handshake itself: the clien
 
 Rules during joining:
 - **Before validation** the relay MAY process authenticated uplink from the candidate path. It MUST limit the bytes it sends to the candidate address to 3× the bytes received from it. For DNS and ICMP carriers it MUST also enforce separate per-client and per-zone query budgets.
-- **MTU probing:** endpoints SHOULD pad (§10.1 `PADDING`) the `PATH_JOIN` and `PATH_CHALLENGE` packets to the size needed to carry a full TUN-MTU packet unfragmented (§17.4). If the padded packets succeed, the path can carry full packets without `IP_FRAGMENT`.
+- **MTU probing:** once a path is validated (path 0: once the session is `ACTIVE`), each endpoint SHOULD send one separate probe: a `PING` padded with `PADDING` (§10.1) to the size needed to carry a full TUN-MTU packet unfragmented (§17.4). If the probe is acknowledged, the sender raises that path's maximum packet size and stops using `IP_FRAGMENT` there. A lost probe leaves the path at its current size and MUST NOT count toward path health or loss statistics. Probing is separate from validation so that a path with a small MTU still validates. Each direction probes independently, because path MTU can be asymmetric.
 - **Retransmission:** `PATH_JOIN` retransmissions use new packets with the **same** `client_cid`, which makes them idempotent. A `PATH_JOIN` for an already-joined path with a different `client_cid` is a `PROTOCOL_VIOLATION`, and that path is abandoned.
 - A `PATH_RESPONSE` matching any outstanding challenge for that path is accepted.
 
@@ -659,7 +659,7 @@ type Capabilities struct {
 ### 16.1 UDP adapter (required)
 
 - Send one ARC packet per UDP datagram to the configured relay IP/port. No cell header.
-- Start with a maximum UDP payload of 1232 bytes, which is safe on any IPv6 path. Raise it to the full-packet size (§17.4) once a padded probe during path validation succeeds (§14.4), and probe further with DPLPMTUD (RFC 8899) using `PADDING`.
+- Start with a maximum UDP payload of 1232 bytes, which is safe on any IPv6 path. Raise it to the full-packet size (§17.4) once the post-validation probe succeeds (§14.4), and probe further with DPLPMTUD (RFC 8899) using `PADDING`.
 - Bind sockets to Wi-Fi and cellular separately when the OS permits and report failures independently.
 - Carry ARC Noise, control, and data in the same envelope. Validate source association for a joined path.
 - Enforce the per-path rate cap and pacing of §15.2. A UDP socket's buffer accepting a write is not delivery.
