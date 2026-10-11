@@ -15,6 +15,12 @@ import (
 // MaxDatagram is the largest datagram the carrier reads.
 const MaxDatagram = 65535
 
+// DefaultBufferSize is the socket send and receive buffer size. TCP inside
+// the tunnel sends a window's worth of packets in one burst, and with the
+// kernel's default (about 208 KB) a burst that arrives before the reader is
+// scheduled overflows and is dropped, which TCP reads as congestion.
+const DefaultBufferSize = 7 << 20
+
 // Options controls the carrier's socket.
 type Options struct {
 	// Mark sets SO_MARK (Linux), so policy routing can keep the carrier's
@@ -23,6 +29,11 @@ type Options struct {
 	// Device binds the socket to one interface (SO_BINDTODEVICE on Linux),
 	// for running one path per underlay. Empty leaves it unbound.
 	Device string
+	// BufferSize sets SO_RCVBUF and SO_SNDBUF. Zero means
+	// DefaultBufferSize. On Linux, privileged processes exceed
+	// net.core.rmem_max/wmem_max via SO_RCVBUFFORCE/SO_SNDBUFFORCE; others
+	// get what the kernel limits allow.
+	BufferSize int
 }
 
 // Conn is a UDP carrier socket. Reads and writes may run on different
@@ -36,9 +47,17 @@ type Conn struct {
 
 // Listen opens an IPv4 UDP socket on addr (use port 0 for a client).
 func Listen(addr netip.AddrPort, opts Options) (*Conn, error) {
+	if opts.BufferSize == 0 {
+		opts.BufferSize = DefaultBufferSize
+	}
+	forced := false
 	lc := net.ListenConfig{Control: func(_, _ string, c syscall.RawConn) error {
 		var sockErr error
-		err := c.Control(func(fd uintptr) { sockErr = setSockopts(int(fd), opts) })
+		err := c.Control(func(fd uintptr) {
+			if sockErr = setSockopts(int(fd), opts); sockErr == nil {
+				forced = forceBuffers(int(fd), opts.BufferSize)
+			}
+		})
 		if err != nil {
 			return err
 		}
@@ -49,6 +68,11 @@ func Listen(addr netip.AddrPort, opts Options) (*Conn, error) {
 		return nil, err
 	}
 	uc := pc.(*net.UDPConn)
+	if !forced {
+		// Best effort: the kernel caps these at its configured maximums.
+		uc.SetReadBuffer(opts.BufferSize)
+		uc.SetWriteBuffer(opts.BufferSize)
+	}
 	return &Conn{uc: uc, pc: ipv4.NewPacketConn(uc)}, nil
 }
 

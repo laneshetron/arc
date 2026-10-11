@@ -47,6 +47,36 @@ teardown_topology() {
   for ns in arc-c arc-r arc-i; do ip netns del "$ns" 2>/dev/null || true; done
 }
 
+# impair LINK NETEM_ARGS...: emulate an impaired link in both directions with
+# netem, e.g. `impair 0 delay 50ms loss 1%`. LINK 0 is c0/r0, 1 is c1/r2.
+# Each direction gets the arguments independently, so `delay 50ms` makes a
+# 100 ms round trip.
+impair() {
+  local link=$1; shift
+  local cdev=c$link rdev=r0
+  [[ $link == 1 ]] && rdev=r2
+  ip netns exec arc-c tc qdisc replace dev "$cdev" root netem limit 100000 "$@"
+  ip netns exec arc-r tc qdisc replace dev "$rdev" root netem limit 100000 "$@"
+}
+
+# unimpair LINK: remove impairment from a link.
+unimpair() {
+  local link=$1 rdev=r0
+  [[ $link == 1 ]] && rdev=r2
+  ip netns exec arc-c tc qdisc del dev "c$link" root 2>/dev/null || true
+  ip netns exec arc-r tc qdisc del dev "$rdev" root 2>/dev/null || true
+}
+
+# netem_available: whether the kernel supports netem (sch_netem).
+netem_available() {
+  ip netns add arc-probe 2>/dev/null || return 1
+  ip -n arc-probe link add d0 type dummy
+  local ok=0
+  ip netns exec arc-probe tc qdisc add dev d0 root netem delay 1ms 2>/dev/null || ok=1
+  ip netns del arc-probe
+  return $ok
+}
+
 # wait_until SECONDS COMMAND...: poll until COMMAND succeeds.
 wait_until() {
   local deadline=$((SECONDS + $1)); shift
