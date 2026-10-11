@@ -284,3 +284,40 @@ func TestJoinWithDifferentCIDIsRejected(t *testing.T) {
 		t.Error("relay kept a path after a conflicting PATH_JOIN")
 	}
 }
+
+// A standby path that recovers from an outage must be noticed quickly, so
+// that a later failure of the primary can fail over to it. Suspect paths
+// are probed every PTO rather than every keepalive interval (§14.1).
+func TestRecoveredStandbyPathIsUsableQuickly(t *testing.T) {
+	n, s, id, c1 := establishTwoPaths(t, 40, 20*time.Millisecond)
+	if p, _ := pathByID(n.client.Paths(n.now), 0); !p.Primary {
+		t.Fatal("path 0 should be primary")
+	}
+	// The standby path goes dark long enough to turn suspect, then recovers.
+	c1.up.down, c1.down.down = true, true
+	n.runFor(15 * time.Second)
+	if p, _ := pathByID(n.client.Paths(n.now), id); p.Healthy {
+		t.Fatal("standby path should be suspect while dark")
+	}
+	c1.up.down, c1.down.down = false, false
+	n.runFor(time.Second)
+	if p, _ := pathByID(n.client.Paths(n.now), id); !p.Healthy {
+		t.Fatal("standby path still suspect 1 s after recovering")
+	}
+
+	// Now the primary dies: traffic must move to the recovered standby.
+	n.up.down, n.down.down = true, true
+	before := len(n.relayIPs())
+	failedAt := n.now
+	for seq := uint32(1); n.now.Sub(failedAt) < 3*time.Second; seq++ {
+		n.client.SendIP(n.now, ipPacket(lease, internet, 100, seq))
+		s.SendIP(n.now, ipPacket(internet, lease, 100, seq))
+		n.runFor(10 * time.Millisecond)
+		if len(n.relayIPs()) > before {
+			break
+		}
+	}
+	if d := n.now.Sub(failedAt); len(n.relayIPs()) == before || d > time.Second {
+		t.Fatalf("failover to the recovered standby took %v", d)
+	}
+}

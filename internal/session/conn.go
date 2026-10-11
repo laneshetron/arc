@@ -121,6 +121,21 @@ func (p *path) healthy(now time.Time, keepalive time.Duration) bool {
 	return !ok || now.Sub(t0) < limit || silent < limit
 }
 
+// suspectAt returns when a currently healthy path would turn suspect if
+// nothing else happened, so callers can wake up and start probing it.
+func (p *path) suspectAt(keepalive time.Duration) time.Time {
+	limit := suspectPTOs * p.rtt.pto()
+	at := p.lastRecv.Add(keepalive + limit + time.Nanosecond)
+	if t0, ok := p.sent.oldestOutstanding(); ok {
+		unanswered := t0.Add(limit)
+		if silent := p.lastRecv.Add(limit); silent.After(unanswered) {
+			unanswered = silent
+		}
+		at = earliest(at, unanswered)
+	}
+	return at
+}
+
 // pathBound reports whether a frame must be retransmitted on the path it
 // was first sent on.
 func pathBound(f wire.Frame) bool {

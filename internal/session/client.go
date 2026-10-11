@@ -102,7 +102,8 @@ type Client struct {
 	conn    *conn
 	config  wire.AuthResult
 	slots   []pathSlot
-	current *path // primary path
+	current *path     // primary path
+	now     time.Time // latest time passed to any input, for NextDeadline
 
 	out    []Datagram
 	events []ClientEvent
@@ -169,6 +170,7 @@ func (c *Client) sendInit(now time.Time) {
 
 // HandlePacket processes one packet received on the carrier bound to pathID.
 func (c *Client) HandlePacket(now time.Time, pathID uint32, b []byte) {
+	c.observe(now)
 	if c.state == StateClosed {
 		return
 	}
@@ -350,6 +352,7 @@ func (c *Client) handleReset(b []byte) {
 // PollTransmit, and received packets go to HandlePacket with that ID. A
 // PathValidated event follows when the relay has proven reachability.
 func (c *Client) OpenPath(now time.Time) (uint32, error) {
+	c.observe(now)
 	if c.state != StateActive {
 		return 0, ErrNotActive
 	}
@@ -399,6 +402,7 @@ func (c *Client) dropPath(p *path, err error) {
 
 // SendIP tunnels one IP packet. The packet is copied.
 func (c *Client) SendIP(now time.Time, pkt []byte) error {
+	c.observe(now)
 	switch {
 	case c.state == StateClosed:
 		return ErrClosed
@@ -431,6 +435,7 @@ func (c *Client) close(now time.Time, err error, notify bool) {
 
 // Tick runs timers that have expired by now.
 func (c *Client) Tick(now time.Time) {
+	c.observe(now)
 	switch c.state {
 	case StateClosed:
 		return
@@ -466,7 +471,7 @@ func (c *Client) Tick(now time.Time) {
 	c.conn.onTimers(now)
 	if c.state == StateActive {
 		for _, p := range c.conn.paths {
-			if p.validated && !now.Before(p.lastSend.Add(c.keepalive())) {
+			if p.validated && !now.Before(p.lastSend.Add(c.pingInterval(p, now))) {
 				c.conn.transmit(now, p, []wire.Frame{wire.Ping{}})
 			}
 		}
@@ -495,6 +500,27 @@ func (c *Client) keepalive() time.Duration {
 	return DefaultKeepalive
 }
 
+// observe records the latest time an input supplied.
+func (c *Client) observe(now time.Time) {
+	if now.After(c.now) {
+		c.now = now
+	}
+}
+
+// minProbeInterval bounds how often a suspect path is probed.
+const minProbeInterval = 100 * time.Millisecond
+
+// pingInterval is how long a validated path may go without sending before
+// it gets a PING: the keepalive interval while healthy, and about one PTO
+// while suspect, so that a path that recovers is noticed within a round
+// trip rather than at the next keepalive (§14.1).
+func (c *Client) pingInterval(p *path, now time.Time) time.Duration {
+	if p.healthy(now, c.conn.keepalive) {
+		return c.keepalive()
+	}
+	return min(c.keepalive(), max(p.rtt.pto(), minProbeInterval))
+}
+
 // NextDeadline returns when Tick should next be called, or zero if no
 // timer is pending.
 func (c *Client) NextDeadline() time.Time {
@@ -512,8 +538,13 @@ func (c *Client) NextDeadline() time.Time {
 		if len(c.conn.paths) > 1 {
 			d = earliest(d, p.lastRecv.Add(c.cfg.PathTimeout))
 		}
-		if p.validated {
-			d = earliest(d, p.lastSend.Add(c.keepalive()))
+		if !p.validated {
+			continue
+		}
+		d = earliest(d, p.lastSend.Add(c.pingInterval(p, c.now)))
+		if p.healthy(c.now, c.conn.keepalive) {
+			// Wake when the path would turn suspect, to start probing it.
+			d = earliest(d, p.suspectAt(c.conn.keepalive))
 		}
 	}
 	return d

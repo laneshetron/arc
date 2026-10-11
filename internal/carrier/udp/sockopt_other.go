@@ -10,3 +10,5 @@ func setSockopts(_ int, opts Options) error {
 	}
 	return nil
 }
+
+func forceBuffers(int, int) bool { return false }

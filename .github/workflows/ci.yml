@@ -40,6 +40,23 @@ jobs:
       - name: tunnel end to end in network namespaces
         run: sudo KEEP_LOGS=1 ./test/netns/e2e.sh bin
 
+  degraded:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: sudo apt-get update && sudo apt-get install -y iperf3 wireguard-tools
+      - name: load netem
+        run: |
+          sudo modprobe sch_netem ||
+            { sudo apt-get install -y "linux-modules-extra-$(uname -r)" && sudo modprobe sch_netem; } ||
+            echo "netem unavailable; degraded.sh will skip"
+      - run: go build -o bin/ ./cmd/arc-client ./cmd/arc-relay
+      - name: degraded networks in network namespaces
+        run: sudo ./test/netns/degraded.sh bin
+
   fixtures:
     runs-on: ubuntu-latest
     steps:
