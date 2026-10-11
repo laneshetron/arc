@@ -3,6 +3,21 @@
   "spec": "arc-v1-spec 0.2",
   "warning": "Handshake packets contain dummy Noise bytes and are not valid Noise IK messages. AEAD keys are standalone deterministic examples, not Noise-derived traffic keys.",
   "format_notes": "Lowercase hex. Multibyte fields are big-endian except the packet number inside the AEAD nonce, which is uint64 little-endian.",
+  "handshake_ik": {
+    "pattern": "Noise_IK_25519_ChaChaPoly_SHA256",
+    "client_static_private_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+    "client_static_public_hex": "7b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13",
+    "client_ephemeral_private_hex": "2222222222222222222222222222222222222222222222222222222222222222",
+    "relay_static_private_hex": "3333333333333333333333333333333333333333333333333333333333333333",
+    "relay_static_public_hex": "7b0d47d93427f8311160781c7c733fd89f88970aef490d8aa0ee19a4cb8a1b14",
+    "relay_ephemeral_private_hex": "4444444444444444444444444444444444444444444444444444444444444444",
+    "prologue_hex": "4152432f3101c1c2c3c4c5c6c7c8",
+    "msg2_payload_hex": "a1a2a3a4a5a6a7a8303132333435363738393a3b3c3d3e3f",
+    "handshake_init_hex": "0101c1c2c3c4c5c6c7c8000000000000000000000000000000000faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20180209d22e6c95bf3b198efd0e3af2c121a6a3464ded18bd60a996a63e55b8692d6cdbecd705a6d86e154ae6893baa1c8fc9528ec420d8028ba56ebfbe5388b9",
+    "handshake_resp_hex": "02c1c2c3c4c5c6c7c8ff2ee45601ec1b67310c7790404585ae697331eee1c1f8cf2419731c1fff3e6b4546bb3fe99841c58db9560a3f246ada4dd3bf4fca20c9dd18e6c17a9e27da7212e2d9b530515c31",
+    "client_to_relay_key_hex": "993820c62616fd23c7fad5976f5ad4aadf8df1b7e6711c5b3f88246458f9328b",
+    "relay_to_client_key_hex": "ad21f50506ab88e3d073a6666ad77574833f4dc97c5070df04753080a94801b7"
+  },
   "packets": {
     "handshake_init": {
       "sender_cid_hex": "c1c2c3c4c5c6c7c8",

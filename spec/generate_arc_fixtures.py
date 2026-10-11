@@ -1,19 +1,24 @@
 """Generate deterministic ARC/1 v0.2 wire fixtures.
 
 Every expected cryptographic output below comes from the `cryptography`
-package (ChaCha20-Poly1305, HMAC-SHA256); nothing is written by hand.
-Handshake packets carry dummy Noise bytes: they test packet framing only,
-not Noise IK. Run with --check to verify the committed JSON is current.
+package (ChaCha20-Poly1305, HMAC-SHA256) or the `noiseprotocol` package
+(Noise IK); nothing is written by hand. The "packets" section carries dummy
+Noise bytes for framing tests; "handshake_ik" is a real handshake with fixed
+keys. Run with --check to verify the committed JSON is current.
 """
 import hashlib
 import hmac
 import json
 import struct
 import sys
+import warnings
 from pathlib import Path
 
 from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+from noise.connection import Keypair, NoiseConnection
 
 OUT = Path(__file__).resolve().with_name("ARC-v1-Wire-Fixtures.json")
 
@@ -87,6 +92,64 @@ def ack_intervals(largest, first_range, ranges):
     return out
 
 
+def x25519_public(private):
+    return X25519PrivateKey.from_private_bytes(private).public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+
+
+def handshake_ik():
+    """A complete Noise IK handshake with fixed static and ephemeral keys."""
+    client_static, client_ephemeral = bytes([0x11] * 32), bytes([0x22] * 32)
+    relay_static, relay_ephemeral = bytes([0x33] * 32), bytes([0x44] * 32)
+    relay_cid, reset_token = bytes.fromhex("a1a2a3a4a5a6a7a8"), bytes(range(0x30, 0x40))
+    prologue = b"ARC/1" + bytes([1]) + CLIENT_CID
+    name = b"Noise_IK_25519_ChaChaPoly_SHA256"
+
+    with warnings.catch_warnings():  # fixed ephemerals are for test vectors only
+        warnings.simplefilter("ignore")
+        client = NoiseConnection.from_name(name)
+        client.set_as_initiator()
+        client.set_keypair_from_private_bytes(Keypair.STATIC, client_static)
+        client.set_keypair_from_public_bytes(Keypair.REMOTE_STATIC, x25519_public(relay_static))
+        client.set_keypair_from_private_bytes(Keypair.EPHEMERAL, client_ephemeral)
+        client.set_prologue(prologue)
+        client.start_handshake()
+        relay = NoiseConnection.from_name(name)
+        relay.set_as_responder()
+        relay.set_keypair_from_private_bytes(Keypair.STATIC, relay_static)
+        relay.set_keypair_from_private_bytes(Keypair.EPHEMERAL, relay_ephemeral)
+        relay.set_prologue(prologue)
+        relay.start_handshake()
+
+    msg1 = client.write_message(b"")
+    relay.read_message(msg1)
+    msg2 = relay.write_message(relay_cid + reset_token)
+    assert client.read_message(msg2) == relay_cid + reset_token
+    assert client.handshake_finished and relay.handshake_finished
+    c2r = client.noise_protocol.cipher_state_encrypt.k
+    r2c = client.noise_protocol.cipher_state_decrypt.k
+    assert relay.noise_protocol.cipher_state_decrypt.k == c2r
+    assert relay.noise_protocol.cipher_state_encrypt.k == r2c
+
+    init = handshake_init(CLIENT_CID, b"\x00" * 16, msg1)
+    resp = handshake_resp(CLIENT_CID, msg2)
+    return {
+        "pattern": name.decode(),
+        "client_static_private_hex": client_static.hex(),
+        "client_static_public_hex": x25519_public(client_static).hex(),
+        "client_ephemeral_private_hex": client_ephemeral.hex(),
+        "relay_static_private_hex": relay_static.hex(),
+        "relay_static_public_hex": x25519_public(relay_static).hex(),
+        "relay_ephemeral_private_hex": relay_ephemeral.hex(),
+        "prologue_hex": prologue.hex(),
+        "msg2_payload_hex": (relay_cid + reset_token).hex(),
+        "handshake_init_hex": init.hex(),
+        "handshake_resp_hex": resp.hex(),
+        "client_to_relay_key_hex": c2r.hex(),
+        "relay_to_client_key_hex": r2c.hex(),
+    }
+
+
 def build():
     fixtures = {
         "fixture_version": 2,
@@ -96,6 +159,8 @@ def build():
         "format_notes": "Lowercase hex. Multibyte fields are big-endian except the packet number "
                         "inside the AEAD nonce, which is uint64 little-endian.",
     }
+
+    fixtures["handshake_ik"] = handshake_ik()
 
     # --- Packets -------------------------------------------------------------
     init = handshake_init(CLIENT_CID, b"\x00" * 16, bytes(range(96)))
