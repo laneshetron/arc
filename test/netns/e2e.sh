@@ -104,10 +104,12 @@ else
   fail "relay did not see the client's real address"
 fi
 
-if $C ip -6 route get 2001:db8::1 2>&1 | grep -qiE 'unreachable|network is unreachable'; then
+v6=$($C ip -6 route get 2001:db8::1 2>&1 || true)
+if grep -qiE 'unreachable' <<<"$v6"; then
   pass "IPv6 is blocked while the full tunnel is up"
 else
-  fail "IPv6 is not blocked by the full tunnel"
+  fail "IPv6 is not blocked by the full tunnel: $v6"
+  $C ip -6 rule; $C ip -6 route show table 5243; $C sysctl net.ipv6.conf.all.disable_ipv6 || true
 fi
 
 $I iperf3 -s -D --logfile "$WORK/iperf-server.log"
