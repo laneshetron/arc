@@ -964,9 +964,9 @@ Before declaring ARC/1 on-wire formats frozen, add deterministic fixtures for:
 1. Exact encoding of every packet type for known field values. *(v0.2 fixtures: done)*
 2. Exact cell header and byte-for-byte fragment reassembly. *(done)*
 3. Every frame type, including lengths, `ACK` range decoding, `IP_FRAGMENT` offset/length validation, and unknown-extension behavior. *(done)*
-4. Noise IK handshake using a vetted implementation, cross-checked against a second one, including rejection on a relay-key mismatch.
+4. Noise IK handshake using a vetted implementation, cross-checked against a second one, including rejection on a relay-key mismatch. *(done: generated with Python `noiseprotocol`, verified against Go `flynn/noise`)*
 5. Explicit-nonce ChaCha20-Poly1305 with fixed keys, a nonzero `path_id`, an authenticated header, and tag-failure mutation cases. *(done)*
-6. Noise `REKEY` vectors *(done)* and out-of-order epoch acceptance/rejection.
+6. Noise `REKEY` vectors and out-of-order epoch acceptance/rejection. *(done)*
 7. Cross-language client↔relay interop, including changes from UDP to TLS/TCP mid-session.
 8. DNS encoding of a known cell and parsing of multi-string TXT response, including case normalization and negative caching fixtures.
 9. ICMP request/response framing on a controlled test host and proof that ordinary echo replies are not accepted as ARC reply data.
