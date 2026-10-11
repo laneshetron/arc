@@ -26,6 +26,18 @@ jobs:
             go test -run='^$' -fuzz="^${target}\$" -fuzztime=20s ./internal/$pkg
           done
 
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: sudo apt-get update && sudo apt-get install -y iperf3
+      - run: go build -o bin/ ./cmd/arc-client ./cmd/arc-relay
+      - name: tunnel end to end in network namespaces
+        run: sudo KEEP_LOGS=1 ./test/netns/e2e.sh bin
+
   fixtures:
     runs-on: ubuntu-latest
     steps:

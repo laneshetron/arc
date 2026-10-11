@@ -75,7 +75,7 @@ func mustKey(seed byte) crypto.StaticKey {
 	return k
 }
 
-func testAuthorizer(credential, _ []byte) (wire.AuthResult, error) {
+func testAuthorizer(credential, _ []byte, _ bool) (wire.AuthResult, error) {
 	if string(credential) != "good" {
 		return wire.AuthResult{}, errors.New("bad credential")
 	}
