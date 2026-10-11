@@ -56,3 +56,7 @@ The end-to-end test builds this setup in three network namespaces:
 sudo test/netns/e2e.sh bin                                   # Linux
 docker build -f test/netns/Dockerfile -t arc-e2e . && docker run --rm --privileged arc-e2e   # macOS
 ```
+
+`test/netns/bench.sh` compares ARC's throughput with kernel WireGuard over the same topology
+(`docker run --rm --privileged arc-e2e bench` on macOS). Treat its numbers as relative: both ends
+share one machine.

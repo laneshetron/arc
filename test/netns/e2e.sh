@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
-# End-to-end tunnel test in three network namespaces (run as root on Linux):
-#
-#   arc-c (client)        arc-r (relay)                arc-i ("internet")
-#   c0 192.168.10.1/32 -- r0 192.168.10.2/24
-#                         r1 192.168.20.1/24  -------- i0 192.168.20.2/24
+# End-to-end tunnel test in three network namespaces (run as root on Linux),
+# using the topology in lib.sh.
 #
 # The client's only route is a default route out of c0, so it cannot reach
 # arc-i except through the tunnel, and in full-tunnel mode its carrier
@@ -14,20 +11,15 @@
 set -euo pipefail
 
 BIN=$(cd "${1:?usage: e2e.sh BIN_DIR}" && pwd)
+source "$(dirname "$0")/lib.sh"
 WORK=$(mktemp -d)
-C="ip netns exec arc-c"
-R="ip netns exec arc-r"
-I="ip netns exec arc-i"
-PIDS=()
 failures=0
 
 pass() { echo "PASS: $*"; }
 fail() { echo "FAIL: $*"; failures=$((failures + 1)); }
 
 cleanup() {
-  for pid in "${PIDS[@]}"; do kill "$pid" 2>/dev/null || true; done
-  wait 2>/dev/null || true
-  for ns in arc-c arc-r arc-i; do ip netns del "$ns" 2>/dev/null || true; done
+  teardown_topology
   if [[ $failures -ne 0 || -n "${KEEP_LOGS:-}" ]]; then
     for f in "$WORK"/*.log; do echo "--- $f"; tail -n 40 "$f"; done
   fi
@@ -36,28 +28,12 @@ cleanup() {
 trap cleanup EXIT
 
 wait_for() { # wait_for SECONDS DESCRIPTION COMMAND...
-  local deadline=$((SECONDS + $1)) what=$2; shift 2
-  until "$@" >/dev/null 2>&1; do
-    if ((SECONDS >= deadline)); then fail "$what (timed out)"; return 1; fi
-    sleep 0.2
-  done
+  local secs=$1 what=$2; shift 2
+  wait_until "$secs" "$@" || { fail "$what (timed out)"; return 1; }
 }
 
 # --- topology ------------------------------------------------------------
-for ns in arc-c arc-r arc-i; do ip netns add "$ns"; ip -n "$ns" link set lo up; done
-ip link add c0 netns arc-c type veth peer name r0 netns arc-r
-ip link add r1 netns arc-r type veth peer name i0 netns arc-i
-ip -n arc-c addr add 192.168.10.1/32 dev c0
-ip -n arc-c link set c0 up
-ip -n arc-c route add 192.168.10.2 dev c0      # peer only, for the baseline check
-ip -n arc-r addr add 192.168.10.2/24 dev r0
-ip -n arc-r addr add 192.168.20.1/24 dev r1
-ip -n arc-r link set r0 up
-ip -n arc-r link set r1 up
-ip -n arc-i addr add 192.168.20.2/24 dev i0
-ip -n arc-i link set i0 up
-$R sysctl -qw net.ipv4.ip_forward=1
-$R iptables -t nat -A POSTROUTING -s 10.77.0.0/16 -o r1 -j MASQUERADE
+setup_topology 10.77.0.0/16
 
 if $C ping -c1 -W1 192.168.20.2 >/dev/null 2>&1; then
   fail "client reaches the internet namespace without the tunnel"
