@@ -50,5 +50,5 @@ func sizeLabel(n int) string {
 	case 1000:
 		return "1000B"
 	}
-	return "1280B-fragmented"
+	return "1280B"
 }
