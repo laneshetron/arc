@@ -59,6 +59,14 @@ func run(args []string) error {
 	fullTunnel := fs.Bool("full-tunnel", false, "route all traffic through the tunnel")
 	var routes prefixList
 	fs.Var(&routes, "route", "route this prefix through the tunnel (repeatable)")
+	var binds []string
+	fs.Func("bind", "bind a carrier socket to this interface (repeatable)", func(iface string) error {
+		if iface == "" {
+			return errors.New("interface name must not be empty")
+		}
+		binds = append(binds, iface)
+		return nil
+	})
 	mark := fs.Uint("mark", 0x5243, "fwmark for carrier sockets, used by -full-tunnel")
 	table := fs.Int("table", 5243, "routing table for -full-tunnel")
 	fs.Parse(args)
@@ -106,11 +114,23 @@ func run(args []string) error {
 	if *fullTunnel {
 		sockOpts.Mark = uint32(*mark)
 	}
-	conn, err := udp.Listen(netip.MustParseAddrPort("0.0.0.0:0"), sockOpts)
-	if err != nil {
-		return err
+	if len(binds) == 0 {
+		binds = []string{""}
 	}
-	defer conn.Close()
+	carriers := make([]engine.Carrier, 0, len(binds))
+	for _, iface := range binds {
+		sockOpts.Device = iface
+		conn, err := udp.Listen(netip.MustParseAddrPort("0.0.0.0:0"), sockOpts)
+		if err != nil {
+			return fmt.Errorf("open carrier %q: %w", iface, err)
+		}
+		defer conn.Close()
+		name := iface
+		if name == "" {
+			name = "default"
+		}
+		carriers = append(carriers, engine.Carrier{Name: name, Conn: conn})
+	}
 
 	var cleanup func() error
 	defer func() {
@@ -147,7 +167,7 @@ func run(args []string) error {
 		"routes", strings.Trim(routes.String(), "[]"))
 	err = engine.RunClient(ctx, engine.ClientConfig{
 		Session: session.ClientConfig{Static: static, RelayPublic: pin[:], Credential: []byte(tokens[0])},
-		Relay:   relayAddr, Conn: conn, TUN: dev, OnEstablished: onEstablished, Logger: log,
+		Relay:   relayAddr, Carriers: carriers, TUN: dev, OnEstablished: onEstablished, Logger: log,
 	})
 	if errors.Is(err, context.Canceled) {
 		return nil

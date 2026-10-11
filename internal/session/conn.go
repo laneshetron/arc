@@ -23,7 +23,7 @@ const (
 	DefaultMaxPacketSize = 1232 // safe on any IPv6 path (§16.1)
 	DefaultKeepalive     = 10 * time.Second
 	DefaultIdleTimeout   = 120 * time.Second
-	PathTimeout          = 30 * time.Second // no packets received: the path is dead
+	DefaultPathTimeout   = 30 * time.Second // no packets received: the path is dead
 	sentHorizon          = 30 * time.Second
 	suspectPTOs          = 3
 	maxPaths             = 8 // joined paths plus unused slots (§14.3)

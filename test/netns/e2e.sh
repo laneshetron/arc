@@ -40,9 +40,12 @@ if $C ping -c1 -W1 192.168.20.2 >/dev/null 2>&1; then
 else
   pass "no route to the internet namespace before the tunnel"
 fi
-# From here on the client reaches everything through one default route.
+# From here on the client reaches everything through default routes, one
+# per link; each carrier socket is bound to its link.
 ip -n arc-c route del 192.168.10.2 dev c0
+ip -n arc-c route del 192.168.10.2 dev c1
 ip -n arc-c route add default dev c0
+ip -n arc-c route add default dev c1 metric 100
 
 # --- relay ---------------------------------------------------------------
 "$BIN/arc-relay" genkey > "$WORK/relay.key"
@@ -61,7 +64,7 @@ wait_for 10 "relay up" $R ip addr show arc0
 
 # --- client --------------------------------------------------------------
 $C "$BIN/arc-client" run -relay 192.168.10.2:4433 -relay-key "$RELAY_PUB" \
-  -token-file "$WORK/token" -full-tunnel >"$WORK/client.log" 2>&1 &
+  -token-file "$WORK/token" -full-tunnel -bind c0 -bind c1 >"$WORK/client.log" 2>&1 &
 CLIENT_PID=$!
 PIDS+=("$CLIENT_PID")
 wait_for 10 "client established" grep -q "session established" "$WORK/client.log" &&
@@ -74,7 +77,7 @@ else
   fail "ping through the tunnel"
 fi
 
-if grep -q 'client=192.168.10.1:' "$WORK/relay.log"; then
+if grep -qE 'client=192\.168\.1[01]\.1:' "$WORK/relay.log"; then
   pass "carrier reached the relay directly, not through the tunnel"
 else
   fail "relay did not see the client's real address"
@@ -106,6 +109,34 @@ if grep -q '192.168.20.1' "$WORK/iperf-server.log"; then
   pass "relay masqueraded tunnel traffic"
 else
   fail "internet namespace saw an unmasqueraded source"
+fi
+
+# Multipath failover: cut whichever link carries traffic in the middle of a
+# ping stream; traffic must continue on the other link.
+wait_for 10 "second link joined" grep -q "path validated" "$WORK/client.log" &&
+  pass "second link joined the session"
+tx() { $C cat "/sys/class/net/$1/statistics/tx_packets"; }
+a0=$(tx c0) b0=$(tx c1)
+$C ping -c20 -i0.05 -W1 192.168.20.2 >/dev/null 2>&1 || true
+if (($(tx c0) - a0 >= $(tx c1) - b0)); then busy=c0; else busy=c1; fi
+$C ping -c100 -i0.05 -W1 192.168.20.2 >"$WORK/failover.log" 2>&1 &
+PING_PID=$!
+sleep 1
+ip -n arc-c link set "$busy" down
+wait "$PING_PID" || true
+received=$(grep -oE '[0-9]+ received' "$WORK/failover.log" | awk '{print $1}')
+lost=$((100 - ${received:-0}))
+# 100 pings at 50 ms intervals: losing at most 40 means recovery within 2 s.
+if ((${received:-0} > 0 && lost <= 40)); then
+  pass "failover from $busy lost $lost/100 pings (about $((lost * 50)) ms)"
+else
+  fail "failover from $busy lost $lost/100 pings"
+fi
+ip -n arc-c link set "$busy" up
+if [[ $busy == c0 ]]; then
+  ip -n arc-c route replace default dev c0
+else
+  ip -n arc-c route replace default dev c1 metric 100
 fi
 
 # Relay restart: the client learns of it through a stateless reset and

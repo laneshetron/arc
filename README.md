@@ -48,6 +48,10 @@ sudo bin/arc-relay run -listen 0.0.0.0:4433 -network 10.77.0.1/16
 # Client host
 echo "some-token" > token
 sudo bin/arc-client run -relay RELAY_IP:4433 -relay-key RELAY_PUBLIC_KEY -full-tunnel
+
+# Several links at once (e.g. Wi-Fi and cellular): one carrier per interface,
+# with failover between them
+sudo bin/arc-client run -relay RELAY_IP:4433 -relay-key RELAY_PUBLIC_KEY -full-tunnel -bind wlan0 -bind wwan0
 ```
 
 The end-to-end test builds this setup in three network namespaces:

@@ -2,10 +2,13 @@
 #
 #   arc-c (client)        arc-r (relay)                arc-i ("internet")
 #   c0 192.168.10.1/32 -- r0 192.168.10.2/24
+#   c1 192.168.11.1/32 -- r2 192.168.11.2/24
 #                         r1 192.168.20.1/24  -------- i0 192.168.20.2/24
 #
-# The client starts with only a host route to the relay. The relay forwards
-# and masquerades the given tunnel networks onto r1.
+# c0 and c1 are two independent client links (think Wi-Fi and cellular),
+# both reaching the relay's address 192.168.10.2. The client starts with
+# only host routes to the relay, preferring c0. The relay forwards and
+# masquerades the given tunnel networks onto r1.
 
 C="ip netns exec arc-c"
 R="ip netns exec arc-r"
@@ -16,13 +19,19 @@ PIDS=()
 setup_topology() {
   for ns in arc-c arc-r arc-i; do ip netns add "$ns"; ip -n "$ns" link set lo up; done
   ip link add c0 netns arc-c type veth peer name r0 netns arc-r
+  ip link add c1 netns arc-c type veth peer name r2 netns arc-r
   ip link add r1 netns arc-r type veth peer name i0 netns arc-i
   ip -n arc-c addr add 192.168.10.1/32 dev c0
+  ip -n arc-c addr add 192.168.11.1/32 dev c1
   ip -n arc-c link set c0 up
+  ip -n arc-c link set c1 up
   ip -n arc-c route add 192.168.10.2 dev c0
+  ip -n arc-c route add 192.168.10.2 dev c1 metric 100
   ip -n arc-r addr add 192.168.10.2/24 dev r0
+  ip -n arc-r addr add 192.168.11.2/24 dev r2
   ip -n arc-r addr add 192.168.20.1/24 dev r1
   ip -n arc-r link set r0 up
+  ip -n arc-r link set r2 up
   ip -n arc-r link set r1 up
   ip -n arc-i addr add 192.168.20.2/24 dev i0
   ip -n arc-i link set i0 up

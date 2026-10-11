@@ -111,7 +111,7 @@ func TestTunnelOverLoopback(t *testing.T) {
 	go func() {
 		clientDone <- RunClient(clientCtx, ClientConfig{
 			Session: session.ClientConfig{Static: clientKey, RelayPublic: relayKey.Public, Credential: []byte("secret")},
-			Relay:   relayConn.LocalAddr(), Conn: clientConn, TUN: clientTUN,
+			Relay:   relayConn.LocalAddr(), Carriers: []Carrier{{Name: "lo", Conn: clientConn}}, TUN: clientTUN,
 			OnEstablished: func(r wire.AuthResult) error { established <- r; return nil },
 		})
 	}()
@@ -193,7 +193,7 @@ func TestClientStopsOnAuthFailure(t *testing.T) {
 	defer clientTUN.Close()
 	err := RunClient(ctx, ClientConfig{
 		Session: session.ClientConfig{Static: clientKey, RelayPublic: relayKey.Public, Credential: []byte("wrong")},
-		Relay:   relayConn.LocalAddr(), Conn: clientConn, TUN: clientTUN,
+		Relay:   relayConn.LocalAddr(), Carriers: []Carrier{{Name: "lo", Conn: clientConn}}, TUN: clientTUN,
 	})
 	if !errors.Is(err, session.ErrAuthFailed) {
 		t.Fatalf("RunClient returned %v", err)

@@ -556,7 +556,7 @@ func (r *Relay) Tick(now time.Time) {
 			r.closeSession(now, s, ErrIdleTimeout, false)
 		default:
 			for _, p := range slices.Clone(s.conn.paths) {
-				if p.joined && !now.Before(p.lastRecv.Add(PathTimeout)) && s.joinedPaths() > 1 {
+				if p.joined && !now.Before(p.lastRecv.Add(DefaultPathTimeout)) && s.joinedPaths() > 1 {
 					s.removePath(p)
 				}
 			}
@@ -587,7 +587,7 @@ func (r *Relay) NextDeadline() time.Time {
 		if s.joinedPaths() > 1 {
 			for _, p := range s.conn.paths {
 				if p.joined {
-					d = earliest(d, p.lastRecv.Add(PathTimeout))
+					d = earliest(d, p.lastRecv.Add(DefaultPathTimeout))
 				}
 			}
 		}
