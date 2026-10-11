@@ -19,6 +19,7 @@ ARC is a multipath, carrier-agnostic overlay VPN. A TUN interface gives applicat
 ```sh
 go test -race ./...
 go test -run='^$' -fuzz='^FuzzPacket$' -fuzztime=1m ./internal/wire   # also FuzzFrames
+go test -run='^$' -bench=. ./internal/...                           # benchmarks
 
 # Regenerate the wire fixtures after a spec change
 python3 -m venv .venv && .venv/bin/pip install -r spec/requirements.txt
