@@ -31,6 +31,11 @@ type ClientConfig struct {
 	RelayPublic []byte // pinned relay static key
 	Credential  []byte
 	Rand        io.Reader // nil uses crypto/rand
+
+	// PathTimeout is how long a path may go without receiving anything
+	// before the client abandons it, unless it is the last path. Default
+	// DefaultPathTimeout.
+	PathTimeout time.Duration
 }
 
 // Datagram is an outgoing packet for one of the client's paths. The caller
@@ -110,6 +115,9 @@ func NewClient(cfg ClientConfig, now time.Time) (*Client, error) {
 	}
 	if cfg.Rand == nil {
 		cfg.Rand = rand.Reader
+	}
+	if cfg.PathTimeout == 0 {
+		cfg.PathTimeout = DefaultPathTimeout
 	}
 	c := &Client{cfg: cfg}
 	if err := c.startHandshake(now); err != nil {
@@ -449,7 +457,7 @@ func (c *Client) Tick(now time.Time) {
 		for _, p := range slices.Clone(c.conn.paths) {
 			// A dead path is abandoned unless it is the last one; the session
 			// idle timeout governs that case (§9.4).
-			if !now.Before(p.lastRecv.Add(PathTimeout)) && len(c.conn.paths) > 1 {
+			if !now.Before(p.lastRecv.Add(c.cfg.PathTimeout)) && len(c.conn.paths) > 1 {
 				c.conn.queue(wire.PathAbandon{PathID: p.id, Code: wire.CodePathUnavailable})
 				c.dropPath(p, ErrPathTimeout)
 			}
@@ -502,7 +510,7 @@ func (c *Client) NextDeadline() time.Time {
 	}
 	for _, p := range c.conn.paths {
 		if len(c.conn.paths) > 1 {
-			d = earliest(d, p.lastRecv.Add(PathTimeout))
+			d = earliest(d, p.lastRecv.Add(c.cfg.PathTimeout))
 		}
 		if p.validated {
 			d = earliest(d, p.lastSend.Add(c.keepalive()))

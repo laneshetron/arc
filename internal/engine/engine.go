@@ -28,12 +28,13 @@ type DatagramConn interface {
 const readBatch = 64
 
 type datagrams struct {
-	pkts [][]byte
-	from []netip.AddrPort
+	carrier int // index of the carrier the batch arrived on
+	pkts    [][]byte
+	from    []netip.AddrPort
 }
 
 // readDatagrams copies batches from conn into out until reading fails.
-func readDatagrams(ctx context.Context, conn DatagramConn, out chan<- datagrams, errc chan<- error) {
+func readDatagrams(ctx context.Context, carrier int, conn DatagramConn, out chan<- datagrams, errc chan<- error) {
 	bufs := make([][]byte, readBatch)
 	for i := range bufs {
 		bufs[i] = make([]byte, udp.MaxDatagram)
@@ -42,7 +43,7 @@ func readDatagrams(ctx context.Context, conn DatagramConn, out chan<- datagrams,
 	for {
 		n, err := conn.ReadBatch(bufs, sizes, addrs)
 		if n > 0 {
-			d := datagrams{pkts: make([][]byte, n), from: make([]netip.AddrPort, n)}
+			d := datagrams{carrier: carrier, pkts: make([][]byte, n), from: make([]netip.AddrPort, n)}
 			for i := range n {
 				d.pkts[i] = append([]byte(nil), bufs[i][:sizes[i]]...)
 				d.from[i] = addrs[i]

@@ -31,7 +31,7 @@ func RunRelay(ctx context.Context, cfg RelayConfig) error {
 	defer cancel()
 
 	udpCh, tunCh, errc := make(chan datagrams, 16), make(chan [][]byte, 16), make(chan error, 2)
-	go readDatagrams(ctx, cfg.Conn, udpCh, errc)
+	go readDatagrams(ctx, 0, cfg.Conn, udpCh, errc)
 	go readPackets(ctx, cfg.TUN, tunCh, errc)
 
 	cfg.Session.Authorize = cfg.Gateway.Authorize

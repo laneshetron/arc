@@ -119,7 +119,7 @@ func TestFailover(t *testing.T) {
 	}
 
 	// After PathTimeout the dead path is abandoned on both sides.
-	n.runFor(PathTimeout + 5*time.Second)
+	n.runFor(DefaultPathTimeout + 5*time.Second)
 	if n.clientEventsOf(func(e ClientEvent) bool { c, ok := e.(PathClosed); return ok && c.ID == 0 }) != 1 {
 		t.Error("client did not close dead path 0")
 	}
