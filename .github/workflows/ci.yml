@@ -23,7 +23,9 @@ jobs:
         run: |
           for spec in wire:FuzzPacket wire:FuzzFrames session:FuzzHandlePacket; do
             pkg=${spec%%:*} target=${spec##*:}
-            go test -run='^$' -fuzz="^${target}\$" -fuzztime=20s ./internal/$pkg
+            # A fixed count, not a duration: time-based runs can end with a
+            # spurious "context deadline exceeded" from the fuzzer's shutdown.
+            go test -run='^$' -fuzz="^${target}\$" -fuzztime=2000000x ./internal/$pkg
           done
 
   e2e:
