@@ -43,7 +43,10 @@ func TestEstablishAndExchange(t *testing.T) {
 
 func TestFullSizePacketsAreFragmented(t *testing.T) {
 	n := newNetwork(t, 2, defaultRelayConfig(), ClientConfig{})
+	// An unprobeable link: the MTU probe is dropped, so packets stay fragmented.
+	n.up.mtu, n.down.mtu = DefaultMaxPacketSize, DefaultMaxPacketSize
 	s := n.establish()
+	n.runFor(5 * time.Second)
 	var sizes []int
 	n.tap = func(_ bool, d []byte) { sizes = append(sizes, len(d)) }
 
@@ -77,7 +80,7 @@ func TestFullSizePacketsAreFragmented(t *testing.T) {
 func TestImpairedLink(t *testing.T) {
 	for seed := range uint64(10) {
 		n := newNetwork(t, 100+seed, defaultRelayConfig(), ClientConfig{})
-		for _, l := range []*link{&n.up, &n.down} {
+		for _, l := range []*link{n.up, n.down} {
 			l.loss, l.dup, l.delay, l.jitter = 0.2, 0.1, 30*time.Millisecond, 40*time.Millisecond
 		}
 		s := n.establish()

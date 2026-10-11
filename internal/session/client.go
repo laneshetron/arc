@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"io"
+	"slices"
 	"time"
 
 	"github.com/laneshetron/arc/internal/crypto"
@@ -32,14 +33,14 @@ type ClientConfig struct {
 	Rand        io.Reader // nil uses crypto/rand
 }
 
-// Datagram is an outgoing packet for one of the client's paths.
+// Datagram is an outgoing packet for one of the client's paths. The caller
+// sends it on the carrier it bound to PathID.
 type Datagram struct {
 	PathID uint32
 	Data   []byte
 }
 
-// ClientEvent is reported by Client.PollEvent: one of Established,
-// IPReceived, or Closed.
+// ClientEvent is reported by Client.PollEvent.
 type ClientEvent interface{ clientEvent() }
 
 // Established reports that the session is active.
@@ -48,12 +49,35 @@ type Established struct{ Config wire.AuthResult }
 // IPReceived carries one tunneled IP packet.
 type IPReceived struct{ Packet []byte }
 
+// PathValidated reports that a path opened with OpenPath can carry traffic.
+type PathValidated struct{ ID uint32 }
+
+// PathClosed reports that a path was removed; its carrier can be closed.
+type PathClosed struct {
+	ID  uint32
+	Err error
+}
+
 // Closed reports that the session ended.
 type Closed struct{ Err error }
 
-func (Established) clientEvent() {}
-func (IPReceived) clientEvent()  {}
-func (Closed) clientEvent()      {}
+func (Established) clientEvent()   {}
+func (IPReceived) clientEvent()    {}
+func (PathValidated) clientEvent() {}
+func (PathClosed) clientEvent()    {}
+func (Closed) clientEvent()        {}
+
+// MaxCredentialLen is the largest credential whose AUTH frame fits in one
+// packet on a path that has not been MTU-probed.
+const MaxCredentialLen = DefaultMaxPacketSize - dataOverhead
+
+var errCredential = errors.New("session: credential must be 1 to MaxCredentialLen bytes")
+
+type pathSlot struct {
+	id    uint32
+	cid   wire.CID
+	token wire.Token
+}
 
 // Client is the initiator side of one ARC session. It is not safe for
 // concurrent use; drive it from a single goroutine.
@@ -70,20 +94,16 @@ type Client struct {
 	initInterval  time.Duration
 	authenticated time.Time
 
-	conn   *conn
-	config wire.AuthResult
+	conn    *conn
+	config  wire.AuthResult
+	slots   []pathSlot
+	current *path // primary path
 
 	out    []Datagram
 	events []ClientEvent
 }
 
-// MaxCredentialLen is the largest credential whose AUTH frame fits in one
-// packet on a path that has not been MTU-probed.
-const MaxCredentialLen = DefaultMaxPacketSize - wire.DataHeaderLen - wire.AEADTagLen - wire.FrameHeaderLen
-
-var errCredential = errors.New("session: credential must be 1 to MaxCredentialLen bytes")
-
-// NewClient creates a client and queues its first HANDSHAKE_INIT.
+// NewClient creates a client and queues its first HANDSHAKE_INIT on path 0.
 func NewClient(cfg ClientConfig, now time.Time) (*Client, error) {
 	if len(cfg.Credential) == 0 || len(cfg.Credential) > MaxCredentialLen {
 		return nil, errCredential
@@ -100,12 +120,20 @@ func NewClient(cfg ClientConfig, now time.Time) (*Client, error) {
 
 func (c *Client) State() State { return c.state }
 
-// Stats returns counters for the current handshake's session, if any.
+// Stats returns counters for the current session, if any.
 func (c *Client) Stats() Stats {
 	if c.conn == nil {
 		return Stats{}
 	}
 	return c.conn.stats
+}
+
+// Paths describes the session's joined paths.
+func (c *Client) Paths(now time.Time) []PathInfo {
+	if c.conn == nil {
+		return nil
+	}
+	return c.conn.pathInfo(now)
 }
 
 func (c *Client) startHandshake(now time.Time) error {
@@ -119,7 +147,7 @@ func (c *Client) startHandshake(now time.Time) error {
 	if err != nil {
 		return err
 	}
-	c.state, c.hs, c.cookie, c.conn = StateHandshaking, hs, nil, nil
+	c.state, c.hs, c.cookie, c.conn, c.slots, c.current = StateHandshaking, hs, nil, nil, nil, nil
 	c.attemptStart, c.initInterval = now, initialRetransmit
 	c.sendInit(now)
 	return nil
@@ -131,7 +159,7 @@ func (c *Client) sendInit(now time.Time) {
 	c.nextInit = now.Add(c.initInterval)
 }
 
-// HandlePacket processes one packet received on a path's carrier.
+// HandlePacket processes one packet received on the carrier bound to pathID.
 func (c *Client) HandlePacket(now time.Time, pathID uint32, b []byte) {
 	if c.state == StateClosed {
 		return
@@ -174,15 +202,33 @@ func (c *Client) handleResp(now time.Time, b []byte) {
 		return // possibly forged; keep waiting for the genuine response
 	}
 	p0 := newPath(0, c.hs.Init(nil).SenderCID, res.RelayCID, now)
-	p0.resetToken = res.ResetToken
-	c.conn = newConn(res.Keys, p0, now, c.emit)
+	p0.resetToken, p0.joined = res.ResetToken, true
+	c.conn = newConn(res.Keys, now)
+	c.conn.primary, c.conn.emit = c.primary, c.emit
+	c.conn.addPath(p0)
 	c.state, c.authenticated = StateAuthenticating, now
 	c.conn.queue(wire.Auth{Credential: c.cfg.Credential})
 	c.conn.flush(now)
 }
 
-func (c *Client) emit(p *path, b []byte) {
+func (c *Client) emit(p *path, b []byte, _ bool) {
 	c.out = append(c.out, Datagram{PathID: p.id, Data: b})
+}
+
+// primary keeps the current path while it is healthy and otherwise moves
+// to the best healthy path. Before the session is active, everything goes
+// on path 0.
+func (c *Client) primary(now time.Time) *path {
+	if c.state != StateActive {
+		return c.conn.path(0)
+	}
+	if c.current != nil && !c.current.removed && c.current.healthy(now, c.conn.keepalive) {
+		return c.current
+	}
+	if best := c.conn.bestPath(now); best != nil {
+		c.current = best
+	}
+	return c.current
 }
 
 func (c *Client) handleData(now time.Time, b []byte) {
@@ -193,7 +239,7 @@ func (c *Client) handleData(now time.Time, b []byte) {
 	if err != nil {
 		return
 	}
-	p := c.conn.pathByCID(h.DestCID)
+	p := c.conn.byCID[h.DestCID]
 	if p == nil {
 		return
 	}
@@ -208,7 +254,7 @@ func (c *Client) handleData(now time.Time, b []byte) {
 	for _, f := range frames {
 		switch f := f.(type) {
 		case wire.AuthResult:
-			c.onAuthResult(f)
+			c.onAuthResult(now, f)
 			if c.state == StateClosed {
 				return
 			}
@@ -224,6 +270,16 @@ func (c *Client) handleData(now time.Time, b []byte) {
 					c.events = append(c.events, IPReceived{Packet: pkt})
 				}
 			}
+		case wire.NewPath:
+			if len(c.slots) < maxPaths && c.conn.path(f.PathID) == nil {
+				c.slots = append(c.slots, pathSlot{id: f.PathID, cid: f.CID, token: f.ResetToken})
+			}
+		case wire.PathChallenge:
+			c.onChallenge(now, p, f)
+		case wire.PathAbandon:
+			if q := c.conn.path(f.PathID); q != nil {
+				c.dropPath(q, ErrPathAbandoned)
+			}
 		case wire.CloseFrame:
 			c.close(now, &PeerClosedError{Code: f.Code}, false)
 			return
@@ -232,7 +288,23 @@ func (c *Client) handleData(now time.Time, b []byte) {
 	c.conn.flush(now)
 }
 
-func (c *Client) onAuthResult(r wire.AuthResult) {
+// onChallenge answers a PATH_CHALLENGE. An authenticated challenge on a
+// joining path proves the relay received our PATH_JOIN and can reach us, so
+// the path is validated (§14.4).
+func (c *Client) onChallenge(now time.Time, p *path, f wire.PathChallenge) {
+	c.conn.transmit(now, p, []wire.Frame{wire.PathResponse{Data: f.Data}})
+	if !p.validated && c.state == StateActive {
+		p.validated = true
+		p.control = nil // the pending PATH_JOIN is no longer needed
+		c.events = append(c.events, PathValidated{ID: p.id})
+		c.conn.probe(now, p)
+		if best := c.conn.bestPath(now); best != nil && (c.current == nil || best.rtt.srtt() < c.current.rtt.srtt()) {
+			c.current = best
+		}
+	}
+}
+
+func (c *Client) onAuthResult(now time.Time, r wire.AuthResult) {
 	if c.state != StateAuthenticating {
 		return // duplicate or a credential refresh acknowledgement
 	}
@@ -243,6 +315,11 @@ func (c *Client) onAuthResult(r wire.AuthResult) {
 	}
 	c.config = r
 	c.state = StateActive
+	p0 := c.conn.path(0)
+	p0.validated = true
+	c.conn.probeSize = int(r.TunMTU) + dataOverhead
+	c.conn.keepalive = c.keepalive()
+	c.conn.probe(now, p0)
 	c.events = append(c.events, Established{Config: r})
 }
 
@@ -251,11 +328,65 @@ func (c *Client) handleReset(b []byte) {
 	if err != nil || c.conn == nil {
 		return
 	}
-	p := c.conn.path0
-	if r.CID == p.remoteCID && crypto.ResetTokenEqual(r.Token, p.resetToken) {
-		c.state, c.err = StateClosed, ErrStatelessReset
-		c.events = append(c.events, Closed{Err: ErrStatelessReset})
+	for _, p := range c.conn.paths {
+		if r.CID == p.remoteCID && crypto.ResetTokenEqual(r.Token, p.resetToken) {
+			c.state, c.err = StateClosed, ErrStatelessReset
+			c.events = append(c.events, Closed{Err: ErrStatelessReset})
+			return
+		}
 	}
+}
+
+// OpenPath joins a new path using a slot the relay issued (§14.4) and
+// returns its ID. Bind a new carrier to the ID: datagrams for it appear in
+// PollTransmit, and received packets go to HandlePacket with that ID. A
+// PathValidated event follows when the relay has proven reachability.
+func (c *Client) OpenPath(now time.Time) (uint32, error) {
+	if c.state != StateActive {
+		return 0, ErrNotActive
+	}
+	if len(c.slots) == 0 {
+		return 0, ErrNoPathSlots
+	}
+	slot := c.slots[0]
+	c.slots = c.slots[1:]
+	var cid wire.CID
+	for {
+		if _, err := io.ReadFull(c.cfg.Rand, cid[:]); err != nil {
+			return 0, err
+		}
+		if c.conn.byCID[cid] == nil {
+			break
+		}
+	}
+	p := newPath(slot.id, cid, slot.cid, now)
+	p.resetToken, p.joined = slot.token, true
+	p.control = []wire.Frame{wire.PathJoin{CID: cid}}
+	c.conn.addPath(p)
+	c.conn.flush(now)
+	return p.id, nil
+}
+
+// ClosePath abandons a path and tells the relay.
+func (c *Client) ClosePath(now time.Time, id uint32) {
+	if c.conn == nil {
+		return
+	}
+	p := c.conn.path(id)
+	if p == nil || len(c.conn.paths) == 1 {
+		return // the last path stays; Close ends the session
+	}
+	c.conn.queue(wire.PathAbandon{PathID: id, Code: wire.CodeNoError})
+	c.dropPath(p, ErrClosed)
+	c.conn.flush(now)
+}
+
+func (c *Client) dropPath(p *path, err error) {
+	c.conn.removePath(p)
+	if c.current == p {
+		c.current = nil
+	}
+	c.events = append(c.events, PathClosed{ID: p.id, Err: err})
 }
 
 // SendIP tunnels one IP packet. The packet is copied.
@@ -271,8 +402,7 @@ func (c *Client) SendIP(now time.Time, pkt []byte) error {
 	if err := wire.ValidateIPPacket(pkt); err != nil {
 		return err
 	}
-	c.conn.sendIP(now, pkt)
-	return nil
+	return c.conn.sendIP(now, pkt)
 }
 
 // Close ends the session, telling the relay.
@@ -283,7 +413,9 @@ func (c *Client) close(now time.Time, err error, notify bool) {
 		return
 	}
 	if notify && c.conn != nil {
-		c.conn.transmit(now, c.conn.path0, []wire.Frame{wire.CloseFrame{Code: wire.CodeNoError}})
+		if p := c.conn.primary(now); p != nil {
+			c.conn.transmit(now, p, []wire.Frame{wire.CloseFrame{Code: wire.CodeNoError}})
+		}
 	}
 	c.state, c.err = StateClosed, err
 	c.events = append(c.events, Closed{Err: err})
@@ -309,14 +441,27 @@ func (c *Client) Tick(now time.Time) {
 		}
 	}
 
-	p := c.conn.path0
-	if !now.Before(p.lastRecv.Add(c.idleTimeout())) {
+	if !now.Before(c.conn.lastRecv().Add(c.idleTimeout())) {
 		c.close(now, ErrIdleTimeout, false)
 		return
 	}
+	if c.state == StateActive {
+		for _, p := range slices.Clone(c.conn.paths) {
+			// A dead path is abandoned unless it is the last one; the session
+			// idle timeout governs that case (§9.4).
+			if !now.Before(p.lastRecv.Add(PathTimeout)) && len(c.conn.paths) > 1 {
+				c.conn.queue(wire.PathAbandon{PathID: p.id, Code: wire.CodePathUnavailable})
+				c.dropPath(p, ErrPathTimeout)
+			}
+		}
+	}
 	c.conn.onTimers(now)
-	if c.state == StateActive && !now.Before(p.lastSend.Add(c.keepalive())) {
-		c.conn.transmit(now, p, []wire.Frame{wire.Ping{}})
+	if c.state == StateActive {
+		for _, p := range c.conn.paths {
+			if p.validated && !now.Before(p.lastSend.Add(c.keepalive())) {
+				c.conn.transmit(now, p, []wire.Frame{wire.Ping{}})
+			}
+		}
 	}
 }
 
@@ -351,12 +496,17 @@ func (c *Client) NextDeadline() time.Time {
 	case StateHandshaking:
 		return earliest(c.nextInit, c.attemptStart.Add(HandshakeTimeout))
 	}
-	p := c.conn.path0
-	d := earliest(c.conn.nextDeadline(), p.lastRecv.Add(c.idleTimeout()))
-	if c.state == StateActive {
-		d = earliest(d, p.lastSend.Add(c.keepalive()))
-	} else {
-		d = earliest(d, c.authenticated.Add(HandshakeTimeout))
+	d := earliest(c.conn.nextDeadline(), c.conn.lastRecv().Add(c.idleTimeout()))
+	if c.state != StateActive {
+		return earliest(d, c.authenticated.Add(HandshakeTimeout))
+	}
+	for _, p := range c.conn.paths {
+		if len(c.conn.paths) > 1 {
+			d = earliest(d, p.lastRecv.Add(PathTimeout))
+		}
+		if p.validated {
+			d = earliest(d, p.lastSend.Add(c.keepalive()))
+		}
 	}
 	return d
 }
