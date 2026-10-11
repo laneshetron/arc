@@ -352,7 +352,7 @@ func parseValue(t FrameType, v []byte) (Frame, error) {
 		return parseAuthResult(v)
 
 	case FrameIPPacket:
-		if err := validateIPPacket(v); err != nil {
+		if err := ValidateIPPacket(v); err != nil {
 			return nil, err
 		}
 		return IPPacket{Packet: v}, nil
@@ -462,9 +462,9 @@ func parseAuthResult(v []byte) (Frame, error) {
 	return r, nil
 }
 
-// validateIPPacket checks the IP version and that the packet's declared
+// ValidateIPPacket checks the IP version and that the packet's declared
 // length matches the frame length (§10.1).
-func validateIPPacket(v []byte) error {
+func ValidateIPPacket(v []byte) error {
 	if len(v) == 0 {
 		return errFrameSize
 	}

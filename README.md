@@ -10,6 +10,9 @@ ARC is a multipath, carrier-agnostic overlay VPN. A TUN interface gives applicat
 |---|---|
 | `spec/` | Protocol spec, wire registry, fixtures, and their generator |
 | `internal/wire` | Packet, frame, and cell codec |
+| `internal/crypto` | Noise IK handshake, packet protection, rekeying, replay windows, cookies, reset tokens |
+| `internal/reassembly` | Bounded IP datagram reassembly |
+| `internal/session` | Client and relay session state machines (sans-IO) |
 
 ## Development
 

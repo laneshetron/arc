@@ -19,8 +19,9 @@ jobs:
       - run: go test -race ./...
       - name: fuzz smoke
         run: |
-          for target in FuzzPacket FuzzFrames; do
-            go test -run='^$' -fuzz="^${target}\$" -fuzztime=20s ./internal/wire
+          for spec in wire:FuzzPacket wire:FuzzFrames session:FuzzHandlePacket; do
+            pkg=${spec%%:*} target=${spec##*:}
+            go test -run='^$' -fuzz="^${target}\$" -fuzztime=20s ./internal/$pkg
           done
 
   fixtures:
