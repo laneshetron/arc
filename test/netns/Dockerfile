@@ -11,9 +11,10 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -o /out/ ./cmd/arc-client ./cmd/arc-relay
 
-FROM debian:bookworm-slim
+# trixie: iperf3 >= 3.16 runs parallel streams on separate threads.
+FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      iproute2 iptables iperf3 iputils-ping procps wireguard-tools && rm -rf /var/lib/apt/lists/*
+      iproute2 iptables iperf3 iputils-ping procps wireguard-tools ethtool && rm -rf /var/lib/apt/lists/*
 COPY --from=build /out/ /arc/bin/
 COPY test/netns/*.sh /arc/
 ENTRYPOINT ["/arc/entry.sh"]
