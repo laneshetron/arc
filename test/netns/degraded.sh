@@ -15,6 +15,8 @@
 #   - on a 50 Mbit/s bottleneck ARC reaches >= 70% of plain routing
 #   - failover from a blackholed link completes within 2 s
 #   - traffic leaves a busy link with 5% or 30% loss when the other is clean
+#   - with both links at 5% loss (RTT ~0 and 40 ms), -redundancy auto at least halves ping loss
+#     and at least doubles TCP goodput
 #
 # Usage: degraded.sh BIN_DIR [SECONDS]   (SECONDS per TCP run, default 10)
 set -euo pipefail
@@ -93,8 +95,8 @@ tcp_up() { # prints TCP uplink goodput in Mbit/s, or 0 if the run failed
   echo 0
 }
 
-ping_stats() { # prints "LOSS% AVG_MS" for 50 pings 20 ms apart
-  $C ping -q -c 50 -i 0.02 -W 2 "$TARGET" >"$WORK/ping.log" 2>&1 || true
+ping_stats() { # ping_stats [COUNT]: prints "LOSS% AVG_MS" for COUNT (50) pings 20 ms apart
+  $C ping -q -c "${1:-50}" -i 0.02 -W 2 "$TARGET" >"$WORK/ping.log" 2>&1 || true
   local loss avg
   loss=$(grep -oE '[0-9.]+% packet loss' "$WORK/ping.log" | cut -d% -f1)
   avg=$(grep -oE 'rtt [^=]+= [0-9.]+/[0-9.]+' "$WORK/ping.log" | awk -F/ '{print $NF}')
@@ -151,11 +153,18 @@ $C ip link del wg0
 $I pkill -x iperf3 || true
 wait_until 5 sh -c "! pgrep -x iperf3 >/dev/null"
 $I iperf3 -s -D --logfile "$WORK/iperf-server.log"
-$C "$BIN/arc-client" run -relay 192.168.10.2:4433 -relay-key "$RELAY_PUB" \
-  -token-file "$WORK/token" -route 192.168.20.0/24 -bind c0 -bind c1 >"$WORK/client2.log" 2>&1 &
-PIDS+=($!)
-wait_until 10 grep -q "path validated" "$WORK/client2.log" ||
-  { cat "$WORK/client2.log"; exit 1; }
+MP_CLIENT=
+start_multipath_client() { # start_multipath_client REDUNDANCY LOG
+  if [[ -n $MP_CLIENT ]]; then kill "$MP_CLIENT"; wait "$MP_CLIENT" 2>/dev/null || true; fi
+  $C "$BIN/arc-client" run -relay 192.168.10.2:4433 -relay-key "$RELAY_PUB" \
+    -token-file "$WORK/token" -route 192.168.20.0/24 -bind c0 -bind c1 \
+    -redundancy "$1" >"$WORK/$2" 2>&1 &
+  MP_CLIENT=$!
+  PIDS+=("$MP_CLIENT")
+  wait_until 10 grep -q "path validated" "$WORK/$2" ||
+    { cat "$WORK/$2"; exit 1; }
+}
+start_multipath_client off client2.log
 
 tx() { $C cat "/sys/class/net/$1/statistics/tx_packets"; }
 busy_link() { # prints 0 or 1: the link carrying tunnel traffic now
@@ -228,6 +237,42 @@ lossy_link() { # lossy_link LOSS
 }
 lossy_link 5%
 lossy_link 30%
+
+# Both links lossy: there is no clean path to move to. Redundancy sends
+# each packet on both links, so with independent 5% loss about 0.25% of
+# packets are lost instead of 5% (spec §11.1). Ping loss counts both
+# directions; 300 pings resolve it to about 0.3%.
+both_lossy() { # both_lossy NAME REDUNDANCY NETEM_ARGS...: sets BL_MBPS and BL_LOSS
+  local name=$1 mode=$2 avg
+  shift 2
+  start_multipath_client "$mode" "client-$mode.log"
+  impair 0 "$@"
+  impair 1 "$@"
+  BL_MBPS=$(tcp_up)
+  read -r BL_LOSS avg <<<"$(ping_stats 300)"
+  unimpair 0
+  unimpair 1
+  MP_ROWS+=("$(printf '%-34s redundancy %-6s TCP %6s Mbit/s, ping loss %s%%' "$name" "$mode" "$BL_MBPS" "$BL_LOSS")")
+}
+compare_redundancy() { # compare_redundancy NAME NETEM_ARGS...
+  local name=$1 off_mbps off_loss
+  shift
+  both_lossy "$name" off "$@"
+  off_mbps=$BL_MBPS off_loss=$BL_LOSS
+  both_lossy "$name" auto "$@"
+  if awk -v a="$BL_LOSS" -v o="$off_loss" 'BEGIN { exit !(a < o / 2) }'; then
+    pass "redundancy cut ping loss from $off_loss% to $BL_LOSS% ($name)"
+  else
+    fail "redundancy left ping loss at $BL_LOSS%, against $off_loss% without ($name)"
+  fi
+  if awk -v a="$BL_MBPS" -v o="$off_mbps" 'BEGIN { exit !(a > 2 * o) }'; then
+    pass "redundancy raised TCP goodput from $off_mbps to $BL_MBPS Mbit/s ($name)"
+  else
+    fail "redundancy gave $BL_MBPS Mbit/s TCP goodput, against $off_mbps without ($name)"
+  fi
+}
+compare_redundancy "both links at 5% loss" loss 5%
+compare_redundancy "both at 5% loss, rtt 40ms" delay 20ms loss 5%
 
 echo
 echo "Part 1: single link, $DURATION s TCP runs; $(nproc) CPUs; kernel $(uname -r)"

@@ -39,6 +39,10 @@ const (
 	lossSwitchRatio = 2
 	lossDwell       = 2 * time.Second
 	lossCheckEvery  = 250 * time.Millisecond
+
+	// RedundancyAuto thresholds (§11.1).
+	redundancyOn  = 0.01
+	redundancyOff = 0.004
 )
 
 // lossEstimator is an exponentially weighted average of one direction's

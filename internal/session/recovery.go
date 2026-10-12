@@ -159,7 +159,7 @@ type sentPacket struct {
 	sentAt time.Time
 	epoch  uint64
 	frames []wire.Frame
-	probe  bool // MTU probe: its loss says nothing about path health
+	probe  int // MTU probe size, or 0: a probe's loss says nothing about path health
 	acked  bool
 }
 
@@ -200,7 +200,7 @@ type ackResult struct {
 	hasRTT            bool
 	lost              []wire.Frame
 	lostCount         int
-	ackedProbe        bool
+	ackedProbe        int // largest MTU probe acknowledged
 }
 
 // onAck marks acknowledged packets and declares older ones lost by the
@@ -216,10 +216,10 @@ func (s *sentLog) onAck(now time.Time, ack *wire.Ack, intervals []wire.PacketRan
 			}
 			s.retire(p)
 			res.newlyAcked++
-			if !p.probe {
+			if p.probe == 0 {
 				res.delivered++
 			}
-			res.ackedProbe = res.ackedProbe || p.probe
+			res.ackedProbe = max(res.ackedProbe, p.probe)
 			res.ackedCurrentEpoch = res.ackedCurrentEpoch || p.epoch == epoch
 			if p.pn == ack.Largest {
 				res.rttSample, res.hasRTT = now.Sub(p.sentAt), true
@@ -241,7 +241,7 @@ func (s *sentLog) onAck(now time.Time, ack *wire.Ack, intervals []wire.PacketRan
 			continue
 		}
 		s.retire(p) // lost
-		if !p.probe {
+		if p.probe == 0 {
 			res.lostCount++
 		}
 		res.lost = append(res.lost, p.frames...)
@@ -287,7 +287,7 @@ func (s *sentLog) ptoDeadline(rtt *rttEstimator) time.Time {
 // than an MTU probe) was sent.
 func (s *sentLog) oldestOutstanding() (time.Time, bool) {
 	for _, p := range s.packets {
-		if !p.acked && !p.probe {
+		if !p.acked && p.probe == 0 {
 			return p.sentAt, true
 		}
 	}

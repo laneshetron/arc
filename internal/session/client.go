@@ -36,7 +36,26 @@ type ClientConfig struct {
 	// before the client abandons it, unless it is the last path. Default
 	// DefaultPathTimeout.
 	PathTimeout time.Duration
+
+	// Redundancy selects when IP traffic is sent on two paths at once
+	// (§11.1). It needs a second healthy path and a relay that supports it.
+	Redundancy RedundancyPolicy
 }
+
+// RedundancyPolicy selects when the client sends IP traffic on two paths
+// and asks the relay to do the same.
+type RedundancyPolicy uint8
+
+const (
+	// RedundancyOff never duplicates traffic.
+	RedundancyOff RedundancyPolicy = iota
+	// RedundancyAuto duplicates a direction while the primary path loses
+	// more than 1% of its packets in that direction, until the loss falls
+	// below 0.4%.
+	RedundancyAuto
+	// RedundancyAlways duplicates all traffic, doubling its cost.
+	RedundancyAlways
+)
 
 // Datagram is an outgoing packet for one of the client's paths. The caller
 // sends it on the carrier it bound to PathID.
@@ -54,6 +73,11 @@ type Established struct{ Config wire.AuthResult }
 // PathValidated reports that a path opened with OpenPath can carry traffic.
 type PathValidated struct{ ID uint32 }
 
+// RedundancyChanged reports that the client started or stopped sending
+// uplink traffic, or asked the relay to send downlink traffic, on two
+// paths. Copies go out only while a second healthy path exists.
+type RedundancyChanged struct{ Uplink, Downlink bool }
+
 // PathClosed reports that a path was removed; its carrier can be closed.
 type PathClosed struct {
 	ID  uint32
@@ -63,10 +87,11 @@ type PathClosed struct {
 // Closed reports that the session ended.
 type Closed struct{ Err error }
 
-func (Established) clientEvent()   {}
-func (PathValidated) clientEvent() {}
-func (PathClosed) clientEvent()    {}
-func (Closed) clientEvent()        {}
+func (Established) clientEvent()       {}
+func (PathValidated) clientEvent()     {}
+func (PathClosed) clientEvent()        {}
+func (Closed) clientEvent()            {}
+func (RedundancyChanged) clientEvent() {}
 
 // MaxCredentialLen is the largest credential whose AUTH frame fits in one
 // packet on a path that has not been MTU-probed.
@@ -102,6 +127,8 @@ type Client struct {
 	// Loss-driven moves of the primary (loss.go): when the next check is
 	// due and the earliest the primary may move again.
 	lossCheckAt, lossMoveAt time.Time
+	downRedundant           bool      // downlink redundancy requested
+	redundancySeq           uint32    // of the last REDUNDANCY sent
 	now                     time.Time // latest time passed to any input, for NextDeadline
 
 	out    []Datagram
@@ -243,6 +270,7 @@ func (c *Client) primary(now time.Time) *path {
 			lossierThan(now, c.current, best) {
 			c.current, c.lossMoveAt = best, now.Add(lossDwell)
 		}
+		c.updateRedundancy(now)
 		return c.current
 	}
 	if best := c.conn.bestPath(now); best != nil {
@@ -282,6 +310,10 @@ func (c *Client) handleData(now time.Time, b []byte) {
 			c.conn.onAck(now, &f)
 		case wire.IPPacket:
 			if c.state == StateActive {
+				c.ips = append(c.ips, copyBytes(f.Packet))
+			}
+		case wire.IPDatagram:
+			if c.state == StateActive && c.conn.receiveDatagram(f) {
 				c.ips = append(c.ips, copyBytes(f.Packet))
 			}
 		case wire.IPFragment:
@@ -337,10 +369,49 @@ func (c *Client) onAuthResult(now time.Time, r wire.AuthResult) {
 	c.state = StateActive
 	p0 := c.conn.path(0)
 	p0.validated = true
-	c.conn.probeSize = int(r.TunMTU) + dataOverhead
+	c.conn.setProbeSizes(r.TunMTU, r.Features&wire.FeatureRedundancy != 0)
 	c.conn.keepalive = c.keepalive()
 	c.conn.probe(now, p0)
 	c.events = append(c.events, Established{Config: r})
+}
+
+// updateRedundancy applies the redundancy policy to the current primary
+// path's loss in each direction, asking the relay to change the downlink.
+func (c *Client) updateRedundancy(now time.Time) {
+	if c.cfg.Redundancy == RedundancyOff || c.config.Features&wire.FeatureRedundancy == 0 {
+		return
+	}
+	up, down := true, true
+	if c.cfg.Redundancy == RedundancyAuto {
+		up = wantRedundancy(now, &c.current.sendLoss, c.conn.redundant)
+		down = wantRedundancy(now, &c.current.recvLoss, c.downRedundant)
+	}
+	if up == c.conn.redundant && down == c.downRedundant {
+		return
+	}
+	if down != c.downRedundant {
+		c.redundancySeq++
+		mode := wire.RedundancyNone
+		if down {
+			mode = wire.RedundancyDuplicate
+		}
+		c.conn.queue(wire.Redundancy{Seq: c.redundancySeq, Mode: mode})
+	}
+	c.conn.redundant, c.downRedundant = up, down
+	c.events = append(c.events, RedundancyChanged{Uplink: up, Downlink: down})
+}
+
+// wantRedundancy applies the RedundancyAuto thresholds to one direction's
+// loss estimate, with hysteresis.
+func wantRedundancy(now time.Time, l *lossEstimator, on bool) bool {
+	rate, ok := l.estimate(now)
+	if !ok {
+		return false
+	}
+	if on {
+		return rate >= redundancyOff
+	}
+	return rate >= redundancyOn
 }
 
 func (c *Client) handleReset(b []byte) {

@@ -50,8 +50,12 @@ echo "some-token" > token
 sudo bin/arc-client run -relay RELAY_IP:4433 -relay-key RELAY_PUBLIC_KEY -full-tunnel
 
 # Several links at once (e.g. Wi-Fi and cellular): one carrier per interface,
-# with failover between them
+# with failover between them, and traffic moved off a link that turns lossy
 sudo bin/arc-client run -relay RELAY_IP:4433 -relay-key RELAY_PUBLIC_KEY -full-tunnel -bind wlan0 -bind wwan0
+
+# When every link is lossy, send each packet on two links while the best one
+# loses over 1% (doubles traffic while on; "always" duplicates everything)
+sudo bin/arc-client run ... -bind wlan0 -bind wwan0 -redundancy auto
 ```
 
 The end-to-end test builds this setup in three network namespaces:
@@ -62,8 +66,8 @@ docker build -f test/netns/Dockerfile -t arc-e2e . && docker run --rm --privileg
 ```
 
 `test/netns/degraded.sh` runs plain routing, ARC, and WireGuard under netem loss, delay, jitter, and
-bandwidth limits, and measures ARC's failover across two links and whether it moves traffic off a lossy
-link (`docker run --rm --privileged arc-e2e degraded`).
+bandwidth limits, and measures ARC's failover across two links, whether it moves traffic off a lossy
+link, and what redundancy does when both links are lossy (`docker run --rm --privileged arc-e2e degraded`).
 `test/netns/bench.sh` compares ARC's throughput with kernel WireGuard over the same topology
 (`docker run --rm --privileged arc-e2e bench` on macOS). Treat its numbers as relative: both ends
 share one machine.

@@ -147,8 +147,10 @@ func TestStandbyKeepaliveDoesNotMoveDownlink(t *testing.T) {
 
 func TestEquallyLossyPathsDoNotFlap(t *testing.T) {
 	n, s, _, c := establishTwoPaths(t, 43, 10*time.Millisecond)
-	n.up.loss, n.down.loss = 0.3, 0.3
-	c.up.loss, c.down.loss = 0.3, 0.3
+	// 10% is well above the switching threshold, without the occasional
+	// health failover that heavier loss causes.
+	n.up.loss, n.down.loss = 0.1, 0.1
+	c.up.loss, c.down.loss = 0.1, 0.1
 	var seq uint32
 	// Each path's estimate is forgotten lossStale after it stops carrying
 	// traffic, so at worst the paths trade places about that often.

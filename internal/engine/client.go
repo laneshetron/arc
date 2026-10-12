@@ -128,6 +128,8 @@ func RunClient(ctx context.Context, cfg ClientConfig) error {
 				}
 			case session.PathValidated:
 				log.Info("path validated", "path", e.ID)
+			case session.RedundancyChanged:
+				log.Info("redundancy changed", "uplink", e.Uplink, "downlink", e.Downlink)
 			case session.PathClosed:
 				log.Info("path closed", "path", e.ID, "reason", e.Err)
 				for _, cs := range carriers {

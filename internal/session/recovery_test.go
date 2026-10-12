@@ -45,7 +45,7 @@ func TestSentLogInvariants(t *testing.T) {
 		now = now.Add(time.Duration(rng.IntN(5)) * time.Millisecond)
 		switch r := rng.IntN(100); {
 		case r < 55: // send
-			p := sentPacket{pn: next, sentAt: now, probe: rng.IntN(50) == 0}
+			p := sentPacket{pn: next, sentAt: now, probe: max(0, 1300*(rng.IntN(50)-48))}
 			if rng.IntN(4) == 0 {
 				p.frames = ping
 			}

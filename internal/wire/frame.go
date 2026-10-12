@@ -23,6 +23,8 @@ const (
 	FrameAck           FrameType = 0x0B
 	FrameClose         FrameType = 0x0C
 	FrameError         FrameType = 0x0D
+	FrameIPDatagram    FrameType = 0x0E
+	FrameRedundancy    FrameType = 0x0F
 
 	// Frame types at or above FirstExtensionFrame are optional extensions
 	// that receivers may ignore; unknown types below it are required.
@@ -32,6 +34,7 @@ const (
 var frameNames = [...]string{
 	"PADDING", "AUTH", "AUTH_RESULT", "IP_PACKET", "IP_FRAGMENT", "NEW_PATH", "PATH_JOIN",
 	"PATH_CHALLENGE", "PATH_RESPONSE", "PATH_ABANDON", "PING", "ACK", "CLOSE", "ERROR",
+	"IP_DATAGRAM", "REDUNDANCY",
 }
 
 func (t FrameType) String() string {
@@ -74,6 +77,8 @@ const (
 	authResultLen   = 28
 	newPathLen      = 28
 	ipFragmentFixed = 12
+	ipDatagramFixed = 8
+	redundancyLen   = 5
 	ackFixed        = 21
 )
 
@@ -100,6 +105,34 @@ type AuthResult struct {
 }
 
 type IPPacket struct{ Packet []byte }
+
+// IPDatagram is an IP packet with a datagram ID, so that copies sent on
+// several paths are delivered once (§11.1). IDs share the IP_FRAGMENT space.
+type IPDatagram struct {
+	DatagramID uint64
+	Packet     []byte
+}
+
+// Features bits in AUTH_RESULT (§10.1).
+const (
+	// FeatureRedundancy: the relay accepts IP_DATAGRAM and REDUNDANCY.
+	FeatureRedundancy uint64 = 1 << 0
+)
+
+// RedundancyMode selects how the relay sends downlink IP traffic (§11.1).
+type RedundancyMode uint8
+
+const (
+	RedundancyNone      RedundancyMode = 0 // primary path only
+	RedundancyDuplicate RedundancyMode = 1 // primary and a second path
+)
+
+// Redundancy asks the relay to change its downlink redundancy. Seq orders
+// requests, since a retransmitted old request may arrive after a new one.
+type Redundancy struct {
+	Seq  uint32
+	Mode RedundancyMode
+}
 
 type IPFragment struct {
 	DatagramID uint64
@@ -169,6 +202,8 @@ func (Ping) Type() FrameType          { return FramePing }
 func (Ack) Type() FrameType           { return FrameAck }
 func (CloseFrame) Type() FrameType    { return FrameClose }
 func (ErrorFrame) Type() FrameType    { return FrameError }
+func (IPDatagram) Type() FrameType    { return FrameIPDatagram }
+func (Redundancy) Type() FrameType    { return FrameRedundancy }
 func (u Unknown) Type() FrameType     { return u.FrameType }
 
 // AppendFrame appends the TLV encoding of f to b. It panics if the encoded
@@ -181,6 +216,17 @@ func AppendIPPacket(b, pkt []byte) []byte {
 		panic("wire: frame value exceeds 65535 bytes")
 	}
 	b = append(b, byte(FrameIPPacket), byte(len(pkt)>>8), byte(len(pkt)))
+	return append(b, pkt...)
+}
+
+// AppendIPDatagram appends an IP_DATAGRAM frame, like AppendIPPacket.
+func AppendIPDatagram(b []byte, id uint64, pkt []byte) []byte {
+	n := ipDatagramFixed + len(pkt)
+	if n > 0xFFFF {
+		panic("wire: frame value exceeds 65535 bytes")
+	}
+	b = append(b, byte(FrameIPDatagram), byte(n>>8), byte(n))
+	b = binary.BigEndian.AppendUint64(b, id)
 	return append(b, pkt...)
 }
 
@@ -217,6 +263,16 @@ func (r AuthResult) appendValue(b []byte) []byte {
 }
 
 func (p IPPacket) appendValue(b []byte) []byte { return append(b, p.Packet...) }
+
+func (d IPDatagram) appendValue(b []byte) []byte {
+	b = binary.BigEndian.AppendUint64(b, d.DatagramID)
+	return append(b, d.Packet...)
+}
+
+func (r Redundancy) appendValue(b []byte) []byte {
+	b = binary.BigEndian.AppendUint32(b, r.Seq)
+	return append(b, byte(r.Mode))
+}
 
 func (f IPFragment) appendValue(b []byte) []byte {
 	b = binary.BigEndian.AppendUint64(b, f.DatagramID)
@@ -297,7 +353,7 @@ var (
 	errPadding          = malformed("nonzero padding")
 	errAuthResultFields = malformed("AUTH_RESULT failure with nonzero fields")
 	errAuthResultMTU    = malformed("AUTH_RESULT tun_mtu below minimum")
-	errAuthResultFeat   = malformed("AUTH_RESULT unknown features")
+	errRedundancyMode   = malformed("REDUNDANCY unknown mode")
 	errIPVersion        = malformed("IP_PACKET has unknown IP version")
 	errIPLength         = malformed("IP_PACKET length does not match IP header")
 	errFragmentRange    = malformed("IP_FRAGMENT range invalid")
@@ -383,6 +439,25 @@ func parseValue(t FrameType, v []byte) (Frame, error) {
 		}
 		return f, nil
 
+	case FrameIPDatagram:
+		if len(v) < ipDatagramFixed {
+			return nil, errFrameSize
+		}
+		if err := ValidateIPPacket(v[ipDatagramFixed:]); err != nil {
+			return nil, err
+		}
+		return IPDatagram{DatagramID: binary.BigEndian.Uint64(v), Packet: v[ipDatagramFixed:]}, nil
+
+	case FrameRedundancy:
+		if len(v) != redundancyLen {
+			return nil, errFrameSize
+		}
+		r := Redundancy{Seq: binary.BigEndian.Uint32(v), Mode: RedundancyMode(v[4])}
+		if r.Mode > RedundancyDuplicate {
+			return nil, errRedundancyMode
+		}
+		return r, nil
+
 	case FrameNewPath:
 		if len(v) != newPathLen {
 			return nil, errFrameSize
@@ -467,10 +542,7 @@ func parseAuthResult(v []byte) (Frame, error) {
 	if r.TunMTU < MinTunMTU {
 		return nil, errAuthResultMTU
 	}
-	if r.Features != 0 {
-		return nil, errAuthResultFeat
-	}
-	return r, nil
+	return r, nil // undefined Features bits are ignored
 }
 
 // ValidateIPPacket checks the IP version and that the packet's declared

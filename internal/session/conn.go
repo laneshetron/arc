@@ -26,6 +26,7 @@ const (
 	DefaultIdleTimeout   = 120 * time.Second
 	DefaultPathTimeout   = 30 * time.Second // no packets received: the path is dead
 	sentHorizon          = 30 * time.Second
+	secondPathRefresh    = 100 * time.Millisecond
 	suspectPTOs          = 3
 	maxPaths             = 8 // joined paths plus unused slots (§14.3)
 	spareSlots           = 2
@@ -166,7 +167,17 @@ type conn struct {
 	control        []wire.Frame // frames that may travel on any path
 	nextDatagramID uint64
 	reasm          *reassembly.IP
-	probeSize      int // UDP payload needed for an unfragmented TUN packet
+	dedup          reassembly.Window // datagram IDs delivered (§11.1)
+	// probeSizes are the MTU probes sent on each path: the UDP payload
+	// needed for an unfragmented TUN packet in IP_PACKET and, when
+	// redundancy is negotiated, in IP_DATAGRAM.
+	probeSizes []int
+
+	// redundant sends each IP packet on the primary and a second path
+	// (§11.1): uplink for the client, downlink for the relay.
+	redundant bool
+	second    *path // cached second path; see secondPath
+	secondAt  time.Time
 
 	plaintext []byte
 	ptScratch []byte // reused to build each outgoing packet's plaintext
@@ -185,6 +196,8 @@ type Stats struct {
 	PacketsLost                  uint64
 	Rekeys                       uint64
 	AmplificationDrops           uint64
+	RedundantSent                uint64 // IP packets sent on two paths
+	DuplicatesDropped            uint64 // received copies already delivered
 }
 
 func newConn(keys crypto.TrafficKeys, now time.Time) *conn {
@@ -337,8 +350,8 @@ func (c *conn) onAck(now time.Time, ack *wire.Ack) {
 	if res.hasRTT {
 		p.rtt.update(res.rttSample, time.Duration(ack.AckDelayMicros)*time.Microsecond)
 	}
-	if res.ackedProbe && c.probeSize > p.maxPacket {
-		p.maxPacket = c.probeSize
+	if res.ackedProbe > p.maxPacket {
+		p.maxPacket = res.ackedProbe
 	}
 	if res.ackedCurrentEpoch {
 		c.ackedThisEpoch = true
@@ -384,7 +397,23 @@ func (c *conn) flush(now time.Time) {
 }
 
 func (c *conn) transmit(now time.Time, p *path, extra []wire.Frame) bool {
-	return c.transmitTo(now, p, extra, nil, false)
+	return c.transmitTo(now, p, extra, ipPayload{}, false)
+}
+
+// ipPayload is an IP packet for transmitTo, carried as IP_DATAGRAM when it
+// has a datagram ID and as IP_PACKET otherwise.
+type ipPayload struct {
+	pkt   []byte
+	id    uint64
+	hasID bool
+}
+
+func (ip ipPayload) frameLen() int {
+	n := wire.FrameHeaderLen + len(ip.pkt)
+	if ip.hasID {
+		n += 8
+	}
+	return n
 }
 
 // transmitTo builds and sends one packet on p carrying the frames in extra
@@ -392,14 +421,17 @@ func (c *conn) transmit(now time.Time, p *path, extra []wire.Frame) bool {
 // the primary path, unbound control frames. It reports whether a packet was
 // sent. toCandidate directs a relay's packet to the path's unvalidated new
 // address.
-func (c *conn) transmitTo(now time.Time, p *path, extra []wire.Frame, ip []byte, toCandidate bool) bool {
+func (c *conn) transmitTo(now time.Time, p *path, extra []wire.Frame, ip ipPayload, toCandidate bool) bool {
 	if !p.joined {
 		return false
 	}
 	budget := p.maxPacket - wire.DataHeaderLen - wire.AEADTagLen
 	pt := c.ptScratch[:0]
-	if ip != nil {
-		pt = wire.AppendIPPacket(pt, ip)
+	switch {
+	case ip.hasID:
+		pt = wire.AppendIPDatagram(pt, ip.id, ip.pkt)
+	case ip.pkt != nil:
+		pt = wire.AppendIPPacket(pt, ip.pkt)
 	}
 	for _, f := range extra {
 		pt = wire.AppendFrame(pt, f)
@@ -422,11 +454,11 @@ func (c *conn) transmitTo(now time.Time, p *path, extra []wire.Frame, ip []byte,
 	if len(pt) == 0 {
 		return false
 	}
-	ackEliciting := len(retx) > 0 || ip != nil
+	ackEliciting := len(retx) > 0 || ip.pkt != nil
 	for _, f := range extra {
 		ackEliciting = ackEliciting || f.Type().AckEliciting()
 	}
-	c.seal(now, p, pt, retx, ackEliciting, false, toCandidate)
+	c.seal(now, p, pt, retx, ackEliciting, 0, toCandidate)
 	return true
 }
 
@@ -445,7 +477,7 @@ func takeFrames(pt []byte, retx []wire.Frame, q *[]wire.Frame, budget int) ([]by
 	return pt, retx
 }
 
-func (c *conn) seal(now time.Time, p *path, pt []byte, retx []wire.Frame, ackEliciting, probe, toCandidate bool) {
+func (c *conn) seal(now time.Time, p *path, pt []byte, retx []wire.Frame, ackEliciting bool, probe int, toCandidate bool) {
 	pn := p.nextPN
 	p.nextPN++
 	epoch := c.send.Epoch()
@@ -460,18 +492,32 @@ func (c *conn) seal(now time.Time, p *path, pt []byte, retx []wire.Frame, ackEli
 	c.maybeRekey(now)
 }
 
-// probe sends one padded PING of probeSize bytes on a validated path. If it
-// is acknowledged the path carries full-size packets without IP_FRAGMENT.
-// A lost probe leaves the path at its current size (§14.4).
+// probe sends a padded PING of each probe size on a validated path. The
+// path's maximum packet size rises to the largest one acknowledged, so it
+// carries full-size packets without IP_FRAGMENT. A lost probe leaves the
+// path at its current size (§14.4).
 func (c *conn) probe(now time.Time, p *path) {
-	if p.probed || !p.validated || c.probeSize <= p.maxPacket {
+	if p.probed || !p.validated {
 		return
 	}
 	p.probed = true
-	pt := wire.AppendFrame(nil, wire.Ping{})
-	pad := c.probeSize - wire.DataHeaderLen - wire.AEADTagLen - len(pt) - wire.FrameHeaderLen
-	pt = wire.AppendFrame(pt, wire.Padding{Len: pad})
-	c.seal(now, p, pt, nil, true, true, false)
+	for _, size := range c.probeSizes {
+		if size <= p.maxPacket {
+			continue
+		}
+		pt := wire.AppendFrame(nil, wire.Ping{})
+		pad := size - wire.DataHeaderLen - wire.AEADTagLen - len(pt) - wire.FrameHeaderLen
+		pt = wire.AppendFrame(pt, wire.Padding{Len: pad})
+		c.seal(now, p, pt, nil, true, size, false)
+	}
+}
+
+// setProbeSizes sets the MTU probe sizes for a TUN MTU (§14.4).
+func (c *conn) setProbeSizes(tunMTU uint16, redundancy bool) {
+	c.probeSizes = []int{int(tunMTU) + dataOverhead}
+	if redundancy {
+		c.probeSizes = append(c.probeSizes, int(tunMTU)+dataOverhead+8)
+	}
 }
 
 // maybeRekey advances the send epoch once it is due and a packet of the
@@ -485,29 +531,84 @@ func (c *conn) maybeRekey(now time.Time) {
 }
 
 // sendIP sends one IP packet on the primary path, fragmenting it to fit.
+// With redundancy on, it sends a copy with the same datagram ID on a second
+// path too (§11.1).
 func (c *conn) sendIP(now time.Time, pkt []byte) error {
 	p := c.primary(now)
 	if p == nil {
 		return ErrNoPath
 	}
-	budget := p.maxPacket - wire.DataHeaderLen - wire.AEADTagLen
-	if wire.FrameHeaderLen+len(pkt) <= budget {
-		c.transmitTo(now, p, nil, pkt, false)
-		return nil
+	if c.redundant {
+		if q := c.secondPath(now, p); q != nil {
+			ip := ipPayload{pkt: pkt, id: c.nextDatagramID, hasID: true}
+			c.nextDatagramID++
+			c.sendOn(now, p, ip)
+			c.sendOn(now, q, ip)
+			c.stats.RedundantSent++
+			return nil
+		}
 	}
-	maxData := budget - wire.FrameHeaderLen - 12
-	c.fragBuf = reassembly.Fragment(c.fragBuf[:0], c.nextDatagramID, pkt, maxData)
-	c.nextDatagramID++
-	for _, f := range c.fragBuf {
-		c.transmit(now, p, []wire.Frame{f})
-	}
+	c.sendOn(now, p, ipPayload{pkt: pkt})
 	return nil
 }
 
-// receiveFragment adds an IP_FRAGMENT and returns a completed packet.
+// sendOn sends an IP packet on p, as IP_FRAGMENTs if it does not fit. The
+// fragments use the packet's datagram ID if it has one.
+func (c *conn) sendOn(now time.Time, p *path, ip ipPayload) {
+	budget := p.maxPacket - wire.DataHeaderLen - wire.AEADTagLen
+	if ip.frameLen() <= budget {
+		c.transmitTo(now, p, nil, ip, false)
+		return
+	}
+	id := ip.id
+	if !ip.hasID {
+		id = c.nextDatagramID
+		c.nextDatagramID++
+	}
+	maxData := budget - wire.FrameHeaderLen - 12
+	c.fragBuf = reassembly.Fragment(c.fragBuf[:0], id, ip.pkt, maxData)
+	for _, f := range c.fragBuf {
+		c.transmit(now, p, []wire.Frame{f})
+	}
+}
+
+// secondPath returns the healthy path other than p with the lowest cost,
+// or nil. The choice is cached briefly, since it is made per packet.
+func (c *conn) secondPath(now time.Time, p *path) *path {
+	if q := c.second; q != nil && q != p && !q.removed && now.Before(c.secondAt) {
+		return q
+	}
+	c.second, c.secondAt = nil, now.Add(secondPathRefresh)
+	var bestCost float64
+	for _, q := range c.paths {
+		if q == p || !q.healthy(now, c.keepalive) {
+			continue
+		}
+		if cost := q.cost(now); c.second == nil || cost < bestCost {
+			c.second, bestCost = q, cost
+		}
+	}
+	return c.second
+}
+
+// receiveFragment adds an IP_FRAGMENT and returns a completed packet that
+// was not already delivered.
 func (c *conn) receiveFragment(now time.Time, f wire.IPFragment) []byte {
 	pkt, _ := c.reasm.Add(now, f)
+	if pkt != nil && !c.dedup.Deliver(f.DatagramID) {
+		c.stats.DuplicatesDropped++
+		return nil
+	}
 	return pkt
+}
+
+// receiveDatagram reports whether an IP_DATAGRAM is new (§11.1).
+func (c *conn) receiveDatagram(f wire.IPDatagram) bool {
+	if !c.dedup.Deliver(f.DatagramID) {
+		c.stats.DuplicatesDropped++
+		return false
+	}
+	return true
 }
 
 // onTimers handles PTO expiry and pending acknowledgements.
