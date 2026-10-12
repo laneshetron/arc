@@ -602,7 +602,16 @@ Do not mistake carrier **capacity** for achievable application goodput. Queueing
 4. Immediate control-plane preference for low-latency validated paths; use redundant control probes when path health is uncertain.
 5. Path failure migration without terminating the outer session.
 6. A policy that avoids loading extremely slow paths (DNS/ICMP) with bulk traffic when faster paths are available.
-7. Scheduling at **both** endpoints. The relay chooses downlink paths per flow from the validated paths. By default it SHOULD send a flow's downlink on the path where that flow's most recent uplink packet arrived, unless that path is `SUSPECT` or worse.
+7. Scheduling at **both** endpoints. The relay chooses downlink paths per flow from the validated paths. By default it SHOULD send a flow's downlink on the path where that flow's most recent uplink packet arrived, unless that path is `SUSPECT` or worse. Only packets carrying IP traffic count: keepalives and probes on other paths MUST NOT move the downlink.
+8. Loss-aware primary selection. Each endpoint estimates every path's loss rate in both directions: the sender from acknowledgements (packets declared lost by the packet threshold, out of those resolved), the receiver from gaps in received packet numbers (a late packet cancels the gap it opened). Both feed an EWMA over windows of at least 32 packets and 100 ms. An estimate with no new samples for 30 s is forgotten, since only paths carrying traffic produce samples.
+
+The reference implementation pins all IP traffic to one primary path chosen by the client, which sees uplink loss through acknowledgements and downlink loss through packet-number gaps; the relay follows by item 7. Paths are ranked by
+
+```text
+cost(path) = (srtt + 20 ms) * sqrt(max(loss, 0.005))
+```
+
+where `loss` is the worse direction's estimate (0 if unknown). This follows the Mathis relation for loss-limited TCP, throughput ∝ 1 / (RTT · √loss). The 20 ms term stands in for the relay-to-destination leg all paths share, and the 0.005 floor keeps a clean path from looking infinitely better than a nearly clean one. A healthy primary is left for loss only when another healthy path costs less than half as much, and at most once per 2 s, so paths of similar quality do not trade places and reorder flows. With equal RTTs this moves traffic off a path above about 2% loss. When every path is lossy, the primary moves at most about once per 30 s, as estimates expire.
 
 Illustrative, **non-normative** path cost:
 

@@ -64,6 +64,14 @@ func (a *ackTracker) insert(pn uint64) {
 	}
 }
 
+// largest returns the largest packet number received, if any.
+func (a *ackTracker) largest() (uint64, bool) {
+	if len(a.ranges) == 0 {
+		return 0, false
+	}
+	return a.ranges[0].Hi, true
+}
+
 func (a *ackTracker) due(now time.Time) bool {
 	return a.unacked >= 2 || (a.unacked > 0 && !now.Before(a.firstUnacked.Add(MaxAckDelay)))
 }
@@ -186,6 +194,7 @@ func (s *sentLog) retire(p *sentPacket) {
 // ackResult summarizes what an ACK frame acknowledged.
 type ackResult struct {
 	newlyAcked        int
+	delivered         int // newly acknowledged, not counting MTU probes
 	ackedCurrentEpoch bool
 	rttSample         time.Duration
 	hasRTT            bool
@@ -207,6 +216,9 @@ func (s *sentLog) onAck(now time.Time, ack *wire.Ack, intervals []wire.PacketRan
 			}
 			s.retire(p)
 			res.newlyAcked++
+			if !p.probe {
+				res.delivered++
+			}
 			res.ackedProbe = res.ackedProbe || p.probe
 			res.ackedCurrentEpoch = res.ackedCurrentEpoch || p.epoch == epoch
 			if p.pn == ack.Largest {

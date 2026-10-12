@@ -98,8 +98,11 @@ type Client struct {
 	conn    *conn
 	config  wire.AuthResult
 	slots   []pathSlot
-	current *path     // primary path
-	now     time.Time // latest time passed to any input, for NextDeadline
+	current *path // primary path
+	// Loss-driven moves of the primary (loss.go): when the next check is
+	// due and the earliest the primary may move again.
+	lossCheckAt, lossMoveAt time.Time
+	now                     time.Time // latest time passed to any input, for NextDeadline
 
 	out    []Datagram
 	events []ClientEvent
@@ -222,14 +225,24 @@ func (c *Client) emit(p *path, b []byte, _ bool) {
 	c.out = append(c.out, Datagram{PathID: p.id, Data: b})
 }
 
-// primary keeps the current path while it is healthy and otherwise moves
-// to the best healthy path. Before the session is active, everything goes
-// on path 0.
+// primary keeps the current path while it is healthy and not much lossier
+// than another, and otherwise moves to the best healthy path. Before the
+// session is active, everything goes on path 0. The relay sends downlink
+// traffic on whichever path the client sends uplink traffic on, so this
+// choice steers both directions.
 func (c *Client) primary(now time.Time) *path {
 	if c.state != StateActive {
 		return c.conn.path(0)
 	}
 	if c.current != nil && !c.current.removed && c.current.healthy(now, c.conn.keepalive) {
+		if now.Before(c.lossCheckAt) {
+			return c.current
+		}
+		c.lossCheckAt = now.Add(lossCheckEvery)
+		if best := c.conn.bestPath(now); best != c.current && !now.Before(c.lossMoveAt) &&
+			lossierThan(now, c.current, best) {
+			c.current, c.lossMoveAt = best, now.Add(lossDwell)
+		}
 		return c.current
 	}
 	if best := c.conn.bestPath(now); best != nil {
@@ -305,7 +318,7 @@ func (c *Client) onChallenge(now time.Time, p *path, f wire.PathChallenge) {
 		p.control = nil // the pending PATH_JOIN is no longer needed
 		c.events = append(c.events, PathValidated{ID: p.id})
 		c.conn.probe(now, p)
-		if best := c.conn.bestPath(now); best != nil && (c.current == nil || best.rtt.srtt() < c.current.rtt.srtt()) {
+		if best := c.conn.bestPath(now); best != nil && (c.current == nil || best.cost(now) < c.current.cost(now)) {
 			c.current = best
 		}
 	}
