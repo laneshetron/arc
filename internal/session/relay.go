@@ -122,6 +122,7 @@ type RelaySession struct {
 	redundancySeq uint32     // REDUNDANCY seq last applied
 	retiredCIDs   []wire.CID // this session's entries in Relay.retired, oldest first
 	redundancySet bool
+	flows         flowTable // downlink path per flow: where its uplink last arrived
 }
 
 func NewRelay(cfg RelayConfig, now time.Time) *Relay {
@@ -155,6 +156,10 @@ func (r *Relay) Stats() RelayStats { return r.stats }
 
 // Sessions returns the number of live sessions, including pending ones.
 func (r *Relay) Sessions() int { return len(r.live) }
+
+// LiveSessions returns the sessions that are not closed, for status
+// reporting. The slice is a copy; the sessions are not.
+func (r *Relay) LiveSessions() []*RelaySession { return slices.Clone(r.live) }
 
 // HandlePacket processes one packet received from a client address.
 func (r *Relay) HandlePacket(now time.Time, from netip.AddrPort, b []byte) {
@@ -215,7 +220,7 @@ func (r *Relay) handleInit(now time.Time, from netip.AddrPort, b []byte) {
 		nextPathID:   1,
 	}
 	s.conn = newConn(res.Keys, now)
-	s.conn.primary, s.conn.emit = s.primary, s.emit
+	s.conn.primary, s.conn.pathFor, s.conn.emit = s.primary, s.pathFor, s.emit
 	p0 := newPath(0, relayCID, init.SenderCID, now)
 	// The handshake round trip validated the client's address.
 	p0.joined, p0.validated, p0.addr = true, true, from
@@ -274,11 +279,11 @@ func (r *Relay) handleData(now time.Time, from netip.AddrPort, b []byte) {
 			s.conn.onAck(now, &f)
 		case wire.IPPacket:
 			s.onUplink(p)
-			s.deliver(f.Packet, true)
+			s.deliver(now, p, f.Packet, true)
 		case wire.IPDatagram:
 			s.onUplink(p)
 			if s.result.Features&wire.FeatureRedundancy != 0 && s.conn.receiveDatagram(f) {
-				s.deliver(f.Packet, true)
+				s.deliver(now, p, f.Packet, true)
 			}
 		case wire.Redundancy:
 			s.onRedundancy(f)
@@ -286,7 +291,7 @@ func (r *Relay) handleData(now time.Time, from netip.AddrPort, b []byte) {
 			s.onUplink(p)
 			if s.state == StateActive {
 				if pkt := s.conn.receiveFragment(now, f); pkt != nil {
-					s.deliver(pkt, false)
+					s.deliver(now, p, pkt, false)
 				}
 			}
 		case wire.PathJoin:
@@ -318,6 +323,22 @@ func (s *RelaySession) onRedundancy(f wire.Redundancy) {
 	}
 	s.redundancySeq, s.redundancySet = f.Seq, true
 	s.conn.redundant = f.Mode == wire.RedundancyDuplicate
+}
+
+// pathFor returns the downlink path for an IP packet: the path its flow's
+// uplink last arrived on while that is healthy, otherwise the session's
+// downlink path (§15.2).
+func (s *RelaySession) pathFor(now time.Time, pkt []byte) *path {
+	prim := s.primary(now)
+	if prim == nil || !s.conn.multipath() {
+		return prim
+	}
+	if k, ok := flowKeyOf(pkt, false); ok {
+		if p, ok := s.flows.get(now, k); ok && p.healthy(now, s.conn.keepalive) {
+			return p
+		}
+	}
+	return prim
 }
 
 // onUplink notes that the client sent IP traffic on p. Downlink traffic
@@ -500,13 +521,20 @@ func (s *RelaySession) onAuth(now time.Time, credential []byte) bool {
 
 // deliver checks a client packet's inner source address against the lease
 // (§11) and reports it.
-func (s *RelaySession) deliver(pkt []byte, mustCopy bool) {
+func (s *RelaySession) deliver(now time.Time, p *path, pkt []byte, mustCopy bool) {
 	if s.state != StateActive {
 		return
 	}
 	if len(pkt) < 20 || pkt[0]>>4 != 4 || [4]byte(pkt[12:16]) != s.result.IPv4 {
 		s.relay.stats.SpoofedDropped++
 		return
+	}
+	if p.joined && p.validated && s.conn.multipath() {
+		if k, ok := flowKeyOf(pkt, true); ok {
+			if q, ok := s.flows.get(now, k); !ok || q != p {
+				s.flows.put(now, k, p)
+			}
+		}
 	}
 	if mustCopy {
 		pkt = copyBytes(pkt)
@@ -616,6 +644,7 @@ func (r *Relay) Tick(now time.Time) {
 				}
 			}
 			s.conn.onTimers(now)
+			s.flows.sweep(now, false)
 		}
 	}
 }

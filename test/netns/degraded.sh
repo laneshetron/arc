@@ -15,6 +15,8 @@
 #   - on a 50 Mbit/s bottleneck ARC reaches >= 70% of plain routing
 #   - failover from a blackholed link completes within 2 s
 #   - traffic leaves a busy link with 5% or 30% loss when the other is clean
+#   - 4 TCP flows over two 50 Mbit/s links get at least 1.4x one link's
+#     goodput, uploading and downloading
 #   - with both links at 5% loss (RTT ~0 and 40 ms), -redundancy auto at least halves ping loss
 #     and at least doubles TCP goodput
 #   - a session comes up within 15 s with both links at 70% loss
@@ -51,7 +53,7 @@ cp "$WORK/tokens" "$WORK/token"
 RELAY_PUB=$("$BIN/arc-relay" pubkey <"$WORK/relay.key")
 $R "$BIN/arc-relay" run -listen 192.168.10.2:4433 -key-file "$WORK/relay.key" \
   -reset-secret-file "$WORK/reset.secret" -tokens-file "$WORK/tokens" \
-  -network 10.77.0.1/16 >"$WORK/relay.log" 2>&1 &
+  -network 10.77.0.1/16 -status 1s >"$WORK/relay.log" 2>&1 &
 PIDS+=($!)
 wait_until 10 $R ip addr show arc0
 $C "$BIN/arc-client" run -relay 192.168.10.2:4433 -relay-key "$RELAY_PUB" \
@@ -82,13 +84,13 @@ use() { # use plain|arc|wireguard
   esac
 }
 
-tcp_up() { # prints TCP uplink goodput in Mbit/s, or 0 if the run failed
+tcp_up() { # tcp_up [IPERF_ARGS...]: prints TCP goodput in Mbit/s (uplink unless -R), or 0 if the run failed
   # Omit the first 2 s: at 100 ms RTT slow start otherwise dominates and
   # single runs swing widely. Retry once, since the server can still be
   # finishing the previous run.
   local try
   for try in 1 2; do
-    if $C iperf3 -c "$TARGET" -t "$DURATION" -O 2 -f m >"$WORK/iperf.log" 2>&1; then
+    if $C iperf3 -c "$TARGET" -t "$DURATION" -O 2 -f m "$@" >"$WORK/iperf.log" 2>&1; then
       grep receiver "$WORK/iperf.log" | tail -1 | awk '{print $(NF-2)}'
       return
     fi
@@ -163,7 +165,7 @@ MP_CLIENT=
 start_multipath_client() { # start_multipath_client REDUNDANCY LOG
   if [[ -n $MP_CLIENT ]]; then kill "$MP_CLIENT"; wait "$MP_CLIENT" 2>/dev/null || true; fi
   $C "$BIN/arc-client" run -relay 192.168.10.2:4433 -relay-key "$RELAY_PUB" \
-    -token-file "$WORK/token" -route 192.168.20.0/24 -bind c0 -bind c1 \
+    -token-file "$WORK/token" -route 192.168.20.0/24 -bind c0 -bind c1 -status 1s \
     -redundancy "$1" >"$WORK/$2" 2>&1 &
   MP_CLIENT=$!
   PIDS+=("$MP_CLIENT")
@@ -243,6 +245,43 @@ lossy_link() { # lossy_link LOSS
 }
 lossy_link 5%
 lossy_link 30%
+
+# Aggregation (spec §20 Stage B exit): independent flows spread across
+# links, so 4 TCP flows over two 50 Mbit/s links beat one link, in both
+# directions; a single flow stays on one link rather than being striped
+# and reordered. The one-link reference blackholes link 1 for its runs.
+aggregate() { # aggregate NAME IPERF_ARGS...: sets AGG_ONE and AGG_TWO
+  local name=$1
+  shift
+  # A queue of about 100 ms at 50 Mbit/s, rather than impair's 100000
+  # packets: TCP fills whatever queue there is, and seconds of standing
+  # queue would make every path look congested.
+  impair 0 rate 50mbit delay 10ms limit 500
+  impair 1 loss 100%
+  sleep 2
+  AGG_ONE=$(tcp_up "$@")
+  impair 1 rate 50mbit delay 10ms limit 500
+  sleep 3 # link 1 answers its probes and turns healthy
+  AGG_TWO=$(tcp_up "$@")
+  unimpair 0
+  unimpair 1
+  MP_ROWS+=("$(printf '%-34s %s: one link %6s Mbit/s, two links %6s Mbit/s' "two 50 Mbit/s links" "$name" "$AGG_ONE" "$AGG_TWO")")
+}
+for dir in up down; do
+  args=(-P 4)
+  [[ $dir == down ]] && args+=(-R)
+  aggregate "4 flows $dir" "${args[@]}"
+  if awk -v two="$AGG_TWO" -v one="$AGG_ONE" 'BEGIN { exit !(two >= 1.4 * one) }'; then
+    pass "4 flows $dir over two links: $AGG_TWO Mbit/s against $AGG_ONE on one"
+  else
+    fail "4 flows $dir over two links: $AGG_TWO Mbit/s, not 1.4x the $AGG_ONE of one link"
+    echo "  path state (client, then relay), from -status:"
+    grep 'msg=path ' "$WORK/client2.log" | tail -2 | sed 's/^/    /'
+    grep 'msg=path ' "$WORK/relay.log" | tail -2 | sed 's/^/    /'
+  fi
+done
+aggregate "1 flow up" # recorded: one flow stays on one link
+sleep 1
 
 # Both links lossy: there is no clean path to move to. Redundancy sends
 # each packet on both links, so with independent 5% loss about 0.25% of

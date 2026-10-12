@@ -117,14 +117,46 @@ func (a *ackTracker) peek(now time.Time, pathID uint32) wire.Ack {
 	return ack
 }
 
-// rttEstimator follows RFC 9002 §5.
+// rttEstimator follows RFC 9002 §5, plus a windowed minimum (as in BBR)
+// for judging path latency and queueing: RFC 9002's min_rtt is a lifetime
+// minimum, which never notices that a path got slower.
 type rttEstimator struct {
 	latest, min, smoothed, variance time.Duration
 	hasSample                       bool
+
+	// mins holds the lowest sample of each of the last minRTTBuckets
+	// intervals of minRTTBucket, newest at minsNext-1.
+	mins     [minRTTBuckets]rttBucket
+	minsNext int
 }
 
-func (r *rttEstimator) update(sample, ackDelay time.Duration) {
+type rttBucket struct {
+	index int64 // interval number since the Unix epoch; 0 if unused
+	min   time.Duration
+}
+
+// minRTTWindow is how long a minimum RTT sample is trusted: a higher one
+// replaces it once it is this old. It should outlast typical transfers: a
+// TCP flow keeps a standing queue for as long as it saturates a path, and
+// once the minimum re-anchors to the queued RTT, the busy path's cost
+// rises and new flows prefer other paths (mild for a minute-long
+// saturation; constant re-anchoring made the primary chase idle paths).
+const (
+	minRTTWindow  = time.Minute
+	minRTTBucket  = 10 * time.Second
+	minRTTBuckets = int(minRTTWindow / minRTTBucket)
+)
+
+func (r *rttEstimator) update(now time.Time, sample, ackDelay time.Duration) {
 	r.latest = sample
+	idx := now.UnixNano() / int64(minRTTBucket)
+	last := &r.mins[(r.minsNext+minRTTBuckets-1)%minRTTBuckets]
+	if last.index == idx {
+		last.min = min(last.min, sample)
+	} else {
+		r.mins[r.minsNext] = rttBucket{index: idx, min: sample}
+		r.minsNext = (r.minsNext + 1) % minRTTBuckets
+	}
 	if !r.hasSample {
 		r.min, r.smoothed, r.variance, r.hasSample = sample, sample, sample/2, true
 		return
@@ -148,6 +180,23 @@ func (r *rttEstimator) srtt() time.Duration {
 	return r.smoothed
 }
 
+// minRTT is the path's recent latency without queueing: the lowest sample
+// of the last minRTTWindow, or of the most recent interval with samples if
+// none is that recent.
+func (r *rttEstimator) minRTT() time.Duration {
+	if !r.hasSample {
+		return initialRTT
+	}
+	newest := r.mins[(r.minsNext+minRTTBuckets-1)%minRTTBuckets]
+	best := newest.min
+	for _, b := range r.mins {
+		if b.index != 0 && b.index > newest.index-int64(minRTTBuckets) {
+			best = min(best, b.min)
+		}
+	}
+	return best
+}
+
 func (r *rttEstimator) pto() time.Duration {
 	if !r.hasSample {
 		return 2*initialRTT + MaxAckDelay
@@ -163,7 +212,14 @@ type sentPacket struct {
 	epoch  uint64
 	frames []wire.Frame
 	probe  int // MTU probe size, or 0: a probe's loss says nothing about path health
-	acked  bool
+	size   int // bytes on the wire, for delivery rate
+	// ping marks a packet carrying no IP payload or control frame, such as
+	// a keepalive or a probe of a suspect path. Like MTU probes, pings
+	// count for path health but not for loss or delivery rate: those sent
+	// into an outage are all declared lost once the path recovers, which
+	// would leave the path looking lossy long after health says it is back.
+	ping  bool
+	acked bool
 }
 
 // sentLog holds a path's outstanding ack-eliciting packets in packet-number
@@ -198,6 +254,7 @@ func (s *sentLog) retire(p *sentPacket) {
 type ackResult struct {
 	newlyAcked        int
 	delivered         int // newly acknowledged, not counting MTU probes
+	deliveredBytes    int // their size
 	ackedCurrentEpoch bool
 	rttSample         time.Duration
 	hasRTT            bool
@@ -220,7 +277,10 @@ func (s *sentLog) onAck(now time.Time, ack *wire.Ack, intervals []wire.PacketRan
 			s.retire(p)
 			res.newlyAcked++
 			if p.probe == 0 {
-				res.delivered++
+				if !p.ping {
+					res.delivered++
+					res.deliveredBytes += p.size
+				}
 			}
 			res.ackedProbe = max(res.ackedProbe, p.probe)
 			res.ackedCurrentEpoch = res.ackedCurrentEpoch || p.epoch == epoch
@@ -244,7 +304,7 @@ func (s *sentLog) onAck(now time.Time, ack *wire.Ack, intervals []wire.PacketRan
 			continue
 		}
 		s.retire(p) // lost
-		if p.probe == 0 {
+		if p.probe == 0 && !p.ping {
 			res.lostCount++
 		}
 		res.lost = append(res.lost, p.frames...)

@@ -21,6 +21,13 @@ type link struct {
 	jitter time.Duration // uniform extra delay; reorders packets
 	mtu    int           // drop larger datagrams; 0 means unlimited
 	down   bool          // drop everything
+
+	// rate limits the link to this many bytes per second, with a FIFO
+	// queue holding at most queue's worth of transmission time (default
+	// 50 ms); 0 means unlimited.
+	rate      int
+	queue     time.Duration
+	busyUntil time.Time
 }
 
 // carrier is one client path's network attachment: the client's address
@@ -150,7 +157,23 @@ func (n *network) send(toRelay bool, pathID uint32, data []byte) {
 		if l.down || n.rng.Float64() < l.loss || (l.mtu > 0 && len(data) > l.mtu) {
 			continue
 		}
-		at := n.now.Add(l.delay)
+		at := n.now
+		if l.rate > 0 {
+			queue := l.queue
+			if queue == 0 {
+				queue = 50 * time.Millisecond
+			}
+			start := l.busyUntil
+			if start.Before(n.now) {
+				start = n.now
+			}
+			if start.Sub(n.now) > queue {
+				continue // tail drop
+			}
+			l.busyUntil = start.Add(time.Duration(len(data)) * time.Second / time.Duration(l.rate))
+			at = l.busyUntil
+		}
+		at = at.Add(l.delay)
 		if l.jitter > 0 {
 			at = at.Add(time.Duration(n.rng.Int64N(int64(l.jitter))))
 		}
@@ -298,21 +321,31 @@ func (n *network) clientClosed() error {
 
 // ipPacket builds an IPv4 packet of the given size with a sequence number
 // in its payload.
+// ipPacket returns a UDP/IPv4 packet of one flow (fixed ports) carrying
+// seq after the UDP header; size must be at least 32.
 func ipPacket(src, dst [4]byte, size int, seq uint32) []byte {
+	return flowPacket(src, dst, 40000, 4000, size, seq)
+}
+
+// flowPacket is ipPacket with the source and destination ports given.
+func flowPacket(src, dst [4]byte, sport, dport uint16, size int, seq uint32) []byte {
 	p := make([]byte, size)
 	p[0] = 0x45
 	binary.BigEndian.PutUint16(p[2:4], uint16(size))
 	p[8], p[9] = 64, 17
 	copy(p[12:16], src[:])
 	copy(p[16:20], dst[:])
-	binary.BigEndian.PutUint32(p[20:24], seq)
-	for i := 24; i < size; i++ {
+	binary.BigEndian.PutUint16(p[20:22], sport)
+	binary.BigEndian.PutUint16(p[22:24], dport)
+	binary.BigEndian.PutUint16(p[24:26], uint16(size-20))
+	binary.BigEndian.PutUint32(p[28:32], seq)
+	for i := 32; i < size; i++ {
 		p[i] = byte(seq) ^ byte(i)
 	}
 	return p
 }
 
-func seqOf(p []byte) uint32 { return binary.BigEndian.Uint32(p[20:24]) }
+func seqOf(p []byte) uint32 { return binary.BigEndian.Uint32(p[28:32]) }
 
 var internet = [4]byte{198, 51, 100, 7}
 

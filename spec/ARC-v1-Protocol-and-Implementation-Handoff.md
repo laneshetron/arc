@@ -435,7 +435,7 @@ When no path is clean, loss-aware selection (§15.2) has nowhere to move traffic
 - **Delivery once.** The receiver keeps a window of delivered datagram IDs (at least 65,000 IDs; the reference implementation keeps 65,472 in 8 KiB). It delivers an `IP_DATAGRAM`, or a datagram completed from fragments, only if its ID is new and within the window. IDs older than the window are treated as delivered.
 - **`REDUNDANCY`.** The client controls both directions. It duplicates uplink traffic itself and asks the relay for downlink duplication with `REDUNDANCY(seq, mode)`: mode 0 sends on the primary path only, and mode 1 also sends on a second path. Other modes are malformed. The frame is retransmitted until acknowledged. The relay applies a request only if its `seq` is greater than that of the last one applied, because a retransmitted old request can arrive after a newer one.
 - **Second path.** Copies go to the healthy validated path with the lowest cost (§15.2) other than the primary. If no other path is healthy, they go to any other validated path, since heavy loss on every link is when copies matter most. With a single validated path, nothing is duplicated.
-- **Policy (reference client).** `off` (the default), `always`, or `auto`. `auto` duplicates a direction while the primary path's loss estimate in that direction (§15.2) is at least 1%, until it falls below 0.4%. It also duplicates both directions while the primary is not healthy. That happens only when no path is healthy, since otherwise the primary moves, and under loss that heavy the estimates update slowly because acknowledgements barely arrive. The primary's own packets keep its estimate current while copies are sent. Copies also keep the second path's estimate current, so loss-aware selection can move the primary to it.
+- **Policy (reference client).** `off` (the default), `always`, or `auto`. `auto` duplicates a direction while the primary path's loss estimate in that direction (§15.2) is at least 1%, until it falls below 0.4%. It considers every path carrying traffic (the primary and paths with flows): a direction is duplicated while any of them loses that much in it. It also duplicates both directions while the primary is not healthy. That happens only when no path is healthy, since otherwise the primary moves, and under loss that heavy the estimates update slowly because acknowledgements barely arrive. The primary's own packets keep its estimate current while copies are sent. Copies also keep the second path's estimate current, so loss-aware selection can move the primary to it.
 - **Limits.** Redundancy lowers loss but does not remove it: a TCP flow over two 5%-loss paths at 40 ms RTT is still loss-limited, at about 0.25%. Parity across paths (k packets plus one XOR, any one loss per group recoverable at 1/k overhead) is a possible later mode that trades recovery delay for bandwidth.
 
 ## 12. Carrier framing and cells
@@ -624,13 +624,34 @@ Do not mistake carrier **capacity** for achievable application goodput. Queueing
 7. Scheduling at **both** endpoints. The relay chooses downlink paths per flow from the validated paths. By default it SHOULD send a flow's downlink on the path where that flow's most recent uplink packet arrived, unless that path is `SUSPECT` or worse. Only packets carrying IP traffic count: keepalives and probes on other paths MUST NOT move the downlink.
 8. Loss-aware primary selection. Each endpoint estimates every path's loss rate in both directions: the sender from acknowledgements (packets declared lost by the packet threshold, out of those resolved), the receiver from gaps in received packet numbers (a late packet cancels the gap it opened). Both feed an EWMA over windows of at least 32 packets and 100 ms. An estimate with no new samples for 30 s is forgotten, since only paths carrying traffic produce samples.
 
-The reference implementation pins all IP traffic to one primary path chosen by the client, which sees uplink loss through acknowledgements and downlink loss through packet-number gaps; the relay follows by item 7. Paths are ranked by
+**Reference implementation.** The client chooses paths and the relay follows (item 7). The client sees uplink loss through acknowledgements and downlink loss through packet-number gaps.
 
-```text
-cost(path) = (srtt + 20 ms) * sqrt(max(loss, 0.005))
-```
+- **Path cost.**
 
-where `loss` is the worse direction's estimate (0 if unknown). This follows the Mathis relation for loss-limited TCP, throughput ∝ 1 / (RTT · √loss). The 20 ms term stands in for the relay-to-destination leg all paths share, and the 0.005 floor keeps a clean path from looking infinitely better than a nearly clean one. A healthy primary is left for loss only when another healthy path costs less than half as much, and at most once per 2 s, so paths of similar quality do not trade places and reorder flows. With equal RTTs this moves traffic off a path above about 2% loss. When every path is lossy, the primary moves at most about once per 30 s, as estimates expire.
+  ```text
+  cost(path) = (min_rtt + 20 ms) * sqrt(max(loss, 0.005))
+  ```
+
+  - `loss` is the worse direction's estimate, 0 if unknown. The formula follows the Mathis relation for loss-limited TCP, throughput ∝ 1 / (RTT · √loss).
+  - The 20 ms term stands in for the relay-to-destination leg that all paths share.
+  - The 0.005 floor keeps a clean path from looking infinitely better than a nearly clean one.
+  - `min_rtt` is the lowest RTT sample of the last 60 s (six 10 s buckets), not the smoothed RTT. Queueing delay reflects the load the tunnel puts on a path, and that load follows the traffic wherever it goes. With the smoothed RTT, a path saturated by TCP looked worse than an idle one, and traffic chased whichever path was idle.
+- **Loss estimates exclude outages.**
+  - Pings (keepalives and probes of suspect paths) count for health but not for loss, like MTU probes. Pings sent into an outage would otherwise all be declared lost when the path recovered.
+  - A path heard from again after an outage starts its loss estimates afresh. An outage here means nothing received for 1 s while a packet sent at least 1 s earlier was unanswered. Without the reset, the gaps the peer's packets left during the outage lingered as loss and kept flows off the recovered path. An idle path is silent without an outage, and a path with heavy random loss falls silent only briefly, so neither is reset.
+  - Congestion loss is not separated out. With TCP saturating a 50 Mbit/s link in the degraded suite it measured about 0.1%, below the cost floor. An RTT-based classifier was tried and removed: it mistook a rise in path latency for queueing and ignored real loss for up to a minute.
+- **Primary path.** It carries control frames and flows without a key, and it is left for loss only when another healthy path costs less than half as much, at most once per 2 s. With equal RTTs this moves traffic off a path above about 2% loss. When every path is lossy, the primary moves at most about once per 30 s, as estimates expire.
+- **Flows (items 2 and 3).**
+  - **Pinning.** Each IPv4 5-tuple stays on one path. Fragments and protocols without ports are keyed by protocol and addresses.
+  - **Eligibility.** Paths are compared with the primary on loss alone, by the cost's loss term √max(loss, 0.005). RTT estimates swing with queueing and lag changes in path delay, and in testing they kept equal links from sharing flows.
+    - A path must be healthy, and its `min_rtt` must be at most 4× the primary's plus 50 ms.
+    - New flows may use a path whose loss term is at most 2× the primary's.
+    - A flow keeps its path while the path is healthy and at most 3× the primary; otherwise it is reassigned.
+    - The gap between 2× and 3× keeps a path whose estimate hovers near the line from having its flows moved back and forth.
+  - **Assignment.** A new flow goes to the eligible path with the fewest active flows (a packet within the last 1 s) per unit of capacity. Capacity is the path's best 250 ms delivery rate of the last 10 s, in either direction. A path below 64 KiB/s counts as unmeasured and is assumed as fast as the best, so it gets tried.
+  - **Downlink.** The relay sends each flow's downlink on the path its uplink last arrived on while that path is healthy, otherwise on the session's downlink path.
+  - **Bounds.** Flows idle for 10 s are forgotten, and the table holds at most 4,096 flows per session.
+  - **Result.** In the degraded suite, 4 TCP flows over two 50 Mbit/s links reach about twice one link's goodput in each direction. A single flow is not striped.
 
 Illustrative, **non-normative** path cost:
 
