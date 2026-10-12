@@ -8,7 +8,8 @@ import (
 )
 
 // TestGSOSegmentsArriveIntact sends runs that GSO coalesces (equal sizes,
-// a shorter final datagram, a size change, two destinations) and checks
+// a shorter final datagram, a size change, two destinations), after one
+// datagram it cannot coalesce, and checks
 // each receiver gets exactly the original datagrams in order.
 func TestGSOSegmentsArriveIntact(t *testing.T) {
 	loop := netip.MustParseAddrPort("127.0.0.1:0")
@@ -37,6 +38,7 @@ func TestGSOSegmentsArriveIntact(t *testing.T) {
 		pkts, to = append(pkts, p), append(to, rxs[rx].LocalAddr())
 		want[rx] = append(want[rx], p)
 	}
+	add(0, 200)    // alone: a first message sent without coalescing
 	for range 70 { // more than one run's worth of segments
 		add(0, 1317)
 	}

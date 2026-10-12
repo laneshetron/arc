@@ -82,7 +82,7 @@ func (c *Conn) writeGSO(pkts [][]byte, addrs []netip.AddrPort) error {
 		if j-i == 1 {
 			m.Buffers[0] = pkts[i]
 		} else {
-			if used >= len(c.gsoBufs) {
+			for len(c.gsoBufs) <= used { // indexed by message; earlier ones may be uncoalesced
 				c.gsoBufs = append(c.gsoBufs, make([]byte, 0, maxGSOBytes))
 			}
 			buf := c.gsoBufs[used][:0]
