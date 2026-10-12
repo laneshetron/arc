@@ -116,8 +116,9 @@ type Client struct {
 	hs            *crypto.ClientHandshake
 	cookie        *[wire.CookieLen]byte
 	attemptStart  time.Time
-	nextInit      time.Time
-	initInterval  time.Duration
+	attempts      uint64    // handshake attempts started
+	heard         time.Time // last authentic packet from the relay, or creation
+	nextInit      time.Time // next HANDSHAKE_INIT, or next AUTH while authenticating
 	authenticated time.Time
 
 	conn    *conn
@@ -147,7 +148,7 @@ func NewClient(cfg ClientConfig, now time.Time) (*Client, error) {
 	if cfg.PathTimeout == 0 {
 		cfg.PathTimeout = DefaultPathTimeout
 	}
-	c := &Client{cfg: cfg}
+	c := &Client{cfg: cfg, heard: now}
 	if err := c.startHandshake(now); err != nil {
 		return nil, err
 	}
@@ -155,6 +156,11 @@ func NewClient(cfg ClientConfig, now time.Time) (*Client, error) {
 }
 
 func (c *Client) State() State { return c.state }
+
+// HandshakeAttempt numbers the current handshake attempt. It changes when
+// the client starts over with a new ephemeral key, which invalidates any
+// cookie the previous attempt held.
+func (c *Client) HandshakeAttempt() uint64 { return c.attempts }
 
 // Stats returns counters for the current session, if any.
 func (c *Client) Stats() Stats {
@@ -184,7 +190,8 @@ func (c *Client) startHandshake(now time.Time) error {
 		return err
 	}
 	c.state, c.hs, c.cookie, c.conn, c.slots, c.current = StateHandshaking, hs, nil, nil, nil, nil
-	c.attemptStart, c.initInterval = now, initialRetransmit
+	c.attemptStart = now
+	c.attempts++
 	c.sendInit(now)
 	return nil
 }
@@ -192,7 +199,15 @@ func (c *Client) startHandshake(now time.Time) error {
 func (c *Client) sendInit(now time.Time) {
 	init := c.hs.Init(c.cookie)
 	c.out = append(c.out, Datagram{PathID: 0, Data: init.Append(nil)})
-	c.nextInit = now.Add(c.initInterval)
+	c.nextInit = now.Add(c.handshakeInterval(now))
+}
+
+// handshakeInterval is how long to wait before repeating INIT or AUTH.
+func (c *Client) handshakeInterval(now time.Time) time.Duration {
+	if now.Sub(c.heard) < handshakeQuiet {
+		return handshakeRetransmit
+	}
+	return handshakeRetransmitQuiet
 }
 
 // HandlePacket processes one packet received on the carrier bound to pathID.
@@ -222,7 +237,7 @@ func (c *Client) handleCookieReply(now time.Time, b []byte) {
 	if err != nil || c.state != StateHandshaking || r.DestCID != c.hs.Init(nil).SenderCID {
 		return
 	}
-	c.cookie = &r.Cookie
+	c.cookie, c.heard = &r.Cookie, now
 	c.sendInit(now)
 }
 
@@ -238,14 +253,23 @@ func (c *Client) handleResp(now time.Time, b []byte) {
 	if err != nil {
 		return // possibly forged; keep waiting for the genuine response
 	}
+	c.heard = now
 	p0 := newPath(0, c.hs.Init(nil).SenderCID, res.RelayCID, now)
 	p0.resetToken, p0.joined = res.ResetToken, true
 	c.conn = newConn(res.Keys, now)
 	c.conn.primary, c.conn.emit = c.primary, c.emit
 	c.conn.addPath(p0)
 	c.state, c.authenticated = StateAuthenticating, now
-	c.conn.queue(wire.Auth{Credential: c.cfg.Credential})
-	c.conn.flush(now)
+	c.sendAuth(now)
+}
+
+// sendAuth sends AUTH in a new DATA packet and schedules the next copy.
+// AUTH is repeated on a timer until AUTH_RESULT arrives rather than
+// retransmitted on PTO, which would back off (§9.2); the relay answers
+// each copy.
+func (c *Client) sendAuth(now time.Time) {
+	c.conn.transmit(now, c.conn.path(0), []wire.Frame{wire.Auth{Credential: c.cfg.Credential}})
+	c.nextInit = now.Add(c.handshakeInterval(now))
 }
 
 func (c *Client) emit(p *path, b []byte, _ bool) {
@@ -299,6 +323,7 @@ func (c *Client) handleData(now time.Time, b []byte) {
 	if err != nil {
 		return
 	}
+	c.heard = now
 	for _, f := range frames {
 		switch f := f.(type) {
 		case wire.AuthResult:
@@ -524,7 +549,6 @@ func (c *Client) Tick(now time.Time) {
 		if !now.Before(c.attemptStart.Add(HandshakeTimeout)) {
 			c.restart(now)
 		} else if !now.Before(c.nextInit) {
-			c.initInterval *= 2
 			c.sendInit(now)
 		}
 		return
@@ -532,6 +556,9 @@ func (c *Client) Tick(now time.Time) {
 		if !now.Before(c.authenticated.Add(HandshakeTimeout)) {
 			c.restart(now)
 			return
+		}
+		if !now.Before(c.nextInit) {
+			c.sendAuth(now)
 		}
 	}
 
@@ -613,7 +640,7 @@ func (c *Client) NextDeadline() time.Time {
 	}
 	d := earliest(c.conn.nextDeadline(), c.conn.lastRecv().Add(c.idleTimeout()))
 	if c.state != StateActive {
-		return earliest(d, c.authenticated.Add(HandshakeTimeout))
+		return earliest(d, c.authenticated.Add(HandshakeTimeout), c.nextInit)
 	}
 	for _, p := range c.conn.paths {
 		if len(c.conn.paths) > 1 {

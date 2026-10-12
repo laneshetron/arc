@@ -293,10 +293,13 @@ Client                                          Relay
 - No 0-RTT application data and no resumed session tickets in v1. A failed or expired session requires a new handshake.
 
 **Loss recovery.**
-- The client retransmits the **byte-identical** `HANDSHAKE_INIT` (same ephemeral key) with exponential backoff: 1 s initial, doubling.
+- The client retransmits the **byte-identical** `HANDSHAKE_INIT` (same ephemeral key) at a fixed interval, 100 ms by default, without backoff. On a link that loses most packets, the number of attempts within the timeout is what matters. Each attempt succeeds only if both the INIT and the response get through, so at 90% loss in each direction 1 attempt in 100 does. The packets are small, and a retransmitted INIT costs the relay no Diffie-Hellman.
+- If the client has heard nothing authentic from the relay (no response, cookie, or `DATA`) for 30 s, the relay is more likely down than the link lossy. The client then slows to 1 s until it hears something.
 - After a 10 s handshake timeout, the client gives up on that attempt and starts over with a new ephemeral key and a new `sender_cid`.
-- For 10 s, the relay caches the `HANDSHAKE_RESP` for each completed `HANDSHAKE_INIT`. If byte-identical INIT bytes arrive from the same source, it re-sends the cached response without doing a new Diffie-Hellman computation.
-- If no `AUTH_RESULT` arrives, the client retransmits `AUTH` in new `DATA` packets. The relay MUST process duplicate `AUTH` idempotently.
+- A client with several carriers sends each INIT on all of them, and the carrier the response arrives on becomes path 0. After a `COOKIE_REPLY`, it sends that attempt's INITs only on the carrier the cookie arrived on, because the cookie is bound to that carrier's address (§9.3).
+- The relay caches the `HANDSHAKE_RESP` for each completed `HANDSHAKE_INIT` while the session is pending. If byte-identical INIT bytes arrive from the same source, it re-sends the cached response without doing a new Diffie-Hellman computation. INITs from different sources are separate handshakes: the relay keeps a pending session for each, and those the client does not authenticate expire.
+- Until `AUTH_RESULT` arrives, the client repeats `AUTH` in new `DATA` packets at the INIT interval, rather than on its loss-recovery timer, which backs off. It gives up 10 s after processing the response. The relay MUST process duplicate `AUTH` idempotently, and it answers each one.
+- The relay keeps a session that has not authenticated for 20 s from its INIT, covering both client phases.
 
 **Resource limits.** The relay MUST implement handshake timeouts, a cap on pending handshakes, per-source rate limits, and the cookie mechanism in §9.3.
 

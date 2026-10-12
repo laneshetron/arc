@@ -19,8 +19,22 @@ import (
 
 // Defaults from the spec.
 const (
-	HandshakeTimeout     = 10 * time.Second
-	initialRetransmit    = time.Second
+	HandshakeTimeout = 10 * time.Second
+	// handshakeRetransmit is the interval at which the client repeats
+	// HANDSHAKE_INIT and AUTH until answered (§9.2). It does not back off:
+	// the packets are small, a duplicate INIT costs the relay no
+	// Diffie-Hellman, and on a link losing most packets only the number of
+	// attempts within the timeout matters. After handshakeQuiet without
+	// hearing from the relay at all, the relay is more likely down than
+	// the link lossy, and the client slows to handshakeRetransmitQuiet
+	// until it hears something.
+	handshakeRetransmit      = 100 * time.Millisecond
+	handshakeRetransmitQuiet = time.Second
+	handshakeQuiet           = 30 * time.Second
+	// relayPendingTimeout is how long the relay keeps a session that has
+	// not authenticated: the client's INIT phase and AUTH phase may each
+	// take up to HandshakeTimeout.
+	relayPendingTimeout  = 2 * HandshakeTimeout
 	DefaultMaxPacketSize = 1232 // safe on any IPv6 path (§16.1)
 	DefaultKeepalive     = 10 * time.Second
 	DefaultIdleTimeout   = 120 * time.Second

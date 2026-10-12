@@ -170,3 +170,71 @@ func TestCarrierFailoverAndRejoin(t *testing.T) {
 	default:
 	}
 }
+
+// startTwoCarrierClient runs a relay and a client with two carriers and
+// returns the carriers' switches and a channel of established sessions.
+func startTwoCarrierClient(t *testing.T, ctx context.Context, rc session.RelayConfig, aDown bool) ([2]*switchConn, chan wire.AuthResult) {
+	t.Helper()
+	loop := netip.MustParseAddrPort("127.0.0.1:0")
+	relayKey, _ := crypto.GenerateStaticKey(nil)
+	clientKey, _ := crypto.GenerateStaticKey(nil)
+	gw, _ := gateway.New(gateway.Config{
+		Network: netip.MustParsePrefix("10.77.0.1/24"), TunMTU: 1280, Tokens: [][]byte{[]byte("secret")},
+	})
+	relayConn, _ := udp.Listen(loop, udp.Options{})
+	t.Cleanup(func() { relayConn.Close() })
+	relayTUN := newMemTUN()
+	t.Cleanup(relayTUN.Close)
+	rc.Static = relayKey
+	go RunRelay(ctx, RelayConfig{Session: rc, Conn: relayConn, TUN: relayTUN, Gateway: gw})
+
+	var links [2]*switchConn
+	var carriers []Carrier
+	for i, name := range []string{"a", "b"} {
+		c, err := udp.Listen(loop, udp.Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { c.Close() })
+		links[i] = &switchConn{Conn: c}
+		carriers = append(carriers, Carrier{Name: name, Conn: links[i]})
+	}
+	links[0].down.Store(aDown)
+	clientTUN := newMemTUN()
+	t.Cleanup(clientTUN.Close)
+	established := make(chan wire.AuthResult, 4)
+	go RunClient(ctx, ClientConfig{
+		Session: session.ClientConfig{Static: clientKey, RelayPublic: relayKey.Public, Credential: []byte("secret")},
+		Relay:   relayConn.LocalAddr(), Carriers: carriers, TUN: clientTUN,
+		OnEstablished: func(r wire.AuthResult) error { established <- r; return nil },
+	})
+	return links, established
+}
+
+func TestHandshakeOnAnyCarrier(t *testing.T) {
+	// The first carrier is dead from the start. The handshake goes out on
+	// both, so the session comes up through the second without waiting
+	// for a handshake timeout.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, established := startTwoCarrierClient(t, ctx, session.RelayConfig{}, true)
+	select {
+	case <-established:
+	case <-time.After(2 * time.Second):
+		t.Fatal("session not established through the live carrier")
+	}
+}
+
+func TestHandshakeWithCookiesOnTwoCarriers(t *testing.T) {
+	// Every INIT needs a cookie, which is valid only for the address it was
+	// issued to: the handshake must settle on one carrier rather than
+	// trading cookies between them.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, established := startTwoCarrierClient(t, ctx, session.RelayConfig{AlwaysRequireCookie: true}, false)
+	select {
+	case <-established:
+	case <-time.After(2 * time.Second):
+		t.Fatal("session not established with cookies required")
+	}
+}

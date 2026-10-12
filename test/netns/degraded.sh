@@ -17,6 +17,7 @@
 #   - traffic leaves a busy link with 5% or 30% loss when the other is clean
 #   - with both links at 5% loss (RTT ~0 and 40 ms), -redundancy auto at least halves ping loss
 #     and at least doubles TCP goodput
+#   - a session comes up within 15 s with both links at 70% loss
 #
 # Usage: degraded.sh BIN_DIR [SECONDS]   (SECONDS per TCP run, default 10)
 set -euo pipefail
@@ -273,6 +274,37 @@ compare_redundancy() { # compare_redundancy NAME NETEM_ARGS...
 }
 compare_redundancy "both links at 5% loss" loss 5%
 compare_redundancy "both at 5% loss, rtt 40ms" delay 20ms loss 5%
+
+# Connecting through heavy loss (spec §9.2): the client repeats its
+# handshake on both links and its AUTH every 100 ms, so a session comes up
+# even when most packets are lost. It needs two round trips to get through,
+# each with probability (1 - loss)^2 per attempt.
+connect_under_loss() { # connect_under_loss LOSS LIMIT_SECONDS: sets CONNECT_S, "-" on timeout
+  local log="$WORK/connect-$1.log" t0
+  if [[ -n $MP_CLIENT ]]; then kill "$MP_CLIENT"; wait "$MP_CLIENT" 2>/dev/null || true; fi
+  impair 0 loss "$1"
+  impair 1 loss "$1"
+  t0=$(date +%s.%N)
+  $C "$BIN/arc-client" run -relay 192.168.10.2:4433 -relay-key "$RELAY_PUB" \
+    -token-file "$WORK/token" -route 192.168.20.0/24 -bind c0 -bind c1 >"$log" 2>&1 &
+  MP_CLIENT=$!
+  PIDS+=("$MP_CLIENT")
+  if wait_until "$2" grep -q "session established" "$log"; then
+    CONNECT_S=$(awk -v a="$t0" -v b="$(date +%s.%N)" 'BEGIN { printf "%.1f", b - a }')
+  else
+    CONNECT_S=-
+  fi
+  unimpair 0
+  unimpair 1
+  MP_ROWS+=("$(printf '%-34s session established after %s s' "connect, both links at $1 loss" "$CONNECT_S")")
+}
+connect_under_loss 70% 30
+if [[ $CONNECT_S != - ]] && awk -v s="$CONNECT_S" 'BEGIN { exit !(s <= 15) }'; then
+  pass "connected through 70% loss on both links in $CONNECT_S s"
+else
+  fail "connecting through 70% loss on both links took $CONNECT_S s (limit 15)"
+fi
+connect_under_loss 90% 60 # recorded, not asserted: typically 10-40 s
 
 echo
 echo "Part 1: single link, $DURATION s TCP runs; $(nproc) CPUs; kernel $(uname -r)"

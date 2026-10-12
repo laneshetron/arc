@@ -587,7 +587,7 @@ func (s *RelaySession) Close(now time.Time) { s.relay.closeSession(now, s, ErrCl
 func (r *Relay) Tick(now time.Time) {
 	for _, s := range slices.Clone(r.live) {
 		switch {
-		case s.state == StateAuthenticating && !now.Before(s.created.Add(HandshakeTimeout)):
+		case s.state == StateAuthenticating && !now.Before(s.created.Add(relayPendingTimeout)):
 			r.closeSession(now, s, ErrAuthFailed, false)
 		case !now.Before(s.conn.lastRecv().Add(r.cfg.IdleTimeout)):
 			r.closeSession(now, s, ErrIdleTimeout, false)
@@ -619,7 +619,7 @@ func (r *Relay) NextDeadline() time.Time {
 	for _, s := range r.live {
 		d = earliest(d, s.conn.nextDeadline(), s.conn.lastRecv().Add(r.cfg.IdleTimeout))
 		if s.state == StateAuthenticating {
-			d = earliest(d, s.created.Add(HandshakeTimeout))
+			d = earliest(d, s.created.Add(relayPendingTimeout))
 		}
 		if s.joinedPaths() > 1 {
 			for _, p := range s.conn.paths {
