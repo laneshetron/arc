@@ -443,3 +443,21 @@ func TestEpochLowWraps(t *testing.T) {
 		send.Advance(now)
 	}
 }
+
+func TestSealOpenDoNotAllocate(t *testing.T) {
+	a := NewAEAD([32]byte{1})
+	pt := make([]byte, 1300)
+	dst := make([]byte, 0, 2048)
+	pkt := a.SealData(make([]byte, 0, 2048), wire.DataHeader{PacketNumber: 1}, 0, pt)
+	h, aad, ct, _ := wire.ParseData(pkt)
+	out := make([]byte, 0, 2048)
+	allocs := testing.AllocsPerRun(100, func() {
+		a.SealData(dst, wire.DataHeader{PacketNumber: 2}, 0, pt)
+		if _, err := a.OpenData(out, h, aad, 0, ct); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if allocs != 0 {
+		t.Errorf("seal+open allocate %v times per packet", allocs)
+	}
+}

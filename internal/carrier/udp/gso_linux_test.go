@@ -69,11 +69,27 @@ func TestGSOSegmentsArriveIntact(t *testing.T) {
 			}
 			got += n
 		}
+		if rx.gro != nil {
+			t.Logf("receiver %d: %d coalesced GRO buffers split", i, rx.gro.coalesced)
+		}
 		for j, w := range want[i] {
 			if !bytes.Equal(bufs[j][:sizes[j]], w) {
 				t.Fatalf("receiver %d datagram %d: got %d bytes starting %q, want %d bytes starting %q",
 					i, j, sizes[j], bufs[j][:4], len(w), w[:4])
 			}
 		}
+	}
+}
+
+// TestNoOffload checks that offloads can be turned off and that plain I/O
+// still round-trips.
+func TestNoOffload(t *testing.T) {
+	c, err := Listen(netip.MustParseAddrPort("127.0.0.1:0"), Options{NoOffload: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if c.gso || c.gro != nil {
+		t.Fatal("offloads enabled despite NoOffload")
 	}
 }

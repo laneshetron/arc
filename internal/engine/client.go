@@ -46,6 +46,9 @@ type carrierState struct {
 	bound   bool
 	path    uint32
 	retryAt time.Time // when an unbound carrier may next try to join
+
+	out [][]byte         // reused per flush: datagrams for this carrier
+	to  []netip.AddrPort // and their destinations
 }
 
 // slotRetry is how soon to retry joining when the relay has not issued a
@@ -123,8 +126,6 @@ func RunClient(ctx context.Context, cfg ClientConfig) error {
 						return err
 					}
 				}
-			case session.IPReceived:
-				toTUN = append(toTUN, e.Packet)
 			case session.PathValidated:
 				log.Info("path validated", "path", e.ID)
 			case session.PathClosed:
@@ -143,6 +144,9 @@ func RunClient(ctx context.Context, cfg ClientConfig) error {
 				log.Warn("session ended; reconnecting", "reason", e.Err, "after", cfg.ReconnectDelay)
 				reconnectAt = time.Now().Add(cfg.ReconnectDelay)
 			}
+		}
+		for p, ok := c.PollIP(); ok; p, ok = c.PollIP() {
+			toTUN = append(toTUN, p)
 		}
 		if len(toTUN) > 0 {
 			if err := cfg.TUN.Write(toTUN); err != nil {
@@ -234,12 +238,11 @@ func joinCarriers(c *session.Client, carriers []*carrierState, rejoinDelay time.
 
 // flushTransmits batches outgoing datagrams by their bound carrier.
 func flushTransmits(c *session.Client, carriers []*carrierState, relay netip.AddrPort, log *slog.Logger) {
-	groups := make([][][]byte, len(carriers))
 	for d, ok := c.PollTransmit(); ok; d, ok = c.PollTransmit() {
 		sent := false
-		for i, cs := range carriers {
+		for _, cs := range carriers {
 			if cs.bound && cs.path == d.PathID {
-				groups[i] = append(groups[i], d.Data)
+				cs.out, cs.to = append(cs.out, d.Data), append(cs.to, relay)
 				sent = true
 				break
 			}
@@ -248,20 +251,18 @@ func flushTransmits(c *session.Client, carriers []*carrierState, relay netip.Add
 			bufpool.Put(d.Data)
 		}
 	}
-	for i, pkts := range groups {
-		if len(pkts) == 0 {
+	for _, cs := range carriers {
+		if len(cs.out) == 0 {
 			continue
 		}
-		to := make([]netip.AddrPort, len(pkts))
-		for j := range to {
-			to[j] = relay
-		}
-		if err := carriers[i].Conn.WriteBatch(pkts, to); err != nil {
-			log.Warn("send failed", "carrier", carriers[i].Name, "err", err)
+		if err := cs.Conn.WriteBatch(cs.out, cs.to); err != nil {
+			log.Warn("send failed", "carrier", cs.Name, "err", err)
 		}
 		// WriteBatch has copied or sent everything; the buffers are free.
-		for _, p := range pkts {
+		for i, p := range cs.out {
 			bufpool.Put(p)
+			cs.out[i] = nil
 		}
+		cs.out, cs.to = cs.out[:0], cs.to[:0]
 	}
 }

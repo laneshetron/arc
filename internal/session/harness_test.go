@@ -58,6 +58,8 @@ type network struct {
 
 	clientEvents []ClientEvent
 	relayEvents  []RelayEvent
+	clientIPList [][]byte                        // IP packets the client received
+	relayIPList  [][]byte                        // IP packets the relay received
 	tap          func(toRelay bool, data []byte) // observes every sent datagram
 }
 
@@ -192,6 +194,12 @@ func (n *network) pump() {
 		}
 		n.relayEvents = append(n.relayEvents, e)
 	}
+	for p, ok := n.client.PollIP(); ok; p, ok = n.client.PollIP() {
+		n.clientIPList = append(n.clientIPList, p)
+	}
+	for _, p, ok := n.relay.PollIP(); ok; _, p, ok = n.relay.PollIP() {
+		n.relayIPList = append(n.relayIPList, p)
+	}
 }
 
 // step advances the clock to the next delivery or timer, but never past
@@ -271,25 +279,9 @@ func (n *network) relaySession() *RelaySession {
 	return nil
 }
 
-func (n *network) clientIPs() [][]byte {
-	var out [][]byte
-	for _, e := range n.clientEvents {
-		if e, ok := e.(IPReceived); ok {
-			out = append(out, e.Packet)
-		}
-	}
-	return out
-}
+func (n *network) clientIPs() [][]byte { return n.clientIPList }
 
-func (n *network) relayIPs() [][]byte {
-	var out [][]byte
-	for _, e := range n.relayEvents {
-		if e, ok := e.(SessionIP); ok {
-			out = append(out, e.Packet)
-		}
-	}
-	return out
-}
+func (n *network) relayIPs() [][]byte { return n.relayIPList }
 
 func (n *network) clientClosed() error {
 	for _, e := range n.clientEvents {
