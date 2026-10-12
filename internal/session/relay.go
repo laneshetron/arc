@@ -33,6 +33,12 @@ type RelayConfig struct {
 	ResetsPerSecond     int // stateless reset rate limit; default 100
 	IdleTimeout         time.Duration
 	Rand                io.Reader
+
+	// NoRedundancy declines to send downlink traffic on two paths when a
+	// client asks (§11.1), which doubles the relay's traffic for that
+	// client. Without the feature advertised, clients send uplink copies
+	// neither.
+	NoRedundancy bool
 }
 
 // RelayDatagram is an outgoing packet for a client address.
@@ -98,17 +104,19 @@ type relayIP struct {
 
 // RelaySession is one client's session on the relay.
 type RelaySession struct {
-	relay        *Relay
-	state        State
-	conn         *conn
-	clientStatic []byte
-	credential   []byte
-	result       wire.AuthResult
-	created      time.Time
-	resp         []byte
-	initKey      initKey
-	nextPathID   uint32
-	lastUplink   *path // where the client most recently sent from
+	relay         *Relay
+	state         State
+	conn          *conn
+	clientStatic  []byte
+	credential    []byte
+	result        wire.AuthResult
+	created       time.Time
+	resp          []byte
+	initKey       initKey
+	nextPathID    uint32
+	lastUplink    *path  // where the client most recently sent from
+	redundancySeq uint32 // REDUNDANCY seq last applied
+	redundancySet bool
 }
 
 func NewRelay(cfg RelayConfig, now time.Time) *Relay {
@@ -259,6 +267,13 @@ func (r *Relay) handleData(now time.Time, from netip.AddrPort, b []byte) {
 		case wire.IPPacket:
 			s.onUplink(p)
 			s.deliver(f.Packet, true)
+		case wire.IPDatagram:
+			s.onUplink(p)
+			if s.result.Features&wire.FeatureRedundancy != 0 && s.conn.receiveDatagram(f) {
+				s.deliver(f.Packet, true)
+			}
+		case wire.Redundancy:
+			s.onRedundancy(f)
 		case wire.IPFragment:
 			s.onUplink(p)
 			if s.state == StateActive {
@@ -284,6 +299,17 @@ func (r *Relay) handleData(now time.Time, from netip.AddrPort, b []byte) {
 		}
 	}
 	s.conn.flush(now)
+}
+
+// onRedundancy applies a client's downlink redundancy request, ignoring
+// requests older than one already applied (§11.1).
+func (s *RelaySession) onRedundancy(f wire.Redundancy) {
+	if s.state != StateActive || s.result.Features&wire.FeatureRedundancy == 0 ||
+		s.redundancySet && f.Seq <= s.redundancySeq {
+		return
+	}
+	s.redundancySeq, s.redundancySet = f.Seq, true
+	s.conn.redundant = f.Mode == wire.RedundancyDuplicate
 }
 
 // onUplink notes that the client sent IP traffic on p. Downlink traffic
@@ -325,7 +351,7 @@ func (s *RelaySession) onAddress(now time.Time, p *path, from netip.AddrPort, n 
 
 func (s *RelaySession) challengeCandidate(now time.Time, p *path) {
 	p.candSentAt = now
-	s.conn.transmitTo(now, p, []wire.Frame{wire.PathChallenge{Data: p.candChallenge}}, nil, true)
+	s.conn.transmitTo(now, p, []wire.Frame{wire.PathChallenge{Data: p.candChallenge}}, ipPayload{}, true)
 }
 
 // onJoin handles PATH_JOIN on a slot path and reports whether the session
@@ -441,11 +467,14 @@ func (s *RelaySession) onAuth(now time.Time, credential []byte) bool {
 		s.conn.queue(s.result) // refresh: the lease is unchanged
 		return true
 	}
+	if !r.cfg.NoRedundancy {
+		result.Features |= wire.FeatureRedundancy
+	}
 	s.result = result
 	s.state = StateActive
 	r.leavePending(s)
 	s.conn.queue(result)
-	s.conn.probeSize = int(result.TunMTU) + dataOverhead
+	s.conn.setProbeSizes(result.TunMTU, !r.cfg.NoRedundancy)
 	if result.KeepaliveMS > 0 {
 		s.conn.keepalive = time.Duration(result.KeepaliveMS) * time.Millisecond
 	}

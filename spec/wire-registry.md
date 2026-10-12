@@ -33,8 +33,20 @@ All other type values are reserved: drop them silently.
 | `0x0B` | `ACK` | 21 + 8·n (n ≤ 32) | no |
 | `0x0C` | `CLOSE` | 2 | no |
 | `0x0D` | `ERROR` | 2 | yes |
-| `0x0E`–`0x7F` | reserved, required | — | reject the packet |
+| `0x0E` | `IP_DATAGRAM` | 28+ (`datagram_id:u64` + IP packet) | yes |
+| `0x0F` | `REDUNDANCY` | 5 (`seq:u32; mode:u8`, mode 0 or 1) | yes |
+| `0x10`–`0x7F` | reserved, required | — | reject the packet |
 | `0x80`–`0xFF` | extensions, ignorable | — | ignore |
+
+`IP_DATAGRAM` and `REDUNDANCY` are sent only when `AUTH_RESULT` advertises features bit 0 (§11.1).
+
+## AUTH_RESULT features (§10.1)
+
+| Bit | Name | Meaning |
+|---|---|---|
+| 0 | `REDUNDANCY` | relay accepts `IP_DATAGRAM` and `REDUNDANCY` (§11.1) |
+
+Other bits are sent as zero and ignored on receipt.
 
 ## Error / close codes (§10.1)
 
@@ -72,6 +84,8 @@ All other type values are reserved: drop them silently.
 | Keepalive | 10 s idle | 14.6 |
 | Suspend grace | 120 s | 9.4 |
 | IP reassembly | 1,024 datagrams / 8 MiB / 5 s / 8,192 completed IDs | 11 |
+| Datagram dedup window (redundancy) | ≥ 65,000 IDs (reference: 65,472) | 11.1 |
+| Redundancy `auto` thresholds | on at ≥ 1% loss, off below 0.4% | 11.1 |
 | Cell reassembly (bound association) | 64 packets / 256 KiB / 10 s | 12.1 |
 | Cell reassembly (unbound association) | 4 packets / 16 KiB | 12.1 |
 | DNS downlink cell | ≤ 280 B | 16.5 |

@@ -95,6 +95,7 @@ func run(args []string) error {
 	network := fs.String("network", "10.77.0.1/16", "relay tunnel address and client network")
 	mtu := fs.Int("mtu", 1280, "tunnel MTU")
 	dns := fs.String("dns", "", "IPv4 resolver to offer clients")
+	noRedundancy := fs.Bool("no-redundancy", false, "decline clients' requests to duplicate downlink traffic on two paths")
 	prof := profiling.Register(fs)
 	fs.Parse(args)
 	stopProfiles, err := prof.Start()
@@ -163,8 +164,11 @@ func run(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	err = engine.RunRelay(ctx, engine.RelayConfig{
-		Session: session.RelayConfig{Static: static, ResetSecret: resetSecret, IdleTimeout: gwCfg.Idle + 10*time.Second},
-		Conn:    conn, TUN: dev, Gateway: gw, Logger: log,
+		Session: session.RelayConfig{
+			Static: static, ResetSecret: resetSecret, IdleTimeout: gwCfg.Idle + 10*time.Second,
+			NoRedundancy: *noRedundancy,
+		},
+		Conn: conn, TUN: dev, Gateway: gw, Logger: log,
 	})
 	if ctx.Err() != nil {
 		return nil

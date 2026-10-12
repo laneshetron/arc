@@ -188,15 +188,20 @@ func TestSpoofedAddressCannotHijackPath(t *testing.T) {
 }
 
 func TestMTUProbe(t *testing.T) {
+	// Probes are sent for a full TUN packet in IP_PACKET and, since the
+	// relay supports redundancy, in IP_DATAGRAM; a link that carries only
+	// the first leaves paths at that size.
 	n := newNetwork(t, 35, defaultRelayConfig(), ClientConfig{})
+	want := 1280 + dataOverhead
+	n.up.mtu, n.down.mtu = want, want
 	s := n.establish()
 	n.runFor(time.Second)
-	want := 1280 + dataOverhead
 	for _, side := range [][]PathInfo{n.client.Paths(n.now), s.Paths(n.now)} {
 		if p, _ := pathByID(side, 0); p.MaxPacket != want {
 			t.Errorf("max packet = %d, want %d", p.MaxPacket, want)
 		}
 	}
+	n.up.mtu, n.down.mtu = 0, 0
 	var sizes []int
 	n.tap = func(_ bool, d []byte) { sizes = append(sizes, len(d)) }
 	n.client.SendIP(n.now, ipPacket(lease, internet, 1280, 1))

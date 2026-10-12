@@ -68,6 +68,20 @@ func run(args []string) error {
 		binds = append(binds, iface)
 		return nil
 	})
+	redundancy := session.RedundancyOff
+	fs.Func("redundancy", "send traffic on two paths at once: off, auto (while the best path loses over 1%), or always; needs two -bind interfaces", func(v string) error {
+		switch v {
+		case "off":
+			redundancy = session.RedundancyOff
+		case "auto":
+			redundancy = session.RedundancyAuto
+		case "always":
+			redundancy = session.RedundancyAlways
+		default:
+			return errors.New("want off, auto, or always")
+		}
+		return nil
+	})
 	mark := fs.Uint("mark", 0x5243, "fwmark for carrier sockets, used by -full-tunnel")
 	table := fs.Int("table", 5243, "routing table for -full-tunnel")
 	prof := profiling.Register(fs)
@@ -173,8 +187,10 @@ func run(args []string) error {
 	log.Info("starting", "relay", relayAddr, "tun", dev.Name(), "full_tunnel", *fullTunnel,
 		"routes", strings.Trim(routes.String(), "[]"))
 	err = engine.RunClient(ctx, engine.ClientConfig{
-		Session: session.ClientConfig{Static: static, RelayPublic: pin[:], Credential: []byte(tokens[0])},
-		Relay:   relayAddr, Carriers: carriers, TUN: dev, OnEstablished: onEstablished, Logger: log,
+		Session: session.ClientConfig{
+			Static: static, RelayPublic: pin[:], Credential: []byte(tokens[0]), Redundancy: redundancy,
+		},
+		Relay: relayAddr, Carriers: carriers, TUN: dev, OnEstablished: onEstablished, Logger: log,
 	})
 	if errors.Is(err, context.Canceled) {
 		return nil

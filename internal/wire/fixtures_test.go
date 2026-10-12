@@ -227,6 +227,14 @@ func checkFrameFields(t *testing.T, fr Frame, fields map[string]any) {
 			v.Offset != uint16(num("offset")) || hex.EncodeToString(v.Data) != fields["data_hex"] {
 			t.Errorf("IP_FRAGMENT = %+v", v)
 		}
+	case IPDatagram:
+		if v.DatagramID != num("datagram_id") || hex.EncodeToString(v.Packet) != fields["ip_packet_hex"] {
+			t.Errorf("IP_DATAGRAM = %+v", v)
+		}
+	case Redundancy:
+		if v.Seq != uint32(num("seq")) || v.Mode != RedundancyMode(num("mode")) {
+			t.Errorf("REDUNDANCY = %+v", v)
+		}
 	case NewPath:
 		if v.PathID != uint32(num("path_id")) || hex.EncodeToString(v.CID[:]) != fields["cid_hex"] ||
 			hex.EncodeToString(v.ResetToken[:]) != fields["reset_token_hex"] {
@@ -337,8 +345,12 @@ func TestAppendIPPacketMatchesAppendFrame(t *testing.T) {
 	if got := AppendIPPacket(nil, pkt); !bytes.Equal(got, want) {
 		t.Fatalf("AppendIPPacket = %x\nwant %x", got[:8], want[:8])
 	}
+	want = AppendFrame(nil, IPDatagram{DatagramID: 0x0102030405060708, Packet: pkt})
+	if got := AppendIPDatagram(nil, 0x0102030405060708, pkt); !bytes.Equal(got, want) {
+		t.Fatalf("AppendIPDatagram = %x\nwant %x", got[:16], want[:16])
+	}
 	buf := make([]byte, 0, 512)
-	if allocs := testing.AllocsPerRun(100, func() { AppendIPPacket(buf, pkt) }); allocs != 0 {
-		t.Errorf("AppendIPPacket allocates %v times", allocs)
+	if allocs := testing.AllocsPerRun(100, func() { AppendIPPacket(buf, pkt); AppendIPDatagram(buf, 1, pkt) }); allocs != 0 {
+		t.Errorf("AppendIPPacket/AppendIPDatagram allocate %v times", allocs)
 	}
 }

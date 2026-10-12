@@ -68,7 +68,7 @@
     {
       "name": "AUTH_RESULT",
       "type": 2,
-      "frame_hex": "02001c000a4d00021005000a4d0001000027100001d4c00000000000000000",
+      "frame_hex": "02001c000a4d00021005000a4d0001000027100001d4c00000000000000001",
       "fields": {
         "status": 0,
         "ipv4": "10.77.0.2",
@@ -77,7 +77,7 @@
         "dns_ipv4": "10.77.0.1",
         "keepalive_ms": 10000,
         "idle_ms": 120000,
-        "features": 0
+        "features": 1
       }
     },
     {
@@ -197,6 +197,24 @@
       "frame_hex": "0d00020006",
       "fields": {
         "code": 6
+      }
+    },
+    {
+      "name": "IP_DATAGRAM",
+      "type": 14,
+      "frame_hex": "0e0025000000000000002b4500001d00000000401100000a4d0002c000020168656c6c6f20617263",
+      "fields": {
+        "datagram_id": 43,
+        "ip_packet_hex": "4500001d00000000401100000a4d0002c000020168656c6c6f20617263"
+      }
+    },
+    {
+      "name": "REDUNDANCY",
+      "type": 15,
+      "frame_hex": "0f00050000000701",
+      "fields": {
+        "seq": 7,
+        "mode": 1
       }
     },
     {
@@ -346,10 +364,6 @@
       "hex": "02001c00000000011004ff0000000000000000000000000000000000000000"
     },
     {
-      "name": "auth_result nonzero features",
-      "hex": "02001c00000000011005000000000000000000000000000000000000000001"
-    },
-    {
       "name": "ip_packet length mismatch",
       "hex": "03001e4500001d00000000401100000a4d0002c000020168656c6c6f2061726300"
     },
@@ -368,6 +382,22 @@
     {
       "name": "ip_fragment total_len too small",
       "hex": "04000d00000000000000010013000000"
+    },
+    {
+      "name": "ip_datagram without packet",
+      "hex": "0e00080000000000000001"
+    },
+    {
+      "name": "ip_datagram length mismatch",
+      "hex": "0e002600000000000000014500001d00000000401100000a4d0002c000020168656c6c6f2061726300"
+    },
+    {
+      "name": "redundancy wrong size",
+      "hex": "0f000400000001"
+    },
+    {
+      "name": "redundancy unknown mode",
+      "hex": "0f00050000000102"
     },
     {
       "name": "path_join wrong size",
