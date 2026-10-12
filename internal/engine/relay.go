@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/netip"
 	"time"
@@ -19,6 +20,9 @@ type RelayConfig struct {
 	TUN     PacketDevice
 	Gateway *gateway.Gateway
 	Logger  *slog.Logger
+
+	// StatusInterval, if nonzero, logs each session's paths that often.
+	StatusInterval time.Duration
 }
 
 // RunRelay runs the relay until ctx is canceled or an I/O error occurs. The
@@ -39,6 +43,12 @@ func RunRelay(ctx context.Context, cfg RelayConfig) error {
 	r := session.NewRelay(cfg.Session, time.Now())
 	timer := time.NewTimer(time.Hour)
 	defer timer.Stop()
+	var status <-chan time.Time
+	if cfg.StatusInterval > 0 {
+		t := time.NewTicker(cfg.StatusInterval)
+		defer t.Stop()
+		status = t.C
+	}
 	var out, toTUN [][]byte
 	var to []netip.AddrPort
 
@@ -98,6 +108,15 @@ func RunRelay(ctx context.Context, cfg RelayConfig) error {
 					s.SendIP(now, p)
 				}
 				bufpool.Put(p) // SendIP copied what it needed
+			}
+		case <-status:
+			now := time.Now()
+			for _, s := range r.LiveSessions() {
+				lease := netip.AddrFrom4(s.Config().IPv4)
+				for _, p := range s.Paths(now) {
+					log.Info("path", "session", lease, "id", p.ID, "downlink", p.Primary, "healthy", p.Healthy,
+						"flows", p.Flows, "srtt", p.SRTT.Round(100*time.Microsecond), "loss", fmt.Sprintf("%.3f", p.Loss))
+				}
 			}
 		case <-timer.C:
 			r.Tick(time.Now())

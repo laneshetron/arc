@@ -82,6 +82,8 @@ func run(args []string) error {
 		}
 		return nil
 	})
+	status := fs.Duration("status", 0, "log each path's state at this interval (0: off)")
+	noOffload := fs.Bool("no-offload", false, "send and receive without UDP GSO/GRO, for comparison")
 	mark := fs.Uint("mark", 0x5243, "fwmark for carrier sockets, used by -full-tunnel")
 	table := fs.Int("table", 5243, "routing table for -full-tunnel")
 	prof := profiling.Register(fs)
@@ -131,7 +133,7 @@ func run(args []string) error {
 		return fmt.Errorf("create TUN: %w", err)
 	}
 	defer dev.Close()
-	sockOpts := udp.Options{}
+	sockOpts := udp.Options{NoOffload: *noOffload}
 	if *fullTunnel {
 		sockOpts.Mark = uint32(*mark)
 	}
@@ -191,6 +193,7 @@ func run(args []string) error {
 			Static: static, RelayPublic: pin[:], Credential: []byte(tokens[0]), Redundancy: redundancy,
 		},
 		Relay: relayAddr, Carriers: carriers, TUN: dev, OnEstablished: onEstablished, Logger: log,
+		StatusInterval: *status,
 	})
 	if errors.Is(err, context.Canceled) {
 		return nil

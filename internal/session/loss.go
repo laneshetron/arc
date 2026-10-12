@@ -92,10 +92,14 @@ func (p *path) loss(now time.Time) (float64, bool) {
 	return max(s, r), sok || rok
 }
 
-// cost ranks paths for carrying traffic; lower is better.
+// cost ranks paths for carrying traffic; lower is better. It uses the
+// minimum RTT, not the smoothed one: queueing delay reflects the load the
+// tunnel itself puts on a path, which follows the traffic wherever it
+// goes, and counting it made a busy clean path look worse than an idle
+// lossy one.
 func (p *path) cost(now time.Time) float64 {
 	loss, _ := p.loss(now)
-	rtt := (p.rtt.srtt() + lossRTTOffset).Seconds()
+	rtt := (p.rtt.minRTT() + lossRTTOffset).Seconds()
 	return rtt * math.Sqrt(max(loss, lossFloor))
 }
 

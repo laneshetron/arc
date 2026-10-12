@@ -128,6 +128,7 @@ type Client struct {
 	// Loss-driven moves of the primary (loss.go): when the next check is
 	// due and the earliest the primary may move again.
 	lossCheckAt, lossMoveAt time.Time
+	flows                   flowTable // flow-to-path pins; see sched.go
 	downRedundant           bool      // downlink redundancy requested
 	redundancySeq           uint32    // of the last REDUNDANCY sent
 	now                     time.Time // latest time passed to any input, for NextDeadline
@@ -190,6 +191,7 @@ func (c *Client) startHandshake(now time.Time) error {
 		return err
 	}
 	c.state, c.hs, c.cookie, c.conn, c.slots, c.current = StateHandshaking, hs, nil, nil, nil, nil
+	c.flows = flowTable{}
 	c.attemptStart = now
 	c.attempts++
 	c.sendInit(now)
@@ -257,7 +259,7 @@ func (c *Client) handleResp(now time.Time, b []byte) {
 	p0 := newPath(0, c.hs.Init(nil).SenderCID, res.RelayCID, now)
 	p0.resetToken, p0.joined = res.ResetToken, true
 	c.conn = newConn(res.Keys, now)
-	c.conn.primary, c.conn.emit = c.primary, c.emit
+	c.conn.primary, c.conn.pathFor, c.conn.emit = c.primary, c.pathFor, c.emit
 	c.conn.addPath(p0)
 	c.state, c.authenticated = StateAuthenticating, now
 	c.sendAuth(now)
@@ -303,6 +305,26 @@ func (c *Client) primary(now time.Time) *path {
 	}
 	c.updateRedundancy(now)
 	return c.current
+}
+
+// pathFor returns the path for an uplink IP packet: its flow's path while
+// that stays eligible, otherwise a newly assigned one (§15.2).
+func (c *Client) pathFor(now time.Time, pkt []byte) *path {
+	prim := c.primary(now)
+	if prim == nil || !c.conn.multipath() {
+		return prim
+	}
+	k, ok := flowKeyOf(pkt, true)
+	if !ok {
+		return prim
+	}
+	if p, ok := c.flows.get(now, k); ok && c.conn.keeps(now, p, prim) {
+		return p
+	}
+	c.flows.sweep(now, false) // fresh counts for the decision
+	p := c.conn.assign(now, prim)
+	c.flows.put(now, k, p)
+	return p
 }
 
 func (c *Client) handleData(now time.Time, b []byte) {
@@ -412,10 +434,17 @@ func (c *Client) updateRedundancy(now time.Time) {
 	// In auto mode a primary that is not healthy also turns redundancy on:
 	// that happens only when no path is healthy (otherwise the primary
 	// moves), and under loss heavy enough that acknowledgements stop
-	// arriving, the loss estimates themselves update slowly.
+	// arriving, the loss estimates themselves update slowly. Otherwise a
+	// direction is duplicated while any path carrying traffic (the primary
+	// or a path with flows) loses enough in that direction.
 	if c.cfg.Redundancy == RedundancyAuto && c.current.healthy(now, c.conn.keepalive) {
-		up = wantRedundancy(now, &c.current.sendLoss, c.conn.redundant)
-		down = wantRedundancy(now, &c.current.recvLoss, c.downRedundant)
+		up, down = false, false
+		for _, p := range c.conn.paths {
+			if p == c.current || p.flows > 0 {
+				up = up || wantRedundancy(now, &p.sendLoss, c.conn.redundant)
+				down = down || wantRedundancy(now, &p.recvLoss, c.downRedundant)
+			}
+		}
 	}
 	if up == c.conn.redundant && down == c.downRedundant {
 		return
@@ -583,6 +612,7 @@ func (c *Client) Tick(now time.Time) {
 		}
 	}
 	c.conn.onTimers(now)
+	c.flows.sweep(now, false)
 	if c.state == StateActive {
 		for _, p := range c.conn.paths {
 			if p.validated && !now.Before(p.lastSend.Add(c.pingInterval(p, now))) {

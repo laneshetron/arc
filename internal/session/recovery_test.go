@@ -69,3 +69,26 @@ func TestSentLogInvariants(t *testing.T) {
 		check(step)
 	}
 }
+
+func TestMinRTTWindow(t *testing.T) {
+	now := time.Unix(1_000_000, 0)
+	var r rttEstimator
+	r.update(now, 20*time.Millisecond, 0)
+	// A standing queue for 50 s: the base RTT is still the minimum.
+	for i := 1; i <= 50; i++ {
+		r.update(now.Add(time.Duration(i)*time.Second), 150*time.Millisecond, 0)
+	}
+	if got := r.minRTT(); got != 20*time.Millisecond {
+		t.Fatalf("after 50 s of queueing: min %v, want 20ms", got)
+	}
+	// Once the base sample is over a minute old, the window moves on.
+	r.update(now.Add(75*time.Second), 150*time.Millisecond, 0)
+	if got := r.minRTT(); got != 150*time.Millisecond {
+		t.Fatalf("after the window: min %v, want 150ms", got)
+	}
+	// A lower sample takes over at once.
+	r.update(now.Add(76*time.Second), 30*time.Millisecond, 0)
+	if got := r.minRTT(); got != 30*time.Millisecond {
+		t.Fatalf("new lower sample: min %v, want 30ms", got)
+	}
+}

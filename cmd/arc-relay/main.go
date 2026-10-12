@@ -95,6 +95,8 @@ func run(args []string) error {
 	network := fs.String("network", "10.77.0.1/16", "relay tunnel address and client network")
 	mtu := fs.Int("mtu", 1280, "tunnel MTU")
 	dns := fs.String("dns", "", "IPv4 resolver to offer clients")
+	noOffload := fs.Bool("no-offload", false, "send and receive without UDP GSO/GRO, for comparison")
+	status := fs.Duration("status", 0, "log each session's paths at this interval (0: off)")
 	noRedundancy := fs.Bool("no-redundancy", false, "decline clients' requests to duplicate downlink traffic on two paths")
 	prof := profiling.Register(fs)
 	fs.Parse(args)
@@ -153,7 +155,7 @@ func run(args []string) error {
 	if err := dev.Configure(netPrefix, *mtu); err != nil {
 		return fmt.Errorf("configure %s: %w", dev.Name(), err)
 	}
-	conn, err := udp.Listen(listenAddr, udp.Options{})
+	conn, err := udp.Listen(listenAddr, udp.Options{NoOffload: *noOffload})
 	if err != nil {
 		return err
 	}
@@ -168,7 +170,7 @@ func run(args []string) error {
 			Static: static, ResetSecret: resetSecret, IdleTimeout: gwCfg.Idle + 10*time.Second,
 			NoRedundancy: *noRedundancy,
 		},
-		Conn: conn, TUN: dev, Gateway: gw, Logger: log,
+		Conn: conn, TUN: dev, Gateway: gw, Logger: log, StatusInterval: *status,
 	})
 	if ctx.Err() != nil {
 		return nil

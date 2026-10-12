@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/netip"
 	"time"
@@ -38,6 +39,9 @@ type ClientConfig struct {
 	// join the session again. Default 5 s.
 	RejoinDelay time.Duration
 	Logger      *slog.Logger
+
+	// StatusInterval, if nonzero, logs each path's state that often.
+	StatusInterval time.Duration
 }
 
 // carrierState records which session path, if any, a carrier carries.
@@ -108,6 +112,12 @@ func RunClient(ctx context.Context, cfg ClientConfig) error {
 	}
 	timer := time.NewTimer(time.Hour)
 	defer timer.Stop()
+	var status <-chan time.Time
+	if cfg.StatusInterval > 0 {
+		t := time.NewTicker(cfg.StatusInterval)
+		defer t.Stop()
+		status = t.C
+	}
 	var reconnectAt time.Time
 	var toTUN [][]byte
 
@@ -206,6 +216,8 @@ func RunClient(ctx context.Context, cfg ClientConfig) error {
 				c.SendIP(now, p) // dropped while not active, like an unplugged link
 				bufpool.Put(p)   // SendIP copied what it needed
 			}
+		case <-status:
+			logPaths(log, c, carriers, time.Now())
 		case <-timer.C:
 			now := time.Now()
 			if !reconnectAt.IsZero() && !now.Before(reconnectAt) {
@@ -318,5 +330,23 @@ func flushTransmits(c *session.Client, carriers []*carrierState, relay netip.Add
 			cs.out[i] = nil
 		}
 		cs.out, cs.to = cs.out[:0], cs.to[:0]
+	}
+}
+
+// logPaths logs each path's state, for -status.
+func logPaths(log *slog.Logger, c *session.Client, carriers []*carrierState, now time.Time) {
+	if c.State() != session.StateActive {
+		return
+	}
+	for _, p := range c.Paths(now) {
+		carrier := ""
+		for _, cs := range carriers {
+			if cs.bound && cs.path == p.ID {
+				carrier = cs.Name
+			}
+		}
+		log.Info("path", "id", p.ID, "carrier", carrier, "primary", p.Primary, "healthy", p.Healthy, "eligible", p.Eligible,
+			"flows", p.Flows, "min_rtt", p.MinRTT.Round(100*time.Microsecond), "srtt", p.SRTT.Round(100*time.Microsecond),
+			"loss", fmt.Sprintf("%.3f", p.Loss), "capacity_mbit", fmt.Sprintf("%.1f", p.Capacity*8/1e6))
 	}
 }

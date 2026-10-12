@@ -41,6 +41,7 @@ const (
 	DefaultPathTimeout   = 30 * time.Second // no packets received: the path is dead
 	sentHorizon          = 30 * time.Second
 	secondPathRefresh    = 100 * time.Millisecond
+	outageSilence        = time.Second
 	maxRetiredCIDs       = 2 * maxPaths // per session; see Relay.retired
 	suspectPTOs          = 3
 	maxPaths             = 8 // joined paths plus unused slots (§14.3)
@@ -80,9 +81,13 @@ type PathInfo struct {
 	Healthy   bool
 	Primary   bool
 	SRTT      time.Duration
+	MinRTT    time.Duration
 	Loss      float64 // worse direction's recent loss rate; 0 if unmeasured
 	MaxPacket int
 	LastRecv  time.Time
+	Flows     int     // flows pinned to the path (§15.2)
+	Capacity  float64 // estimated, in bytes per second; 0 if unmeasured
+	Eligible  bool    // may take new flows
 }
 
 type path struct {
@@ -101,7 +106,13 @@ type path struct {
 	rtt        rttEstimator
 	sendLoss   lossEstimator // from acknowledgements; see loss.go
 	recvLoss   lossEstimator // from gaps in received packet numbers
-	control    []wire.Frame  // frames that must travel on this path
+	sendRate   rateMax       // acknowledged bytes per second; see sched.go
+	recvRate   rateMax       // received bytes per second
+	flows      int           // active flows pinned to this path (sched.go)
+	ratio      float64       // cached conn.costRatio result, until ratioAt
+	ratioOK    bool
+	ratioAt    time.Time
+	control    []wire.Frame // frames that must travel on this path
 	probed     bool
 	created    time.Time
 	lastSend   time.Time
@@ -177,8 +188,10 @@ type conn struct {
 	paths []*path // ordered by ID for deterministic iteration
 	byCID map[wire.CID]*path
 
-	// primary chooses the path for IP traffic and unbound control frames.
+	// primary chooses the path for unbound control frames, and pathFor
+	// the path for each IP packet (the primary when nil); see sched.go.
 	primary func(now time.Time) *path
+	pathFor func(now time.Time, pkt []byte) *path
 	emit    func(p *path, b []byte, toCandidate bool)
 
 	ackedThisEpoch bool
@@ -310,10 +323,15 @@ func (c *conn) pathInfo(now time.Time) []PathInfo {
 			continue
 		}
 		loss, _ := p.loss(now)
-		out = append(out, PathInfo{
+		info := PathInfo{
 			ID: p.id, Validated: p.validated, Healthy: p.healthy(now, c.keepalive), Primary: p == prim,
-			SRTT: p.rtt.srtt(), Loss: loss, MaxPacket: p.maxPacket, LastRecv: p.lastRecv,
-		})
+			SRTT: p.rtt.srtt(), MinRTT: p.rtt.minRTT(), Loss: loss, MaxPacket: p.maxPacket, LastRecv: p.lastRecv,
+			Flows: p.flows, Capacity: p.capacity(now),
+		}
+		if prim != nil {
+			info.Eligible = c.eligible(now, p, prim)
+		}
+		out = append(out, info)
 	}
 	return out
 }
@@ -346,6 +364,22 @@ func (c *conn) open(now time.Time, p *path, h wire.DataHeader, aad, ct []byte) (
 		return nil, err
 	}
 	c.plaintext = pt
+	p.recvRate.add(now, len(ct)+wire.DataHeaderLen)
+	// A path heard from again after an outage (nothing received for
+	// outageSilence while a packet sent at least that long ago was waiting
+	// for an answer) starts its loss estimates afresh: what was lost was
+	// the outage, which health accounts for, and it would otherwise linger
+	// as loss and keep flows off the recovered path (§15.2). An idle path
+	// is silent without an outage, and a path with heavy random loss falls
+	// silent briefly and often; resetting then would erase its evidence.
+	recovered := false
+	if p.validated && now.Sub(p.lastRecv) >= outageSilence {
+		t0, waiting := p.sent.oldestOutstanding()
+		recovered = waiting && now.Sub(t0) >= outageSilence
+	}
+	if recovered {
+		p.sendLoss, p.recvLoss = lossEstimator{}, lossEstimator{}
+	}
 	p.replay.Record(h.PacketNumber)
 	p.lastRecv = now
 	c.stats.PacketsReceived++
@@ -363,6 +397,9 @@ func (c *conn) open(now time.Time, p *path, h wire.DataHeader, aad, ct []byte) (
 		p.recvLoss.record(now, 1, 0)
 	} else if pn := h.PacketNumber; pn > top {
 		gap := int(min(pn-top-1, 1<<20))
+		if recovered {
+			gap = 0 // packets the peer sent into the outage
+		}
 		p.recvLoss.record(now, gap+1, gap)
 	} else {
 		p.recvLoss.record(now, 0, -1) // late: counted as lost when the gap opened
@@ -384,7 +421,7 @@ func (c *conn) onAck(now time.Time, ack *wire.Ack) {
 	c.ivScratch = intervals
 	res := p.sent.onAck(now, ack, intervals, c.send.Epoch())
 	if res.hasRTT {
-		p.rtt.update(res.rttSample, time.Duration(ack.AckDelayMicros)*time.Microsecond)
+		p.rtt.update(now, res.rttSample, time.Duration(ack.AckDelayMicros)*time.Microsecond)
 	}
 	if res.ackedProbe > p.maxPacket {
 		p.maxPacket = res.ackedProbe
@@ -394,6 +431,9 @@ func (c *conn) onAck(now time.Time, ack *wire.Ack) {
 	}
 	if n := res.delivered + res.lostCount; n > 0 {
 		p.sendLoss.record(now, n, res.lostCount)
+	}
+	if res.deliveredBytes > 0 {
+		p.sendRate.add(now, res.deliveredBytes)
 	}
 	c.stats.PacketsLost += uint64(res.lostCount)
 	c.requeue(p, res.lost)
@@ -495,7 +535,7 @@ func (c *conn) transmitTo(now time.Time, p *path, extra []wire.Frame, ip ipPaylo
 	for _, f := range extra {
 		ackEliciting = ackEliciting || f.Type().AckEliciting()
 	}
-	c.seal(now, p, pt, retx, ackEliciting, 0, toCandidate)
+	c.sealPacket(now, p, pt, retx, ackEliciting, 0, ip.pkt == nil && len(retx) == 0, toCandidate)
 	if unbound := retx[pathBound:]; len(unbound) > 0 && !p.healthy(now, c.keepalive) {
 		c.copyControl(now, p, unbound)
 	}
@@ -535,13 +575,19 @@ func takeFrames(pt []byte, retx []wire.Frame, q *[]wire.Frame, budget int) ([]by
 }
 
 func (c *conn) seal(now time.Time, p *path, pt []byte, retx []wire.Frame, ackEliciting bool, probe int, toCandidate bool) {
+	c.sealPacket(now, p, pt, retx, ackEliciting, probe, false, toCandidate)
+}
+
+// sealPacket encrypts and sends one packet; ping marks a packet that
+// carries no IP payload or control frame (see sentPacket.ping).
+func (c *conn) sealPacket(now time.Time, p *path, pt []byte, retx []wire.Frame, ackEliciting bool, probe int, ping, toCandidate bool) {
 	pn := p.nextPN
 	p.nextPN++
 	epoch := c.send.Epoch()
 	// The packet buffer comes from the pool; whoever sends it returns it.
 	pkt := c.send.Seal(bufpool.Get(), wire.DataHeader{DestCID: p.remoteCID, PacketNumber: pn}, p.id, pt)
 	if ackEliciting {
-		p.sent.add(sentPacket{pn: pn, sentAt: now, epoch: epoch, frames: retx, probe: probe})
+		p.sent.add(sentPacket{pn: pn, sentAt: now, epoch: epoch, frames: retx, probe: probe, size: len(pkt), ping: ping})
 	}
 	p.lastSend = now
 	c.stats.PacketsSent++
@@ -591,7 +637,12 @@ func (c *conn) maybeRekey(now time.Time) {
 // With redundancy on, it sends a copy with the same datagram ID on a second
 // path too (§11.1).
 func (c *conn) sendIP(now time.Time, pkt []byte) error {
-	p := c.primary(now)
+	var p *path
+	if c.pathFor != nil {
+		p = c.pathFor(now, pkt)
+	} else {
+		p = c.primary(now)
+	}
 	if p == nil {
 		return ErrNoPath
 	}

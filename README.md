@@ -50,7 +50,8 @@ echo "some-token" > token
 sudo bin/arc-client run -relay RELAY_IP:4433 -relay-key RELAY_PUBLIC_KEY -full-tunnel
 
 # Several links at once (e.g. Wi-Fi and cellular): one carrier per interface,
-# with failover between them, and traffic moved off a link that turns lossy
+# with flows spread across them, failover, and traffic moved off a link that
+# turns lossy (-status 5s logs each path's state)
 sudo bin/arc-client run -relay RELAY_IP:4433 -relay-key RELAY_PUBLIC_KEY -full-tunnel -bind wlan0 -bind wwan0
 
 # When every link is lossy, send each packet on two links while the best one
