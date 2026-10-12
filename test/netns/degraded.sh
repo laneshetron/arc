@@ -7,13 +7,14 @@
 # impairments, reporting TCP goodput, ping loss, and ping RTT.
 #
 # Part 2 runs ARC over both links and measures multipath behavior: failover
-# time when the busy link is blackholed (clean and at 100 ms RTT), and what
-# happens when the busy link becomes lossy but stays alive.
+# time when the busy link is blackholed (clean and at 100 ms RTT), and
+# whether traffic leaves the busy link when it becomes lossy but stays alive.
 #
 # Assertions are deliberately loose so they hold on shared CI runners:
 #   - every tunnel carries traffic in every scenario
 #   - on a 50 Mbit/s bottleneck ARC reaches >= 70% of plain routing
 #   - failover from a blackholed link completes within 2 s
+#   - traffic leaves a busy link with 5% or 30% loss when the other is clean
 #
 # Usage: degraded.sh BIN_DIR [SECONDS]   (SECONDS per TCP run, default 10)
 set -euo pipefail
@@ -88,6 +89,7 @@ tcp_up() { # prints TCP uplink goodput in Mbit/s, or 0 if the run failed
     fi
     sleep 1
   done
+  sed 's/^/  iperf3: /' "$WORK/iperf.log" >&2
   echo 0
 }
 
@@ -144,6 +146,11 @@ fi
 # --- Part 2: multipath under impairment (ARC over both links) --------------
 kill "$ARC1"; wait "$ARC1" 2>/dev/null || true
 $C ip link del wg0
+# Deleting wg0 can strand the last run's control connection, leaving the
+# server waiting on it and refusing new tests as busy; start a fresh one.
+$I pkill -x iperf3 || true
+wait_until 5 sh -c "! pgrep -x iperf3 >/dev/null"
+$I iperf3 -s -D --logfile "$WORK/iperf-server.log"
 $C "$BIN/arc-client" run -relay 192.168.10.2:4433 -relay-key "$RELAY_PUB" \
   -token-file "$WORK/token" -route 192.168.20.0/24 -bind c0 -bind c1 >"$WORK/client2.log" 2>&1 &
 PIDS+=($!)
@@ -200,16 +207,27 @@ measure_failover() { # measure_failover NAME BASE_NETEM_ARGS
 measure_failover "blackholed busy link, clean links" ""
 measure_failover "blackholed busy link, rtt 100ms" "delay 50ms"
 
-# A lossy but live path: the health check only reacts to silence, so ARC
-# keeps using it. Recorded, not asserted; a loss-aware scheduler should
-# move traffic here.
-link=$(busy_link)
-impair "$link" loss 30%
-sleep 1
-read -r loss avg <<<"$(ping_stats)"
-after=$(busy_link)
-MP_ROWS+=("$(printf '%-34s c%s at 30%% loss: ping loss %s%%, traffic now on c%s' "lossy busy link, other clean" "$link" "$loss" "$after")")
-unimpair "$link"
+# A lossy but live busy link: loss-aware path selection (spec §15.2) should
+# move traffic to the clean link within a couple of seconds, so TCP runs at
+# clean-link speed rather than at the loss-limited speed of Part 1. The TCP
+# run itself supplies the traffic the client measures loss on.
+lossy_link() { # lossy_link LOSS
+  local link after mbps
+  link=$(busy_link)
+  impair "$link" loss "$1"
+  mbps=$(tcp_up)
+  after=$(busy_link)
+  MP_ROWS+=("$(printf '%-34s c%s at %s loss: traffic moved to c%s, TCP %s Mbit/s' "lossy busy link, other clean" "$link" "$1" "$after" "$mbps")")
+  if [[ $after != "$link" ]]; then
+    pass "traffic left c$link at $1 loss"
+  else
+    fail "traffic stayed on c$link at $1 loss"
+  fi
+  unimpair "$link"
+  sleep 1
+}
+lossy_link 5%
+lossy_link 30%
 
 echo
 echo "Part 1: single link, $DURATION s TCP runs; $(nproc) CPUs; kernel $(uname -r)"

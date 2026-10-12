@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"time"
 
+	"github.com/laneshetron/arc/internal/bufpool"
 	"github.com/laneshetron/arc/internal/session"
 	"github.com/laneshetron/arc/internal/wire"
 )
@@ -45,6 +46,9 @@ type carrierState struct {
 	bound   bool
 	path    uint32
 	retryAt time.Time // when an unbound carrier may next try to join
+
+	out [][]byte         // reused per flush: datagrams for this carrier
+	to  []netip.AddrPort // and their destinations
 }
 
 // slotRetry is how soon to retry joining when the relay has not issued a
@@ -122,8 +126,6 @@ func RunClient(ctx context.Context, cfg ClientConfig) error {
 						return err
 					}
 				}
-			case session.IPReceived:
-				toTUN = append(toTUN, e.Packet)
 			case session.PathValidated:
 				log.Info("path validated", "path", e.ID)
 			case session.PathClosed:
@@ -143,9 +145,15 @@ func RunClient(ctx context.Context, cfg ClientConfig) error {
 				reconnectAt = time.Now().Add(cfg.ReconnectDelay)
 			}
 		}
+		for p, ok := c.PollIP(); ok; p, ok = c.PollIP() {
+			toTUN = append(toTUN, p)
+		}
 		if len(toTUN) > 0 {
 			if err := cfg.TUN.Write(toTUN); err != nil {
 				log.Warn("tun write failed", "err", err)
+			}
+			for _, p := range toTUN {
+				bufpool.Put(p)
 			}
 		}
 
@@ -178,19 +186,18 @@ func RunClient(ctx context.Context, cfg ClientConfig) error {
 			return err
 		case d := <-udpCh:
 			cs := carriers[d.carrier]
-			if !cs.bound {
-				continue
-			}
 			now := time.Now()
 			for i, p := range d.pkts {
-				if d.from[i] == cfg.Relay {
+				if cs.bound && d.from[i] == cfg.Relay {
 					c.HandlePacket(now, cs.path, p)
 				}
+				bufpool.Put(p) // the session keeps no reference to its input
 			}
 		case pkts := <-tunCh:
 			now := time.Now()
 			for _, p := range pkts {
 				c.SendIP(now, p) // dropped while not active, like an unplugged link
+				bufpool.Put(p)   // SendIP copied what it needed
 			}
 		case <-timer.C:
 			now := time.Now()
@@ -231,25 +238,31 @@ func joinCarriers(c *session.Client, carriers []*carrierState, rejoinDelay time.
 
 // flushTransmits batches outgoing datagrams by their bound carrier.
 func flushTransmits(c *session.Client, carriers []*carrierState, relay netip.AddrPort, log *slog.Logger) {
-	groups := make([][][]byte, len(carriers))
 	for d, ok := c.PollTransmit(); ok; d, ok = c.PollTransmit() {
-		for i, cs := range carriers {
+		sent := false
+		for _, cs := range carriers {
 			if cs.bound && cs.path == d.PathID {
-				groups[i] = append(groups[i], d.Data)
+				cs.out, cs.to = append(cs.out, d.Data), append(cs.to, relay)
+				sent = true
 				break
 			}
 		}
+		if !sent {
+			bufpool.Put(d.Data)
+		}
 	}
-	for i, pkts := range groups {
-		if len(pkts) == 0 {
+	for _, cs := range carriers {
+		if len(cs.out) == 0 {
 			continue
 		}
-		to := make([]netip.AddrPort, len(pkts))
-		for j := range to {
-			to[j] = relay
+		if err := cs.Conn.WriteBatch(cs.out, cs.to); err != nil {
+			log.Warn("send failed", "carrier", cs.Name, "err", err)
 		}
-		if err := carriers[i].Conn.WriteBatch(pkts, to); err != nil {
-			log.Warn("send failed", "carrier", carriers[i].Name, "err", err)
+		// WriteBatch has copied or sent everything; the buffers are free.
+		for i, p := range cs.out {
+			bufpool.Put(p)
+			cs.out[i] = nil
 		}
+		cs.out, cs.to = cs.out[:0], cs.to[:0]
 	}
 }

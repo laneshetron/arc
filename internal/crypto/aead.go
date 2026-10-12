@@ -16,6 +16,10 @@ var ErrAuth = errors.New("crypto: packet authentication failed")
 // AEAD protects DATA packets under one directional key (§8.6).
 type AEAD struct {
 	c cipher.AEAD
+	// nonce is scratch space. Passing a stack array to the cipher.AEAD
+	// interface would make it escape, allocating on every packet. An AEAD
+	// is therefore not safe for concurrent use.
+	nonce [12]byte
 }
 
 func NewAEAD(key [32]byte) *AEAD {
@@ -43,15 +47,15 @@ func (a *AEAD) SealData(dst []byte, h wire.DataHeader, pathID uint32, plaintext 
 	}
 	start := len(dst)
 	dst = h.Append(dst)
-	n := Nonce(pathID, h.PacketNumber)
-	return a.c.Seal(dst, n[:], plaintext, dst[start:])
+	a.nonce = Nonce(pathID, h.PacketNumber)
+	return a.c.Seal(dst, a.nonce[:], plaintext, dst[start:])
 }
 
 // OpenData authenticates and decrypts a DATA packet's ciphertext, appending
 // the plaintext to dst. aad is the raw 18-byte header from wire.ParseData.
 func (a *AEAD) OpenData(dst []byte, h wire.DataHeader, aad []byte, pathID uint32, ciphertext []byte) ([]byte, error) {
-	n := Nonce(pathID, h.PacketNumber)
-	out, err := a.c.Open(dst, n[:], ciphertext, aad)
+	a.nonce = Nonce(pathID, h.PacketNumber)
+	out, err := a.c.Open(dst, a.nonce[:], ciphertext, aad)
 	if err != nil {
 		return dst, ErrAuth
 	}

@@ -51,9 +51,6 @@ type ClientEvent interface{ clientEvent() }
 // Established reports that the session is active.
 type Established struct{ Config wire.AuthResult }
 
-// IPReceived carries one tunneled IP packet.
-type IPReceived struct{ Packet []byte }
-
 // PathValidated reports that a path opened with OpenPath can carry traffic.
 type PathValidated struct{ ID uint32 }
 
@@ -67,7 +64,6 @@ type PathClosed struct {
 type Closed struct{ Err error }
 
 func (Established) clientEvent()   {}
-func (IPReceived) clientEvent()    {}
 func (PathValidated) clientEvent() {}
 func (PathClosed) clientEvent()    {}
 func (Closed) clientEvent()        {}
@@ -102,11 +98,15 @@ type Client struct {
 	conn    *conn
 	config  wire.AuthResult
 	slots   []pathSlot
-	current *path     // primary path
-	now     time.Time // latest time passed to any input, for NextDeadline
+	current *path // primary path
+	// Loss-driven moves of the primary (loss.go): when the next check is
+	// due and the earliest the primary may move again.
+	lossCheckAt, lossMoveAt time.Time
+	now                     time.Time // latest time passed to any input, for NextDeadline
 
 	out    []Datagram
 	events []ClientEvent
+	ips    [][]byte // received IP packets, kept apart from events to avoid boxing
 }
 
 // NewClient creates a client and queues its first HANDSHAKE_INIT on path 0.
@@ -225,14 +225,24 @@ func (c *Client) emit(p *path, b []byte, _ bool) {
 	c.out = append(c.out, Datagram{PathID: p.id, Data: b})
 }
 
-// primary keeps the current path while it is healthy and otherwise moves
-// to the best healthy path. Before the session is active, everything goes
-// on path 0.
+// primary keeps the current path while it is healthy and not much lossier
+// than another, and otherwise moves to the best healthy path. Before the
+// session is active, everything goes on path 0. The relay sends downlink
+// traffic on whichever path the client sends uplink traffic on, so this
+// choice steers both directions.
 func (c *Client) primary(now time.Time) *path {
 	if c.state != StateActive {
 		return c.conn.path(0)
 	}
 	if c.current != nil && !c.current.removed && c.current.healthy(now, c.conn.keepalive) {
+		if now.Before(c.lossCheckAt) {
+			return c.current
+		}
+		c.lossCheckAt = now.Add(lossCheckEvery)
+		if best := c.conn.bestPath(now); best != c.current && !now.Before(c.lossMoveAt) &&
+			lossierThan(now, c.current, best) {
+			c.current, c.lossMoveAt = best, now.Add(lossDwell)
+		}
 		return c.current
 	}
 	if best := c.conn.bestPath(now); best != nil {
@@ -272,12 +282,12 @@ func (c *Client) handleData(now time.Time, b []byte) {
 			c.conn.onAck(now, &f)
 		case wire.IPPacket:
 			if c.state == StateActive {
-				c.events = append(c.events, IPReceived{Packet: copyBytes(f.Packet)})
+				c.ips = append(c.ips, copyBytes(f.Packet))
 			}
 		case wire.IPFragment:
 			if c.state == StateActive {
 				if pkt := c.conn.receiveFragment(now, f); pkt != nil {
-					c.events = append(c.events, IPReceived{Packet: pkt})
+					c.ips = append(c.ips, pkt)
 				}
 			}
 		case wire.NewPath:
@@ -308,7 +318,7 @@ func (c *Client) onChallenge(now time.Time, p *path, f wire.PathChallenge) {
 		p.control = nil // the pending PATH_JOIN is no longer needed
 		c.events = append(c.events, PathValidated{ID: p.id})
 		c.conn.probe(now, p)
-		if best := c.conn.bestPath(now); best != nil && (c.current == nil || best.rtt.srtt() < c.current.rtt.srtt()) {
+		if best := c.conn.bestPath(now); best != nil && (c.current == nil || best.cost(now) < c.current.cost(now)) {
 			c.current = best
 		}
 	}
@@ -558,6 +568,18 @@ func (c *Client) PollTransmit() (Datagram, bool) {
 	d := c.out[0]
 	c.out = c.out[1:]
 	return d, true
+}
+
+// PollIP returns the next tunneled IP packet received from the relay. The
+// packet is in a pooled buffer; return it with bufpool.Put when done.
+func (c *Client) PollIP() ([]byte, bool) {
+	if len(c.ips) == 0 {
+		return nil, false
+	}
+	p := c.ips[0]
+	c.ips[0] = nil
+	c.ips = c.ips[1:]
+	return p, true
 }
 
 // PollEvent returns the next event.

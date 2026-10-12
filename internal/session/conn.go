@@ -11,6 +11,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/laneshetron/arc/internal/bufpool"
 	"github.com/laneshetron/arc/internal/crypto"
 	"github.com/laneshetron/arc/internal/reassembly"
 	"github.com/laneshetron/arc/internal/wire"
@@ -59,6 +60,7 @@ type PathInfo struct {
 	Healthy   bool
 	Primary   bool
 	SRTT      time.Duration
+	Loss      float64 // worse direction's recent loss rate; 0 if unmeasured
 	MaxPacket int
 	LastRecv  time.Time
 }
@@ -77,7 +79,9 @@ type path struct {
 	acks       ackTracker
 	sent       sentLog
 	rtt        rttEstimator
-	control    []wire.Frame // frames that must travel on this path
+	sendLoss   lossEstimator // from acknowledgements; see loss.go
+	recvLoss   lossEstimator // from gaps in received packet numbers
+	control    []wire.Frame  // frames that must travel on this path
 	probed     bool
 	created    time.Time
 	lastSend   time.Time
@@ -165,6 +169,8 @@ type conn struct {
 	probeSize      int // UDP payload needed for an unfragmented TUN packet
 
 	plaintext []byte
+	ptScratch []byte // reused to build each outgoing packet's plaintext
+	ivScratch []wire.PacketRange
 	frameBuf  []wire.Frame
 	fragBuf   []wire.IPFragment
 
@@ -222,10 +228,11 @@ func (c *conn) path(id uint32) *path {
 	return nil
 }
 
-// bestPath returns the healthy validated path with the lowest smoothed
-// RTT, falling back to any validated path.
+// bestPath returns the healthy validated path with the lowest cost (RTT
+// and loss; see loss.go), falling back to any validated path.
 func (c *conn) bestPath(now time.Time) *path {
 	var best, fallback *path
+	var bestCost float64
 	for _, p := range c.paths {
 		if !p.validated {
 			continue
@@ -233,8 +240,11 @@ func (c *conn) bestPath(now time.Time) *path {
 		if fallback == nil {
 			fallback = p
 		}
-		if p.healthy(now, c.keepalive) && (best == nil || p.rtt.srtt() < best.rtt.srtt()) {
-			best = p
+		if !p.healthy(now, c.keepalive) {
+			continue
+		}
+		if cost := p.cost(now); best == nil || cost < bestCost {
+			best, bestCost = p, cost
 		}
 	}
 	if best != nil {
@@ -250,9 +260,10 @@ func (c *conn) pathInfo(now time.Time) []PathInfo {
 		if !p.joined {
 			continue
 		}
+		loss, _ := p.loss(now)
 		out = append(out, PathInfo{
 			ID: p.id, Validated: p.validated, Healthy: p.healthy(now, c.keepalive), Primary: p == prim,
-			SRTT: p.rtt.srtt(), MaxPacket: p.maxPacket, LastRecv: p.lastRecv,
+			SRTT: p.rtt.srtt(), Loss: loss, MaxPacket: p.maxPacket, LastRecv: p.lastRecv,
 		})
 	}
 	return out
@@ -299,6 +310,14 @@ func (c *conn) open(now time.Time, p *path, h wire.DataHeader, aad, ct []byte) (
 	for _, f := range frames {
 		ackEliciting = ackEliciting || f.Type().AckEliciting()
 	}
+	if top, ok := p.acks.largest(); !ok {
+		p.recvLoss.record(now, 1, 0)
+	} else if pn := h.PacketNumber; pn > top {
+		gap := int(min(pn-top-1, 1<<20))
+		p.recvLoss.record(now, gap+1, gap)
+	} else {
+		p.recvLoss.record(now, 0, -1) // late: counted as lost when the gap opened
+	}
 	p.acks.onReceive(h.PacketNumber, now, ackEliciting)
 	return frames, nil
 }
@@ -309,21 +328,23 @@ func (c *conn) onAck(now time.Time, ack *wire.Ack) {
 	if p == nil {
 		return
 	}
-	intervals, err := ack.AppendIntervals(nil)
+	intervals, err := ack.AppendIntervals(c.ivScratch[:0])
 	if err != nil {
 		return
 	}
-	res := p.sent.onAck(now, ack, intervals)
+	c.ivScratch = intervals
+	res := p.sent.onAck(now, ack, intervals, c.send.Epoch())
 	if res.hasRTT {
 		p.rtt.update(res.rttSample, time.Duration(ack.AckDelayMicros)*time.Microsecond)
 	}
 	if res.ackedProbe && c.probeSize > p.maxPacket {
 		p.maxPacket = c.probeSize
 	}
-	for _, e := range res.ackedEpochs {
-		if e == c.send.Epoch() {
-			c.ackedThisEpoch = true
-		}
+	if res.ackedCurrentEpoch {
+		c.ackedThisEpoch = true
+	}
+	if n := res.delivered + res.lostCount; n > 0 {
+		p.sendLoss.record(now, n, res.lostCount)
 	}
 	c.stats.PacketsLost += uint64(res.lostCount)
 	c.requeue(p, res.lost)
@@ -363,7 +384,7 @@ func (c *conn) flush(now time.Time) {
 }
 
 func (c *conn) transmit(now time.Time, p *path, extra []wire.Frame) bool {
-	return c.transmitTo(now, p, extra, false)
+	return c.transmitTo(now, p, extra, nil, false)
 }
 
 // transmitTo builds and sends one packet on p carrying the frames in extra
@@ -371,12 +392,15 @@ func (c *conn) transmit(now time.Time, p *path, extra []wire.Frame) bool {
 // the primary path, unbound control frames. It reports whether a packet was
 // sent. toCandidate directs a relay's packet to the path's unvalidated new
 // address.
-func (c *conn) transmitTo(now time.Time, p *path, extra []wire.Frame, toCandidate bool) bool {
+func (c *conn) transmitTo(now time.Time, p *path, extra []wire.Frame, ip []byte, toCandidate bool) bool {
 	if !p.joined {
 		return false
 	}
 	budget := p.maxPacket - wire.DataHeaderLen - wire.AEADTagLen
-	var pt []byte
+	pt := c.ptScratch[:0]
+	if ip != nil {
+		pt = wire.AppendIPPacket(pt, ip)
+	}
 	for _, f := range extra {
 		pt = wire.AppendFrame(pt, f)
 	}
@@ -390,25 +414,15 @@ func (c *conn) transmitTo(now time.Time, p *path, extra []wire.Frame, toCandidat
 		}
 	}
 	var retx []wire.Frame
-	take := func(q *[]wire.Frame) {
-		for len(*q) > 0 {
-			next := wire.AppendFrame(pt, (*q)[0])
-			if len(next) > budget {
-				return
-			}
-			pt = next
-			retx = append(retx, (*q)[0])
-			*q = (*q)[1:]
-		}
-	}
-	take(&p.control)
+	pt, retx = takeFrames(pt, retx, &p.control, budget)
 	if !toCandidate && len(c.control) > 0 && p == c.primary(now) {
-		take(&c.control)
+		pt, retx = takeFrames(pt, retx, &c.control, budget)
 	}
+	c.ptScratch = pt[:0] // keep any growth for the next packet
 	if len(pt) == 0 {
 		return false
 	}
-	ackEliciting := len(retx) > 0
+	ackEliciting := len(retx) > 0 || ip != nil
 	for _, f := range extra {
 		ackEliciting = ackEliciting || f.Type().AckEliciting()
 	}
@@ -416,11 +430,27 @@ func (c *conn) transmitTo(now time.Time, p *path, extra []wire.Frame, toCandidat
 	return true
 }
 
+// takeFrames moves frames from the front of q into the plaintext while they
+// fit in budget, recording them for retransmission.
+func takeFrames(pt []byte, retx []wire.Frame, q *[]wire.Frame, budget int) ([]byte, []wire.Frame) {
+	for len(*q) > 0 {
+		next := wire.AppendFrame(pt, (*q)[0])
+		if len(next) > budget {
+			break
+		}
+		pt = next
+		retx = append(retx, (*q)[0])
+		*q = (*q)[1:]
+	}
+	return pt, retx
+}
+
 func (c *conn) seal(now time.Time, p *path, pt []byte, retx []wire.Frame, ackEliciting, probe, toCandidate bool) {
 	pn := p.nextPN
 	p.nextPN++
 	epoch := c.send.Epoch()
-	pkt := c.send.Seal(nil, wire.DataHeader{DestCID: p.remoteCID, PacketNumber: pn}, p.id, pt)
+	// The packet buffer comes from the pool; whoever sends it returns it.
+	pkt := c.send.Seal(bufpool.Get(), wire.DataHeader{DestCID: p.remoteCID, PacketNumber: pn}, p.id, pt)
 	if ackEliciting {
 		p.sent.add(sentPacket{pn: pn, sentAt: now, epoch: epoch, frames: retx, probe: probe})
 	}
@@ -462,7 +492,7 @@ func (c *conn) sendIP(now time.Time, pkt []byte) error {
 	}
 	budget := p.maxPacket - wire.DataHeaderLen - wire.AEADTagLen
 	if wire.FrameHeaderLen+len(pkt) <= budget {
-		c.transmit(now, p, []wire.Frame{wire.IPPacket{Packet: pkt}})
+		c.transmitTo(now, p, nil, pkt, false)
 		return nil
 	}
 	maxData := budget - wire.FrameHeaderLen - 12
@@ -511,4 +541,11 @@ func earliest(ts ...time.Time) time.Time {
 	return out
 }
 
-func copyBytes(b []byte) []byte { return append([]byte(nil), b...) }
+// copyBytes copies a packet into a pooled buffer, which the receiver of
+// the event returns with bufpool.Put.
+func copyBytes(b []byte) []byte {
+	if len(b) > bufpool.Packet {
+		return append([]byte(nil), b...)
+	}
+	return append(bufpool.Get(), b...)
+}

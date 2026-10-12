@@ -328,3 +328,17 @@ func TestAppendFramePanicsOnOversizedValue(t *testing.T) {
 	}()
 	AppendFrame(nil, Unknown{FrameType: 0x80, Value: make([]byte, 0x10000)})
 }
+
+func TestAppendIPPacketMatchesAppendFrame(t *testing.T) {
+	pkt := make([]byte, 300)
+	pkt[0] = 0x45
+	pkt[2], pkt[3] = 0x01, 0x2c
+	want := AppendFrame(nil, IPPacket{Packet: pkt})
+	if got := AppendIPPacket(nil, pkt); !bytes.Equal(got, want) {
+		t.Fatalf("AppendIPPacket = %x\nwant %x", got[:8], want[:8])
+	}
+	buf := make([]byte, 0, 512)
+	if allocs := testing.AllocsPerRun(100, func() { AppendIPPacket(buf, pkt) }); allocs != 0 {
+		t.Errorf("AppendIPPacket allocates %v times", allocs)
+	}
+}

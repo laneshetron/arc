@@ -35,6 +35,10 @@ func FuzzHandlePacket(f *testing.F) {
 		}
 		for _, ok := n.relay.PollEvent(); ok; _, ok = n.relay.PollEvent() {
 		}
+		for _, ok := n.client.PollIP(); ok; _, ok = n.client.PollIP() {
+		}
+		for _, _, ok := n.relay.PollIP(); ok; _, _, ok = n.relay.PollIP() {
+		}
 		if n.client.State() != StateActive || s.State() != StateActive {
 			t.Fatal("garbage closed the session")
 		}

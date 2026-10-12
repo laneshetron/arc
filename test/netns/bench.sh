@@ -16,9 +16,13 @@
 # Columns: TCP goodput (Mbit/s) up and down with 1 and 4 streams, then for
 # the single-stream uplink run: CPU-seconds per GB moved (all cores, both
 # tunnel ends, iperf3 included), context switches and inter-processor
-# interrupts per 1000 packets on the relay's client-facing link, and wire
-# bytes on that link per byte of goodput (which checks that the tunnel
-# carried the traffic and shows its overhead). All counters are system-wide,
+# interrupts per MB of goodput, and bytes on the relay's client-facing link
+# per byte of goodput (which checks that the tunnel carried the traffic).
+# Everything is normalized by goodput, not by link packets: with GSO a veth
+# counts a whole super-packet, and its headers, once, so per-packet and
+# overhead figures from link counters would flatter ARC and plain routing.
+# The wire/good column is therefore a lower bound on true per-packet
+# overhead whenever GSO is in play. All counters are system-wide,
 # so run nothing else alongside. Treat results as relative: both ends share
 # one machine, and in a VM cross-CPU wakeups are unusually expensive.
 #
@@ -50,13 +54,13 @@ iperf() { # iperf ARGS...: prints receiver Mbit/s
 ROWS=()
 measure() { # measure NAME
   local name=$1 b0 p0 t0 c0 i0 up1 cost
-  b0=$(link_stat rx_bytes) p0=$(link_stat rx_packets) t0=$(cpu_ticks) c0=$(ctxt) i0=$(ipis)
+  b0=$(link_stat rx_bytes) t0=$(cpu_ticks) c0=$(ctxt) i0=$(ipis)
   up1=$(iperf -P 1)
   cost=$(awk -v mb="$up1" -v d="$DURATION" -v hz="$HZ" \
-    -v b=$(($(link_stat rx_bytes) - b0)) -v p=$(($(link_stat rx_packets) - p0)) \
+    -v b=$(($(link_stat rx_bytes) - b0)) \
     -v t=$(($(cpu_ticks) - t0)) -v c=$(($(ctxt) - c0)) -v i=$(($(ipis) - i0)) 'BEGIN {
       good = mb * 1e6 / 8 * d
-      printf "%9.2f %9.0f %9.0f %9.3f", t / hz / (good / 1e9), c / p * 1000, i / p * 1000, b / good
+      printf "%9.2f %9.0f %9.0f %9.3f", t / hz / (good / 1e9), c / (good / 1e6), i / (good / 1e6), b / good
     }')
   ROWS+=("$(printf '%-20s %8s %8s %8s %8s %s' "$name" "$up1" "$(iperf -P 1 -R)" "$(iperf -P 4)" "$(iperf -P 4 -R)" "$cost")")
   echo "measured $name" >&2
@@ -114,6 +118,6 @@ done
 echo
 echo "$DURATION s per run; $(nproc) CPUs; kernel $(uname -r); $($C iperf3 --version | head -1)"
 printf '%-20s %8s %8s %8s %8s %9s %9s %9s %9s\n' "" "Mbit/s" "" "" "" "single-stream uplink:" "" "" ""
-printf '%-20s %8s %8s %8s %8s %9s %9s %9s %9s\n' "" "up x1" "down x1" "up x4" "down x4" "cpu-s/GB" "ctx/kpkt" "ipi/kpkt" "wire/good"
+printf '%-20s %8s %8s %8s %8s %9s %9s %9s %9s\n' "" "up x1" "down x1" "up x4" "down x4" "cpu-s/GB" "ctx/MB" "ipi/MB" "wire/good"
 printf '%s\n' "${ROWS[@]}"
-echo "(plain routing moves TSO super-packets across the veth, so its per-packet columns are not comparable)"
+echo "(wire/good counts GSO super-packet headers once, so it understates overhead when GSO is used)"

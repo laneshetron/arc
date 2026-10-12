@@ -1,6 +1,7 @@
 package session
 
 import (
+	"github.com/laneshetron/arc/internal/bufpool"
 	"testing"
 	"time"
 )
@@ -26,10 +27,9 @@ func BenchmarkUplink(b *testing.B) {
 				for d, ok := n.client.PollTransmit(); ok; d, ok = n.client.PollTransmit() {
 					n.relay.HandlePacket(n.now, n.clientAddr, d.Data)
 				}
-				for e, ok := n.relay.PollEvent(); ok; e, ok = n.relay.PollEvent() {
-					if _, isIP := e.(SessionIP); isIP {
-						delivered++
-					}
+				for _, p, ok := n.relay.PollIP(); ok; _, p, ok = n.relay.PollIP() {
+					delivered++
+					bufpool.Put(p)
 				}
 				n.relay.Tick(n.now)
 				for d, ok := n.relay.PollTransmit(); ok; d, ok = n.relay.PollTransmit() {

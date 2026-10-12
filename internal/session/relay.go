@@ -41,18 +41,11 @@ type RelayDatagram struct {
 	Data []byte
 }
 
-// RelayEvent is reported by Relay.PollEvent: one of SessionEstablished,
-// SessionIP, or SessionClosed.
+// RelayEvent is reported by Relay.PollEvent: SessionEstablished or
+// SessionClosed. IP packets from clients come from Relay.PollIP.
 type RelayEvent interface{ relayEvent() }
 
 type SessionEstablished struct{ Session *RelaySession }
-
-// SessionIP carries an IP packet from a client whose source address has
-// been checked against the session's lease.
-type SessionIP struct {
-	Session *RelaySession
-	Packet  []byte
-}
 
 type SessionClosed struct {
 	Session *RelaySession
@@ -60,7 +53,6 @@ type SessionClosed struct {
 }
 
 func (SessionEstablished) relayEvent() {}
-func (SessionIP) relayEvent()          {}
 func (SessionClosed) relayEvent()      {}
 
 // RelayStats counts relay-wide events.
@@ -95,7 +87,13 @@ type Relay struct {
 
 	out    []RelayDatagram
 	events []RelayEvent
+	ips    []relayIP // kept apart from events to avoid boxing per packet
 	stats  RelayStats
+}
+
+type relayIP struct {
+	s   *RelaySession
+	pkt []byte
 }
 
 // RelaySession is one client's session on the relay.
@@ -259,8 +257,10 @@ func (r *Relay) handleData(now time.Time, from netip.AddrPort, b []byte) {
 		case wire.Ack:
 			s.conn.onAck(now, &f)
 		case wire.IPPacket:
+			s.onUplink(p)
 			s.deliver(f.Packet, true)
 		case wire.IPFragment:
+			s.onUplink(p)
 			if s.state == StateActive {
 				if pkt := s.conn.receiveFragment(now, f); pkt != nil {
 					s.deliver(pkt, false)
@@ -286,13 +286,20 @@ func (r *Relay) handleData(now time.Time, from netip.AddrPort, b []byte) {
 	s.conn.flush(now)
 }
 
+// onUplink notes that the client sent IP traffic on p. Downlink traffic
+// follows it there (§15.2), so the client's choice of path, which accounts
+// for loss in both directions, steers the downlink as well. Keepalives and
+// probes on other paths do not move the downlink.
+func (s *RelaySession) onUplink(p *path) {
+	if p.joined && p.validated {
+		s.lastUplink = p
+	}
+}
+
 // onAddress tracks where an authenticated packet came from. A new path
 // learns its address; a validated path seeing a new address starts
 // validating it without moving the downlink (§14.5).
 func (s *RelaySession) onAddress(now time.Time, p *path, from netip.AddrPort, n int) {
-	if p.joined && p.validated {
-		s.lastUplink = p
-	}
 	switch {
 	case !p.validated:
 		if p.addr != from {
@@ -318,7 +325,7 @@ func (s *RelaySession) onAddress(now time.Time, p *path, from netip.AddrPort, n 
 
 func (s *RelaySession) challengeCandidate(now time.Time, p *path) {
 	p.candSentAt = now
-	s.conn.transmitTo(now, p, []wire.Frame{wire.PathChallenge{Data: p.candChallenge}}, true)
+	s.conn.transmitTo(now, p, []wire.Frame{wire.PathChallenge{Data: p.candChallenge}}, nil, true)
 }
 
 // onJoin handles PATH_JOIN on a slot path and reports whether the session
@@ -388,7 +395,8 @@ func (s *RelaySession) removePath(p *path) {
 }
 
 // primary picks the downlink path: the path the client most recently sent
-// on while it is healthy, otherwise the best healthy path (§15.2).
+// IP traffic on while it is healthy, otherwise the best healthy path
+// (§15.2).
 func (s *RelaySession) primary(now time.Time) *path {
 	if s.lastUplink != nil && s.lastUplink.healthy(now, s.conn.keepalive) {
 		return s.lastUplink
@@ -460,7 +468,7 @@ func (s *RelaySession) deliver(pkt []byte, mustCopy bool) {
 	if mustCopy {
 		pkt = copyBytes(pkt)
 	}
-	s.relay.events = append(s.relay.events, SessionIP{Session: s, Packet: pkt})
+	s.relay.ips = append(s.relay.ips, relayIP{s, pkt})
 }
 
 func (r *Relay) leavePending(s *RelaySession) {
@@ -603,6 +611,19 @@ func (r *Relay) PollTransmit() (RelayDatagram, bool) {
 	d := r.out[0]
 	r.out = r.out[1:]
 	return d, true
+}
+
+// PollIP returns the next IP packet from a client, whose inner source
+// address has been checked against the session's lease (§11). The packet
+// is in a pooled buffer; return it with bufpool.Put when done.
+func (r *Relay) PollIP() (*RelaySession, []byte, bool) {
+	if len(r.ips) == 0 {
+		return nil, nil, false
+	}
+	ip := r.ips[0]
+	r.ips[0] = relayIP{}
+	r.ips = r.ips[1:]
+	return ip.s, ip.pkt, true
 }
 
 // PollEvent returns the next event.
