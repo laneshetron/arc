@@ -285,21 +285,23 @@ func (c *Client) primary(now time.Time) *path {
 	if c.state != StateActive {
 		return c.conn.path(0)
 	}
-	if c.current != nil && !c.current.removed && c.current.healthy(now, c.conn.keepalive) {
-		if now.Before(c.lossCheckAt) {
-			return c.current
+	healthy := c.current != nil && !c.current.removed && c.current.healthy(now, c.conn.keepalive)
+	if !healthy {
+		if best := c.conn.bestPath(now); best != nil {
+			c.current = best
 		}
-		c.lossCheckAt = now.Add(lossCheckEvery)
+	}
+	if c.current == nil || now.Before(c.lossCheckAt) {
+		return c.current
+	}
+	c.lossCheckAt = now.Add(lossCheckEvery)
+	if healthy {
 		if best := c.conn.bestPath(now); best != c.current && !now.Before(c.lossMoveAt) &&
 			lossierThan(now, c.current, best) {
 			c.current, c.lossMoveAt = best, now.Add(lossDwell)
 		}
-		c.updateRedundancy(now)
-		return c.current
 	}
-	if best := c.conn.bestPath(now); best != nil {
-		c.current = best
-	}
+	c.updateRedundancy(now)
 	return c.current
 }
 
@@ -407,7 +409,11 @@ func (c *Client) updateRedundancy(now time.Time) {
 		return
 	}
 	up, down := true, true
-	if c.cfg.Redundancy == RedundancyAuto {
+	// In auto mode a primary that is not healthy also turns redundancy on:
+	// that happens only when no path is healthy (otherwise the primary
+	// moves), and under loss heavy enough that acknowledgements stop
+	// arriving, the loss estimates themselves update slowly.
+	if c.cfg.Redundancy == RedundancyAuto && c.current.healthy(now, c.conn.keepalive) {
 		up = wantRedundancy(now, &c.current.sendLoss, c.conn.redundant)
 		down = wantRedundancy(now, &c.current.recvLoss, c.downRedundant)
 	}

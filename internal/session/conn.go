@@ -483,6 +483,7 @@ func (c *conn) transmitTo(now time.Time, p *path, extra []wire.Frame, ip ipPaylo
 	}
 	var retx []wire.Frame
 	pt, retx = takeFrames(pt, retx, &p.control, budget)
+	pathBound := len(retx)
 	if !toCandidate && len(c.control) > 0 && p == c.primary(now) {
 		pt, retx = takeFrames(pt, retx, &c.control, budget)
 	}
@@ -495,7 +496,27 @@ func (c *conn) transmitTo(now time.Time, p *path, extra []wire.Frame, ip ipPaylo
 		ackEliciting = ackEliciting || f.Type().AckEliciting()
 	}
 	c.seal(now, p, pt, retx, ackEliciting, 0, toCandidate)
+	if unbound := retx[pathBound:]; len(unbound) > 0 && !p.healthy(now, c.keepalive) {
+		c.copyControl(now, p, unbound)
+	}
 	return true
+}
+
+// copyControl sends copies of unbound control frames on every validated
+// path other than p, the unhealthy path that carries the tracked original.
+// Copies are not retransmitted; the original is. Under heavy loss on every
+// path this gets frames such as REDUNDANCY and PATH_ABANDON through several
+// times faster (§15.2 item 4).
+func (c *conn) copyControl(now time.Time, p *path, frames []wire.Frame) {
+	n := 0
+	for _, f := range frames {
+		n += len(wire.AppendFrame(c.ptScratch[:0], f))
+	}
+	for _, q := range c.paths {
+		if q != p && q.validated && q.joined && n <= q.maxPacket-wire.DataHeaderLen-wire.AEADTagLen {
+			c.transmit(now, q, frames)
+		}
+	}
 }
 
 // takeFrames moves frames from the front of q into the plaintext while they

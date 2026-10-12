@@ -15,7 +15,10 @@ const (
 	MaxAckDelay     = 25 * time.Millisecond
 	initialRTT      = 333 * time.Millisecond
 	packetThreshold = 3
-	maxPTOBackoff   = 6
+	// maxPTOBackoff caps PTO doubling at 8x. Control packets are small,
+	// and under heavy loss a longer wait only delays the frames that
+	// recover the session, such as REDUNDANCY and PATH_ABANDON.
+	maxPTOBackoff = 3
 )
 
 // ackTracker records received packet numbers on one path and decides when

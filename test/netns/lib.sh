@@ -35,6 +35,15 @@ setup_topology() {
   ip -n arc-r link set r1 up
   ip -n arc-i addr add 192.168.20.2/24 dev i0
   ip -n arc-i link set i0 up
+  # Static neighbor entries: netem drops ARP along with everything else,
+  # and under heavy loss the kernel then fails to resolve the next hop and
+  # silently drops packets queued for it, so impairments would cost
+  # several times their nominal loss. They should model IP packet loss.
+  mac() { ip -n "$1" -br link show "$2" | awk '{print $3}'; }
+  ip -n arc-c neigh replace 192.168.10.2 lladdr "$(mac arc-r r0)" dev c0 nud permanent
+  ip -n arc-c neigh replace 192.168.10.2 lladdr "$(mac arc-r r2)" dev c1 nud permanent
+  ip -n arc-r neigh replace 192.168.10.1 lladdr "$(mac arc-c c0)" dev r0 nud permanent
+  ip -n arc-r neigh replace 192.168.11.1 lladdr "$(mac arc-c c1)" dev r2 nud permanent
   $R sysctl -qw net.ipv4.ip_forward=1
   for net in "$@"; do
     $R iptables -t nat -A POSTROUTING -s "$net" -o r1 -j MASQUERADE
