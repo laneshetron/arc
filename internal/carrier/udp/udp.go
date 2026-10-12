@@ -34,6 +34,9 @@ type Options struct {
 	// net.core.rmem_max/wmem_max via SO_RCVBUFFORCE/SO_SNDBUFFORCE; others
 	// get what the kernel limits allow.
 	BufferSize int
+	// NoOffload disables UDP GSO and GRO, for comparing against plain
+	// per-datagram I/O.
+	NoOffload bool
 }
 
 // Conn is a UDP carrier socket. Reads and writes may run on different
@@ -48,6 +51,7 @@ type Conn struct {
 	// gso_linux.go. gsoBufs are reused coalescing buffers.
 	gso     bool
 	gsoBufs [][]byte
+	gro     *groReader // non-nil when UDP_GRO is enabled; see gro_linux.go
 
 	// Caches for the send path: the last destination's *net.UDPAddr and
 	// the last segment size's control message, which would otherwise be
@@ -95,7 +99,12 @@ func Listen(addr netip.AddrPort, opts Options) (*Conn, error) {
 		uc.SetReadBuffer(opts.BufferSize)
 		uc.SetWriteBuffer(opts.BufferSize)
 	}
-	return &Conn{uc: uc, pc: ipv4.NewPacketConn(uc), gso: gsoSupported(uc)}, nil
+	c := &Conn{uc: uc, pc: ipv4.NewPacketConn(uc)}
+	if !opts.NoOffload {
+		c.gso = gsoSupported(uc)
+		c.gro = enableGRO(uc)
+	}
+	return c, nil
 }
 
 // LocalAddr returns the socket's bound address.
@@ -104,6 +113,9 @@ func (c *Conn) LocalAddr() netip.AddrPort { return c.uc.LocalAddr().(*net.UDPAdd
 // ReadBatch reads up to len(bufs) datagrams. Datagram i is bufs[i][:sizes[i]]
 // from addrs[i].
 func (c *Conn) ReadBatch(bufs [][]byte, sizes []int, addrs []netip.AddrPort) (int, error) {
+	if c.gro != nil {
+		return c.gro.read(bufs, sizes, addrs)
+	}
 	if len(c.rx) < len(bufs) {
 		c.rx = make([]ipv4.Message, len(bufs))
 		for i := range c.rx {
