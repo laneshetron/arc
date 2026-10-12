@@ -257,8 +257,10 @@ func (r *Relay) handleData(now time.Time, from netip.AddrPort, b []byte) {
 		case wire.Ack:
 			s.conn.onAck(now, &f)
 		case wire.IPPacket:
+			s.onUplink(p)
 			s.deliver(f.Packet, true)
 		case wire.IPFragment:
+			s.onUplink(p)
 			if s.state == StateActive {
 				if pkt := s.conn.receiveFragment(now, f); pkt != nil {
 					s.deliver(pkt, false)
@@ -284,13 +286,20 @@ func (r *Relay) handleData(now time.Time, from netip.AddrPort, b []byte) {
 	s.conn.flush(now)
 }
 
+// onUplink notes that the client sent IP traffic on p. Downlink traffic
+// follows it there (§15.2), so the client's choice of path, which accounts
+// for loss in both directions, steers the downlink as well. Keepalives and
+// probes on other paths do not move the downlink.
+func (s *RelaySession) onUplink(p *path) {
+	if p.joined && p.validated {
+		s.lastUplink = p
+	}
+}
+
 // onAddress tracks where an authenticated packet came from. A new path
 // learns its address; a validated path seeing a new address starts
 // validating it without moving the downlink (§14.5).
 func (s *RelaySession) onAddress(now time.Time, p *path, from netip.AddrPort, n int) {
-	if p.joined && p.validated {
-		s.lastUplink = p
-	}
 	switch {
 	case !p.validated:
 		if p.addr != from {
@@ -386,7 +395,8 @@ func (s *RelaySession) removePath(p *path) {
 }
 
 // primary picks the downlink path: the path the client most recently sent
-// on while it is healthy, otherwise the best healthy path (§15.2).
+// IP traffic on while it is healthy, otherwise the best healthy path
+// (§15.2).
 func (s *RelaySession) primary(now time.Time) *path {
 	if s.lastUplink != nil && s.lastUplink.healthy(now, s.conn.keepalive) {
 		return s.lastUplink

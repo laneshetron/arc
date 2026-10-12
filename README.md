@@ -62,7 +62,8 @@ docker build -f test/netns/Dockerfile -t arc-e2e . && docker run --rm --privileg
 ```
 
 `test/netns/degraded.sh` runs plain routing, ARC, and WireGuard under netem loss, delay, jitter, and
-bandwidth limits, and measures ARC's failover across two links (`docker run --rm --privileged arc-e2e degraded`).
+bandwidth limits, and measures ARC's failover across two links and whether it moves traffic off a lossy
+link (`docker run --rm --privileged arc-e2e degraded`).
 `test/netns/bench.sh` compares ARC's throughput with kernel WireGuard over the same topology
 (`docker run --rm --privileged arc-e2e bench` on macOS). Treat its numbers as relative: both ends
 share one machine.

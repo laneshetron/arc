@@ -60,6 +60,7 @@ type PathInfo struct {
 	Healthy   bool
 	Primary   bool
 	SRTT      time.Duration
+	Loss      float64 // worse direction's recent loss rate; 0 if unmeasured
 	MaxPacket int
 	LastRecv  time.Time
 }
@@ -78,7 +79,9 @@ type path struct {
 	acks       ackTracker
 	sent       sentLog
 	rtt        rttEstimator
-	control    []wire.Frame // frames that must travel on this path
+	sendLoss   lossEstimator // from acknowledgements; see loss.go
+	recvLoss   lossEstimator // from gaps in received packet numbers
+	control    []wire.Frame  // frames that must travel on this path
 	probed     bool
 	created    time.Time
 	lastSend   time.Time
@@ -225,10 +228,11 @@ func (c *conn) path(id uint32) *path {
 	return nil
 }
 
-// bestPath returns the healthy validated path with the lowest smoothed
-// RTT, falling back to any validated path.
+// bestPath returns the healthy validated path with the lowest cost (RTT
+// and loss; see loss.go), falling back to any validated path.
 func (c *conn) bestPath(now time.Time) *path {
 	var best, fallback *path
+	var bestCost float64
 	for _, p := range c.paths {
 		if !p.validated {
 			continue
@@ -236,8 +240,11 @@ func (c *conn) bestPath(now time.Time) *path {
 		if fallback == nil {
 			fallback = p
 		}
-		if p.healthy(now, c.keepalive) && (best == nil || p.rtt.srtt() < best.rtt.srtt()) {
-			best = p
+		if !p.healthy(now, c.keepalive) {
+			continue
+		}
+		if cost := p.cost(now); best == nil || cost < bestCost {
+			best, bestCost = p, cost
 		}
 	}
 	if best != nil {
@@ -253,9 +260,10 @@ func (c *conn) pathInfo(now time.Time) []PathInfo {
 		if !p.joined {
 			continue
 		}
+		loss, _ := p.loss(now)
 		out = append(out, PathInfo{
 			ID: p.id, Validated: p.validated, Healthy: p.healthy(now, c.keepalive), Primary: p == prim,
-			SRTT: p.rtt.srtt(), MaxPacket: p.maxPacket, LastRecv: p.lastRecv,
+			SRTT: p.rtt.srtt(), Loss: loss, MaxPacket: p.maxPacket, LastRecv: p.lastRecv,
 		})
 	}
 	return out
@@ -302,6 +310,14 @@ func (c *conn) open(now time.Time, p *path, h wire.DataHeader, aad, ct []byte) (
 	for _, f := range frames {
 		ackEliciting = ackEliciting || f.Type().AckEliciting()
 	}
+	if top, ok := p.acks.largest(); !ok {
+		p.recvLoss.record(now, 1, 0)
+	} else if pn := h.PacketNumber; pn > top {
+		gap := int(min(pn-top-1, 1<<20))
+		p.recvLoss.record(now, gap+1, gap)
+	} else {
+		p.recvLoss.record(now, 0, -1) // late: counted as lost when the gap opened
+	}
 	p.acks.onReceive(h.PacketNumber, now, ackEliciting)
 	return frames, nil
 }
@@ -326,6 +342,9 @@ func (c *conn) onAck(now time.Time, ack *wire.Ack) {
 	}
 	if res.ackedCurrentEpoch {
 		c.ackedThisEpoch = true
+	}
+	if n := res.delivered + res.lostCount; n > 0 {
+		p.sendLoss.record(now, n, res.lostCount)
 	}
 	c.stats.PacketsLost += uint64(res.lostCount)
 	c.requeue(p, res.lost)

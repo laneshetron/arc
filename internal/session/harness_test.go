@@ -61,6 +61,7 @@ type network struct {
 	clientIPList [][]byte                        // IP packets the client received
 	relayIPList  [][]byte                        // IP packets the relay received
 	tap          func(toRelay bool, data []byte) // observes every sent datagram
+	pathTap      func(toRelay bool, pathID uint32, data []byte)
 }
 
 var (
@@ -129,6 +130,9 @@ func (n *network) newClient(cc ClientConfig) *Client {
 func (n *network) send(toRelay bool, pathID uint32, data []byte) {
 	if n.tap != nil {
 		n.tap(toRelay, data)
+	}
+	if n.pathTap != nil {
+		n.pathTap(toRelay, pathID, data)
 	}
 	c := n.carriers[pathID]
 	if c == nil {
