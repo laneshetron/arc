@@ -52,9 +52,11 @@ ip -n arc-c route add default dev c1 metric 100
 RELAY_PUB=$("$BIN/arc-relay" pubkey < "$WORK/relay.key")
 echo "e2e-token" > "$WORK/tokens"
 echo "e2e-token" > "$WORK/token"
+"$BIN/arc-relay" gencert -hosts 192.168.10.2 -cert "$WORK/relay.crt" -key "$WORK/relay.tls.key"
 start_relay() {
   $R "$BIN/arc-relay" run -listen 192.168.10.2:4433 -key-file "$WORK/relay.key" \
     -reset-secret-file "$WORK/reset.secret" -tokens-file "$WORK/tokens" \
+    -tls-listen 192.168.10.2:8443 -tls-cert "$WORK/relay.crt" -tls-key "$WORK/relay.tls.key" \
     -network 10.77.0.1/16 >>"$WORK/relay.log" 2>&1 &
   RELAY_PID=$!
   PIDS+=("$RELAY_PID")
@@ -63,8 +65,10 @@ start_relay
 wait_for 10 "relay up" $R ip addr show arc0
 
 # --- client --------------------------------------------------------------
-$C "$BIN/arc-client" run -relay 192.168.10.2:4433 -relay-key "$RELAY_PUB" \
-  -token-file "$WORK/token" -full-tunnel -bind c0 -bind c1 >"$WORK/client.log" 2>&1 &
+# Each link also gets a TLS/TCP carrier, used only while UDP does not work.
+CLIENT_ARGS=(-relay 192.168.10.2:4433 -relay-key "$RELAY_PUB" -token-file "$WORK/token"
+  -full-tunnel -bind c0 -bind c1 -tls 192.168.10.2:8443 -tls-ca "$WORK/relay.crt")
+$C "$BIN/arc-client" run "${CLIENT_ARGS[@]}" >"$WORK/client.log" 2>&1 &
 CLIENT_PID=$!
 PIDS+=("$CLIENT_PID")
 wait_for 10 "client established" grep -q "session established" "$WORK/client.log" &&
@@ -151,6 +155,56 @@ if wait_for 15 "reconnect after relay restart" bash -c "[ \$(grep -c 'session es
 else
   fail "client did not recover after relay restart"
 fi
+
+# UDP blocked (spec §20 Stage C exit): the session's TLS/TCP paths take
+# over without a new handshake, and UDP takes back over when it returns.
+block_udp() { $C iptables -"$1" OUTPUT -p udp -d 192.168.10.2 --dport 4433 -j DROP; }
+sessions=$(grep -c 'session established' "$WORK/client.log")
+sleep 2 # the TLS carriers connect and join
+$C ping -c100 -i0.05 -W1 192.168.20.2 >"$WORK/tls-failover.log" 2>&1 &
+PING_PID=$!
+sleep 1
+block_udp A
+wait "$PING_PID" || true
+received=$(grep -oE '[0-9]+ received' "$WORK/tls-failover.log" | awk '{print $1}')
+lost=$((100 - ${received:-0}))
+if ((${received:-0} > 0 && lost <= 40)); then
+  pass "UDP blocked: traffic moved to TLS/TCP, losing $lost/100 pings (about $((lost * 50)) ms)"
+else
+  fail "UDP blocked: traffic did not move to TLS/TCP ($lost/100 pings lost)"
+fi
+if $C iperf3 -c 192.168.20.2 -t 3 -f m >"$WORK/iperf-tls.log" 2>&1; then
+  pass "TCP uplink over TLS/TCP: $(grep -E 'receiver$' "$WORK/iperf-tls.log" | awk '{print $(NF-2), $(NF-1)}')"
+else
+  fail "TCP uplink over TLS/TCP"
+fi
+if [[ $(grep -c 'session established' "$WORK/client.log") -eq $sessions ]]; then
+  pass "UDP to TLS/TCP failover kept the session"
+else
+  fail "UDP to TLS/TCP failover started a new session"
+fi
+block_udp D
+sleep 3 # UDP paths turn healthy again
+if $C ping -c5 -i0.2 -W2 192.168.20.2 >/dev/null 2>&1; then
+  pass "traffic continues after UDP returns"
+else
+  fail "traffic stopped after UDP returned"
+fi
+
+# Connecting with UDP blocked from the start: the handshake goes out on
+# every carrier, so it completes over TLS/TCP.
+kill "$CLIENT_PID"; wait "$CLIENT_PID" 2>/dev/null || true
+block_udp A
+$C "$BIN/arc-client" run "${CLIENT_ARGS[@]}" >"$WORK/client-tls.log" 2>&1 &
+CLIENT_PID=$!
+PIDS+=("$CLIENT_PID")
+if wait_for 15 "session over TLS/TCP" grep -q "session established" "$WORK/client-tls.log" &&
+  $C ping -c3 -i0.2 -W2 192.168.20.2 >/dev/null 2>&1; then
+  pass "connected with UDP blocked, over TLS/TCP"
+else
+  fail "could not connect with UDP blocked"
+fi
+block_udp D
 
 # Shutdown removes the routing rules.
 kill "$CLIENT_PID"; wait "$CLIENT_PID" 2>/dev/null || true

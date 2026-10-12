@@ -10,6 +10,9 @@
 # time when the busy link is blackholed (clean and at 100 ms RTT), and
 # whether traffic leaves the busy link when it becomes lossy but stays alive.
 #
+# Part 3 compares ARC's UDP and TLS/TCP carriers on one link, measuring TCP
+# goodput and the ping RTT during the transfer (head-of-line blocking).
+#
 # Assertions are deliberately loose so they hold on shared CI runners:
 #   - every tunnel carries traffic in every scenario
 #   - on a 50 Mbit/s bottleneck ARC reaches >= 70% of plain routing
@@ -20,6 +23,7 @@
 #   - with both links at 5% loss (RTT ~0 and 40 ms), -redundancy auto at least halves ping loss
 #     and at least doubles TCP goodput
 #   - a session comes up within 15 s with both links at 70% loss
+#   - TCP runs over the TLS/TCP carrier when UDP is blocked (Part 3)
 #   - a session survives about 80 s of 90% loss on both links and carries
 #     traffic again within 5 s of the loss clearing
 #
@@ -51,8 +55,10 @@ $I iperf3 -s -D --logfile "$WORK/iperf-server.log"
 echo degraded-token >"$WORK/tokens"
 cp "$WORK/tokens" "$WORK/token"
 RELAY_PUB=$("$BIN/arc-relay" pubkey <"$WORK/relay.key")
+"$BIN/arc-relay" gencert -hosts 192.168.10.2 -cert "$WORK/relay.crt" -key "$WORK/relay.tls.key"
 $R "$BIN/arc-relay" run -listen 192.168.10.2:4433 -key-file "$WORK/relay.key" \
   -reset-secret-file "$WORK/reset.secret" -tokens-file "$WORK/tokens" \
+  -tls-listen 192.168.10.2:8443 -tls-cert "$WORK/relay.crt" -tls-key "$WORK/relay.tls.key" \
   -network 10.77.0.1/16 -status 1s >"$WORK/relay.log" 2>&1 &
 PIDS+=($!)
 wait_until 10 $R ip addr show arc0
@@ -392,6 +398,45 @@ extreme_loss() { # extreme_loss REDUNDANCY
 extreme_loss off
 extreme_loss auto
 
+# --- Part 3: TLS/TCP carrier (spec §16.3) -----------------------------------
+# One link, with UDP to the relay blocked for the TLS/TCP runs. TCP inside
+# a TCP carrier suffers head-of-line blocking: a carrier retransmission
+# holds up every packet behind it, so loss costs more and delay spikes.
+# Ping RTT is measured during each transfer to show it. Only that TLS/TCP
+# carries traffic is asserted.
+if [[ -n $MP_CLIENT ]]; then kill "$MP_CLIENT"; wait "$MP_CLIENT" 2>/dev/null || true; fi
+$C "$BIN/arc-client" run -relay 192.168.10.2:4433 -relay-key "$RELAY_PUB" \
+  -token-file "$WORK/token" -route 192.168.20.0/24 -bind c0 \
+  -tls 192.168.10.2:8443 -tls-ca "$WORK/relay.crt" >"$WORK/client3.log" 2>&1 &
+PIDS+=($!)
+wait_until 10 grep -q "session established" "$WORK/client3.log" ||
+  { cat "$WORK/client3.log"; exit 1; }
+block_udp() { $C iptables -"$1" OUTPUT -p udp -d 192.168.10.2 --dport 4433 -j DROP; }
+TLS_ROWS=()
+carrier_row() { # carrier_row NAME NETEM_ARGS...
+  local name=$1 carrier mbps rtt
+  shift
+  if [[ $# -gt 0 ]]; then impair 0 "$@"; else unimpair 0; fi
+  for carrier in udp tls; do
+    if [[ $carrier == tls ]]; then block_udp A; fi
+    sleep 3 # the session moves to the working carrier
+    $C ping -q -c 40 -i 0.25 -W 3 "$TARGET" >"$WORK/ping-during.log" 2>&1 &
+    local ping_pid=$!
+    mbps=$(tcp_up)
+    wait "$ping_pid" || true
+    rtt=$(grep -oE 'rtt [^=]+= [0-9./]+' "$WORK/ping-during.log" | awk -F'= ' '{print $2}' | awk -F/ '{printf "%s / %s", $2, $3}')
+    TLS_ROWS+=("$(printf '%-26s %-10s %10s %20s' "$name" "arc-$carrier" "$mbps" "${rtt:--}")")
+    if [[ $carrier == tls ]]; then
+      block_udp D
+      if [[ $mbps == 0 ]]; then fail "no TCP goodput over TLS/TCP ($name)"; fi
+    fi
+  done
+  unimpair 0
+}
+carrier_row "clean"
+carrier_row "loss 1%" loss 1%
+carrier_row "rtt 40ms, loss 1%" delay 20ms loss 1%
+
 echo
 echo "Part 1: single link, $DURATION s TCP runs; $(nproc) CPUs; kernel $(uname -r)"
 printf '%-26s %-10s %10s %10s %10s\n' "scenario" "tunnel" "TCP Mbit/s" "ping loss%" "ping ms"
@@ -399,6 +444,10 @@ printf '%s\n' "${ROWS[@]}"
 echo
 echo "Part 2: ARC over two links"
 printf '%s\n' "${MP_ROWS[@]}"
+echo
+echo "Part 3: one link, UDP vs the TLS/TCP carrier (UDP blocked); ping during each transfer"
+printf '%-26s %-10s %10s %20s\n' "scenario" "tunnel" "TCP Mbit/s" "ping avg / max ms"
+printf '%s\n' "${TLS_ROWS[@]}"
 echo
 echo "UDP receive-buffer drops over the whole run: relay $(rcvbuf_errors "$R"), client $(rcvbuf_errors "$C")"
 echo

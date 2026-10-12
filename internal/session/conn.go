@@ -109,14 +109,18 @@ type path struct {
 	sendRate   rateMax       // acknowledged bytes per second; see sched.go
 	recvRate   rateMax       // received bytes per second
 	flows      int           // active flows pinned to this path (sched.go)
-	ratio      float64       // cached conn.costRatio result, until ratioAt
-	ratioOK    bool
-	ratioAt    time.Time
-	control    []wire.Frame // frames that must travel on this path
-	probed     bool
-	created    time.Time
-	lastSend   time.Time
-	lastRecv   time.Time
+	// fallback marks a path to use only when no other path is healthy,
+	// such as one over TLS/TCP, where tunneled TCP suffers head-of-line
+	// blocking (§16.3). Client only.
+	fallback bool
+	ratio    float64 // cached conn.costRatio result, until ratioAt
+	ratioOK  bool
+	ratioAt  time.Time
+	control  []wire.Frame // frames that must travel on this path
+	probed   bool
+	created  time.Time
+	lastSend time.Time
+	lastRecv time.Time
 
 	// Relay only: where the client is, and address validation (§14.4–14.5).
 	addr          netip.AddrPort
@@ -291,28 +295,30 @@ func (c *conn) abandonAt(p *path, timeout time.Duration) time.Time {
 }
 
 // bestPath returns the healthy validated path with the lowest cost (RTT
-// and loss; see loss.go), falling back to any validated path.
+// and loss; see loss.go), preferring paths not marked fallback, and
+// otherwise any validated path.
 func (c *conn) bestPath(now time.Time) *path {
-	var best, fallback *path
+	var best, any *path
 	var bestCost float64
 	for _, p := range c.paths {
 		if !p.validated {
 			continue
 		}
-		if fallback == nil {
-			fallback = p
+		if any == nil {
+			any = p
 		}
 		if !p.healthy(now, c.keepalive) {
 			continue
 		}
-		if cost := p.cost(now); best == nil || cost < bestCost {
+		cost := p.cost(now)
+		if best == nil || (best.fallback && !p.fallback) || (best.fallback == p.fallback && cost < bestCost) {
 			best, bestCost = p, cost
 		}
 	}
 	if best != nil {
 		return best
 	}
-	return fallback
+	return any
 }
 
 func (c *conn) pathInfo(now time.Time) []PathInfo {

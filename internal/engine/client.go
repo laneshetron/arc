@@ -18,6 +18,13 @@ import (
 type Carrier struct {
 	Name string // for logs, e.g. the interface name
 	Conn DatagramConn
+	// Relay is the relay address this carrier sends to and accepts
+	// packets from; zero means ClientConfig.Relay. A stream carrier sends
+	// to its own endpoint and reports packets as coming from Relay.
+	Relay netip.AddrPort
+	// Fallback marks the carrier's path for use only while no other path
+	// is healthy, as for TLS/TCP (spec §16.3).
+	Fallback bool
 }
 
 // ClientConfig configures a client engine.
@@ -92,6 +99,9 @@ func RunClient(ctx context.Context, cfg ClientConfig) error {
 	errc := make(chan error, len(cfg.Carriers)+1)
 	carriers := make([]*carrierState, len(cfg.Carriers))
 	for i, cr := range cfg.Carriers {
+		if !cr.Relay.IsValid() {
+			cr.Relay = cfg.Relay
+		}
 		carriers[i] = &carrierState{Carrier: cr}
 		go readDatagrams(ctx, i, cr.Conn, udpCh, errc)
 	}
@@ -124,7 +134,7 @@ func RunClient(ctx context.Context, cfg ClientConfig) error {
 	for {
 		hs.update(c, carriers)
 		joinCarriers(c, carriers, cfg.RejoinDelay, log)
-		flushTransmits(c, carriers, cfg.Relay, hs.pinned, log)
+		flushTransmits(c, carriers, hs.pinned, log)
 		toTUN = toTUN[:0]
 		for e, ok := c.PollEvent(); ok; e, ok = c.PollEvent() {
 			switch e := e.(type) {
@@ -193,7 +203,7 @@ func RunClient(ctx context.Context, cfg ClientConfig) error {
 		select {
 		case <-ctx.Done():
 			c.Close(time.Now())
-			flushTransmits(c, carriers, cfg.Relay, hs.pinned, log)
+			flushTransmits(c, carriers, hs.pinned, log)
 			return ctx.Err()
 		case err := <-errc:
 			return err
@@ -202,7 +212,7 @@ func RunClient(ctx context.Context, cfg ClientConfig) error {
 			now := time.Now()
 			for i, p := range d.pkts {
 				switch {
-				case d.from[i] != cfg.Relay:
+				case d.from[i] != cs.Relay:
 				case cs.bound:
 					c.HandlePacket(now, cs.path, p)
 				case c.State() == session.StateHandshaking:
@@ -246,6 +256,9 @@ func joinCarriers(c *session.Client, carriers []*carrierState, rejoinDelay time.
 		switch {
 		case err == nil:
 			cs.bound, cs.path = true, id
+			if cs.Fallback {
+				c.SetFallback(id, true)
+			}
 		case errors.Is(err, session.ErrNoPathSlots):
 			cs.retryAt = now.Add(slotRetry)
 		default:
@@ -286,20 +299,23 @@ func (h *handshakeState) receive(c *session.Client, now time.Time, carrier int, 
 	if c.State() != session.StateHandshaking {
 		cs := carriers[carrier]
 		cs.bound, cs.path = true, 0
+		if cs.Fallback {
+			c.SetFallback(0, true)
+		}
 	}
 }
 
 // flushTransmits batches outgoing datagrams by their bound carrier. While
 // handshaking, path 0's datagrams go to every carrier, or to pinned if it
 // is not -1.
-func flushTransmits(c *session.Client, carriers []*carrierState, relay netip.AddrPort, pinned int, log *slog.Logger) {
+func flushTransmits(c *session.Client, carriers []*carrierState, pinned int, log *slog.Logger) {
 	handshaking := c.State() == session.StateHandshaking
 	for d, ok := c.PollTransmit(); ok; d, ok = c.PollTransmit() {
 		if handshaking && d.PathID == 0 {
 			for i, cs := range carriers {
 				if pinned < 0 || i == pinned {
 					// A copy each: the buffers are returned per carrier.
-					cs.out, cs.to = append(cs.out, append(bufpool.Get(), d.Data...)), append(cs.to, relay)
+					cs.out, cs.to = append(cs.out, append(bufpool.Get(), d.Data...)), append(cs.to, cs.Relay)
 				}
 			}
 			bufpool.Put(d.Data)
@@ -308,7 +324,7 @@ func flushTransmits(c *session.Client, carriers []*carrierState, relay netip.Add
 		sent := false
 		for _, cs := range carriers {
 			if cs.bound && cs.path == d.PathID {
-				cs.out, cs.to = append(cs.out, d.Data), append(cs.to, relay)
+				cs.out, cs.to = append(cs.out, d.Data), append(cs.to, cs.Relay)
 				sent = true
 				break
 			}

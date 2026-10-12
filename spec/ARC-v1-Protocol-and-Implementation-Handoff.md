@@ -727,6 +727,22 @@ type Capabilities struct {
 - Expose delivery metrics conservatively: remote ACKs distinguish true overlay arrival from local stream-buffer success.
 - Treat long-lived head-of-line delay as a scheduling cost, particularly for UDP application traffic encapsulated over TCP.
 
+**Reference implementation** (`internal/carrier/stream`):
+- **Client.** It dials with TLS 1.3, certificate verification and ALPN `arc/1`, using the same interface binding and firewall mark as its UDP sibling.
+  - Writes go through a bounded queue (1,024 packets). A full queue drops packets, as a congested link would, rather than blocking the session's event loop.
+  - A failed connection redials in the background, starting at 500 ms and backing off to 30 s. While disconnected, writes are dropped. A reconnection reaches the relay from a new address and is revalidated as after NAT rebinding (§14.5).
+- **Relay.** It gives each connection a synthetic address in `fd61:7263:2f31::/64` ("arc/1"), so the session layer treats it like a UDP client address. The engine routes packets for those addresses to the connection.
+  - Connections are bounded (4,096) and closed after 5 minutes without a packet. The TLS handshake must finish within 10 s.
+  - Cookies (§9.3) still apply, although TCP already validates addresses.
+- **Fallback paths.** The client marks TLS/TCP paths as fallbacks, used only while no other path is healthy.
+  - The primary prefers non-fallback paths and returns to them when they recover.
+  - Flows avoid fallback paths while the primary is not one.
+  - The handshake goes out on every carrier (§9.2), so a client whose UDP is blocked from the start connects over TLS/TCP.
+- **Head-of-line blocking (degraded suite, one link).**
+  - With 1% loss at 40 ms RTT, TCP inside the TLS/TCP carrier reached 12.7 Mbit/s against 3.55 over UDP, because the carrier's own retransmission hides loss from the inner TCP.
+  - Ping RTT during the transfer averaged 240 ms against 45 ms, with peaks of 450 ms. Every packet waits behind each carrier retransmission.
+  - Throughput alone would mislead. TLS/TCP stays a fallback for UDP-hostile networks, and its delay cost is what loss recovery inside the tunnel (FEC, bounded retransmission) aims to avoid while keeping the throughput gain.
+
 ### 16.4 HTTPS / enterprise proxy adapter (optional)
 
 - Support standards-based HTTP CONNECT where explicitly permitted and available. Consider RFC 9298 CONNECT-UDP or RFC 9484 CONNECT-IP for compatible proxy infrastructure.
