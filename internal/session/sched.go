@@ -186,7 +186,7 @@ func (t *flowTable) sweep(now time.Time, force bool) {
 // before its flows are moved off it. It is above lossSwitchRatio, which
 // bars new flows, so that a path whose estimate hovers near the line does
 // not have its flows moved back and forth, reordering them.
-const keepFlowRatio = 3
+const keepFlowRatio = 2.5
 
 // costRatio compares q with the primary for carrying flows, returning the
 // ratio of their loss terms of the cost (√max(loss, floor)) and whether q

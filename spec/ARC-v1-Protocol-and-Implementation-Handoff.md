@@ -646,8 +646,8 @@ Do not mistake carrier **capacity** for achievable application goodput. Queueing
   - **Eligibility.** Paths are compared with the primary on loss alone, by the cost's loss term √max(loss, 0.005). RTT estimates swing with queueing and lag changes in path delay, and in testing they kept equal links from sharing flows.
     - A path must be healthy, and its `min_rtt` must be at most 4× the primary's plus 50 ms.
     - New flows may use a path whose loss term is at most 2× the primary's.
-    - A flow keeps its path while the path is healthy and at most 3× the primary; otherwise it is reassigned.
-    - The gap between 2× and 3× keeps a path whose estimate hovers near the line from having its flows moved back and forth.
+    - A flow keeps its path while the path is healthy and at most 2.5× the primary; otherwise it is reassigned. With equal RTTs, flows leave a path above about 3% loss.
+    - The gap between 2× and 2.5× keeps a path whose estimate hovers near the line from having its flows moved back and forth.
   - **Assignment.** A new flow goes to the eligible path with the fewest active flows (a packet within the last 1 s) per unit of capacity. Capacity is the path's best 250 ms delivery rate of the last 10 s, in either direction. A path below 64 KiB/s counts as unmeasured and is assumed as fast as the best, so it gets tried.
   - **Downlink.** The relay sends each flow's downlink on the path its uplink last arrived on while that path is healthy, otherwise on the session's downlink path.
   - **Bounds.** Flows idle for 10 s are forgotten, and the table holds at most 4,096 flows per session.

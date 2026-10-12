@@ -236,6 +236,11 @@ measure_failover "blackholed busy link, rtt 100ms" "delay 50ms"
 # run itself supplies the traffic the client measures loss on.
 lossy_link() { # lossy_link LOSS
   local link after mbps
+  # A fresh session: loss estimates only refresh from traffic and are
+  # otherwise kept for 30 s, so a link that an earlier scenario made lossy
+  # would still look lossy, and staying put would then be right.
+  start_multipath_client off "client-lossy-$1.log"
+  sleep 1
   link=$(busy_link)
   impair "$link" loss "$1"
   mbps=$(tcp_up)
@@ -245,6 +250,9 @@ lossy_link() { # lossy_link LOSS
     pass "traffic left c$link at $1 loss"
   else
     fail "traffic stayed on c$link at $1 loss"
+    echo "  path state (client, then relay), from -status:"
+    grep 'msg=path ' "$WORK/client-lossy-$1.log" | tail -2 | sed 's/^/    /'
+    grep 'msg=path ' "$WORK/relay.log" | tail -2 | sed 's/^/    /'
   fi
   unimpair "$link"
   sleep 1
@@ -273,6 +281,7 @@ aggregate() { # aggregate NAME IPERF_ARGS...: sets AGG_ONE and AGG_TWO
   unimpair 1
   MP_ROWS+=("$(printf '%-34s %s: one link %6s Mbit/s, two links %6s Mbit/s' "two 50 Mbit/s links" "$name" "$AGG_ONE" "$AGG_TWO")")
 }
+start_multipath_client off client-agg.log
 for dir in up down; do
   args=(-P 4)
   [[ $dir == down ]] && args+=(-R)
@@ -282,7 +291,7 @@ for dir in up down; do
   else
     fail "4 flows $dir over two links: $AGG_TWO Mbit/s, not 1.4x the $AGG_ONE of one link"
     echo "  path state (client, then relay), from -status:"
-    grep 'msg=path ' "$WORK/client2.log" | tail -2 | sed 's/^/    /'
+    grep 'msg=path ' "$WORK/client-agg.log" | tail -2 | sed 's/^/    /'
     grep 'msg=path ' "$WORK/relay.log" | tail -2 | sed 's/^/    /'
   fi
 done
