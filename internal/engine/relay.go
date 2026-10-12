@@ -62,12 +62,13 @@ func RunRelay(ctx context.Context, cfg RelayConfig) error {
 				cfg.Gateway.Bind(e.Session)
 				log.Info("session established", "client", e.Session.Addr(time.Now()),
 					"address", netip.AddrFrom4(e.Session.Config().IPv4))
-			case session.SessionIP:
-				toTUN = append(toTUN, e.Packet)
 			case session.SessionClosed:
 				cfg.Gateway.Release(e.Session)
 				log.Info("session closed", "address", netip.AddrFrom4(e.Session.Config().IPv4), "reason", e.Err)
 			}
+		}
+		for _, p, ok := r.PollIP(); ok; _, p, ok = r.PollIP() {
+			toTUN = append(toTUN, p)
 		}
 		if len(toTUN) > 0 {
 			if err := cfg.TUN.Write(toTUN); err != nil {

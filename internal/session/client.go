@@ -51,9 +51,6 @@ type ClientEvent interface{ clientEvent() }
 // Established reports that the session is active.
 type Established struct{ Config wire.AuthResult }
 
-// IPReceived carries one tunneled IP packet.
-type IPReceived struct{ Packet []byte }
-
 // PathValidated reports that a path opened with OpenPath can carry traffic.
 type PathValidated struct{ ID uint32 }
 
@@ -67,7 +64,6 @@ type PathClosed struct {
 type Closed struct{ Err error }
 
 func (Established) clientEvent()   {}
-func (IPReceived) clientEvent()    {}
 func (PathValidated) clientEvent() {}
 func (PathClosed) clientEvent()    {}
 func (Closed) clientEvent()        {}
@@ -107,6 +103,7 @@ type Client struct {
 
 	out    []Datagram
 	events []ClientEvent
+	ips    [][]byte // received IP packets, kept apart from events to avoid boxing
 }
 
 // NewClient creates a client and queues its first HANDSHAKE_INIT on path 0.
@@ -272,12 +269,12 @@ func (c *Client) handleData(now time.Time, b []byte) {
 			c.conn.onAck(now, &f)
 		case wire.IPPacket:
 			if c.state == StateActive {
-				c.events = append(c.events, IPReceived{Packet: copyBytes(f.Packet)})
+				c.ips = append(c.ips, copyBytes(f.Packet))
 			}
 		case wire.IPFragment:
 			if c.state == StateActive {
 				if pkt := c.conn.receiveFragment(now, f); pkt != nil {
-					c.events = append(c.events, IPReceived{Packet: pkt})
+					c.ips = append(c.ips, pkt)
 				}
 			}
 		case wire.NewPath:
@@ -558,6 +555,18 @@ func (c *Client) PollTransmit() (Datagram, bool) {
 	d := c.out[0]
 	c.out = c.out[1:]
 	return d, true
+}
+
+// PollIP returns the next tunneled IP packet received from the relay. The
+// packet is in a pooled buffer; return it with bufpool.Put when done.
+func (c *Client) PollIP() ([]byte, bool) {
+	if len(c.ips) == 0 {
+		return nil, false
+	}
+	p := c.ips[0]
+	c.ips[0] = nil
+	c.ips = c.ips[1:]
+	return p, true
 }
 
 // PollEvent returns the next event.

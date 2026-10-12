@@ -156,30 +156,47 @@ type sentPacket struct {
 }
 
 // sentLog holds a path's outstanding ack-eliciting packets in packet-number
-// order.
+// (and therefore send-time) order. Retired packets stay in place, marked
+// acked, until they reach the front; every walk stops as soon as the order
+// says nothing further can match, so per-ACK work is proportional to what
+// changed, not to the number of packets in flight.
 type sentLog struct {
 	packets      []sentPacket
 	largestAcked uint64
 	anyAcked     bool
 	ptoCount     int
+	control      int // outstanding packets that carry control frames
 }
 
-func (s *sentLog) add(p sentPacket) { s.packets = append(s.packets, p) }
+func (s *sentLog) add(p sentPacket) {
+	if len(p.frames) > 0 {
+		s.control++
+	}
+	s.packets = append(s.packets, p)
+}
+
+// retire marks an outstanding packet acknowledged, lost, or expired.
+func (s *sentLog) retire(p *sentPacket) {
+	p.acked = true
+	if len(p.frames) > 0 {
+		s.control--
+	}
+}
 
 // ackResult summarizes what an ACK frame acknowledged.
 type ackResult struct {
-	newlyAcked  int
-	ackedEpochs []uint64
-	rttSample   time.Duration
-	hasRTT      bool
-	lost        []wire.Frame
-	lostCount   int
-	ackedProbe  bool
+	newlyAcked        int
+	ackedCurrentEpoch bool
+	rttSample         time.Duration
+	hasRTT            bool
+	lost              []wire.Frame
+	lostCount         int
+	ackedProbe        bool
 }
 
 // onAck marks acknowledged packets and declares older ones lost by the
-// packet threshold.
-func (s *sentLog) onAck(now time.Time, ack *wire.Ack, intervals []wire.PacketRange) ackResult {
+// packet threshold. epoch is the sender's current key epoch.
+func (s *sentLog) onAck(now time.Time, ack *wire.Ack, intervals []wire.PacketRange, epoch uint64) ackResult {
 	var res ackResult
 	for _, iv := range intervals {
 		i := sort.Search(len(s.packets), func(i int) bool { return s.packets[i].pn >= iv.Lo })
@@ -188,10 +205,10 @@ func (s *sentLog) onAck(now time.Time, ack *wire.Ack, intervals []wire.PacketRan
 			if p.acked {
 				continue
 			}
-			p.acked = true
+			s.retire(p)
 			res.newlyAcked++
 			res.ackedProbe = res.ackedProbe || p.probe
-			res.ackedEpochs = append(res.ackedEpochs, p.epoch)
+			res.ackedCurrentEpoch = res.ackedCurrentEpoch || p.epoch == epoch
 			if p.pn == ack.Largest {
 				res.rttSample, res.hasRTT = now.Sub(p.sentAt), true
 			}
@@ -205,10 +222,13 @@ func (s *sentLog) onAck(now time.Time, ack *wire.Ack, intervals []wire.PacketRan
 	}
 	for i := range s.packets {
 		p := &s.packets[i]
-		if p.acked || p.pn+packetThreshold > s.largestAcked {
+		if p.pn+packetThreshold > s.largestAcked {
+			break // everything after this is newer still
+		}
+		if p.acked {
 			continue
 		}
-		p.acked = true // retired as lost
+		s.retire(p) // lost
 		if !p.probe {
 			res.lostCount++
 		}
@@ -222,10 +242,13 @@ func (s *sentLog) onAck(now time.Time, ack *wire.Ack, intervals []wire.PacketRan
 // returns its frames for retransmission.
 func (s *sentLog) onPTO() []wire.Frame {
 	s.ptoCount = min(s.ptoCount+1, maxPTOBackoff)
+	if s.control == 0 {
+		return nil
+	}
 	for i := range s.packets {
 		p := &s.packets[i]
 		if !p.acked && len(p.frames) > 0 {
-			p.acked = true
+			s.retire(p)
 			frames := p.frames
 			s.trim()
 			return frames
@@ -237,6 +260,9 @@ func (s *sentLog) onPTO() []wire.Frame {
 // ptoDeadline is when the oldest outstanding control packet should be
 // considered lost, or zero if none is outstanding.
 func (s *sentLog) ptoDeadline(rtt *rttEstimator) time.Time {
+	if s.control == 0 {
+		return time.Time{}
+	}
 	for _, p := range s.packets {
 		if !p.acked && len(p.frames) > 0 {
 			return p.sentAt.Add(rtt.pto() << s.ptoCount)
@@ -256,24 +282,29 @@ func (s *sentLog) oldestOutstanding() (time.Time, bool) {
 	return time.Time{}, false
 }
 
-// expire forgets packets that have been outstanding for so long that an
-// acknowledgement no longer matters, bounding memory.
+// expire forgets packets without control frames that have been outstanding
+// for so long that an acknowledgement no longer matters, bounding memory.
 func (s *sentLog) expire(now time.Time, horizon time.Duration) {
 	for i := range s.packets {
 		p := &s.packets[i]
-		if !p.acked && len(p.frames) == 0 && now.Sub(p.sentAt) > horizon {
-			p.acked = true
+		if now.Sub(p.sentAt) <= horizon {
+			break // later packets were sent later
+		}
+		if !p.acked && len(p.frames) == 0 {
+			s.retire(p)
 		}
 	}
 	s.trim()
 }
 
+// trim drops retired packets from the front. Reslicing avoids copying the
+// rest; append reallocates, copying only live packets, when capacity runs
+// out.
 func (s *sentLog) trim() {
 	i := 0
 	for i < len(s.packets) && s.packets[i].acked {
+		s.packets[i] = sentPacket{} // release frame references
 		i++
 	}
-	if i > 0 {
-		s.packets = append(s.packets[:0], s.packets[i:]...)
-	}
+	s.packets = s.packets[i:]
 }

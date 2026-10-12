@@ -167,6 +167,7 @@ type conn struct {
 
 	plaintext []byte
 	ptScratch []byte // reused to build each outgoing packet's plaintext
+	ivScratch []wire.PacketRange
 	frameBuf  []wire.Frame
 	fragBuf   []wire.IPFragment
 
@@ -311,21 +312,20 @@ func (c *conn) onAck(now time.Time, ack *wire.Ack) {
 	if p == nil {
 		return
 	}
-	intervals, err := ack.AppendIntervals(nil)
+	intervals, err := ack.AppendIntervals(c.ivScratch[:0])
 	if err != nil {
 		return
 	}
-	res := p.sent.onAck(now, ack, intervals)
+	c.ivScratch = intervals
+	res := p.sent.onAck(now, ack, intervals, c.send.Epoch())
 	if res.hasRTT {
 		p.rtt.update(res.rttSample, time.Duration(ack.AckDelayMicros)*time.Microsecond)
 	}
 	if res.ackedProbe && c.probeSize > p.maxPacket {
 		p.maxPacket = c.probeSize
 	}
-	for _, e := range res.ackedEpochs {
-		if e == c.send.Epoch() {
-			c.ackedThisEpoch = true
-		}
+	if res.ackedCurrentEpoch {
+		c.ackedThisEpoch = true
 	}
 	c.stats.PacketsLost += uint64(res.lostCount)
 	c.requeue(p, res.lost)
@@ -365,7 +365,7 @@ func (c *conn) flush(now time.Time) {
 }
 
 func (c *conn) transmit(now time.Time, p *path, extra []wire.Frame) bool {
-	return c.transmitTo(now, p, extra, false)
+	return c.transmitTo(now, p, extra, nil, false)
 }
 
 // transmitTo builds and sends one packet on p carrying the frames in extra
@@ -373,12 +373,15 @@ func (c *conn) transmit(now time.Time, p *path, extra []wire.Frame) bool {
 // the primary path, unbound control frames. It reports whether a packet was
 // sent. toCandidate directs a relay's packet to the path's unvalidated new
 // address.
-func (c *conn) transmitTo(now time.Time, p *path, extra []wire.Frame, toCandidate bool) bool {
+func (c *conn) transmitTo(now time.Time, p *path, extra []wire.Frame, ip []byte, toCandidate bool) bool {
 	if !p.joined {
 		return false
 	}
 	budget := p.maxPacket - wire.DataHeaderLen - wire.AEADTagLen
 	pt := c.ptScratch[:0]
+	if ip != nil {
+		pt = wire.AppendIPPacket(pt, ip)
+	}
 	for _, f := range extra {
 		pt = wire.AppendFrame(pt, f)
 	}
@@ -392,31 +395,35 @@ func (c *conn) transmitTo(now time.Time, p *path, extra []wire.Frame, toCandidat
 		}
 	}
 	var retx []wire.Frame
-	take := func(q *[]wire.Frame) {
-		for len(*q) > 0 {
-			next := wire.AppendFrame(pt, (*q)[0])
-			if len(next) > budget {
-				return
-			}
-			pt = next
-			retx = append(retx, (*q)[0])
-			*q = (*q)[1:]
-		}
-	}
-	take(&p.control)
+	pt, retx = takeFrames(pt, retx, &p.control, budget)
 	if !toCandidate && len(c.control) > 0 && p == c.primary(now) {
-		take(&c.control)
+		pt, retx = takeFrames(pt, retx, &c.control, budget)
 	}
 	c.ptScratch = pt[:0] // keep any growth for the next packet
 	if len(pt) == 0 {
 		return false
 	}
-	ackEliciting := len(retx) > 0
+	ackEliciting := len(retx) > 0 || ip != nil
 	for _, f := range extra {
 		ackEliciting = ackEliciting || f.Type().AckEliciting()
 	}
 	c.seal(now, p, pt, retx, ackEliciting, false, toCandidate)
 	return true
+}
+
+// takeFrames moves frames from the front of q into the plaintext while they
+// fit in budget, recording them for retransmission.
+func takeFrames(pt []byte, retx []wire.Frame, q *[]wire.Frame, budget int) ([]byte, []wire.Frame) {
+	for len(*q) > 0 {
+		next := wire.AppendFrame(pt, (*q)[0])
+		if len(next) > budget {
+			break
+		}
+		pt = next
+		retx = append(retx, (*q)[0])
+		*q = (*q)[1:]
+	}
+	return pt, retx
 }
 
 func (c *conn) seal(now time.Time, p *path, pt []byte, retx []wire.Frame, ackEliciting, probe, toCandidate bool) {
@@ -466,7 +473,7 @@ func (c *conn) sendIP(now time.Time, pkt []byte) error {
 	}
 	budget := p.maxPacket - wire.DataHeaderLen - wire.AEADTagLen
 	if wire.FrameHeaderLen+len(pkt) <= budget {
-		c.transmit(now, p, []wire.Frame{wire.IPPacket{Packet: pkt}})
+		c.transmitTo(now, p, nil, pkt, false)
 		return nil
 	}
 	maxData := budget - wire.FrameHeaderLen - 12

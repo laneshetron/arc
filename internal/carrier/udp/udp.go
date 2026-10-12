@@ -48,6 +48,23 @@ type Conn struct {
 	// gso_linux.go. gsoBufs are reused coalescing buffers.
 	gso     bool
 	gsoBufs [][]byte
+
+	// Caches for the send path: the last destination's *net.UDPAddr and
+	// the last segment size's control message, which would otherwise be
+	// allocated per message.
+	lastTo   netip.AddrPort
+	lastAddr *net.UDPAddr
+	lastSeg  int
+	lastCmsg []byte
+}
+
+// udpAddr returns a *net.UDPAddr for to, reusing the previous one when the
+// destination repeats, as it does for every packet a client sends.
+func (c *Conn) udpAddr(to netip.AddrPort) *net.UDPAddr {
+	if c.lastAddr == nil || to != c.lastTo {
+		c.lastTo, c.lastAddr = to, net.UDPAddrFromAddrPort(to)
+	}
+	return c.lastAddr
 }
 
 // Listen opens an IPv4 UDP socket on addr (use port 0 for a client).
@@ -129,7 +146,7 @@ func (c *Conn) writePlain(pkts [][]byte, addrs []netip.AddrPort) error {
 	msgs := c.tx[:len(pkts)]
 	for i := range msgs {
 		msgs[i].Buffers[0] = pkts[i]
-		msgs[i].Addr = net.UDPAddrFromAddrPort(addrs[i])
+		msgs[i].Addr = c.udpAddr(addrs[i])
 	}
 	for len(msgs) > 0 {
 		n, err := c.pc.WriteBatch(msgs, 0)

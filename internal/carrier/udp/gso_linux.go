@@ -77,7 +77,7 @@ func (c *Conn) writeGSO(pkts [][]byte, addrs []netip.AddrPort) error {
 		if m.Buffers == nil {
 			m.Buffers = make([][]byte, 1)
 		}
-		m.Addr = net.UDPAddrFromAddrPort(to)
+		m.Addr = c.udpAddr(to)
 		m.OOB = nil
 		if j-i == 1 {
 			m.Buffers[0] = pkts[i]
@@ -91,7 +91,10 @@ func (c *Conn) writeGSO(pkts [][]byte, addrs []netip.AddrPort) error {
 			}
 			c.gsoBufs[used] = buf
 			m.Buffers[0] = buf
-			m.OOB = segmentCmsg(size)
+			if size != c.lastSeg || c.lastCmsg == nil {
+				c.lastSeg, c.lastCmsg = size, segmentCmsg(size)
+			}
+			m.OOB = c.lastCmsg
 		}
 		msgs = append(msgs, m)
 		used++

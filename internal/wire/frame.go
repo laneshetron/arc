@@ -173,6 +173,17 @@ func (u Unknown) Type() FrameType     { return u.FrameType }
 
 // AppendFrame appends the TLV encoding of f to b. It panics if the encoded
 // value exceeds 65535 bytes, which no valid ARC packet can contain.
+// AppendIPPacket appends an IP_PACKET frame carrying pkt. It is
+// AppendFrame(b, IPPacket{Packet: pkt}) without converting to the Frame
+// interface, which would allocate on the per-packet path.
+func AppendIPPacket(b, pkt []byte) []byte {
+	if len(pkt) > 0xFFFF {
+		panic("wire: frame value exceeds 65535 bytes")
+	}
+	b = append(b, byte(FrameIPPacket), byte(len(pkt)>>8), byte(len(pkt)))
+	return append(b, pkt...)
+}
+
 func AppendFrame(b []byte, f Frame) []byte {
 	start := len(b)
 	b = append(b, byte(f.Type()), 0, 0)
