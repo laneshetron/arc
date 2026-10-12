@@ -1,6 +1,7 @@
 package session
 
 import (
+	"sort"
 	"testing"
 	"time"
 
@@ -193,5 +194,37 @@ func TestRedundancyWithNoHealthyPath(t *testing.T) {
 	t.Logf("delivered: uplink %.3f, downlink %.3f; a healthy path existed %d%% of the time", up, down, healthy*100/count)
 	if up < 0.16 || down < 0.16 {
 		t.Errorf("delivered uplink %.3f, downlink %.3f; want about 0.19", up, down)
+	}
+}
+
+// TestRedundancyAutoEngagesQuicklyUnderHeavyLoss: at 90% loss on every
+// path with sparse traffic (5 packets per second each way), auto
+// redundancy must be on at both ends within a few seconds. The loss
+// estimates update slowly when acknowledgements barely arrive, and the
+// REDUNDANCY request must get through the same loss.
+func TestRedundancyAutoEngagesQuicklyUnderHeavyLoss(t *testing.T) {
+	var times []time.Duration
+	for seed := range uint64(10) {
+		n, s, _ := lossyPaths(t, 200+seed, ClientConfig{Redundancy: RedundancyAuto}, defaultRelayConfig(), 0.9)
+		start, engaged := n.now, time.Duration(0)
+		for i := range 300 { // up to 60 s
+			n.client.SendIP(n.now, ipPacket(lease, internet, 100, uint32(i)))
+			s.SendIP(n.now, ipPacket(internet, lease, 100, uint32(i)))
+			n.runFor(200 * time.Millisecond)
+			if n.client.conn.redundant && s.conn.redundant {
+				engaged = n.now.Sub(start)
+				break
+			}
+		}
+		if engaged == 0 {
+			t.Fatalf("seed %d: redundancy not on at both ends within 60 s", seed)
+		}
+		times = append(times, engaged)
+	}
+	sort.Slice(times, func(i, j int) bool { return times[i] < times[j] })
+	t.Logf("on at both ends after %v", times)
+	// Before control-frame copies and the unhealthy-primary rule: 5-37 s.
+	if median, worst := times[len(times)/2], times[len(times)-1]; median > 3*time.Second || worst > 10*time.Second {
+		t.Errorf("median %v, worst %v; want at most 3 s and 10 s", median, worst)
 	}
 }
