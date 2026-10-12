@@ -11,6 +11,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/laneshetron/arc/internal/bufpool"
 	"github.com/laneshetron/arc/internal/crypto"
 	"github.com/laneshetron/arc/internal/reassembly"
 	"github.com/laneshetron/arc/internal/wire"
@@ -165,6 +166,7 @@ type conn struct {
 	probeSize      int // UDP payload needed for an unfragmented TUN packet
 
 	plaintext []byte
+	ptScratch []byte // reused to build each outgoing packet's plaintext
 	frameBuf  []wire.Frame
 	fragBuf   []wire.IPFragment
 
@@ -376,7 +378,7 @@ func (c *conn) transmitTo(now time.Time, p *path, extra []wire.Frame, toCandidat
 		return false
 	}
 	budget := p.maxPacket - wire.DataHeaderLen - wire.AEADTagLen
-	var pt []byte
+	pt := c.ptScratch[:0]
 	for _, f := range extra {
 		pt = wire.AppendFrame(pt, f)
 	}
@@ -405,6 +407,7 @@ func (c *conn) transmitTo(now time.Time, p *path, extra []wire.Frame, toCandidat
 	if !toCandidate && len(c.control) > 0 && p == c.primary(now) {
 		take(&c.control)
 	}
+	c.ptScratch = pt[:0] // keep any growth for the next packet
 	if len(pt) == 0 {
 		return false
 	}
@@ -420,7 +423,8 @@ func (c *conn) seal(now time.Time, p *path, pt []byte, retx []wire.Frame, ackEli
 	pn := p.nextPN
 	p.nextPN++
 	epoch := c.send.Epoch()
-	pkt := c.send.Seal(nil, wire.DataHeader{DestCID: p.remoteCID, PacketNumber: pn}, p.id, pt)
+	// The packet buffer comes from the pool; whoever sends it returns it.
+	pkt := c.send.Seal(bufpool.Get(), wire.DataHeader{DestCID: p.remoteCID, PacketNumber: pn}, p.id, pt)
 	if ackEliciting {
 		p.sent.add(sentPacket{pn: pn, sentAt: now, epoch: epoch, frames: retx, probe: probe})
 	}
@@ -511,4 +515,11 @@ func earliest(ts ...time.Time) time.Time {
 	return out
 }
 
-func copyBytes(b []byte) []byte { return append([]byte(nil), b...) }
+// copyBytes copies a packet into a pooled buffer, which the receiver of
+// the event returns with bufpool.Put.
+func copyBytes(b []byte) []byte {
+	if len(b) > bufpool.Packet {
+		return append([]byte(nil), b...)
+	}
+	return append(bufpool.Get(), b...)
+}

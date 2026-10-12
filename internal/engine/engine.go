@@ -9,7 +9,7 @@ import (
 	"net/netip"
 	"time"
 
-	"github.com/laneshetron/arc/internal/carrier/udp"
+	"github.com/laneshetron/arc/internal/bufpool"
 )
 
 // PacketDevice is a source and sink of IP packets, normally a TUN device.
@@ -33,11 +33,13 @@ type datagrams struct {
 	from    []netip.AddrPort
 }
 
-// readDatagrams copies batches from conn into out until reading fails.
+// readDatagrams reads batches from conn into pooled buffers and hands them
+// to out without copying, until reading fails. The receiver of each batch
+// returns its buffers with bufpool.Put.
 func readDatagrams(ctx context.Context, carrier int, conn DatagramConn, out chan<- datagrams, errc chan<- error) {
 	bufs := make([][]byte, readBatch)
 	for i := range bufs {
-		bufs[i] = make([]byte, udp.MaxDatagram)
+		bufs[i] = bufpool.GetDatagram()
 	}
 	sizes, addrs := make([]int, readBatch), make([]netip.AddrPort, readBatch)
 	for {
@@ -45,8 +47,9 @@ func readDatagrams(ctx context.Context, carrier int, conn DatagramConn, out chan
 		if n > 0 {
 			d := datagrams{carrier: carrier, pkts: make([][]byte, n), from: make([]netip.AddrPort, n)}
 			for i := range n {
-				d.pkts[i] = append([]byte(nil), bufs[i][:sizes[i]]...)
+				d.pkts[i] = bufs[i][:sizes[i]]
 				d.from[i] = addrs[i]
+				bufs[i] = bufpool.GetDatagram()
 			}
 			select {
 			case out <- d:
@@ -61,14 +64,20 @@ func readDatagrams(ctx context.Context, carrier int, conn DatagramConn, out chan
 	}
 }
 
-// readPackets copies batches from dev into out until reading fails.
+// readPackets copies batches from dev into pooled buffers and hands them to
+// out, until reading fails. The device reuses its own buffers, so one copy
+// is needed; the receiver returns the copies with bufpool.Put.
 func readPackets(ctx context.Context, dev PacketDevice, out chan<- [][]byte, errc chan<- error) {
 	for {
 		pkts, err := dev.Read()
 		if len(pkts) > 0 {
 			owned := make([][]byte, len(pkts))
 			for i, p := range pkts {
-				owned[i] = append([]byte(nil), p...)
+				if len(p) <= bufpool.Packet {
+					owned[i] = append(bufpool.Get(), p...)
+				} else {
+					owned[i] = append([]byte(nil), p...)
+				}
 			}
 			select {
 			case out <- owned:

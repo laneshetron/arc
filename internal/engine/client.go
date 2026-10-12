@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"time"
 
+	"github.com/laneshetron/arc/internal/bufpool"
 	"github.com/laneshetron/arc/internal/session"
 	"github.com/laneshetron/arc/internal/wire"
 )
@@ -147,6 +148,9 @@ func RunClient(ctx context.Context, cfg ClientConfig) error {
 			if err := cfg.TUN.Write(toTUN); err != nil {
 				log.Warn("tun write failed", "err", err)
 			}
+			for _, p := range toTUN {
+				bufpool.Put(p)
+			}
 		}
 
 		deadline := c.NextDeadline()
@@ -178,19 +182,18 @@ func RunClient(ctx context.Context, cfg ClientConfig) error {
 			return err
 		case d := <-udpCh:
 			cs := carriers[d.carrier]
-			if !cs.bound {
-				continue
-			}
 			now := time.Now()
 			for i, p := range d.pkts {
-				if d.from[i] == cfg.Relay {
+				if cs.bound && d.from[i] == cfg.Relay {
 					c.HandlePacket(now, cs.path, p)
 				}
+				bufpool.Put(p) // the session keeps no reference to its input
 			}
 		case pkts := <-tunCh:
 			now := time.Now()
 			for _, p := range pkts {
 				c.SendIP(now, p) // dropped while not active, like an unplugged link
+				bufpool.Put(p)   // SendIP copied what it needed
 			}
 		case <-timer.C:
 			now := time.Now()
@@ -233,11 +236,16 @@ func joinCarriers(c *session.Client, carriers []*carrierState, rejoinDelay time.
 func flushTransmits(c *session.Client, carriers []*carrierState, relay netip.AddrPort, log *slog.Logger) {
 	groups := make([][][]byte, len(carriers))
 	for d, ok := c.PollTransmit(); ok; d, ok = c.PollTransmit() {
+		sent := false
 		for i, cs := range carriers {
 			if cs.bound && cs.path == d.PathID {
 				groups[i] = append(groups[i], d.Data)
+				sent = true
 				break
 			}
+		}
+		if !sent {
+			bufpool.Put(d.Data)
 		}
 	}
 	for i, pkts := range groups {
@@ -250,6 +258,10 @@ func flushTransmits(c *session.Client, carriers []*carrierState, relay netip.Add
 		}
 		if err := carriers[i].Conn.WriteBatch(pkts, to); err != nil {
 			log.Warn("send failed", "carrier", carriers[i].Name, "err", err)
+		}
+		// WriteBatch has copied or sent everything; the buffers are free.
+		for _, p := range pkts {
+			bufpool.Put(p)
 		}
 	}
 }

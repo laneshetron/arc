@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"time"
 
+	"github.com/laneshetron/arc/internal/bufpool"
 	"github.com/laneshetron/arc/internal/gateway"
 	"github.com/laneshetron/arc/internal/session"
 )
@@ -50,6 +51,9 @@ func RunRelay(ctx context.Context, cfg RelayConfig) error {
 			if err := cfg.Conn.WriteBatch(out, to); err != nil {
 				log.Warn("send failed", "err", err)
 			}
+			for _, p := range out {
+				bufpool.Put(p)
+			}
 		}
 		toTUN = toTUN[:0]
 		for e, ok := r.PollEvent(); ok; e, ok = r.PollEvent() {
@@ -69,6 +73,9 @@ func RunRelay(ctx context.Context, cfg RelayConfig) error {
 			if err := cfg.TUN.Write(toTUN); err != nil {
 				log.Warn("tun write failed", "err", err)
 			}
+			for _, p := range toTUN {
+				bufpool.Put(p)
+			}
 		}
 		resetTimer(timer, r.NextDeadline())
 
@@ -81,6 +88,7 @@ func RunRelay(ctx context.Context, cfg RelayConfig) error {
 			now := time.Now()
 			for i, p := range d.pkts {
 				r.HandlePacket(now, d.from[i], p)
+				bufpool.Put(p) // the session keeps no reference to its input
 			}
 		case pkts := <-tunCh:
 			now := time.Now()
@@ -88,6 +96,7 @@ func RunRelay(ctx context.Context, cfg RelayConfig) error {
 				if s := cfg.Gateway.Lookup(p); s != nil {
 					s.SendIP(now, p)
 				}
+				bufpool.Put(p) // SendIP copied what it needed
 			}
 		case <-timer.C:
 			r.Tick(time.Now())
