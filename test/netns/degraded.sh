@@ -18,6 +18,8 @@
 #   - with both links at 5% loss (RTT ~0 and 40 ms), -redundancy auto at least halves ping loss
 #     and at least doubles TCP goodput
 #   - a session comes up within 15 s with both links at 70% loss
+#   - a session survives about 80 s of 90% loss on both links and carries
+#     traffic again within 5 s of the loss clearing
 #
 # Usage: degraded.sh BIN_DIR [SECONDS]   (SECONDS per TCP run, default 10)
 set -euo pipefail
@@ -151,9 +153,12 @@ kill "$ARC1"; wait "$ARC1" 2>/dev/null || true
 $C ip link del wg0
 # Deleting wg0 can strand the last run's control connection, leaving the
 # server waiting on it and refusing new tests as busy; start a fresh one.
-$I pkill -x iperf3 || true
-wait_until 5 sh -c "! pgrep -x iperf3 >/dev/null"
-$I iperf3 -s -D --logfile "$WORK/iperf-server.log"
+restart_iperf_server() {
+  $I pkill -x iperf3 || true
+  wait_until 5 sh -c "! pgrep -x iperf3 >/dev/null"
+  $I iperf3 -s -D --logfile "$WORK/iperf-server.log"
+}
+restart_iperf_server
 MP_CLIENT=
 start_multipath_client() { # start_multipath_client REDUNDANCY LOG
   if [[ -n $MP_CLIENT ]]; then kill "$MP_CLIENT"; wait "$MP_CLIENT" 2>/dev/null || true; fi
@@ -305,6 +310,48 @@ else
   fail "connecting through 70% loss on both links took $CONNECT_S s (limit 15)"
 fi
 connect_under_loss 90% 60 # recorded, not asserted: typically 10-40 s
+
+# An established session through 90% loss on both links for about 80 s:
+# what still gets through (pings; a 100 KB TCP transfer given 60 s), and
+# whether the session survives and carries traffic again as soon as the
+# loss clears. Objective: keep *a* connection, however slow. Only survival
+# and recovery are asserted; the rest is the baseline for loss recovery
+# inside the tunnel.
+extreme_loss() { # extreme_loss REDUNDANCY
+  local log="client-extreme-$1.log" received xfer t0 recover
+  start_multipath_client "$1" "$log"
+  sleep 1
+  impair 0 loss 90%
+  impair 1 loss 90%
+  # ping fails when no reply arrives at all, which is a result here
+  received=$({ $C ping -q -c 100 -i 0.2 -W 2 "$TARGET" 2>/dev/null || true; } | grep -oE '[0-9]+ received' | cut -d' ' -f1)
+  t0=$(date +%s.%N)
+  if $C timeout 60 iperf3 -c "$TARGET" -n 100K -f k >"$WORK/iperf-extreme.log" 2>&1; then
+    xfer="$(awk -v a="$t0" -v b="$(date +%s.%N)" 'BEGIN { printf "%.1f s", b - a }')"
+  else
+    xfer="not done in 60 s"
+    restart_iperf_server # a killed client can leave the server stuck busy
+  fi
+  unimpair 0
+  unimpair 1
+  t0=$(date +%s.%N)
+  if wait_until 10 $C ping -c 1 -W 1 "$TARGET"; then
+    recover=$(awk -v a="$t0" -v b="$(date +%s.%N)" 'BEGIN { printf "%.1f", b - a }')
+  else
+    recover=-
+  fi
+  MP_ROWS+=("$(printf '%-34s redundancy %-6s pings %3s/100, 100 KB TCP %s, traffic again %s s after' \
+    "90% loss on both links" "$1" "${received:-0}" "$xfer" "$recover")")
+  if grep -q "session ended" "$WORK/$log" || ! kill -0 "$MP_CLIENT" 2>/dev/null; then
+    fail "session did not survive 90% loss on both links (redundancy $1): $(grep -m1 "session ended" "$WORK/$log")"
+  elif [[ $recover == - ]] || ! awk -v r="$recover" 'BEGIN { exit !(r <= 5) }'; then
+    fail "session survived 90% loss but carried no traffic within 5 s of it clearing (redundancy $1): $recover"
+  else
+    pass "session survived 90% loss on both links and recovered in $recover s (redundancy $1)"
+  fi
+}
+extreme_loss off
+extreme_loss auto
 
 echo
 echo "Part 1: single link, $DURATION s TCP runs; $(nproc) CPUs; kernel $(uname -r)"

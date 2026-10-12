@@ -434,7 +434,7 @@ When no path is clean, loss-aware selection (§15.2) has nowhere to move traffic
 - **`IP_DATAGRAM`.** The value is `datagram_id:u64` followed by exactly one IP packet, validated as for `IP_PACKET`. Datagram IDs come from the same per-direction counter as `IP_FRAGMENT`. A sender transmits each copy on a different path with the same ID. On a path whose maximum packet size is too small, the copy is sent as `IP_FRAGMENT`s with that ID.
 - **Delivery once.** The receiver keeps a window of delivered datagram IDs (at least 65,000 IDs; the reference implementation keeps 65,472 in 8 KiB). It delivers an `IP_DATAGRAM`, or a datagram completed from fragments, only if its ID is new and within the window. IDs older than the window are treated as delivered.
 - **`REDUNDANCY`.** The client controls both directions. It duplicates uplink traffic itself and asks the relay for downlink duplication with `REDUNDANCY(seq, mode)`: mode 0 sends on the primary path only, and mode 1 also sends on a second path. Other modes are malformed. The frame is retransmitted until acknowledged. The relay applies a request only if its `seq` is greater than that of the last one applied, because a retransmitted old request can arrive after a newer one.
-- **Second path.** Copies go to the healthy validated path with the lowest cost (§15.2) other than the primary. With only one healthy path, nothing is duplicated.
+- **Second path.** Copies go to the healthy validated path with the lowest cost (§15.2) other than the primary. If no other path is healthy, they go to any other validated path, since heavy loss on every link is when copies matter most. With a single validated path, nothing is duplicated.
 - **Policy (reference client).** `off` (the default), `always`, or `auto`. `auto` duplicates a direction while the primary path's loss estimate in that direction (§15.2) is at least 1%, until it falls below 0.4%. The primary's own packets keep its estimate current while copies are sent. Copies also keep the second path's estimate current, so loss-aware selection can move the primary to it.
 - **Limits.** Redundancy lowers loss but does not remove it: a TCP flow over two 5%-loss paths at 40 ms RTT is still loss-limited, at about 0.25%. Parity across paths (k packets plus one XOR, any one loss per group recoverable at 1/k overhead) is a possible later mode that trades recovery delay for bandwidth.
 
@@ -579,9 +579,10 @@ The client usually cannot tell that its NAT mapping changed, so the relay handle
   - On request/response carriers, the authenticated polls double as keepalives.
   - ACKs for low-rate carriers may be sampled so that heartbeats don't congest them.
 - **Timeouts.** A path becomes `SUSPECT` after 3 unanswered probes or a measurable transport failure. It becomes `DEAD` after an additional configurable timeout.
+- **Shared outages.** An endpoint abandons a path for silence (30 s by default) only if another validated path received something at least half that time after the silent path last did. That shows the silence belongs to the path. When every path falls silent together, as in a relay outage or heavy loss on every link, all paths are kept and the session idle timeout governs (§9.4). Rejoining takes several round trips, which the same conditions would defeat, while kept paths carry traffic again as soon as packets get through.
 - **Session continuity.** The session stays `ACTIVE` while any validated path remains usable. New data is reassigned automatically, with no application reconnect and no new VPN IP.
 - **Proof of success.** Never infer path success from local socket writability alone. Require a remote response or authenticated acknowledgements.
-- **Abandoning.** `PATH_ABANDON(path_id, code)` retires a path explicitly. Its path ID and CIDs are never reused.
+- **Abandoning.** `PATH_ABANDON(path_id, code)` retires a path explicitly. An endpoint that abandons a path, including for silence, MUST send it, retransmitting until acknowledged. The path ID and CIDs are never reused.
 
 ### 14.7 Stateless reset
 
@@ -595,6 +596,7 @@ If the relay loses session state, for example on restart, it can no longer send 
 
   - `reset_secret` is persisted across relay restarts.
   - The relay MUST rate-limit resets.
+  - The relay MUST NOT send a reset for a CID of a path it removed from a session that is still live. The client may not have received the `PATH_ABANDON` yet, especially under heavy loss, and a reset ends the whole session. The relay drops such packets silently. The reference relay remembers each live session's 16 most recently retired CIDs.
   - The relay MUST NOT send a reset in response to a packet of 25 bytes or fewer. The reset (25 bytes) is always smaller than any `DATA` packet (≥ 37 bytes).
 - **Receiving a reset.** The client compares the token, in constant time, with the token issued for that CID: in message 2 for path 0, or in `NEW_PATH` for other paths.
   - On a match, the client treats the session as dead immediately and starts a new handshake.

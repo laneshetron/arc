@@ -326,3 +326,95 @@ func TestRecoveredStandbyPathIsUsableQuickly(t *testing.T) {
 		t.Fatalf("failover to the recovered standby took %v", d)
 	}
 }
+
+// TestSharedOutageKeepsPaths: when every path is silent at once, neither
+// side abandons any of them, so traffic resumes on the existing paths as
+// soon as packets get through again. Abandoning them would leave rejoins,
+// which take several round trips, to the same bad network.
+func TestSharedOutageKeepsPaths(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		loss float64
+		down bool
+	}{{"90% loss", 0.9, false}, {"blackout", 0, true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			n, s, id, c := establishTwoPaths(t, 90, 20*time.Millisecond)
+			for _, l := range []*link{n.up, n.down, c.up, c.down} {
+				l.loss, l.down = tc.loss, tc.down
+			}
+			var seq uint32
+			for range 6000 { // 60 s of light traffic
+				seq++
+				n.client.SendIP(n.now, ipPacket(lease, internet, 200, seq))
+				s.SendIP(n.now, ipPacket(internet, lease, 200, seq))
+				n.runFor(10 * time.Millisecond)
+			}
+			for _, l := range []*link{n.up, n.down, c.up, c.down} {
+				l.loss, l.down = 0, false
+			}
+			if k := n.clientEventsOf(func(e ClientEvent) bool { _, ok := e.(PathClosed); return ok }); k != 0 {
+				t.Fatalf("client closed %d paths during the outage", k)
+			}
+			if got := len(s.Paths(n.now)); got != 2 {
+				t.Fatalf("relay has %d paths after the outage, want 2", got)
+			}
+			upBefore, downBefore, cleared := len(n.relayIPs()), len(n.clientIPs()), n.now
+			for len(n.relayIPs()) == upBefore || len(n.clientIPs()) == downBefore {
+				if n.now.Sub(cleared) > 2*time.Second {
+					t.Fatal("no traffic within 2 s of the outage ending")
+				}
+				seq++
+				n.client.SendIP(n.now, ipPacket(lease, internet, 200, seq))
+				s.SendIP(n.now, ipPacket(internet, lease, 200, seq))
+				n.runFor(10 * time.Millisecond)
+			}
+			t.Logf("traffic both ways %v after the outage; paths %d and %d kept", n.now.Sub(cleared), 0, id)
+		})
+	}
+}
+
+// TestRetiredPathDoesNotResetSession: when the relay abandons a path and
+// the client has not yet heard (its PATH_ABANDON lost, as it may be under
+// heavy loss), the client's packets on that path must not draw a
+// stateless reset, which would end the whole session.
+func TestRetiredPathDoesNotResetSession(t *testing.T) {
+	n, s, id, _ := establishTwoPaths(t, 91, 20*time.Millisecond)
+	p := s.conn.path(id)
+	s.removePath(p) // as on the relay, minus the PATH_ABANDON reaching the client
+	var seq uint32
+	for range 300 {
+		seq++
+		n.client.SendIP(n.now, ipPacket(lease, internet, 200, seq))
+		n.runFor(100 * time.Millisecond)
+	}
+	if n.client.State() != StateActive {
+		t.Fatalf("session ended: %v", n.clientClosed())
+	}
+	if n.relay.Stats().ResetsSent != 0 {
+		t.Errorf("relay sent %d stateless resets for a retired path", n.relay.Stats().ResetsSent)
+	}
+}
+
+func TestRelayAbandonTellsClient(t *testing.T) {
+	// Path 1 goes silent toward the relay; the relay abandons it and says
+	// so, and the client, whose own timeout is longer, closes it on that.
+	n, s, c := lossyPaths(t, 92, ClientConfig{PathTimeout: time.Minute}, defaultRelayConfig(), 0)
+	const id = 1
+	c.up.down = true
+	var seq uint32
+	for range 400 { // 40 s
+		seq++
+		n.client.SendIP(n.now, ipPacket(lease, internet, 200, seq))
+		n.runFor(100 * time.Millisecond)
+	}
+	if _, ok := pathByID(s.Paths(n.now), id); ok {
+		t.Fatal("relay kept the silent path")
+	}
+	closed := n.clientEventsOf(func(e ClientEvent) bool {
+		pc, ok := e.(PathClosed)
+		return ok && pc.ID == id && errors.Is(pc.Err, ErrPathAbandoned)
+	})
+	if closed != 1 {
+		t.Errorf("client did not close path %d on the relay's PATH_ABANDON; events %v", id, n.clientEvents)
+	}
+}

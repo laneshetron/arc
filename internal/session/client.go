@@ -568,9 +568,9 @@ func (c *Client) Tick(now time.Time) {
 	}
 	if c.state == StateActive {
 		for _, p := range slices.Clone(c.conn.paths) {
-			// A dead path is abandoned unless it is the last one; the session
-			// idle timeout governs that case (§9.4).
-			if !now.Before(p.lastRecv.Add(c.cfg.PathTimeout)) && len(c.conn.paths) > 1 {
+			// A silent path is abandoned only while another is heard from
+			// (§14.6); the session idle timeout governs the rest (§9.4).
+			if at := c.conn.abandonAt(p, c.cfg.PathTimeout); !at.IsZero() && !now.Before(at) {
 				c.conn.queue(wire.PathAbandon{PathID: p.id, Code: wire.CodePathUnavailable})
 				c.dropPath(p, ErrPathTimeout)
 			}
@@ -643,9 +643,7 @@ func (c *Client) NextDeadline() time.Time {
 		return earliest(d, c.authenticated.Add(HandshakeTimeout), c.nextInit)
 	}
 	for _, p := range c.conn.paths {
-		if len(c.conn.paths) > 1 {
-			d = earliest(d, p.lastRecv.Add(c.cfg.PathTimeout))
-		}
+		d = earliest(d, c.conn.abandonAt(p, c.cfg.PathTimeout))
 		if !p.validated {
 			continue
 		}

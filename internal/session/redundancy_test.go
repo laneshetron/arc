@@ -168,3 +168,30 @@ func TestStaleRedundancyRequestIgnored(t *testing.T) {
 		t.Error("a newer request was ignored")
 	}
 }
+
+func TestRedundancyWithNoHealthyPath(t *testing.T) {
+	// At 90% loss with sparse traffic (5 packets per second, like pings)
+	// neither path counts as healthy; copies must still go out on both,
+	// since that is when they matter most: about 19% of packets get
+	// through each way instead of 10%.
+	n, s, _ := lossyPaths(t, 66, ClientConfig{Redundancy: RedundancyAlways}, defaultRelayConfig(), 0.9)
+	const count = 3000
+	upBefore, downBefore, healthy := len(n.relayIPs()), len(n.clientIPs()), 0
+	for i := range count {
+		n.client.SendIP(n.now, ipPacket(lease, internet, 100, uint32(i)))
+		s.SendIP(n.now, ipPacket(internet, lease, 100, uint32(i)))
+		n.runFor(200 * time.Millisecond)
+		for _, p := range n.client.Paths(n.now) {
+			if p.Healthy {
+				healthy++
+				break
+			}
+		}
+	}
+	up := float64(len(n.relayIPs())-upBefore) / count
+	down := float64(len(n.clientIPs())-downBefore) / count
+	t.Logf("delivered: uplink %.3f, downlink %.3f; a healthy path existed %d%% of the time", up, down, healthy*100/count)
+	if up < 0.16 || down < 0.16 {
+		t.Errorf("delivered uplink %.3f, downlink %.3f; want about 0.19", up, down)
+	}
+}
