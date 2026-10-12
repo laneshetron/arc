@@ -58,10 +58,12 @@ const slotRetry = 200 * time.Millisecond
 // RunClient runs sessions until ctx is canceled, authentication fails, or
 // an I/O error occurs. It reconnects after resets and timeouts.
 //
-// Each session handshakes on one carrier, which becomes path 0. Once the
-// session is active, each other carrier joins as another path, and a
-// carrier whose path closes rejoins after RejoinDelay. Successive sessions
-// rotate the handshake carrier, so one dead link cannot block reconnecting.
+// Each handshake goes out on every carrier at once, and the carrier the
+// relay's response arrives on becomes path 0: on links that lose most
+// packets, more attempts per second is what gets a session up, and a dead
+// link cannot block one. Once the session is active, each other carrier
+// joins as another path, and a carrier whose path closes rejoins after
+// RejoinDelay.
 //
 // The caller owns the carriers' connections and the TUN and must close
 // them after RunClient returns, which also stops the reader goroutines.
@@ -91,14 +93,12 @@ func RunClient(ctx context.Context, cfg ClientConfig) error {
 	}
 	go readPackets(ctx, cfg.TUN, tunCh, errc)
 
-	attempt := 0
+	// hs tracks where handshake packets go: every carrier, or only the one
+	// a COOKIE_REPLY arrived on, since the cookie is valid only for that
+	// carrier's address (§9.3).
+	hs := handshakeState{pinned: -1}
 	newSession := func(now time.Time) (*session.Client, error) {
-		first := attempt % len(carriers)
-		attempt++
-		for i, cs := range carriers {
-			cs.bound, cs.path, cs.retryAt = i == first, 0, time.Time{}
-		}
-		log.Info("connecting", "relay", cfg.Relay, "carrier", carriers[first].Name)
+		log.Info("connecting", "relay", cfg.Relay, "carriers", len(carriers))
 		return session.NewClient(cfg.Session, now)
 	}
 
@@ -112,8 +112,9 @@ func RunClient(ctx context.Context, cfg ClientConfig) error {
 	var toTUN [][]byte
 
 	for {
+		hs.update(c, carriers)
 		joinCarriers(c, carriers, cfg.RejoinDelay, log)
-		flushTransmits(c, carriers, cfg.Relay, log)
+		flushTransmits(c, carriers, cfg.Relay, hs.pinned, log)
 		toTUN = toTUN[:0]
 		for e, ok := c.PollEvent(); ok; e, ok = c.PollEvent() {
 			switch e := e.(type) {
@@ -182,7 +183,7 @@ func RunClient(ctx context.Context, cfg ClientConfig) error {
 		select {
 		case <-ctx.Done():
 			c.Close(time.Now())
-			flushTransmits(c, carriers, cfg.Relay, log)
+			flushTransmits(c, carriers, cfg.Relay, hs.pinned, log)
 			return ctx.Err()
 		case err := <-errc:
 			return err
@@ -190,8 +191,12 @@ func RunClient(ctx context.Context, cfg ClientConfig) error {
 			cs := carriers[d.carrier]
 			now := time.Now()
 			for i, p := range d.pkts {
-				if cs.bound && d.from[i] == cfg.Relay {
+				switch {
+				case d.from[i] != cfg.Relay:
+				case cs.bound:
 					c.HandlePacket(now, cs.path, p)
+				case c.State() == session.StateHandshaking:
+					hs.receive(c, now, d.carrier, carriers, p)
 				}
 				bufpool.Put(p) // the session keeps no reference to its input
 			}
@@ -238,9 +243,56 @@ func joinCarriers(c *session.Client, carriers []*carrierState, rejoinDelay time.
 	}
 }
 
-// flushTransmits batches outgoing datagrams by their bound carrier.
-func flushTransmits(c *session.Client, carriers []*carrierState, relay netip.AddrPort, log *slog.Logger) {
+// handshakeState steers handshake packets across carriers.
+type handshakeState struct {
+	client  *session.Client
+	attempt uint64
+	pinned  int // carrier holding the attempt's cookie, or -1 for all
+	active  bool
+}
+
+// update unbinds every carrier when a handshake attempt starts, since path
+// 0 will be whichever carrier the response arrives on.
+func (h *handshakeState) update(c *session.Client, carriers []*carrierState) {
+	handshaking := c.State() == session.StateHandshaking
+	if handshaking && (!h.active || c != h.client || c.HandshakeAttempt() != h.attempt) {
+		for _, cs := range carriers {
+			cs.bound, cs.path, cs.retryAt = false, 0, time.Time{}
+		}
+		h.client, h.attempt, h.pinned = c, c.HandshakeAttempt(), -1
+	}
+	h.active = handshaking
+}
+
+// receive handles a packet from the relay on an unbound carrier during the
+// handshake, binding that carrier to path 0 if it completes the handshake.
+func (h *handshakeState) receive(c *session.Client, now time.Time, carrier int, carriers []*carrierState, p []byte) {
+	if t, err := wire.PeekType(p); err == nil && t == wire.TypeCookieReply {
+		h.pinned = carrier
+	}
+	c.HandlePacket(now, 0, p)
+	if c.State() != session.StateHandshaking {
+		cs := carriers[carrier]
+		cs.bound, cs.path = true, 0
+	}
+}
+
+// flushTransmits batches outgoing datagrams by their bound carrier. While
+// handshaking, path 0's datagrams go to every carrier, or to pinned if it
+// is not -1.
+func flushTransmits(c *session.Client, carriers []*carrierState, relay netip.AddrPort, pinned int, log *slog.Logger) {
+	handshaking := c.State() == session.StateHandshaking
 	for d, ok := c.PollTransmit(); ok; d, ok = c.PollTransmit() {
+		if handshaking && d.PathID == 0 {
+			for i, cs := range carriers {
+				if pinned < 0 || i == pinned {
+					// A copy each: the buffers are returned per carrier.
+					cs.out, cs.to = append(cs.out, append(bufpool.Get(), d.Data...)), append(cs.to, relay)
+				}
+			}
+			bufpool.Put(d.Data)
+			continue
+		}
 		sent := false
 		for _, cs := range carriers {
 			if cs.bound && cs.path == d.PathID {

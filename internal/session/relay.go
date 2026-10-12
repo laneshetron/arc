@@ -84,9 +84,13 @@ type Relay struct {
 	cfg      RelayConfig
 	cookies  *crypto.CookieGenerator
 	sessions map[wire.CID]*RelaySession // every live relay CID, all paths
-	live     []*RelaySession            // each live session once, oldest first
-	inits    map[initKey]*RelaySession
-	pending  int
+	// retired holds CIDs of paths removed from sessions that are still
+	// live. Packets for them are dropped rather than reset: the client may
+	// not have heard of the removal yet, and a reset ends the whole session.
+	retired map[wire.CID]bool
+	live    []*RelaySession // each live session once, oldest first
+	inits   map[initKey]*RelaySession
+	pending int
 
 	resetTokens float64
 	resetRefill time.Time
@@ -114,8 +118,9 @@ type RelaySession struct {
 	resp          []byte
 	initKey       initKey
 	nextPathID    uint32
-	lastUplink    *path  // where the client most recently sent from
-	redundancySeq uint32 // REDUNDANCY seq last applied
+	lastUplink    *path      // where the client most recently sent from
+	redundancySeq uint32     // REDUNDANCY seq last applied
+	retiredCIDs   []wire.CID // this session's entries in Relay.retired, oldest first
 	redundancySet bool
 }
 
@@ -139,6 +144,7 @@ func NewRelay(cfg RelayConfig, now time.Time) *Relay {
 		cfg:         cfg,
 		cookies:     crypto.NewCookieGenerator(cfg.Rand, now),
 		sessions:    make(map[wire.CID]*RelaySession),
+		retired:     make(map[wire.CID]bool),
 		inits:       make(map[initKey]*RelaySession),
 		resetTokens: float64(cfg.ResetsPerSecond),
 		resetRefill: now,
@@ -242,7 +248,9 @@ func (r *Relay) handleData(now time.Time, from netip.AddrPort, b []byte) {
 	}
 	s := r.sessions[h.DestCID]
 	if s == nil {
-		r.maybeReset(now, from, h.DestCID, len(b))
+		if !r.retired[h.DestCID] {
+			r.maybeReset(now, from, h.DestCID, len(b))
+		}
 		return
 	}
 	p := s.conn.byCID[h.DestCID]
@@ -415,6 +423,12 @@ func (s *RelaySession) issueSlots() {
 func (s *RelaySession) removePath(p *path) {
 	s.conn.removePath(p)
 	delete(s.relay.sessions, p.localCID)
+	s.retiredCIDs = append(s.retiredCIDs, p.localCID)
+	s.relay.retired[p.localCID] = true
+	if len(s.retiredCIDs) > maxRetiredCIDs {
+		delete(s.relay.retired, s.retiredCIDs[0])
+		s.retiredCIDs = s.retiredCIDs[1:]
+	}
 	if s.lastUplink == p {
 		s.lastUplink = nil
 	}
@@ -520,6 +534,9 @@ func (r *Relay) closeSession(now time.Time, s *RelaySession, err error, notify b
 	for _, p := range s.conn.paths {
 		delete(r.sessions, p.localCID)
 	}
+	for _, cid := range s.retiredCIDs {
+		delete(r.retired, cid)
+	}
 	r.live = slices.DeleteFunc(r.live, func(q *RelaySession) bool { return q == s })
 	s.state = StateClosed
 	r.events = append(r.events, SessionClosed{Session: s, Err: err})
@@ -587,13 +604,14 @@ func (s *RelaySession) Close(now time.Time) { s.relay.closeSession(now, s, ErrCl
 func (r *Relay) Tick(now time.Time) {
 	for _, s := range slices.Clone(r.live) {
 		switch {
-		case s.state == StateAuthenticating && !now.Before(s.created.Add(HandshakeTimeout)):
-			r.closeSession(now, s, ErrAuthFailed, false)
+		case s.state == StateAuthenticating && !now.Before(s.created.Add(relayPendingTimeout)):
+			r.closeSession(now, s, ErrHandshakeTimeout, false)
 		case !now.Before(s.conn.lastRecv().Add(r.cfg.IdleTimeout)):
 			r.closeSession(now, s, ErrIdleTimeout, false)
 		default:
 			for _, p := range slices.Clone(s.conn.paths) {
-				if p.joined && !now.Before(p.lastRecv.Add(DefaultPathTimeout)) && s.joinedPaths() > 1 {
+				if at := s.conn.abandonAt(p, DefaultPathTimeout); p.joined && !at.IsZero() && !now.Before(at) {
+					s.conn.queue(wire.PathAbandon{PathID: p.id, Code: wire.CodePathUnavailable})
 					s.removePath(p)
 				}
 			}
@@ -619,13 +637,11 @@ func (r *Relay) NextDeadline() time.Time {
 	for _, s := range r.live {
 		d = earliest(d, s.conn.nextDeadline(), s.conn.lastRecv().Add(r.cfg.IdleTimeout))
 		if s.state == StateAuthenticating {
-			d = earliest(d, s.created.Add(HandshakeTimeout))
+			d = earliest(d, s.created.Add(relayPendingTimeout))
 		}
-		if s.joinedPaths() > 1 {
-			for _, p := range s.conn.paths {
-				if p.joined {
-					d = earliest(d, p.lastRecv.Add(DefaultPathTimeout))
-				}
+		for _, p := range s.conn.paths {
+			if p.joined {
+				d = earliest(d, s.conn.abandonAt(p, DefaultPathTimeout))
 			}
 		}
 	}

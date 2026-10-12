@@ -19,14 +19,29 @@ import (
 
 // Defaults from the spec.
 const (
-	HandshakeTimeout     = 10 * time.Second
-	initialRetransmit    = time.Second
+	HandshakeTimeout = 10 * time.Second
+	// handshakeRetransmit is the interval at which the client repeats
+	// HANDSHAKE_INIT and AUTH until answered (§9.2). It does not back off:
+	// the packets are small, a duplicate INIT costs the relay no
+	// Diffie-Hellman, and on a link losing most packets only the number of
+	// attempts within the timeout matters. After handshakeQuiet without
+	// hearing from the relay at all, the relay is more likely down than
+	// the link lossy, and the client slows to handshakeRetransmitQuiet
+	// until it hears something.
+	handshakeRetransmit      = 100 * time.Millisecond
+	handshakeRetransmitQuiet = time.Second
+	handshakeQuiet           = 30 * time.Second
+	// relayPendingTimeout is how long the relay keeps a session that has
+	// not authenticated: the client's INIT phase and AUTH phase may each
+	// take up to HandshakeTimeout.
+	relayPendingTimeout  = 2 * HandshakeTimeout
 	DefaultMaxPacketSize = 1232 // safe on any IPv6 path (§16.1)
 	DefaultKeepalive     = 10 * time.Second
 	DefaultIdleTimeout   = 120 * time.Second
 	DefaultPathTimeout   = 30 * time.Second // no packets received: the path is dead
 	sentHorizon          = 30 * time.Second
 	secondPathRefresh    = 100 * time.Millisecond
+	maxRetiredCIDs       = 2 * maxPaths // per session; see Relay.retired
 	suspectPTOs          = 3
 	maxPaths             = 8 // joined paths plus unused slots (§14.3)
 	spareSlots           = 2
@@ -41,12 +56,16 @@ var (
 	ErrNoPath         = errors.New("session: no usable path")
 	ErrNoPathSlots    = errors.New("session: relay has not issued a path slot")
 	ErrAuthFailed     = errors.New("session: authentication failed")
-	ErrStatelessReset = errors.New("session: relay reset the session")
-	ErrIdleTimeout    = errors.New("session: idle timeout")
-	ErrPathTimeout    = errors.New("session: path timed out")
-	ErrPathAbandoned  = errors.New("session: path abandoned by peer")
-	ErrIntegrityLimit = errors.New("session: too many authentication failures")
-	errReplay         = errors.New("session: replayed or stale packet")
+	// ErrHandshakeTimeout ends a relay session the client never
+	// authenticated, such as one of the extra handshakes a client with
+	// several carriers starts (§9.2).
+	ErrHandshakeTimeout = errors.New("session: handshake timed out")
+	ErrStatelessReset   = errors.New("session: relay reset the session")
+	ErrIdleTimeout      = errors.New("session: idle timeout")
+	ErrPathTimeout      = errors.New("session: path timed out")
+	ErrPathAbandoned    = errors.New("session: path abandoned by peer")
+	ErrIntegrityLimit   = errors.New("session: too many authentication failures")
+	errReplay           = errors.New("session: replayed or stale packet")
 )
 
 // PeerClosedError reports a CLOSE frame from the peer.
@@ -239,6 +258,23 @@ func (c *conn) path(id uint32) *path {
 		}
 	}
 	return nil
+}
+
+// abandonAt returns when p is abandoned for silence: timeout after it last
+// received anything, provided another validated path received something at
+// least timeout/2 after that, showing the silence is p's own. Otherwise it
+// returns zero. When every path falls silent together the trouble is
+// shared (the relay, or loss on every link), and closing paths would only
+// discard state that rejoining could not rebuild under the same
+// conditions; the session idle timeout governs that case. The answer
+// changes only when a packet arrives, so it is also a stable deadline.
+func (c *conn) abandonAt(p *path, timeout time.Duration) time.Time {
+	for _, q := range c.paths {
+		if q != p && q.validated && q.lastRecv.Sub(p.lastRecv) >= timeout/2 {
+			return p.lastRecv.Add(timeout)
+		}
+	}
+	return time.Time{}
 }
 
 // bestPath returns the healthy validated path with the lowest cost (RTT
@@ -573,20 +609,32 @@ func (c *conn) sendOn(now time.Time, p *path, ip ipPayload) {
 }
 
 // secondPath returns the healthy path other than p with the lowest cost,
-// or nil. The choice is cached briefly, since it is made per packet.
+// falling back, like bestPath, to any other validated path: when loss is
+// heavy enough that no path counts as healthy, copies matter most. The
+// choice is cached briefly, since it is made per packet.
 func (c *conn) secondPath(now time.Time, p *path) *path {
 	if q := c.second; q != nil && q != p && !q.removed && now.Before(c.secondAt) {
 		return q
 	}
 	c.second, c.secondAt = nil, now.Add(secondPathRefresh)
+	var fallback *path
 	var bestCost float64
 	for _, q := range c.paths {
-		if q == p || !q.healthy(now, c.keepalive) {
+		if q == p || !q.validated {
+			continue
+		}
+		if fallback == nil {
+			fallback = q
+		}
+		if !q.healthy(now, c.keepalive) {
 			continue
 		}
 		if cost := q.cost(now); c.second == nil || cost < bestCost {
 			c.second, bestCost = q, cost
 		}
+	}
+	if c.second == nil {
+		c.second = fallback
 	}
 	return c.second
 }
