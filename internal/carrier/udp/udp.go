@@ -43,6 +43,11 @@ type Conn struct {
 	pc *ipv4.PacketConn
 	rx []ipv4.Message
 	tx []ipv4.Message
+
+	// gso is set when the kernel supports UDP segmentation offload; see
+	// gso_linux.go. gsoBufs are reused coalescing buffers.
+	gso     bool
+	gsoBufs [][]byte
 }
 
 // Listen opens an IPv4 UDP socket on addr (use port 0 for a client).
@@ -73,7 +78,7 @@ func Listen(addr netip.AddrPort, opts Options) (*Conn, error) {
 		uc.SetReadBuffer(opts.BufferSize)
 		uc.SetWriteBuffer(opts.BufferSize)
 	}
-	return &Conn{uc: uc, pc: ipv4.NewPacketConn(uc)}, nil
+	return &Conn{uc: uc, pc: ipv4.NewPacketConn(uc), gso: gsoSupported(uc)}, nil
 }
 
 // LocalAddr returns the socket's bound address.
@@ -104,6 +109,17 @@ func (c *Conn) ReadBatch(bufs [][]byte, sizes []int, addrs []netip.AddrPort) (in
 
 // WriteBatch sends each packet to the matching address.
 func (c *Conn) WriteBatch(pkts [][]byte, addrs []netip.AddrPort) error {
+	if c.gso {
+		err := c.writeGSO(pkts, addrs)
+		if err == nil || !gsoUnsupported(err) {
+			return err
+		}
+		c.gso = false // the path cannot segment; fall back for good
+	}
+	return c.writePlain(pkts, addrs)
+}
+
+func (c *Conn) writePlain(pkts [][]byte, addrs []netip.AddrPort) error {
 	if len(c.tx) < len(pkts) {
 		c.tx = make([]ipv4.Message, len(pkts))
 		for i := range c.tx {

@@ -28,6 +28,7 @@ import (
 	"github.com/laneshetron/arc/internal/engine"
 	"github.com/laneshetron/arc/internal/gateway"
 	"github.com/laneshetron/arc/internal/keyfile"
+	"github.com/laneshetron/arc/internal/profiling"
 	"github.com/laneshetron/arc/internal/session"
 	"github.com/laneshetron/arc/internal/tun"
 )
@@ -94,7 +95,13 @@ func run(args []string) error {
 	network := fs.String("network", "10.77.0.1/16", "relay tunnel address and client network")
 	mtu := fs.Int("mtu", 1280, "tunnel MTU")
 	dns := fs.String("dns", "", "IPv4 resolver to offer clients")
+	prof := profiling.Register(fs)
 	fs.Parse(args)
+	stopProfiles, err := prof.Start()
+	if err != nil {
+		return err
+	}
+	defer stopProfiles()
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	listenAddr, err := netip.ParseAddrPort(*listen)

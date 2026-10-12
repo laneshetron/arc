@@ -21,6 +21,7 @@ import (
 	"github.com/laneshetron/arc/internal/crypto"
 	"github.com/laneshetron/arc/internal/engine"
 	"github.com/laneshetron/arc/internal/keyfile"
+	"github.com/laneshetron/arc/internal/profiling"
 	"github.com/laneshetron/arc/internal/session"
 	"github.com/laneshetron/arc/internal/tun"
 	"github.com/laneshetron/arc/internal/wire"
@@ -69,7 +70,13 @@ func run(args []string) error {
 	})
 	mark := fs.Uint("mark", 0x5243, "fwmark for carrier sockets, used by -full-tunnel")
 	table := fs.Int("table", 5243, "routing table for -full-tunnel")
+	prof := profiling.Register(fs)
 	fs.Parse(args)
+	stopProfiles, err := prof.Start()
+	if err != nil {
+		return err
+	}
+	defer stopProfiles()
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	relayAddr, err := netip.ParseAddrPort(*relay)
