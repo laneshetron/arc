@@ -276,6 +276,7 @@ aggregate() { # aggregate NAME IPERF_ARGS...: sets AGG_ONE and AGG_TWO
   AGG_ONE=$(tcp_up "$@")
   impair 1 rate 50mbit delay 10ms limit 500
   sleep 3 # link 1 answers its probes and turns healthy
+  AGG_CLIENT_LINE=$(wc -l <"$WORK/client-agg.log") AGG_RELAY_LINE=$(wc -l <"$WORK/relay.log")
   AGG_TWO=$(tcp_up "$@")
   unimpair 0
   unimpair 1
@@ -290,9 +291,9 @@ for dir in up down; do
     pass "4 flows $dir over two links: $AGG_TWO Mbit/s against $AGG_ONE on one"
   else
     fail "4 flows $dir over two links: $AGG_TWO Mbit/s, not 1.4x the $AGG_ONE of one link"
-    echo "  path state (client, then relay), from -status:"
-    grep 'msg=path ' "$WORK/client-agg.log" | tail -2 | sed 's/^/    /'
-    grep 'msg=path ' "$WORK/relay.log" | tail -2 | sed 's/^/    /'
+    echo "  path state during the two-link run (client, then relay), from -status:"
+    tail -n +"$AGG_CLIENT_LINE" "$WORK/client-agg.log" | grep 'msg=path ' | sed 's/^/    /'
+    tail -n +"$AGG_RELAY_LINE" "$WORK/relay.log" | grep 'msg=path ' | sed 's/^/    /'
   fi
 done
 aggregate "1 flow up" # recorded: one flow stays on one link

@@ -418,3 +418,19 @@ func TestRelayAbandonTellsClient(t *testing.T) {
 		t.Errorf("client did not close path %d on the relay's PATH_ABANDON; events %v", id, n.clientEvents)
 	}
 }
+
+func TestIdlePathToleratesLateKeepalive(t *testing.T) {
+	// A standby path hears from the peer about once per keepalive. A
+	// keepalive 200 ms late on a busy host must not make it unhealthy,
+	// which a margin of only a few PTOs (here about 80 ms) did.
+	now := time.Unix(1_000_000, 0)
+	p := newPath(1, wire.CID{}, wire.CID{}, now)
+	p.validated = true
+	p.rtt.update(now, time.Millisecond, 0)
+	if !p.healthy(now.Add(DefaultKeepalive+200*time.Millisecond), DefaultKeepalive) {
+		t.Error("idle path unhealthy 200 ms after a keepalive was due")
+	}
+	if p.healthy(now.Add(DefaultKeepalive*3/2+time.Millisecond), DefaultKeepalive) {
+		t.Error("idle path still healthy after 1.5 keepalive intervals of silence")
+	}
+}

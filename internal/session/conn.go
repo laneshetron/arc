@@ -153,18 +153,28 @@ func (p *path) healthy(now time.Time, keepalive time.Duration) bool {
 	}
 	limit := suspectPTOs * p.rtt.pto()
 	silent := now.Sub(p.lastRecv)
-	if silent > keepalive+limit {
+	if silent > idleLimit(keepalive, limit) {
 		return false
 	}
 	t0, ok := p.sent.oldestOutstanding()
 	return !ok || now.Sub(t0) < limit || silent < limit
 }
 
+// idleLimit is how long a path may go without receiving anything before it
+// is suspect even with nothing outstanding. An idle path hears from the
+// peer about once per keepalive interval (the relay hears the client's
+// keepalives themselves), so the limit allows half an interval of slack
+// for timers that fire late on a busy host: with only a few PTOs of slack,
+// the relay judged idle standby paths unhealthy just before each keepalive.
+func idleLimit(keepalive, limit time.Duration) time.Duration {
+	return keepalive + max(limit, keepalive/2)
+}
+
 // suspectAt returns when a currently healthy path would turn suspect if
 // nothing else happened, so callers can wake up and start probing it.
 func (p *path) suspectAt(keepalive time.Duration) time.Time {
 	limit := suspectPTOs * p.rtt.pto()
-	at := p.lastRecv.Add(keepalive + limit + time.Nanosecond)
+	at := p.lastRecv.Add(idleLimit(keepalive, limit) + time.Nanosecond)
 	if t0, ok := p.sent.oldestOutstanding(); ok {
 		unanswered := t0.Add(limit)
 		if silent := p.lastRecv.Add(limit); silent.After(unanswered) {
