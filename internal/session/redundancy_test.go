@@ -128,8 +128,13 @@ func TestRedundancyDeclinedByRelay(t *testing.T) {
 	if n.client.Stats().RedundantSent != 0 || s.Stats().RedundantSent != 0 {
 		t.Error("copies sent although the relay does not support redundancy")
 	}
-	if p, _ := pathByID(n.client.Paths(n.now), 0); p.MaxPacket != 1280+dataOverhead {
-		t.Errorf("max packet %d: probed for IP_DATAGRAM without redundancy", p.MaxPacket)
+	// IP_DATAGRAM is still negotiated, for FEC; with FEC declined as well,
+	// paths are not probed for its larger packets.
+	rc.NoFEC = true
+	n2, _, _ := lossyPaths(t, 63, ClientConfig{}, rc, 0)
+	n2.runFor(time.Second)
+	if p, _ := pathByID(n2.client.Paths(n2.now), 0); p.MaxPacket != 1280+dataOverhead {
+		t.Errorf("max packet %d: probed for IP_DATAGRAM without redundancy or FEC", p.MaxPacket)
 	}
 }
 

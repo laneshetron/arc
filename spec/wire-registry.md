@@ -35,16 +35,19 @@ All other type values are reserved: drop them silently.
 | `0x0D` | `ERROR` | 2 | yes |
 | `0x0E` | `IP_DATAGRAM` | 28+ (`datagram_id:u64` + IP packet) | yes |
 | `0x0F` | `REDUNDANCY` | 5 (`seq:u32; mode:u8`, mode 0 or 1) | yes |
-| `0x10`–`0x7F` | reserved, required | — | reject the packet |
+| `0x10` | `FEC_REPAIR` | 9+ (`first32:u32; stride:u8; k:u8; m:u8; index:u8` + symbol) | yes |
+| `0x11` | `FEC` | 5 (`seq:u32; mode:u8`, mode 0–2) | yes |
+| `0x12`–`0x7F` | reserved, required | — | reject the packet |
 | `0x80`–`0xFF` | extensions, ignorable | — | ignore |
 
-`IP_DATAGRAM` and `REDUNDANCY` are sent only when `AUTH_RESULT` advertises features bit 0 (§11.1).
+`IP_DATAGRAM` and `REDUNDANCY` are sent only when `AUTH_RESULT` advertises features bit 0 (§11.1), and `FEC_REPAIR` and `FEC` only with bit 1 (§11.2), which also allows `IP_DATAGRAM`.
 
 ## AUTH_RESULT features (§10.1)
 
 | Bit | Name | Meaning |
 |---|---|---|
 | 0 | `REDUNDANCY` | relay accepts `IP_DATAGRAM` and `REDUNDANCY` (§11.1) |
+| 1 | `FEC` | relay accepts `IP_DATAGRAM`, `FEC_REPAIR` and `FEC` (§11.2) |
 
 Other bits are sent as zero and ignored on receipt.
 

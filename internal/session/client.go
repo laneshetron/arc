@@ -40,6 +40,11 @@ type ClientConfig struct {
 	// Redundancy selects when IP traffic is sent on two paths at once
 	// (§11.1). It needs a second healthy path and a relay that supports it.
 	Redundancy RedundancyPolicy
+
+	// FEC selects forward error correction (§11.2) for both directions:
+	// off, auto (while measured loss is at least 0.5%, sized from it), or
+	// always. It needs a relay that supports it.
+	FEC wire.FECMode
 }
 
 // RedundancyPolicy selects when the client sends IP traffic on two paths
@@ -345,6 +350,13 @@ func (c *Client) pathFor(now time.Time, pkt []byte) *path {
 	return p
 }
 
+// deliverRecovered queues IP packets rebuilt by FEC; the decoder owns them.
+func (c *Client) deliverRecovered(pkts [][]byte) {
+	for _, p := range pkts {
+		c.ips = append(c.ips, copyBytes(p))
+	}
+}
+
 func (c *Client) handleData(now time.Time, b []byte) {
 	if c.conn == nil {
 		return
@@ -382,12 +394,18 @@ func (c *Client) handleData(now time.Time, b []byte) {
 		case wire.IPDatagram:
 			if c.state == StateActive && c.conn.receiveDatagram(f) {
 				c.ips = append(c.ips, copyBytes(f.Packet))
+				c.deliverRecovered(c.conn.fecSource(now, f.DatagramID, f.Packet))
 			}
 		case wire.IPFragment:
 			if c.state == StateActive {
 				if pkt := c.conn.receiveFragment(now, f); pkt != nil {
 					c.ips = append(c.ips, pkt)
+					c.deliverRecovered(c.conn.fecSource(now, f.DatagramID, pkt))
 				}
+			}
+		case wire.FECRepair:
+			if c.state == StateActive {
+				c.deliverRecovered(c.conn.fecRepair(now, f))
 			}
 		case wire.NewPath:
 			if len(c.slots) < maxPaths && c.conn.path(f.PathID) == nil {
@@ -436,7 +454,11 @@ func (c *Client) onAuthResult(now time.Time, r wire.AuthResult) {
 	c.state = StateActive
 	p0 := c.conn.path(0)
 	p0.validated = true
-	c.conn.setProbeSizes(r.TunMTU, r.Features&wire.FeatureRedundancy != 0)
+	c.conn.setProbeSizes(r.TunMTU, r.Features&(wire.FeatureRedundancy|wire.FeatureFEC) != 0)
+	if r.Features&wire.FeatureFEC != 0 && c.cfg.FEC != wire.FECOff {
+		c.conn.fec.mode = c.cfg.FEC
+		c.conn.queue(wire.FEC{Seq: 1, Mode: c.cfg.FEC}) // the relay protects the downlink likewise
+	}
 	c.conn.keepalive = c.keepalive()
 	c.conn.probe(now, p0)
 	c.events = append(c.events, Established{Config: r})

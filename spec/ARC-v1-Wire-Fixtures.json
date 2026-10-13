@@ -68,7 +68,7 @@
     {
       "name": "AUTH_RESULT",
       "type": 2,
-      "frame_hex": "02001c000a4d00021005000a4d0001000027100001d4c00000000000000001",
+      "frame_hex": "02001c000a4d00021005000a4d0001000027100001d4c00000000000000003",
       "fields": {
         "status": 0,
         "ipv4": "10.77.0.2",
@@ -77,7 +77,7 @@
         "dns_ipv4": "10.77.0.1",
         "keepalive_ms": 10000,
         "idle_ms": 120000,
-        "features": 1
+        "features": 3
       }
     },
     {
@@ -214,6 +214,28 @@
       "frame_hex": "0f00050000000701",
       "fields": {
         "seq": 7,
+        "mode": 1
+      }
+    },
+    {
+      "name": "FEC_REPAIR",
+      "type": 16,
+      "frame_hex": "1000300000002b04100302000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2021222324252627",
+      "fields": {
+        "first32": 43,
+        "stride": 4,
+        "k": 16,
+        "m": 3,
+        "index": 2,
+        "data_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2021222324252627"
+      }
+    },
+    {
+      "name": "FEC",
+      "type": 17,
+      "frame_hex": "1100050000000801",
+      "fields": {
+        "seq": 8,
         "mode": 1
       }
     },
@@ -394,6 +416,22 @@
     {
       "name": "redundancy wrong size",
       "hex": "0f000400000001"
+    },
+    {
+      "name": "fec_repair without data",
+      "hex": "1000080000000101040100"
+    },
+    {
+      "name": "fec_repair index past m",
+      "hex": "10001c00000001010402020000000000000000000000000000000000000000"
+    },
+    {
+      "name": "fec_repair stride zero",
+      "hex": "10001c00000001000402000000000000000000000000000000000000000000"
+    },
+    {
+      "name": "fec unknown mode",
+      "hex": "1100050000000103"
     },
     {
       "name": "redundancy unknown mode",

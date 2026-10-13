@@ -34,6 +34,10 @@ type RelayConfig struct {
 	IdleTimeout         time.Duration
 	Rand                io.Reader
 
+	// NoFEC declines forward error correction (§11.2): clients neither
+	// protect their uplink nor have the relay protect their downlink.
+	NoFEC bool
+
 	// NoRedundancy declines to send downlink traffic on two paths when a
 	// client asks (§11.1), which doubles the relay's traffic for that
 	// client. Without the feature advertised, clients send uplink copies
@@ -118,8 +122,10 @@ type RelaySession struct {
 	resp          []byte
 	initKey       initKey
 	nextPathID    uint32
-	lastUplink    *path      // where the client most recently sent from
-	redundancySeq uint32     // REDUNDANCY seq last applied
+	lastUplink    *path  // where the client most recently sent from
+	redundancySeq uint32 // REDUNDANCY seq last applied
+	fecSeq        uint32 // FEC seq last applied
+	fecSet        bool
 	retiredCIDs   []wire.CID // this session's entries in Relay.retired, oldest first
 	redundancySet bool
 	flows         flowTable // downlink path per flow: where its uplink last arrived
@@ -282,9 +288,20 @@ func (r *Relay) handleData(now time.Time, from netip.AddrPort, b []byte) {
 			s.deliver(now, p, f.Packet, true)
 		case wire.IPDatagram:
 			s.onUplink(p)
-			if s.result.Features&wire.FeatureRedundancy != 0 && s.conn.receiveDatagram(f) {
+			if s.result.Features&(wire.FeatureRedundancy|wire.FeatureFEC) != 0 && s.conn.receiveDatagram(f) {
 				s.deliver(now, p, f.Packet, true)
+				for _, pkt := range s.conn.fecSource(now, f.DatagramID, f.Packet) {
+					s.deliver(now, p, pkt, true)
+				}
 			}
+		case wire.FECRepair:
+			if s.result.Features&wire.FeatureFEC != 0 {
+				for _, pkt := range s.conn.fecRepair(now, f) {
+					s.deliver(now, p, pkt, true)
+				}
+			}
+		case wire.FEC:
+			s.onFEC(f)
 		case wire.Redundancy:
 			s.onRedundancy(f)
 		case wire.IPFragment:
@@ -292,6 +309,9 @@ func (r *Relay) handleData(now time.Time, from netip.AddrPort, b []byte) {
 			if s.state == StateActive {
 				if pkt := s.conn.receiveFragment(now, f); pkt != nil {
 					s.deliver(now, p, pkt, false)
+					for _, rec := range s.conn.fecSource(now, f.DatagramID, pkt) {
+						s.deliver(now, p, rec, true)
+					}
 				}
 			}
 		case wire.PathJoin:
@@ -339,6 +359,16 @@ func (s *RelaySession) pathFor(now time.Time, pkt []byte) *path {
 		}
 	}
 	return prim
+}
+
+// onFEC applies a client's downlink FEC request, ignoring requests older
+// than one already applied (§11.2).
+func (s *RelaySession) onFEC(f wire.FEC) {
+	if s.state != StateActive || s.result.Features&wire.FeatureFEC == 0 || s.fecSet && f.Seq <= s.fecSeq {
+		return
+	}
+	s.fecSeq, s.fecSet = f.Seq, true
+	s.conn.fec.mode = f.Mode
 }
 
 // onUplink notes that the client sent IP traffic on p. Downlink traffic
@@ -505,11 +535,14 @@ func (s *RelaySession) onAuth(now time.Time, credential []byte) bool {
 	if !r.cfg.NoRedundancy {
 		result.Features |= wire.FeatureRedundancy
 	}
+	if !r.cfg.NoFEC {
+		result.Features |= wire.FeatureFEC
+	}
 	s.result = result
 	s.state = StateActive
 	r.leavePending(s)
 	s.conn.queue(result)
-	s.conn.setProbeSizes(result.TunMTU, !r.cfg.NoRedundancy)
+	s.conn.setProbeSizes(result.TunMTU, result.Features&(wire.FeatureRedundancy|wire.FeatureFEC) != 0)
 	if result.KeepaliveMS > 0 {
 		s.conn.keepalive = time.Duration(result.KeepaliveMS) * time.Millisecond
 	}

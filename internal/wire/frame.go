@@ -25,6 +25,8 @@ const (
 	FrameError         FrameType = 0x0D
 	FrameIPDatagram    FrameType = 0x0E
 	FrameRedundancy    FrameType = 0x0F
+	FrameFECRepair     FrameType = 0x10
+	FrameFEC           FrameType = 0x11
 
 	// Frame types at or above FirstExtensionFrame are optional extensions
 	// that receivers may ignore; unknown types below it are required.
@@ -34,7 +36,7 @@ const (
 var frameNames = [...]string{
 	"PADDING", "AUTH", "AUTH_RESULT", "IP_PACKET", "IP_FRAGMENT", "NEW_PATH", "PATH_JOIN",
 	"PATH_CHALLENGE", "PATH_RESPONSE", "PATH_ABANDON", "PING", "ACK", "CLOSE", "ERROR",
-	"IP_DATAGRAM", "REDUNDANCY",
+	"IP_DATAGRAM", "REDUNDANCY", "FEC_REPAIR", "FEC",
 }
 
 func (t FrameType) String() string {
@@ -79,6 +81,8 @@ const (
 	ipFragmentFixed = 12
 	ipDatagramFixed = 8
 	redundancyLen   = 5
+	fecRepairFixed  = 8
+	fecLen          = 5
 	ackFixed        = 21
 )
 
@@ -117,7 +121,36 @@ type IPDatagram struct {
 const (
 	// FeatureRedundancy: the relay accepts IP_DATAGRAM and REDUNDANCY.
 	FeatureRedundancy uint64 = 1 << 0
+	// FeatureFEC: the relay accepts FEC_REPAIR and FEC (§11.2).
+	FeatureFEC uint64 = 1 << 1
 )
+
+// FECRepair is one forward-error-correction repair symbol (§11.2) for the
+// block of K datagrams with IDs First, First+Stride, ..., of which only
+// the low 32 bits travel. Data is as long as the block's longest datagram.
+type FECRepair struct {
+	First32 uint32
+	Stride  uint8
+	K, M    uint8
+	Index   uint8
+	Data    []byte
+}
+
+// FECMode is the forward error correction a client asks the relay to
+// apply to downlink traffic (§11.2).
+type FECMode uint8
+
+const (
+	FECOff    FECMode = 0
+	FECAuto   FECMode = 1 // sized from the relay's measured downlink loss
+	FECAlways FECMode = 2 // at least one repair per block even without loss
+)
+
+// FEC sets the downlink FEC mode. Seq orders requests, as for REDUNDANCY.
+type FEC struct {
+	Seq  uint32
+	Mode FECMode
+}
 
 // RedundancyMode selects how the relay sends downlink IP traffic (§11.1).
 type RedundancyMode uint8
@@ -204,6 +237,8 @@ func (CloseFrame) Type() FrameType    { return FrameClose }
 func (ErrorFrame) Type() FrameType    { return FrameError }
 func (IPDatagram) Type() FrameType    { return FrameIPDatagram }
 func (Redundancy) Type() FrameType    { return FrameRedundancy }
+func (FECRepair) Type() FrameType     { return FrameFECRepair }
+func (FEC) Type() FrameType           { return FrameFEC }
 func (u Unknown) Type() FrameType     { return u.FrameType }
 
 // AppendFrame appends the TLV encoding of f to b. It panics if the encoded
@@ -272,6 +307,17 @@ func (d IPDatagram) appendValue(b []byte) []byte {
 func (r Redundancy) appendValue(b []byte) []byte {
 	b = binary.BigEndian.AppendUint32(b, r.Seq)
 	return append(b, byte(r.Mode))
+}
+
+func (r FECRepair) appendValue(b []byte) []byte {
+	b = binary.BigEndian.AppendUint32(b, r.First32)
+	b = append(b, r.Stride, r.K, r.M, r.Index)
+	return append(b, r.Data...)
+}
+
+func (f FEC) appendValue(b []byte) []byte {
+	b = binary.BigEndian.AppendUint32(b, f.Seq)
+	return append(b, byte(f.Mode))
 }
 
 func (f IPFragment) appendValue(b []byte) []byte {
@@ -354,6 +400,8 @@ var (
 	errAuthResultFields = malformed("AUTH_RESULT failure with nonzero fields")
 	errAuthResultMTU    = malformed("AUTH_RESULT tun_mtu below minimum")
 	errRedundancyMode   = malformed("REDUNDANCY unknown mode")
+	errFECRepair        = malformed("FEC_REPAIR geometry invalid")
+	errFECMode          = malformed("FEC unknown mode")
 	errIPVersion        = malformed("IP_PACKET has unknown IP version")
 	errIPLength         = malformed("IP_PACKET length does not match IP header")
 	errFragmentRange    = malformed("IP_FRAGMENT range invalid")
@@ -457,6 +505,26 @@ func parseValue(t FrameType, v []byte) (Frame, error) {
 			return nil, errRedundancyMode
 		}
 		return r, nil
+
+	case FrameFECRepair:
+		if len(v) <= fecRepairFixed {
+			return nil, errFrameSize
+		}
+		r := FECRepair{First32: binary.BigEndian.Uint32(v), Stride: v[4], K: v[5], M: v[6], Index: v[7], Data: v[fecRepairFixed:]}
+		if r.Stride < 1 || r.Stride > 16 || r.K < 1 || r.K > 64 || r.M < 1 || r.M > 32 || r.Index >= r.M {
+			return nil, errFECRepair
+		}
+		return r, nil
+
+	case FrameFEC:
+		if len(v) != fecLen {
+			return nil, errFrameSize
+		}
+		f := FEC{Seq: binary.BigEndian.Uint32(v), Mode: FECMode(v[4])}
+		if f.Mode > FECAlways {
+			return nil, errFECMode
+		}
+		return f, nil
 
 	case FrameNewPath:
 		if len(v) != newPathLen {

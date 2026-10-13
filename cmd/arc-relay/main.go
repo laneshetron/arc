@@ -134,6 +134,7 @@ func run(args []string) error {
 	tlsListen := fs.String("tls-listen", "", "TCP address for TLS/TCP carriers, e.g. 0.0.0.0:443 (default: off)")
 	tlsCert := fs.String("tls-cert", "relay.crt", "TLS certificate (PEM) for -tls-listen")
 	tlsKey := fs.String("tls-key", "relay.tls.key", "TLS private key (PEM) for -tls-listen")
+	noFEC := fs.Bool("no-fec", false, "decline forward error correction for clients' traffic")
 	noRedundancy := fs.Bool("no-redundancy", false, "decline clients' requests to duplicate downlink traffic on two paths")
 	prof := profiling.Register(fs)
 	fs.Parse(args)
@@ -220,7 +221,7 @@ func run(args []string) error {
 	err = engine.RunRelay(ctx, engine.RelayConfig{
 		Session: session.RelayConfig{
 			Static: static, ResetSecret: resetSecret, IdleTimeout: gwCfg.Idle + 10*time.Second,
-			NoRedundancy: *noRedundancy,
+			NoRedundancy: *noRedundancy, NoFEC: *noFEC,
 		},
 		Conn: conn, Streams: streams, TUN: dev, Gateway: gw, Logger: log, StatusInterval: *status,
 	})

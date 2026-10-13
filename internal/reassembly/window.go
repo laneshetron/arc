@@ -42,3 +42,6 @@ func (w *Window) Deliver(id uint64) bool {
 	*block |= bit
 	return true
 }
+
+// Highest returns the highest ID delivered, and whether any has been.
+func (w *Window) Highest() (uint64, bool) { return w.highest, w.started }
