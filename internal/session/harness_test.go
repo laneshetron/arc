@@ -28,6 +28,35 @@ type link struct {
 	rate      int
 	queue     time.Duration
 	busyUntil time.Time
+
+	// Bursty loss (Gilbert-Elliott, as netem's gemodel): per datagram the
+	// link enters a bad state with probability burstP and leaves it with
+	// probability burstR, losing everything while bad. Average loss is
+	// burstP/(burstP+burstR) and the mean burst 1/burstR datagrams.
+	burstP, burstR float64
+	bad            bool
+}
+
+// lost reports whether the link loses its next datagram.
+func (l *link) lost(rng *rand.Rand) bool {
+	if l.down || rng.Float64() < l.loss {
+		return true
+	}
+	if l.burstP == 0 {
+		return false
+	}
+	if l.bad {
+		l.bad = rng.Float64() >= l.burstR
+	} else {
+		l.bad = rng.Float64() < l.burstP
+	}
+	return l.bad
+}
+
+// bursty sets bursty loss averaging loss with bursts of meanBurst datagrams.
+func (l *link) bursty(loss, meanBurst float64) {
+	l.burstR = 1 / meanBurst
+	l.burstP = loss * l.burstR / (1 - loss)
 }
 
 // carrier is one client path's network attachment: the client's address
@@ -154,7 +183,7 @@ func (n *network) send(toRelay bool, pathID uint32, data []byte) {
 		copies = 2
 	}
 	for range copies {
-		if l.down || n.rng.Float64() < l.loss || (l.mtu > 0 && len(data) > l.mtu) {
+		if l.lost(n.rng) || (l.mtu > 0 && len(data) > l.mtu) {
 			continue
 		}
 		at := n.now
@@ -387,4 +416,25 @@ func (n *network) clientEventsOf(match func(ClientEvent) bool) int {
 		}
 	}
 	return k
+}
+
+func TestBurstyLinkModel(t *testing.T) {
+	rng := rand.New(rand.NewPCG(1, 2))
+	var l link
+	l.bursty(0.05, 10)
+	lost, bursts, run := 0, 0, 0
+	const n = 1_000_000
+	for range n {
+		if l.lost(rng) {
+			lost++
+			run++
+		} else if run > 0 {
+			bursts++
+			run = 0
+		}
+	}
+	rate, mean := float64(lost)/n, float64(lost)/float64(bursts)
+	if rate < 0.045 || rate > 0.055 || mean < 9 || mean > 11 {
+		t.Errorf("loss %.4f in bursts of %.1f; want 0.05 in bursts of 10", rate, mean)
+	}
 }

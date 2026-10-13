@@ -4,7 +4,8 @@
 #
 # Part 1 runs plain routing (a control: what the impairment alone does to
 # TCP), ARC, and kernel WireGuard over link 0 under a set of netem
-# impairments, reporting TCP goodput, ping loss, and ping RTT.
+# impairments, reporting TCP goodput, ping loss, and ping RTT. Loss comes
+# uniform and in bursts (netem's Gilbert-Elliott model).
 #
 # Part 2 runs ARC over both links and measures multipath behavior: failover
 # time when the busy link is blackholed (clean and at 100 ms RTT), and
@@ -20,8 +21,9 @@
 #   - traffic leaves a busy link with 5% or 30% loss when the other is clean
 #   - 4 TCP flows over two 50 Mbit/s links get at least 1.4x one link's
 #     goodput, uploading and downloading
-#   - with both links at 5% loss (RTT ~0 and 40 ms), -redundancy auto at least halves ping loss
-#     and at least doubles TCP goodput
+#   - with both links at 5% loss (RTT ~0 and 40 ms, uniform and in bursts),
+#     -redundancy auto at least halves ping loss and at least doubles TCP
+#     goodput
 #   - a session comes up within 15 s with both links at 70% loss
 #   - TCP runs over the TLS/TCP carrier when UDP is blocked (Part 3)
 #   - a session survives about 80 s of 90% loss on both links and carries
@@ -121,6 +123,13 @@ SCENARIOS=(
   "loss 1%|loss 1%"
   "loss 5%|loss 5%"
   "rtt 100ms, jitter 20ms|delay 50ms 20ms distribution normal"
+  # Loss in bursts (Gilbert-Elliott: p = good->bad, r = bad->good per
+  # packet, every packet lost while bad), as on real wireless links, at the
+  # same average rates as uniform loss. "bursty 1% (4)" averages 1% loss in
+  # bursts of 4 packets; the mean burst length is 1/r.
+  "rtt 40ms, loss 1%|delay 20ms loss 1%"
+  "rtt 40ms, bursty 1% (4)|delay 20ms loss gemodel 0.25% 25%"
+  "rtt 40ms, bursty 5% (10)|delay 20ms loss gemodel 0.53% 10%"
   "50 Mbit/s, rtt 40ms|rate 50mbit delay 20ms"
 )
 ROWS=()
@@ -334,6 +343,7 @@ compare_redundancy() { # compare_redundancy NAME NETEM_ARGS...
 }
 compare_redundancy "both links at 5% loss" loss 5%
 compare_redundancy "both at 5% loss, rtt 40ms" delay 20ms loss 5%
+compare_redundancy "both bursty 5% (10), rtt 40ms" delay 20ms loss gemodel 0.53% 10%
 
 # Connecting through heavy loss (spec §9.2): the client repeats its
 # handshake on both links and its AUTH every 100 ms, so a session comes up
