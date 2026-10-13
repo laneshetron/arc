@@ -107,7 +107,7 @@ tcp_up() { # tcp_up [IPERF_ARGS...]: prints TCP goodput in Mbit/s (uplink unless
 }
 
 ping_stats() { # ping_stats [COUNT]: prints "LOSS% AVG_MS" for COUNT (50) pings 20 ms apart
-  $C ping -q -c "${1:-50}" -i 0.02 -W 2 "$TARGET" >"$WORK/ping.log" 2>&1 || true
+  $C timeout 60 ping -q -c "${1:-50}" -i 0.02 -W 2 "$TARGET" >"$WORK/ping.log" 2>&1 || true
   local loss avg
   loss=$(grep -oE '[0-9.]+% packet loss' "$WORK/ping.log" | cut -d% -f1)
   avg=$(grep -oE 'rtt [^=]+= [0-9.]+/[0-9.]+' "$WORK/ping.log" | awk -F/ '{print $NF}')
@@ -184,7 +184,7 @@ tx() { $C cat "/sys/class/net/$1/statistics/tx_packets"; }
 busy_link() { # prints 0 or 1: the link carrying tunnel traffic now
   local a b
   a=$(tx c0) b=$(tx c1)
-  $C ping -q -c 20 -i 0.02 -W 1 "$TARGET" >/dev/null 2>&1 || true
+  $C timeout 60 ping -q -c 20 -i 0.02 -W 1 "$TARGET" >/dev/null 2>&1 || true
   if (($(tx c0) - a >= $(tx c1) - b)); then echo 0; else echo 1; fi
 }
 
@@ -194,7 +194,7 @@ busy_link() { # prints 0 or 1: the link carrying tunnel traffic now
 outage() {
   local link
   link=$(busy_link)
-  $C ping -q -c 300 -i 0.02 -W 1 "$TARGET" >"$WORK/outage.log" 2>&1 &
+  $C timeout 60 ping -q -c 300 -i 0.02 -W 1 "$TARGET" >"$WORK/outage.log" 2>&1 &
   local ping_pid=$!
   sleep 1
   impair "$link" "$@"
@@ -379,7 +379,7 @@ extreme_loss() { # extreme_loss REDUNDANCY
   impair 0 loss 90%
   impair 1 loss 90%
   # ping fails when no reply arrives at all, which is a result here
-  received=$({ $C ping -q -c 100 -i 0.2 -W 2 "$TARGET" 2>/dev/null || true; } | grep -oE '[0-9]+ received' | cut -d' ' -f1)
+  received=$({ $C timeout 60 ping -q -c 100 -i 0.2 -W 2 "$TARGET" 2>/dev/null || true; } | grep -oE '[0-9]+ received' | cut -d' ' -f1)
   t0=$(date +%s.%N)
   if $C timeout 60 iperf3 -c "$TARGET" -n 100K -f k >"$WORK/iperf-extreme.log" 2>&1; then
     xfer="$(awk -v a="$t0" -v b="$(date +%s.%N)" 'BEGIN { printf "%.1f s", b - a }')"
@@ -390,7 +390,7 @@ extreme_loss() { # extreme_loss REDUNDANCY
   unimpair 0
   unimpair 1
   t0=$(date +%s.%N)
-  if wait_until 10 $C ping -c 1 -W 1 "$TARGET"; then
+  if wait_until 10 $C timeout 60 ping -c 1 -W 1 "$TARGET"; then
     recover=$(awk -v a="$t0" -v b="$(date +%s.%N)" 'BEGIN { printf "%.1f", b - a }')
   else
     recover=-
@@ -430,7 +430,7 @@ carrier_row() { # carrier_row NAME NETEM_ARGS...
   for carrier in udp tls; do
     if [[ $carrier == tls ]]; then block_udp A; fi
     sleep 3 # the session moves to the working carrier
-    $C ping -q -c 40 -i 0.25 -W 3 "$TARGET" >"$WORK/ping-during.log" 2>&1 &
+    $C timeout 60 ping -q -c 40 -i 0.25 -W 3 "$TARGET" >"$WORK/ping-during.log" 2>&1 &
     local ping_pid=$!
     mbps=$(tcp_up)
     wait "$ping_pid" || true

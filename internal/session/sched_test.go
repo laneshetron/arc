@@ -186,7 +186,7 @@ func TestPingLossNotCounted(t *testing.T) {
 		s.add(sentPacket{pn: pn, sentAt: now, ping: pn < 10, size: 100})
 	}
 	ack := wire.Ack{Largest: 19}
-	res := s.onAck(now, &ack, []wire.PacketRange{{Lo: 19, Hi: 19}}, 0)
+	res := s.onAck(now, &ack, []wire.PacketRange{{Lo: 19, Hi: 19}}, 0, 0)
 	if res.lostCount != 7 { // data packets 10..16 lost; 17 and 18 within the threshold
 		t.Errorf("lost %d, want 7: pings must not count", res.lostCount)
 	}

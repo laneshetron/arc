@@ -35,7 +35,7 @@ wait_for() { # wait_for SECONDS DESCRIPTION COMMAND...
 # --- topology ------------------------------------------------------------
 setup_topology 10.77.0.0/16
 
-if $C ping -c1 -W1 192.168.20.2 >/dev/null 2>&1; then
+if $C timeout 60 ping -c1 -W1 192.168.20.2 >/dev/null 2>&1; then
   fail "client reaches the internet namespace without the tunnel"
 else
   pass "no route to the internet namespace before the tunnel"
@@ -75,7 +75,7 @@ wait_for 10 "client established" grep -q "session established" "$WORK/client.log
   pass "session established"
 
 # --- checks --------------------------------------------------------------
-if $C ping -c5 -i0.2 -W2 192.168.20.2 >"$WORK/ping.log" 2>&1; then
+if $C timeout 60 ping -c5 -i0.2 -W2 192.168.20.2 >"$WORK/ping.log" 2>&1; then
   pass "ping through the tunnel ($(grep -o 'rtt.*' "$WORK/ping.log"))"
 else
   fail "ping through the tunnel"
@@ -121,9 +121,9 @@ wait_for 10 "second link joined" grep -q "path validated" "$WORK/client.log" &&
   pass "second link joined the session"
 tx() { $C cat "/sys/class/net/$1/statistics/tx_packets"; }
 a0=$(tx c0) b0=$(tx c1)
-$C ping -c20 -i0.05 -W1 192.168.20.2 >/dev/null 2>&1 || true
+$C timeout 60 ping -c20 -i0.05 -W1 192.168.20.2 >/dev/null 2>&1 || true
 if (($(tx c0) - a0 >= $(tx c1) - b0)); then busy=c0; else busy=c1; fi
-$C ping -c100 -i0.05 -W1 192.168.20.2 >"$WORK/failover.log" 2>&1 &
+$C timeout 60 ping -c100 -i0.05 -W1 192.168.20.2 >"$WORK/failover.log" 2>&1 &
 PING_PID=$!
 sleep 1
 ip -n arc-c link set "$busy" down
@@ -147,9 +147,9 @@ fi
 # reconnects with a new session.
 kill "$RELAY_PID"; wait "$RELAY_PID" 2>/dev/null || true
 start_relay
-$C ping -c1 -W1 192.168.20.2 >/dev/null 2>&1 || true   # triggers the reset
+$C timeout 60 ping -c1 -W1 192.168.20.2 >/dev/null 2>&1 || true   # triggers the reset
 if wait_for 15 "reconnect after relay restart" bash -c "[ \$(grep -c 'session established' '$WORK/client.log') -ge 2 ]" &&
-  $C ping -c3 -i0.2 -W2 192.168.20.2 >/dev/null 2>&1; then
+  $C timeout 60 ping -c3 -i0.2 -W2 192.168.20.2 >/dev/null 2>&1; then
   pass "client recovered after relay restart"
   grep -q 'relay reset the session' "$WORK/client.log" && pass "recovery used the stateless reset"
 else
@@ -161,7 +161,7 @@ fi
 block_udp() { $C iptables -"$1" OUTPUT -p udp -d 192.168.10.2 --dport 4433 -j DROP; }
 sessions=$(grep -c 'session established' "$WORK/client.log")
 sleep 2 # the TLS carriers connect and join
-$C ping -c100 -i0.05 -W1 192.168.20.2 >"$WORK/tls-failover.log" 2>&1 &
+$C timeout 60 ping -c100 -i0.05 -W1 192.168.20.2 >"$WORK/tls-failover.log" 2>&1 &
 PING_PID=$!
 sleep 1
 block_udp A
@@ -185,7 +185,7 @@ else
 fi
 block_udp D
 sleep 3 # UDP paths turn healthy again
-if $C ping -c5 -i0.2 -W2 192.168.20.2 >/dev/null 2>&1; then
+if $C timeout 60 ping -c5 -i0.2 -W2 192.168.20.2 >/dev/null 2>&1; then
   pass "traffic continues after UDP returns"
 else
   fail "traffic stopped after UDP returned"
@@ -199,7 +199,7 @@ $C "$BIN/arc-client" run "${CLIENT_ARGS[@]}" >"$WORK/client-tls.log" 2>&1 &
 CLIENT_PID=$!
 PIDS+=("$CLIENT_PID")
 if wait_for 15 "session over TLS/TCP" grep -q "session established" "$WORK/client-tls.log" &&
-  $C ping -c3 -i0.2 -W2 192.168.20.2 >/dev/null 2>&1; then
+  $C timeout 60 ping -c3 -i0.2 -W2 192.168.20.2 >/dev/null 2>&1; then
   pass "connected with UDP blocked, over TLS/TCP"
 else
   fail "could not connect with UDP blocked"
