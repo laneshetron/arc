@@ -93,9 +93,11 @@ func TestLossyPathLosesTraffic(t *testing.T) {
 				t.Fatalf("primary before loss: client %d, relay %d", c, r)
 			}
 			n.up.loss, n.down.loss = tc.up, tc.down
-			moves, c, r := lossTraffic(n, s, &seq, 3*time.Second)
+			// The primary moves within about a second; the flow, and with
+			// it the relay's downlink, follows after evictGrace.
+			moves, c, r := lossTraffic(n, s, &seq, 5*time.Second)
 			if c != id || r != id || moves != 1 {
-				t.Fatalf("after 3 s of loss: client on %d, relay on %d, %d moves; want both on %d after one move", c, r, moves, id)
+				t.Fatalf("after 5 s of loss: client on %d, relay on %d, %d moves; want both on %d after one move", c, r, moves, id)
 			}
 			// Path 0's estimate is no longer refreshed, so it stays bad
 			// until it goes stale; nothing should move in the meantime.
@@ -146,17 +148,27 @@ func TestStandbyKeepaliveDoesNotMoveDownlink(t *testing.T) {
 }
 
 func TestEquallyLossyPathsDoNotFlap(t *testing.T) {
+	// What flapping costs is a flow's packets switching paths, reordering
+	// them, so that is what is counted: switches of the path carrying the
+	// flow's uplink data. Each path's estimate is forgotten lossStale after
+	// it stops carrying traffic, so loss-driven switches come at most about
+	// that often.
 	n, s, _, c := establishTwoPaths(t, 43, 10*time.Millisecond)
-	// 10% is well above the switching threshold, without the occasional
-	// health failover that heavier loss causes.
 	n.up.loss, n.down.loss = 0.1, 0.1
 	c.up.loss, c.down.loss = 0.1, 0.1
-	var seq uint32
-	// Each path's estimate is forgotten lossStale after it stops carrying
-	// traffic, so at worst the paths trade places about that often.
-	moves, _, _ := lossTraffic(n, s, &seq, 2*time.Minute)
-	if limit := int(2*time.Minute/lossStale) + 1; moves > limit {
-		t.Errorf("%d moves in 2 minutes, want at most %d", moves, limit)
+	switches, last := 0, uint32(1<<31)
+	n.pathTap = func(toRelay bool, pathID uint32, data []byte) {
+		if toRelay && len(data) > 500 && pathID != last {
+			if last != 1<<31 {
+				switches++
+			}
+			last = pathID
+		}
 	}
-	t.Logf("%d moves", moves)
+	var seq uint32
+	lossTraffic(n, s, &seq, 2*time.Minute)
+	t.Logf("%d switches of the flow's path", switches)
+	if limit := int(2*time.Minute/lossStale) + 1; switches > limit {
+		t.Errorf("the flow switched paths %d times in 2 minutes, want at most %d", switches, limit)
+	}
 }

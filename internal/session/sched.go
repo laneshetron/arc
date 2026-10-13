@@ -227,10 +227,28 @@ func (c *conn) eligible(now time.Time, q, prim *path) bool {
 	return ok && r <= lossSwitchRatio
 }
 
-// keeps reports whether flows already on q stay there; see keepFlowRatio.
+// evictGrace is how long a healthy path must stay over keepFlowRatio
+// before its flows move. A burst of loss, such as TCP slow start
+// overshooting a queue just after flows arrive on a path, decays below the
+// line within about a second; sustained loss stays over it. Evicting on the
+// burst moved flows off a good path for good, since nothing moves them back.
+const evictGrace = 2 * time.Second
+
+// keeps reports whether flows already on q stay there: while it is healthy
+// and no more than keepFlowRatio costlier than the primary, or has been
+// costlier for less than evictGrace.
 func (c *conn) keeps(now time.Time, q, prim *path) bool {
 	r, ok := c.costRatio(now, q, prim)
-	return ok && r <= keepFlowRatio
+	switch {
+	case !ok:
+		return false
+	case r <= keepFlowRatio:
+		q.overSince = time.Time{}
+		return true
+	case q.overSince.IsZero():
+		q.overSince = now
+	}
+	return now.Sub(q.overSince) < evictGrace
 }
 
 // assign picks the path for a new flow: among eligible paths, the one with

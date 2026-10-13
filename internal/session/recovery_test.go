@@ -55,10 +55,14 @@ func TestSentLogInvariants(t *testing.T) {
 			hi := next - 1 - uint64(rng.IntN(int(min(next, 20))))
 			lo := hi - min(hi, uint64(rng.IntN(10)))
 			ack := wire.Ack{Largest: hi}
-			s.onAck(now, &ack, []wire.PacketRange{{Lo: lo, Hi: hi}}, 0)
+			const lossDelay = 10 * time.Millisecond
+			s.onAck(now, &ack, []wire.PacketRange{{Lo: lo, Hi: hi}}, 0, lossDelay)
 			for _, p := range s.packets {
 				if !p.acked && p.pn+packetThreshold <= s.largestAcked {
 					t.Fatalf("step %d: packet %d outstanding below the loss threshold", step, p.pn)
+				}
+				if !p.acked && p.pn < s.largestAcked && p.sentAt.Before(s.largestSent.Add(-lossDelay)) {
+					t.Fatalf("step %d: packet %d outstanding past the time threshold", step, p.pn)
 				}
 			}
 		case r < 95:
