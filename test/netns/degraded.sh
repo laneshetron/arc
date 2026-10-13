@@ -251,6 +251,8 @@ lossy_link() { # lossy_link LOSS
   start_multipath_client off "client-lossy-$1.log"
   sleep 1
   link=$(busy_link)
+  local from
+  from=$(wc -l <"$WORK/client-lossy-$1.log")
   impair "$link" loss "$1"
   mbps=$(tcp_up)
   after=$(busy_link)
@@ -260,8 +262,8 @@ lossy_link() { # lossy_link LOSS
   else
     fail "traffic stayed on c$link at $1 loss"
     echo "  path state (client, then relay), from -status:"
-    grep 'msg=path ' "$WORK/client-lossy-$1.log" | tail -2 | sed 's/^/    /'
-    grep 'msg=path ' "$WORK/relay.log" | tail -2 | sed 's/^/    /'
+    echo "  client path state since the loss began, from -status:"
+    tail -n +"$from" "$WORK/client-lossy-$1.log" | grep 'msg=path ' | sed 's/^/    /'
   fi
   unimpair "$link"
   sleep 1
@@ -330,7 +332,11 @@ compare_redundancy() { # compare_redundancy NAME NETEM_ARGS...
   both_lossy "$name" off "$@"
   off_mbps=$BL_MBPS off_loss=$BL_LOSS
   both_lossy "$name" auto "$@"
-  if awk -v a="$BL_LOSS" -v o="$off_loss" 'BEGIN { exit !(a < o / 2) }'; then
+  if awk -v o="$off_loss" 'BEGIN { exit !(o < 2) }'; then
+    # Bursty loss can miss a 300-ping run entirely; then there is nothing
+    # to halve, and the goodput check below carries the comparison.
+    echo "  ping loss without redundancy was only $off_loss%; not comparing ($name)"
+  elif awk -v a="$BL_LOSS" -v o="$off_loss" 'BEGIN { exit !(a < o / 2) }'; then
     pass "redundancy cut ping loss from $off_loss% to $BL_LOSS% ($name)"
   else
     fail "redundancy left ping loss at $BL_LOSS%, against $off_loss% without ($name)"
