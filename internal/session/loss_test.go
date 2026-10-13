@@ -24,14 +24,24 @@ func TestLossEstimator(t *testing.T) {
 		t.Fatalf("first window: %v %v, want 0.25", r, ok)
 	}
 
-	// Later windows move the estimate by lossGain.
-	now = now.Add(lossWindowTime)
-	l.record(now, 0, 0) // starts nothing: no outcomes
-	l.record(now, lossWindow, 0)
-	now = now.Add(lossWindowTime)
-	l.record(now, lossWindow, 0)
-	if r, _ := l.estimate(now); math.Abs(r-0.25*(1-lossGain)) > 1e-9 {
-		t.Fatalf("second window: %v", r)
+	// The first lossWarmup windows are averaged plainly.
+	fold := func(lost int) { // closes exactly one window with this many losses
+		l.record(now, lossWindow, lost)
+		now = now.Add(lossWindowTime)
+		l.record(now, 0, 0)
+	}
+	fold(0)
+	if r, _ := l.estimate(now); math.Abs(r-0.125) > 1e-9 {
+		t.Fatalf("second window: %v, want the mean 0.125", r)
+	}
+	// After them, each window moves the estimate by lossGain.
+	for range lossWarmup - 2 {
+		fold(0)
+	}
+	before, _ := l.estimate(now)
+	fold(lossWindow) // total loss
+	if r, _ := l.estimate(now); math.Abs(r-(before+lossGain*(1-before))) > 1e-9 {
+		t.Fatalf("after warm-up: %v from %v, want a step of lossGain", r, before)
 	}
 
 	// A late arrival cancels a loss; a window cannot go below zero.

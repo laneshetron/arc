@@ -17,6 +17,11 @@ const (
 	lossWindow     = 32
 	lossWindowTime = 100 * time.Millisecond
 	lossGain       = 0.125 // EWMA weight of each new window
+	// lossWarmup is how many windows a new estimate averages plainly
+	// before smoothing with lossGain. Smoothing from the first window
+	// converged slowly where a lossy path carries few packets (TCP at 5%
+	// loss), reading 1.3% for a 5% path when its flows had already left.
+	lossWarmup = 8
 
 	// lossStale is how long an estimate is trusted without new samples.
 	// Only paths carrying traffic produce samples, so an idle path's old
@@ -52,6 +57,7 @@ type lossEstimator struct {
 	start       time.Time
 	rate        float64
 	valid       bool
+	windows     int // folded so far, up to lossWarmup
 	updated     time.Time
 }
 
@@ -67,11 +73,13 @@ func (l *lossEstimator) record(now time.Time, total, lost int) {
 		return
 	}
 	frac := min(max(float64(l.lost)/float64(l.total), 0), 1)
-	if l.valid {
-		l.rate += lossGain * (frac - l.rate)
+	if l.windows < lossWarmup {
+		l.windows++
+		l.rate += (frac - l.rate) / float64(l.windows) // running mean
 	} else {
-		l.rate, l.valid = frac, true
+		l.rate += lossGain * (frac - l.rate)
 	}
+	l.valid = true
 	l.updated = now
 	l.total, l.lost = 0, 0
 }
