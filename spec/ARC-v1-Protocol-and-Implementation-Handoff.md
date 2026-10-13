@@ -368,12 +368,14 @@ frame_value:  frame_length bytes
 | `0D` | `ERROR` | 2 bytes: `code:u16` | Either, diagnostic only | Yes |
 | `0E` | `IP_DATAGRAM` | `datagram_id:u64; packet` (§11.1) | Both, after AUTH, if negotiated | Yes |
 | `0F` | `REDUNDANCY` | 5 bytes: `seq:u32; mode:u8` (§11.1) | Client → relay, if negotiated | Yes |
+| `10` | `FEC_REPAIR` | `first32:u32; stride:u8; k:u8; m:u8; index:u8; symbol` (§11.2) | Both, after AUTH, if negotiated | Yes |
+| `11` | `FEC` | 5 bytes: `seq:u32; mode:u8` (§11.2) | Client → relay, if negotiated | Yes |
 
 **`AUTH_RESULT`:**
 - `status=0` means success. Any other value is a failure, and all other fields MUST then be zero.
 - `tun_mtu` MUST be at least 1280 on success.
 - `dns_ipv4=0` means the relay supplied no resolver. Full-tunnel mode MUST then get an authenticated resolver setting from trusted, explicit client configuration.
-- `features` bit 0 (`REDUNDANCY`): the relay accepts `IP_DATAGRAM` and `REDUNDANCY` (§11.1). A relay MUST send other bits as zero, and a client MUST ignore bits it does not know.
+- `features` bit 0 (`REDUNDANCY`): the relay accepts `IP_DATAGRAM` and `REDUNDANCY` (§11.1). Bit 1 (`FEC`): the relay accepts `IP_DATAGRAM`, `FEC_REPAIR` and `FEC` (§11.2). A relay MUST send other bits as zero, and a client MUST ignore bits it does not know.
 - IPv6 configuration and pushed routes are deferred to an extension frame.
 - The relay controls address assignment by deployment policy. Receiving an address does not by itself authorize inbound Internet exposure.
 
@@ -437,6 +439,40 @@ When no path is clean, loss-aware selection (§15.2) has nowhere to move traffic
 - **Second path.** Copies go to the healthy validated path with the lowest cost (§15.2) other than the primary. If no other path is healthy, they go to any other validated path, since heavy loss on every link is when copies matter most. With a single validated path, nothing is duplicated.
 - **Policy (reference client).** `off` (the default), `always`, or `auto`. `auto` duplicates a direction while the primary path's loss estimate in that direction (§15.2) is at least 1%, until it falls below 0.4%. It considers every path carrying traffic (the primary and paths with flows): a direction is duplicated while any of them loses that much in it. It also duplicates both directions while the primary is not healthy. That happens only when no path is healthy, since otherwise the primary moves, and under loss that heavy the estimates update slowly because acknowledgements barely arrive. The primary's own packets keep its estimate current while copies are sent. Copies also keep the second path's estimate current, so loss-aware selection can move the primary to it.
 - **Limits.** Redundancy lowers loss but does not remove it: a TCP flow over two 5%-loss paths at 40 ms RTT is still loss-limited, at about 0.25%. Parity across paths (k packets plus one XOR, any one loss per group recoverable at 1/k overhead) is a possible later mode that trades recovery delay for bandwidth.
+
+### 11.2 Forward error correction
+
+Redundancy needs a second path. On a single lossy path, forward error correction (FEC) sends repair symbols that let the receiver rebuild lost IP packets without waiting for TCP to retransmit them.
+
+- **Negotiation.** The relay advertises support with `AUTH_RESULT` features bit 1. Without it, neither side sends `FEC_REPAIR` or `FEC`.
+- **Code.** Systematic Reed-Solomon over GF(2^8) (the reference implementation uses `klauspost/reedsolomon`). Source packets travel unchanged as `IP_DATAGRAM` or `IP_FRAGMENT`, and the receiver delivers each one as it arrives. Nothing waits for repairs unless a packet is missing.
+- **Blocks.** A block is K packets with consecutive datagram IDs `first, first+stride, …`. Repairs carry M symbols (indexes 0..M−1), each as long as the block's longest packet with shorter packets zero-padded. A rebuilt packet is trimmed to the length in its own IP header.
+- **Interleaving.** With stride d above 1, the sender assigns consecutive packets round-robin to d blocks that close together, and sends their repairs interleaved, so a burst of losses costs each block about 1/d of it.
+- **`FEC_REPAIR` frame.** It carries the low 32 bits of the block's first ID; the receiver takes the full ID closest to the highest ID it has delivered. It also carries stride (1–16), K (1–64), M (1–32), the repair index (< M), and the symbol. The 8-byte header plus a full-size symbol fits the probe size of §14.4 for `IP_DATAGRAM`.
+- **Delivery once.** Rebuilt packets pass through the same delivery window as `IP_DATAGRAM` (§11.1), so a copy rebuilt and a copy arriving late are delivered once.
+- **`FEC` frame.** The client controls both directions: it protects its own uplink according to its policy and sends `FEC(seq, mode)` for the downlink, with mode 0 off, 1 auto and 2 always. Other modes are malformed. The relay applies a request only if its `seq` is greater than the last applied, and sizes downlink FEC from its own measurements.
+- **Sizing (reference implementation).** All sizing comes from the sender's loss estimates for the paths carrying traffic (§15.2).
+  - `auto` protects while loss is at least 0.5%, until it falls below 0.2%. `always` sends at least one repair per block.
+  - The repair count per block is the smallest M for which more than M losses among K+M packets, lost independently at the measured rate, has probability at most 0.1%. It is capped at K/2.
+  - The interleaving depth is about the mean loss-burst length, at most 8. Bursts are measured as runs of lost packets ended by a later acknowledged one.
+  - A block group stays open about RTT/4, so rebuilt packets arrive before TCP takes the gap for loss, and at least long enough to collect 4 packets per block at the current send rate. The limit is 20 ms, or with interleaving min(RTT, 50 ms).
+  - With long bursts, `auto` stays off when a group at the current rate and window cannot span 4 mean bursts. Interleaving then cannot spread a burst, and the repairs would mostly be lost with it.
+  - Repairs travel on the primary path.
+- **Limits.** FEC repairs random loss well. Long bursts on one path are hard for any block code at moderate rates: a group deep enough to spread them spans more time than a rebuilt packet can usefully arrive in. Redundancy across independent paths (§11.1) handles that case far better.
+- **Default.** `arc-client` defaults to `auto`, on this evidence (`test/netns/fec.sh`: one link, 40 ms RTT, medians of repeated 10 s TCP runs, Mbit/s up / down):
+
+  | Scenario | FEC off | FEC auto | FEC always |
+  |---|---|---|---|
+  | Clean | 594 / 595 | 609 / 605 | 346 / 399 |
+  | 1% uniform loss | 4.1 / 3.7 | 13.5 / 30.0 | 19.0 / 16.3 |
+  | 5% uniform loss | 1.15 / 1.05 | 5.6 / 5.2 | 6.8 / 8.6 |
+  | 1% in bursts of 4 (7 runs) | 10.3 / 13.2 | 8.7 / 13.6 | — |
+  | 5% in bursts of 10 (7 runs) | 2.5 / 3.7 | 3.8 / 3.6 | — |
+
+  - On a clean path, `auto` sends nothing extra.
+  - Under uniform loss, TCP gains 3–8×.
+  - Under bursty loss, `auto` mostly holds back and is neutral: single runs vary several-fold, and the medians do not separate.
+  - `always` costs about 40% of clean-path throughput in this setup, in CPU for encoding and in extra packets.
 
 ## 12. Carrier framing and cells
 
@@ -559,7 +595,7 @@ Path 0 carries the handshake. Its CIDs come from the handshake itself: the clien
 
 Rules during joining:
 - **Before validation** the relay MAY process authenticated uplink from the candidate path. It MUST limit the bytes it sends to the candidate address to 3× the bytes received from it. For DNS and ICMP carriers it MUST also enforce separate per-client and per-zone query budgets.
-- **MTU probing:** once a path is validated (path 0: once the session is `ACTIVE`), each endpoint SHOULD send one separate probe: a `PING` padded with `PADDING` (§10.1) to the size needed to carry a full TUN-MTU packet unfragmented (§17.4). When redundancy is negotiated (§11.1), it also sends a second probe 8 bytes larger, the size of a full packet in `IP_DATAGRAM`. If a probe is acknowledged, the sender raises that path's maximum packet size to the largest probe acknowledged and stops using `IP_FRAGMENT` for packets that fit. A lost probe leaves the path at its current size and MUST NOT count toward path health or loss statistics. Probing is separate from validation so that a path with a small MTU still validates. Each direction probes independently, because path MTU can be asymmetric.
+- **MTU probing:** once a path is validated (path 0: once the session is `ACTIVE`), each endpoint SHOULD send one separate probe: a `PING` padded with `PADDING` (§10.1) to the size needed to carry a full TUN-MTU packet unfragmented (§17.4). When redundancy or FEC is negotiated (§11.1, §11.2), it also sends a second probe 8 bytes larger, the size of a full packet in `IP_DATAGRAM` or of a full-size repair in `FEC_REPAIR`. If a probe is acknowledged, the sender raises that path's maximum packet size to the largest probe acknowledged and stops using `IP_FRAGMENT` for packets that fit. A lost probe leaves the path at its current size and MUST NOT count toward path health or loss statistics. Probing is separate from validation so that a path with a small MTU still validates. Each direction probes independently, because path MTU can be asymmetric.
 - **Retransmission:** `PATH_JOIN` retransmissions use new packets with the **same** `client_cid`, which makes them idempotent. A `PATH_JOIN` for an already-joined path with a different `client_cid` is a `PROTOCOL_VIOLATION`, and that path is abandoned.
 - A `PATH_RESPONSE` matching any outstanding challenge for that path is accepted.
 

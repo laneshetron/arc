@@ -231,6 +231,15 @@ func checkFrameFields(t *testing.T, fr Frame, fields map[string]any) {
 		if v.DatagramID != num("datagram_id") || hex.EncodeToString(v.Packet) != fields["ip_packet_hex"] {
 			t.Errorf("IP_DATAGRAM = %+v", v)
 		}
+	case FECRepair:
+		if v.First32 != uint32(num("first32")) || v.Stride != uint8(num("stride")) || v.K != uint8(num("k")) ||
+			v.M != uint8(num("m")) || v.Index != uint8(num("index")) || hex.EncodeToString(v.Data) != fields["data_hex"] {
+			t.Errorf("FEC_REPAIR = %+v", v)
+		}
+	case FEC:
+		if v.Seq != uint32(num("seq")) || v.Mode != FECMode(num("mode")) {
+			t.Errorf("FEC = %+v", v)
+		}
 	case Redundancy:
 		if v.Seq != uint32(num("seq")) || v.Mode != RedundancyMode(num("mode")) {
 			t.Errorf("REDUNDANCY = %+v", v)

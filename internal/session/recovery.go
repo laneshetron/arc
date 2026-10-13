@@ -237,6 +237,13 @@ type sentLog struct {
 	anyAcked     bool
 	ptoCount     int
 	control      int // outstanding packets that carry control frames
+
+	// The run of lost packets in progress, for burst length: a run grows
+	// with each loss until a later packet is acknowledged, which ends it.
+	// One burst may be declared lost over several ACKs, and packets that
+	// are not tracked here (acknowledgement-only ones) do not split it.
+	runEnd uint64
+	runLen int
 }
 
 func (s *sentLog) add(p sentPacket) {
@@ -264,6 +271,7 @@ type ackResult struct {
 	hasRTT            bool
 	lost              []wire.Frame
 	lostCount         int
+	runSum, runCount  int // lengths and number of loss runs that ended
 	ackedProbe        int // largest MTU probe acknowledged
 }
 
@@ -289,6 +297,11 @@ func (s *sentLog) onAck(now time.Time, ack *wire.Ack, intervals []wire.PacketRan
 				if !p.ping {
 					res.delivered++
 					res.deliveredBytes += p.size
+					if s.runLen > 0 && p.pn > s.runEnd {
+						res.runSum += s.runLen // a later packet got through
+						res.runCount++
+						s.runLen = 0
+					}
 				}
 			}
 			res.ackedProbe = max(res.ackedProbe, p.probe)
@@ -324,6 +337,8 @@ func (s *sentLog) onAck(now time.Time, ack *wire.Ack, intervals []wire.PacketRan
 		s.retire(p) // lost
 		if p.probe == 0 && !p.ping {
 			res.lostCount++
+			s.runLen++
+			s.runEnd = p.pn
 		}
 		res.lost = append(res.lost, p.frames...)
 	}

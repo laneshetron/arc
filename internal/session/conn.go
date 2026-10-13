@@ -104,6 +104,7 @@ type path struct {
 	acks       ackTracker
 	sent       sentLog
 	rtt        rttEstimator
+	burst      float64       // mean length of loss runs in the send direction, 0 if none seen
 	sendLoss   lossEstimator // from acknowledgements; see loss.go
 	recvLoss   lossEstimator // from gaps in received packet numbers
 	sendRate   rateMax       // acknowledged bytes per second; see sched.go
@@ -224,6 +225,7 @@ type conn struct {
 	// (§11.1): uplink for the client, downlink for the relay.
 	redundant bool
 	second    *path // cached second path; see secondPath
+	fec       fecState
 	secondAt  time.Time
 
 	plaintext []byte
@@ -245,6 +247,8 @@ type Stats struct {
 	AmplificationDrops           uint64
 	RedundantSent                uint64 // IP packets sent on two paths
 	DuplicatesDropped            uint64 // received copies already delivered
+	FECRepairsSent               uint64 // FEC repair symbols sent
+	FECRecovered                 uint64 // IP packets rebuilt from FEC repairs
 }
 
 func newConn(keys crypto.TrafficKeys, now time.Time) *conn {
@@ -450,6 +454,14 @@ func (c *conn) onAck(now time.Time, ack *wire.Ack) {
 	if n := res.delivered + res.lostCount; n > 0 {
 		p.sendLoss.record(now, n, res.lostCount)
 	}
+	if res.runCount > 0 {
+		mean := float64(res.runSum) / float64(res.runCount)
+		if p.burst == 0 {
+			p.burst = mean
+		} else {
+			p.burst += lossGain * (mean - p.burst)
+		}
+	}
 	if res.deliveredBytes > 0 {
 		p.sendRate.add(now, res.deliveredBytes)
 	}
@@ -553,7 +565,7 @@ func (c *conn) transmitTo(now time.Time, p *path, extra []wire.Frame, ip ipPaylo
 	for _, f := range extra {
 		ackEliciting = ackEliciting || f.Type().AckEliciting()
 	}
-	c.sealPacket(now, p, pt, retx, ackEliciting, 0, ip.pkt == nil && len(retx) == 0, toCandidate)
+	c.sealPacket(now, p, pt, retx, ackEliciting, 0, ip.pkt == nil && len(retx) == 0 && !carriesRepair(extra), toCandidate)
 	if unbound := retx[pathBound:]; len(unbound) > 0 && !p.healthy(now, c.keepalive) {
 		c.copyControl(now, p, unbound)
 	}
@@ -633,10 +645,23 @@ func (c *conn) probe(now time.Time, p *path) {
 	}
 }
 
-// setProbeSizes sets the MTU probe sizes for a TUN MTU (§14.4).
-func (c *conn) setProbeSizes(tunMTU uint16, redundancy bool) {
+// carriesRepair reports whether frames include an FEC repair, whose loss
+// says as much about a path as a data packet's.
+func carriesRepair(frames []wire.Frame) bool {
+	for _, f := range frames {
+		if f.Type() == wire.FrameFECRepair {
+			return true
+		}
+	}
+	return false
+}
+
+// setProbeSizes sets the MTU probe sizes for a TUN MTU (§14.4). datagrams
+// says whether IP_DATAGRAM may be sent (redundancy or FEC negotiated),
+// whose packets and FEC repairs are 8 bytes larger.
+func (c *conn) setProbeSizes(tunMTU uint16, datagrams bool) {
 	c.probeSizes = []int{int(tunMTU) + dataOverhead}
-	if redundancy {
+	if datagrams {
 		c.probeSizes = append(c.probeSizes, int(tunMTU)+dataOverhead+8)
 	}
 }
@@ -664,17 +689,25 @@ func (c *conn) sendIP(now time.Time, pkt []byte) error {
 	if p == nil {
 		return ErrNoPath
 	}
+	var q *path
 	if c.redundant {
-		if q := c.secondPath(now, p); q != nil {
-			ip := ipPayload{pkt: pkt, id: c.nextDatagramID, hasID: true}
-			c.nextDatagramID++
-			c.sendOn(now, p, ip)
-			c.sendOn(now, q, ip)
-			c.stats.RedundantSent++
-			return nil
-		}
+		q = c.secondPath(now, p)
 	}
-	c.sendOn(now, p, ipPayload{pkt: pkt})
+	c.fec.sent++
+	protect := c.fecSending(now)
+	ip := ipPayload{pkt: pkt}
+	if q != nil || protect {
+		ip.id, ip.hasID = c.nextDatagramID, true
+		c.nextDatagramID++
+	}
+	c.sendOn(now, p, ip)
+	if q != nil {
+		c.sendOn(now, q, ip)
+		c.stats.RedundantSent++
+	}
+	if protect {
+		c.fecAdd(now, ip.id, pkt)
+	}
 	return nil
 }
 
@@ -758,11 +791,12 @@ func (c *conn) onTimers(now time.Time) {
 		p.sent.expire(now, sentHorizon)
 	}
 	c.reasm.Expire(now)
+	c.fecTimers(now)
 	c.flush(now)
 }
 
 func (c *conn) nextDeadline() time.Time {
-	var d time.Time
+	d := c.fecDeadline()
 	for _, p := range c.paths {
 		d = earliest(d, p.acks.deadline(), p.sent.ptoDeadline(&p.rtt))
 	}

@@ -92,6 +92,20 @@ func run(args []string) error {
 	tlsCA := fs.String("tls-ca", "", "PEM certificates to trust for -tls (default: the system roots)")
 	tlsName := fs.String("tls-server-name", "", "name to verify the relay's TLS certificate against (default: the -tls host)")
 	noOffload := fs.Bool("no-offload", false, "send and receive without UDP GSO/GRO, for comparison")
+	fecMode := wire.FECAuto
+	fs.Func("fec", "forward error correction: auto (default; while loss is at least 0.5%), off, or always", func(v string) error {
+		switch v {
+		case "off":
+			fecMode = wire.FECOff
+		case "auto":
+			fecMode = wire.FECAuto
+		case "always":
+			fecMode = wire.FECAlways
+		default:
+			return errors.New("want off, auto, or always")
+		}
+		return nil
+	})
 	mark := fs.Uint("mark", 0x5243, "fwmark for carrier sockets, used by -full-tunnel")
 	table := fs.Int("table", 5243, "routing table for -full-tunnel")
 	prof := profiling.Register(fs)
@@ -221,7 +235,7 @@ func run(args []string) error {
 		"routes", strings.Trim(routes.String(), "[]"))
 	err = engine.RunClient(ctx, engine.ClientConfig{
 		Session: session.ClientConfig{
-			Static: static, RelayPublic: pin[:], Credential: []byte(tokens[0]), Redundancy: redundancy,
+			Static: static, RelayPublic: pin[:], Credential: []byte(tokens[0]), Redundancy: redundancy, FEC: fecMode,
 		},
 		Relay: relayAddr, Carriers: carriers, TUN: dev, OnEstablished: onEstablished, Logger: log,
 		StatusInterval: *status,

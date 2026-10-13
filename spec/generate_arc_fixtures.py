@@ -29,7 +29,7 @@ HANDSHAKE_INIT, HANDSHAKE_RESP, COOKIE_REPLY, DATA, STATELESS_RESET, CELL = 1, 2
 F = dict(PADDING=0x00, AUTH=0x01, AUTH_RESULT=0x02, IP_PACKET=0x03, IP_FRAGMENT=0x04,
          NEW_PATH=0x05, PATH_JOIN=0x06, PATH_CHALLENGE=0x07, PATH_RESPONSE=0x08,
          PATH_ABANDON=0x09, PING=0x0A, ACK=0x0B, CLOSE=0x0C, ERROR=0x0D,
-         IP_DATAGRAM=0x0E, REDUNDANCY=0x0F)
+         IP_DATAGRAM=0x0E, REDUNDANCY=0x0F, FEC_REPAIR=0x10, FEC=0x11)
 
 CLIENT_CID = bytes.fromhex("c1c2c3c4c5c6c7c8")
 RELAY_CID = bytes.fromhex("a1a2a3a4a5a6a7a8")
@@ -188,8 +188,8 @@ def build():
 
     # --- Frames --------------------------------------------------------------
     ip = ipv4_packet(b"hello arc")
-    # features bit 0: redundancy (IP_DATAGRAM and REDUNDANCY) is supported.
-    auth_result = struct.pack("!BIBHIIIQ", 0, 0x0A4D0002, 16, 1280, 0x0A4D0001, 10000, 120000, 1)
+    # features bit 0: redundancy (IP_DATAGRAM and REDUNDANCY); bit 1: FEC.
+    auth_result = struct.pack("!BIBHIIIQ", 0, 0x0A4D0002, 16, 1280, 0x0A4D0001, 10000, 120000, 3)
     assert len(auth_result) == 28
     new_path = struct.pack("!I", 1) + bytes.fromhex("b1b2b3b4b5b6b7b8") + bytes(range(0x40, 0x50))
     ack_ranges = [(1, 3), (0, 0)]
@@ -199,7 +199,7 @@ def build():
         ("AUTH", F["AUTH"], b"test-credential", {"credential_hex": b"test-credential".hex()}),
         ("AUTH_RESULT", F["AUTH_RESULT"], auth_result,
          {"status": 0, "ipv4": "10.77.0.2", "prefix4": 16, "tun_mtu": 1280, "dns_ipv4": "10.77.0.1",
-          "keepalive_ms": 10000, "idle_ms": 120000, "features": 1}),
+          "keepalive_ms": 10000, "idle_ms": 120000, "features": 3}),
         ("IP_PACKET", F["IP_PACKET"], ip, {"ip_packet_hex": ip.hex()}),
         ("IP_FRAGMENT", F["IP_FRAGMENT"], struct.pack("!QHH", 42, len(ip), 8) + ip[8:20],
          {"datagram_id": 42, "total_len": len(ip), "offset": 8, "data_hex": ip[8:20].hex()}),
@@ -219,6 +219,9 @@ def build():
         ("IP_DATAGRAM", F["IP_DATAGRAM"], struct.pack("!Q", 43) + ip,
          {"datagram_id": 43, "ip_packet_hex": ip.hex()}),
         ("REDUNDANCY", F["REDUNDANCY"], struct.pack("!IB", 7, 1), {"seq": 7, "mode": 1}),
+        ("FEC_REPAIR", F["FEC_REPAIR"], struct.pack("!IBBBB", 43, 4, 16, 3, 2) + bytes(range(40)),
+         {"first32": 43, "stride": 4, "k": 16, "m": 3, "index": 2, "data_hex": bytes(range(40)).hex()}),
+        ("FEC", F["FEC"], struct.pack("!IB", 8, 1), {"seq": 8, "mode": 1}),
         ("UNKNOWN_EXTENSION", 0x9F, b"\xAA\xBB", {"ignorable": True}),
     ]
     fixtures["frames"] = [
@@ -321,6 +324,10 @@ def build():
         {"name": "ip_datagram without packet", "hex": frame(0x0E, struct.pack("!Q", 1)).hex()},
         {"name": "ip_datagram length mismatch", "hex": frame(0x0E, struct.pack("!Q", 1) + ip + b"\x00").hex()},
         {"name": "redundancy wrong size", "hex": frame(0x0F, struct.pack("!I", 1)).hex()},
+        {"name": "fec_repair without data", "hex": frame(0x10, struct.pack("!IBBBB", 1, 1, 4, 1, 0)).hex()},
+        {"name": "fec_repair index past m", "hex": frame(0x10, struct.pack("!IBBBB", 1, 1, 4, 2, 2) + b"\x00" * 20).hex()},
+        {"name": "fec_repair stride zero", "hex": frame(0x10, struct.pack("!IBBBB", 1, 0, 4, 2, 0) + b"\x00" * 20).hex()},
+        {"name": "fec unknown mode", "hex": frame(0x11, struct.pack("!IB", 1, 3)).hex()},
         {"name": "redundancy unknown mode", "hex": frame(0x0F, struct.pack("!IB", 1, 2)).hex()},
         {"name": "path_join wrong size", "hex": "06000700000000000000"},
         {"name": "ping with value", "hex": "0a000100"},
