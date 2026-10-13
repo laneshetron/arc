@@ -186,20 +186,21 @@ func (t *flowTable) sweep(now time.Time, force bool) {
 // before its flows are moved off it. It is above lossSwitchRatio, which
 // bars new flows, so that a path whose estimate hovers near the line does
 // not have its flows moved back and forth, reordering them.
-const keepFlowRatio = 3
+const keepFlowRatio = 2.5
 
 // costRatio compares q with the primary for carrying flows, returning the
 // ratio of their loss terms of the cost (√max(loss, floor)) and whether q
-// may carry flows at all: both healthy (or q is the primary), and q's RTT
-// not drastically worse (at most 4x the primary's plus 50 ms). RTT is
-// otherwise left out: RTT estimates swing with queueing and lag changes in
+// may carry flows at all. A fallback path carries flows only while the
+// primary is one too (no other path is healthy). Otherwise both must be
+// healthy (or q is the primary), and q's RTT not drastically worse (at
+// most 4x the primary's plus 50 ms). RTT is otherwise left out: RTT estimates swing with queueing and lag changes in
 // path delay, and capacity weighting already favors paths that deliver
 // more. Cached briefly, since it is asked per packet.
 func (c *conn) costRatio(now time.Time, q, prim *path) (float64, bool) {
 	if q == prim {
 		return 1, true
 	}
-	if q.removed || !q.validated {
+	if q.removed || !q.validated || (q.fallback && !prim.fallback) {
 		return 0, false
 	}
 	if now.Before(q.ratioAt) {

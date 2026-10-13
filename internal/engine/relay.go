@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/laneshetron/arc/internal/bufpool"
+	"github.com/laneshetron/arc/internal/carrier/stream"
 	"github.com/laneshetron/arc/internal/gateway"
 	"github.com/laneshetron/arc/internal/session"
 )
@@ -17,6 +18,10 @@ import (
 type RelayConfig struct {
 	Session session.RelayConfig
 	Conn    DatagramConn
+	// Streams, if set, accepts TLS/TCP carrier connections (a
+	// *stream.Listener). Packets for its synthetic addresses go to it,
+	// everything else to Conn.
+	Streams DatagramConn
 	TUN     PacketDevice
 	Gateway *gateway.Gateway
 	Logger  *slog.Logger
@@ -35,8 +40,11 @@ func RunRelay(ctx context.Context, cfg RelayConfig) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	udpCh, tunCh, errc := make(chan datagrams, 16), make(chan [][]byte, 16), make(chan error, 2)
+	udpCh, tunCh, errc := make(chan datagrams, 16), make(chan [][]byte, 16), make(chan error, 3)
 	go readDatagrams(ctx, 0, cfg.Conn, udpCh, errc)
+	if cfg.Streams != nil {
+		go readDatagrams(ctx, 1, cfg.Streams, udpCh, errc)
+	}
 	go readPackets(ctx, cfg.TUN, tunCh, errc)
 
 	cfg.Session.Authorize = cfg.Gateway.Authorize
@@ -49,19 +57,30 @@ func RunRelay(ctx context.Context, cfg RelayConfig) error {
 		defer t.Stop()
 		status = t.C
 	}
-	var out, toTUN [][]byte
-	var to []netip.AddrPort
+	var out, sout, toTUN [][]byte
+	var to, sto []netip.AddrPort
 
 	for {
-		out, to = out[:0], to[:0]
+		out, to, sout, sto = out[:0], to[:0], sout[:0], sto[:0]
 		for d, ok := r.PollTransmit(); ok; d, ok = r.PollTransmit() {
-			out, to = append(out, d.Data), append(to, d.Addr)
+			if cfg.Streams != nil && stream.IsStreamAddr(d.Addr) {
+				sout, sto = append(sout, d.Data), append(sto, d.Addr)
+			} else {
+				out, to = append(out, d.Data), append(to, d.Addr)
+			}
 		}
-		if len(out) > 0 {
-			if err := cfg.Conn.WriteBatch(out, to); err != nil {
+		for i, batch := range [][][]byte{out, sout} {
+			if len(batch) == 0 {
+				continue
+			}
+			conn, addrs := cfg.Conn, to
+			if i == 1 {
+				conn, addrs = cfg.Streams, sto
+			}
+			if err := conn.WriteBatch(batch, addrs); err != nil {
 				log.Warn("send failed", "err", err)
 			}
-			for _, p := range out {
+			for _, p := range batch {
 				bufpool.Put(p)
 			}
 		}

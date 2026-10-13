@@ -7,16 +7,21 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/netip"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 
+	"github.com/laneshetron/arc/internal/carrier/sockopt"
+	"github.com/laneshetron/arc/internal/carrier/stream"
 	"github.com/laneshetron/arc/internal/carrier/udp"
 	"github.com/laneshetron/arc/internal/crypto"
 	"github.com/laneshetron/arc/internal/engine"
@@ -83,6 +88,9 @@ func run(args []string) error {
 		return nil
 	})
 	status := fs.Duration("status", 0, "log each path's state at this interval (0: off)")
+	tlsAddr := fs.String("tls", "", "relay TLS/TCP endpoint, host:port: adds a TLS carrier per interface, used only while no UDP path works")
+	tlsCA := fs.String("tls-ca", "", "PEM certificates to trust for -tls (default: the system roots)")
+	tlsName := fs.String("tls-server-name", "", "name to verify the relay's TLS certificate against (default: the -tls host)")
 	noOffload := fs.Bool("no-offload", false, "send and receive without UDP GSO/GRO, for comparison")
 	mark := fs.Uint("mark", 0x5243, "fwmark for carrier sockets, used by -full-tunnel")
 	table := fs.Int("table", 5243, "routing table for -full-tunnel")
@@ -154,6 +162,29 @@ func run(args []string) error {
 		}
 		carriers = append(carriers, engine.Carrier{Name: name, Conn: conn})
 	}
+	if *tlsAddr != "" {
+		tlsConfig, err := clientTLS(*tlsAddr, *tlsCA, *tlsName)
+		if err != nil {
+			return err
+		}
+		for _, iface := range binds {
+			name := iface
+			if name == "" {
+				name = "default"
+			}
+			conn := stream.Dial(stream.ClientOptions{
+				Addr: *tlsAddr, TLS: tlsConfig, Peer: relayAddr,
+				Sockopt: sockopt.Options{Mark: sockOpts.Mark, Device: iface},
+				OnState: func(err error) {
+					if err != nil {
+						log.Debug("tls carrier", "carrier", name+"/tls", "err", err)
+					}
+				},
+			})
+			defer conn.Close()
+			carriers = append(carriers, engine.Carrier{Name: name + "/tls", Conn: conn, Fallback: true})
+		}
+	}
 
 	var cleanup func() error
 	defer func() {
@@ -199,4 +230,28 @@ func run(args []string) error {
 		return nil
 	}
 	return err
+}
+
+// clientTLS builds the TLS configuration for -tls: the system roots or the
+// -tls-ca file, and the server name from -tls-server-name or the -tls host.
+func clientTLS(addr, caFile, serverName string) (*tls.Config, error) {
+	if serverName == "" {
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, fmt.Errorf("-tls: %w", err)
+		}
+		serverName = host
+	}
+	cfg := &tls.Config{ServerName: serverName}
+	if caFile != "" {
+		pem, err := os.ReadFile(caFile)
+		if err != nil {
+			return nil, err
+		}
+		cfg.RootCAs = x509.NewCertPool()
+		if !cfg.RootCAs.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("-tls-ca: no certificates in %s", caFile)
+		}
+	}
+	return cfg, nil
 }

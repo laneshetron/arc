@@ -646,8 +646,8 @@ Do not mistake carrier **capacity** for achievable application goodput. Queueing
   - **Eligibility.** Paths are compared with the primary on loss alone, by the cost's loss term √max(loss, 0.005). RTT estimates swing with queueing and lag changes in path delay, and in testing they kept equal links from sharing flows.
     - A path must be healthy, and its `min_rtt` must be at most 4× the primary's plus 50 ms.
     - New flows may use a path whose loss term is at most 2× the primary's.
-    - A flow keeps its path while the path is healthy and at most 3× the primary; otherwise it is reassigned.
-    - The gap between 2× and 3× keeps a path whose estimate hovers near the line from having its flows moved back and forth.
+    - A flow keeps its path while the path is healthy and at most 2.5× the primary; otherwise it is reassigned. With equal RTTs, flows leave a path above about 3% loss.
+    - The gap between 2× and 2.5× keeps a path whose estimate hovers near the line from having its flows moved back and forth.
   - **Assignment.** A new flow goes to the eligible path with the fewest active flows (a packet within the last 1 s) per unit of capacity. Capacity is the path's best 250 ms delivery rate of the last 10 s, in either direction. A path below 64 KiB/s counts as unmeasured and is assumed as fast as the best, so it gets tried.
   - **Downlink.** The relay sends each flow's downlink on the path its uplink last arrived on while that path is healthy, otherwise on the session's downlink path.
   - **Bounds.** Flows idle for 10 s are forgotten, and the table holds at most 4,096 flows per session.
@@ -726,6 +726,22 @@ type Capabilities struct {
 - Carry length-prefixed ARC packets (§12.2) over the resulting TLS byte stream.
 - Expose delivery metrics conservatively: remote ACKs distinguish true overlay arrival from local stream-buffer success.
 - Treat long-lived head-of-line delay as a scheduling cost, particularly for UDP application traffic encapsulated over TCP.
+
+**Reference implementation** (`internal/carrier/stream`):
+- **Client.** It dials with TLS 1.3, certificate verification and ALPN `arc/1`, using the same interface binding and firewall mark as its UDP sibling.
+  - Writes go through a bounded queue (1,024 packets). A full queue drops packets, as a congested link would, rather than blocking the session's event loop.
+  - A failed connection redials in the background, starting at 500 ms and backing off to 30 s. While disconnected, writes are dropped. A reconnection reaches the relay from a new address and is revalidated as after NAT rebinding (§14.5).
+- **Relay.** It gives each connection a synthetic address in `fd61:7263:2f31::/64` ("arc/1"), so the session layer treats it like a UDP client address. The engine routes packets for those addresses to the connection.
+  - Connections are bounded (4,096) and closed after 5 minutes without a packet. The TLS handshake must finish within 10 s.
+  - Cookies (§9.3) still apply, although TCP already validates addresses.
+- **Fallback paths.** The client marks TLS/TCP paths as fallbacks, used only while no other path is healthy.
+  - The primary prefers non-fallback paths and returns to them when they recover.
+  - Flows avoid fallback paths while the primary is not one.
+  - The handshake goes out on every carrier (§9.2), so a client whose UDP is blocked from the start connects over TLS/TCP.
+- **Head-of-line blocking (degraded suite, one link).**
+  - With 1% loss at 40 ms RTT, TCP inside the TLS/TCP carrier reached 12.7 Mbit/s against 3.55 over UDP, because the carrier's own retransmission hides loss from the inner TCP.
+  - Ping RTT during the transfer averaged 240 ms against 45 ms, with peaks of 450 ms. Every packet waits behind each carrier retransmission.
+  - Throughput alone would mislead. TLS/TCP stays a fallback for UDP-hostile networks, and its delay cost is what loss recovery inside the tunnel (FEC, bounded retransmission) aims to avoid while keeping the throughput gain.
 
 ### 16.4 HTTPS / enterprise proxy adapter (optional)
 

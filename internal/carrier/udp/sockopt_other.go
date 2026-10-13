@@ -2,13 +2,10 @@
 
 package udp
 
-import "errors"
+import "github.com/laneshetron/arc/internal/carrier/sockopt"
 
-func setSockopts(_ int, opts Options) error {
-	if opts.Mark != 0 || opts.Device != "" {
-		return errors.New("udp: socket marks and device binding require Linux")
-	}
-	return nil
+func setSockopts(fd int, opts Options) error {
+	return sockopt.Apply(fd, sockopt.Options{Mark: opts.Mark, Device: opts.Device})
 }
 
 func forceBuffers(int, int) bool { return false }

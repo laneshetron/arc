@@ -158,6 +158,19 @@ func NewClient(cfg ClientConfig, now time.Time) (*Client, error) {
 
 func (c *Client) State() State { return c.state }
 
+// SetFallback marks a path to carry traffic only while no other path is
+// healthy, as for a TLS/TCP carrier (§16.3). It may be called before the
+// path validates, and for path 0.
+func (c *Client) SetFallback(id uint32, fallback bool) {
+	if c.conn == nil {
+		return
+	}
+	if p := c.conn.path(id); p != nil {
+		p.fallback = fallback
+		p.ratioAt = time.Time{}
+	}
+}
+
 // HandshakeAttempt numbers the current handshake attempt. It changes when
 // the client starts over with a new ephemeral key, which invalidates any
 // cookie the previous attempt held.
@@ -297,6 +310,11 @@ func (c *Client) primary(now time.Time) *path {
 		return c.current
 	}
 	c.lossCheckAt = now.Add(lossCheckEvery)
+	if healthy && c.current.fallback {
+		if best := c.conn.bestPath(now); best != nil && !best.fallback {
+			c.current = best // a preferred path is healthy again
+		}
+	}
 	if healthy {
 		if best := c.conn.bestPath(now); best != c.current && !now.Before(c.lossMoveAt) &&
 			lossierThan(now, c.current, best) {

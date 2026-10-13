@@ -213,3 +213,34 @@ func TestEndedFlowsDoNotRepelNewOnes(t *testing.T) {
 		t.Errorf("4 new flows went %v, want 2 and 2", got)
 	}
 }
+
+func TestFallbackPathCarriesTrafficOnlyWhenNeeded(t *testing.T) {
+	// Path 1 is a fallback (TLS/TCP): flows stay off it while path 0 is
+	// healthy, move to it when path 0 dies, and come back when it returns.
+	n, s, _ := rateLimitedPaths(t, 120, 1_000_000, 1_000_000, ClientConfig{})
+	n.client.SetFallback(1, true)
+	sent := map[uint32]int{}
+	n.pathTap = func(toRelay bool, pathID uint32, data []byte) {
+		if len(data) > 900 {
+			sent[pathID]++
+		}
+	}
+	flowLoad(n, s, 6, 10*time.Millisecond, 2*time.Second)
+	if sent[1] != 0 || sent[0] == 0 {
+		t.Fatalf("with path 0 healthy, data packets per path %v", sent)
+	}
+	n.up.down, n.down.down = true, true
+	flowLoad(n, s, 6, 10*time.Millisecond, 2*time.Second) // failover
+	clear(sent)
+	up, down := flowLoad(n, s, 6, 10*time.Millisecond, 2*time.Second)
+	if sent[0] != 0 || up == 0 || down == 0 {
+		t.Fatalf("with path 0 dead: per path %v, delivered %d up and %d down", sent, up, down)
+	}
+	n.up.down, n.down.down = false, false
+	flowLoad(n, s, 6, 10*time.Millisecond, 3*time.Second) // path 0 recovers
+	clear(sent)
+	flowLoad(n, s, 6, 10*time.Millisecond, time.Second)
+	if sent[1] != 0 {
+		t.Errorf("after path 0 recovered, %d data packets still on the fallback", sent[1])
+	}
+}

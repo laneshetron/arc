@@ -109,14 +109,18 @@ type path struct {
 	sendRate   rateMax       // acknowledged bytes per second; see sched.go
 	recvRate   rateMax       // received bytes per second
 	flows      int           // active flows pinned to this path (sched.go)
-	ratio      float64       // cached conn.costRatio result, until ratioAt
-	ratioOK    bool
-	ratioAt    time.Time
-	control    []wire.Frame // frames that must travel on this path
-	probed     bool
-	created    time.Time
-	lastSend   time.Time
-	lastRecv   time.Time
+	// fallback marks a path to use only when no other path is healthy,
+	// such as one over TLS/TCP, where tunneled TCP suffers head-of-line
+	// blocking (§16.3). Client only.
+	fallback bool
+	ratio    float64 // cached conn.costRatio result, until ratioAt
+	ratioOK  bool
+	ratioAt  time.Time
+	control  []wire.Frame // frames that must travel on this path
+	probed   bool
+	created  time.Time
+	lastSend time.Time
+	lastRecv time.Time
 
 	// Relay only: where the client is, and address validation (§14.4–14.5).
 	addr          netip.AddrPort
@@ -149,18 +153,28 @@ func (p *path) healthy(now time.Time, keepalive time.Duration) bool {
 	}
 	limit := suspectPTOs * p.rtt.pto()
 	silent := now.Sub(p.lastRecv)
-	if silent > keepalive+limit {
+	if silent > idleLimit(keepalive, limit) {
 		return false
 	}
 	t0, ok := p.sent.oldestOutstanding()
 	return !ok || now.Sub(t0) < limit || silent < limit
 }
 
+// idleLimit is how long a path may go without receiving anything before it
+// is suspect even with nothing outstanding. An idle path hears from the
+// peer about once per keepalive interval (the relay hears the client's
+// keepalives themselves), so the limit allows half an interval of slack
+// for timers that fire late on a busy host: with only a few PTOs of slack,
+// the relay judged idle standby paths unhealthy just before each keepalive.
+func idleLimit(keepalive, limit time.Duration) time.Duration {
+	return keepalive + max(limit, keepalive/2)
+}
+
 // suspectAt returns when a currently healthy path would turn suspect if
 // nothing else happened, so callers can wake up and start probing it.
 func (p *path) suspectAt(keepalive time.Duration) time.Time {
 	limit := suspectPTOs * p.rtt.pto()
-	at := p.lastRecv.Add(keepalive + limit + time.Nanosecond)
+	at := p.lastRecv.Add(idleLimit(keepalive, limit) + time.Nanosecond)
 	if t0, ok := p.sent.oldestOutstanding(); ok {
 		unanswered := t0.Add(limit)
 		if silent := p.lastRecv.Add(limit); silent.After(unanswered) {
@@ -291,28 +305,30 @@ func (c *conn) abandonAt(p *path, timeout time.Duration) time.Time {
 }
 
 // bestPath returns the healthy validated path with the lowest cost (RTT
-// and loss; see loss.go), falling back to any validated path.
+// and loss; see loss.go), preferring paths not marked fallback, and
+// otherwise any validated path.
 func (c *conn) bestPath(now time.Time) *path {
-	var best, fallback *path
+	var best, any *path
 	var bestCost float64
 	for _, p := range c.paths {
 		if !p.validated {
 			continue
 		}
-		if fallback == nil {
-			fallback = p
+		if any == nil {
+			any = p
 		}
 		if !p.healthy(now, c.keepalive) {
 			continue
 		}
-		if cost := p.cost(now); best == nil || cost < bestCost {
+		cost := p.cost(now)
+		if best == nil || (best.fallback && !p.fallback) || (best.fallback == p.fallback && cost < bestCost) {
 			best, bestCost = p, cost
 		}
 	}
 	if best != nil {
 		return best
 	}
-	return fallback
+	return any
 }
 
 func (c *conn) pathInfo(now time.Time) []PathInfo {

@@ -54,6 +54,11 @@ sudo bin/arc-client run -relay RELAY_IP:4433 -relay-key RELAY_PUBLIC_KEY -full-t
 # turns lossy (-status 5s logs each path's state)
 sudo bin/arc-client run -relay RELAY_IP:4433 -relay-key RELAY_PUBLIC_KEY -full-tunnel -bind wlan0 -bind wwan0
 
+# Where UDP may be blocked, also carry the session over TLS/TCP (used only
+# while no UDP path works); the relay runs with -tls-listen 0.0.0.0:443, and
+# `arc-relay gencert -hosts ...` makes a certificate for -tls-ca if needed
+sudo bin/arc-client run ... -tls RELAY_HOST:443
+
 # When every link is lossy, send each packet on two links while the best one
 # loses over 1% (doubles traffic while on; "always" duplicates everything)
 sudo bin/arc-client run ... -bind wlan0 -bind wwan0 -redundancy auto
