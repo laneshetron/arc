@@ -15,6 +15,9 @@ const (
 	MaxAckDelay     = 25 * time.Millisecond
 	initialRTT      = 333 * time.Millisecond
 	packetThreshold = 3
+	// timeThreshold is RFC 9002's kTimeThreshold: a packet sent this
+	// many RTTs before an acknowledged one is lost.
+	timeThresholdNum, timeThresholdDen = 9, 8
 	// maxPTOBackoff caps PTO doubling at 8x. Control packets are small,
 	// and under heavy loss a longer wait only delays the frames that
 	// recover the session, such as REDUNDANCY and PATH_ABANDON.
@@ -230,6 +233,7 @@ type sentPacket struct {
 type sentLog struct {
 	packets      []sentPacket
 	largestAcked uint64
+	largestSent  time.Time // when largestAcked was sent, if known
 	anyAcked     bool
 	ptoCount     int
 	control      int // outstanding packets that carry control frames
@@ -264,8 +268,13 @@ type ackResult struct {
 }
 
 // onAck marks acknowledged packets and declares older ones lost by the
-// packet threshold. epoch is the sender's current key epoch.
-func (s *sentLog) onAck(now time.Time, ack *wire.Ack, intervals []wire.PacketRange, epoch uint64) ackResult {
+// packet threshold or, sent more than lossDelay before the largest
+// acknowledged packet, by the time threshold (RFC 9002 §6.1). The time
+// threshold matters on sparsely used paths: packets lost in an outage would
+// otherwise wait for three later packets to be acknowledged, keeping the
+// path suspect long after it recovered. epoch is the sender's current key
+// epoch.
+func (s *sentLog) onAck(now time.Time, ack *wire.Ack, intervals []wire.PacketRange, epoch uint64, lossDelay time.Duration) ackResult {
 	var res ackResult
 	for _, iv := range intervals {
 		i := sort.Search(len(s.packets), func(i int) bool { return s.packets[i].pn >= iv.Lo })
@@ -286,6 +295,9 @@ func (s *sentLog) onAck(now time.Time, ack *wire.Ack, intervals []wire.PacketRan
 			res.ackedCurrentEpoch = res.ackedCurrentEpoch || p.epoch == epoch
 			if p.pn == ack.Largest {
 				res.rttSample, res.hasRTT = now.Sub(p.sentAt), true
+				if !s.anyAcked || p.pn >= s.largestAcked {
+					s.largestSent = p.sentAt
+				}
 			}
 		}
 	}
@@ -295,10 +307,16 @@ func (s *sentLog) onAck(now time.Time, ack *wire.Ack, intervals []wire.PacketRan
 	if !s.anyAcked || ack.Largest > s.largestAcked {
 		s.largestAcked, s.anyAcked = ack.Largest, true
 	}
+	var cutoff time.Time // packets sent before this are lost
+	if !s.largestSent.IsZero() && lossDelay > 0 {
+		cutoff = s.largestSent.Add(-lossDelay)
+	}
 	for i := range s.packets {
 		p := &s.packets[i]
-		if p.pn+packetThreshold > s.largestAcked {
-			break // everything after this is newer still
+		byCount := p.pn+packetThreshold <= s.largestAcked
+		byTime := p.pn < s.largestAcked && p.sentAt.Before(cutoff)
+		if !byCount && !byTime {
+			break // later packets have higher numbers and send times
 		}
 		if p.acked {
 			continue

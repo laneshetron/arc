@@ -112,15 +112,16 @@ type path struct {
 	// fallback marks a path to use only when no other path is healthy,
 	// such as one over TLS/TCP, where tunneled TCP suffers head-of-line
 	// blocking (§16.3). Client only.
-	fallback bool
-	ratio    float64 // cached conn.costRatio result, until ratioAt
-	ratioOK  bool
-	ratioAt  time.Time
-	control  []wire.Frame // frames that must travel on this path
-	probed   bool
-	created  time.Time
-	lastSend time.Time
-	lastRecv time.Time
+	fallback  bool
+	overSince time.Time // when the path rose over keepFlowRatio; see keeps
+	ratio     float64   // cached conn.costRatio result, until ratioAt
+	ratioOK   bool
+	ratioAt   time.Time
+	control   []wire.Frame // frames that must travel on this path
+	probed    bool
+	created   time.Time
+	lastSend  time.Time
+	lastRecv  time.Time
 
 	// Relay only: where the client is, and address validation (§14.4–14.5).
 	addr          netip.AddrPort
@@ -435,7 +436,8 @@ func (c *conn) onAck(now time.Time, ack *wire.Ack) {
 		return
 	}
 	c.ivScratch = intervals
-	res := p.sent.onAck(now, ack, intervals, c.send.Epoch())
+	lossDelay := max(p.rtt.srtt(), p.rtt.latest) * timeThresholdNum / timeThresholdDen
+	res := p.sent.onAck(now, ack, intervals, c.send.Epoch(), max(lossDelay, time.Millisecond))
 	if res.hasRTT {
 		p.rtt.update(now, res.rttSample, time.Duration(ack.AckDelayMicros)*time.Microsecond)
 	}

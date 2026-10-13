@@ -434,3 +434,35 @@ func TestIdlePathToleratesLateKeepalive(t *testing.T) {
 		t.Error("idle path still healthy after 1.5 keepalive intervals of silence")
 	}
 }
+
+// TestRecoveryAfterOutageIsPrompt: pings lost in an outage used to stay
+// outstanding until three later packets were acknowledged; on an idle path
+// that probes only while suspect, that kept it flapping between healthy and
+// suspect for seconds after it recovered, so new flows avoided it. The
+// time threshold declares them lost at the first acknowledgement.
+func TestRecoveryAfterOutageIsPrompt(t *testing.T) {
+	n, s, c := rateLimitedPaths(t, 131, 1_000_000, 1_000_000, ClientConfig{})
+	c.up.queue, c.down.queue = 200*time.Millisecond, 200*time.Millisecond
+	n.client.SetFallback(0, true)                      // put the load on path 1 first
+	flowLoad(n, s, 4, time.Millisecond, 3*time.Second) // a standing queue inflates its RTT
+	n.client.SetFallback(0, false)
+	flowLoad(n, s, 4, 10*time.Millisecond, 2*time.Second)
+	c.up.down, c.down.down = true, true
+	flowLoad(n, s, 1, 10*time.Millisecond, 15*time.Second)
+	c.up.down, c.down.down = false, false
+	start, stableFrom := n.now, time.Duration(-1)
+	for n.now.Sub(start) < 5*time.Second {
+		n.runFor(20 * time.Millisecond)
+		healthy := n.client.conn.path(1).healthy(n.now, n.client.conn.keepalive)
+		switch {
+		case !healthy:
+			stableFrom = -1
+		case stableFrom < 0:
+			stableFrom = n.now.Sub(start)
+		}
+	}
+	t.Logf("path 1 healthy for good %v after the outage ended (srtt %v)", stableFrom, n.client.conn.path(1).rtt.srtt())
+	if stableFrom < 0 || stableFrom > time.Second {
+		t.Errorf("path 1 healthy for good only after %v", stableFrom)
+	}
+}
