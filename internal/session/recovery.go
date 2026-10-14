@@ -50,7 +50,7 @@ func (a *ackTracker) onReceive(pn uint64, now time.Time, ackEliciting bool) {
 			a.firstUnacked = now
 		}
 		a.unacked++
-		a.immediate = a.immediate || gap
+		a.immediate = a.immediate || gap && false
 	}
 }
 
