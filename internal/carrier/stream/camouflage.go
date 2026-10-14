@@ -77,15 +77,17 @@ func (cam *Camouflage) Validate() error {
 	return nil
 }
 
-// dial performs the camouflaged TLS handshake over raw, the TCP
-// connection to the relay endpoint at addr. base is the carrier's TLS
-// configuration: its pinned roots (if any) still verify the relay, and
-// its server name is the fallback for cam.Name. It returns the TLS
-// connection, its underlying transport, and the negotiated protocol,
-// which the caller does not validate under this profile.
-func (cam *Camouflage) dial(ctx context.Context, raw net.Conn, addr string, base *tls.Config) (net.Conn, net.Conn, string, error) {
+// Handshake performs the camouflaged TLS handshake over raw, an
+// established connection to the endpoint named by addr, and returns the
+// TLS connection and its negotiated protocol, which callers under this
+// profile do not validate. base carries any pinned roots and the
+// fallback server name. On failure raw is left open: the caller closes
+// it, and the byte counts on a tracking wrapper, if any, survive the
+// classification. The profiler uses this as the probe client for
+// canaries (network-profiling.md §5); relays are never probed (its P1).
+func (cam *Camouflage) Handshake(ctx context.Context, raw net.Conn, addr string, base *tls.Config) (net.Conn, string, error) {
 	if err := cam.Validate(); err != nil {
-		return nil, nil, "", err
+		return nil, "", err
 	}
 	if base == nil {
 		base = &tls.Config{}
@@ -97,7 +99,7 @@ func (cam *Camouflage) dial(ctx context.Context, raw net.Conn, addr string, base
 	if cfg.ServerName == "" {
 		host, _, err := net.SplitHostPort(addr)
 		if err != nil {
-			return nil, nil, "", fmt.Errorf("stream: camouflage needs a server name: %w", err)
+			return nil, "", fmt.Errorf("stream: camouflage needs a server name: %w", err)
 		}
 		cfg.ServerName = host
 	}
@@ -114,8 +116,7 @@ func (cam *Camouflage) dial(ctx context.Context, raw net.Conn, addr string, base
 	if cam.Fingerprint != "" {
 		id, err := FingerprintID(cam.Fingerprint)
 		if err != nil {
-			raw.Close()
-			return nil, nil, "", err
+			return nil, "", err
 		}
 		uconn := utls.UClient(hconn, &utls.Config{
 			ServerName:         cfg.ServerName,
@@ -125,25 +126,23 @@ func (cam *Camouflage) dial(ctx context.Context, raw net.Conn, addr string, base
 			NextProtos:         browserALPN,
 		}, id)
 		if err := uconn.HandshakeContext(ctx); err != nil {
-			raw.Close()
-			return nil, nil, "", err
+			return nil, "", err
 		}
 		if f, ok := hconn.(*fragmentConn); ok {
 			f.clear = true // post-handshake writes pass whole
 		}
-		return uconn, raw, uconn.ConnectionState().NegotiatedProtocol, nil
+		return uconn, uconn.ConnectionState().NegotiatedProtocol, nil
 	}
 	cfg.MinVersion = tls.VersionTLS13
 	cfg.NextProtos = browserALPN
 	conn := tls.Client(hconn, cfg)
 	if err := conn.HandshakeContext(ctx); err != nil {
-		raw.Close()
-		return nil, nil, "", err
+		return nil, "", err
 	}
 	if f, ok := hconn.(*fragmentConn); ok {
 		f.clear = true // post-handshake writes pass whole
 	}
-	return conn, raw, conn.ConnectionState().NegotiatedProtocol, nil
+	return conn, conn.ConnectionState().NegotiatedProtocol, nil
 }
 
 // fragmentConn splits every write into pieces of at most n bytes while its

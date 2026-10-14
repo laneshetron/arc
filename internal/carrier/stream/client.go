@@ -72,7 +72,7 @@ func Dial(opts ClientOptions) *Client {
 func (c *Client) connectLoop() {
 	backoff := 500 * time.Millisecond
 	for c.ctx.Err() == nil {
-		l, err := c.connect()
+		l, track, err := c.connect()
 		if err == nil {
 			c.setLink(l) // before OnState, so a write it prompts is not dropped
 		}
@@ -88,13 +88,17 @@ func (c *Client) connectLoop() {
 				case <-l.done:
 				}
 			}()
-			l.run(c.in)
+			derr := l.run(c.in)
 			c.setLink(nil)
 			if c.ctx.Err() != nil {
 				return
 			}
 			if c.opts.OnState != nil {
-				c.opts.OnState(errors.New("stream: connection closed"))
+				if derr != nil {
+					c.opts.OnState(classifyDeath(track, derr))
+				} else {
+					c.opts.OnState(errors.New("stream: connection closed"))
+				}
 			}
 			if time.Since(start) > 10*time.Second {
 				backoff = 500 * time.Millisecond // it worked for a while
@@ -109,45 +113,54 @@ func (c *Client) connectLoop() {
 	}
 }
 
-func (c *Client) connect() (*link, error) {
+func (c *Client) connect() (*link, *trackingConn, error) {
 	ctx, cancel := context.WithTimeout(c.ctx, 10*time.Second)
 	defer cancel()
-	conn, _, alpn, err := c.dialTLS(ctx)
+	conn, raw, alpn, err := c.dialTLS(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	// The camouflage profile offers a browser's ALPN, so the negotiated
 	// label is not the carrier's; the ARC session authenticates the peer.
 	if c.opts.Camouflage == nil && alpn != ALPN {
 		conn.Close()
-		return nil, errors.New("stream: relay did not negotiate ALPN " + ALPN)
+		return nil, nil, errors.New("stream: relay did not negotiate ALPN " + ALPN)
 	}
-	return newLink(conn, c.opts.Peer, c.opts.Queue, 0), nil
+	return newLink(conn, c.opts.Peer, c.opts.Queue, 0), raw, nil
 }
 
 // dialTLS connects to the relay endpoint and runs the TLS handshake,
-// returning the TLS connection, its underlying transport, and the
-// negotiated protocol. SetNoDelay runs before the handshake: the
-// camouflage profile needs its ClientHello fragments to leave as TCP
-// segments at once.
-func (c *Client) dialTLS(ctx context.Context) (_ net.Conn, raw net.Conn, alpn string, err error) {
-	raw, err = (&net.Dialer{
+// returning the TLS connection, its tracked transport (whose byte counts
+// classify any later death), and the negotiated protocol. Failures are
+// classified (§8 taxonomy): OnState receives a *Failure, not a bare
+// error. SetNoDelay runs before the handshake: the camouflage profile
+// needs its ClientHello fragments to leave as TCP segments at once.
+func (c *Client) dialTLS(ctx context.Context) (net.Conn, *trackingConn, string, error) {
+	tcp, err := (&net.Dialer{
 		Control:   sockopt.Control(c.opts.Sockopt),
 		KeepAlive: 15 * time.Second,
 	}).DialContext(ctx, "tcp", c.opts.Addr)
 	if err != nil {
-		return nil, nil, "", err
+		return nil, nil, "", classifyConnect(err)
 	}
-	defer func() {
-		if err != nil && raw != nil {
-			raw.Close()
-		}
-	}()
-	if tcp, ok := raw.(*net.TCPConn); ok {
-		tcp.SetNoDelay(true)
+	raw := &trackingConn{Conn: tcp}
+	if t, ok := tcp.(*net.TCPConn); ok {
+		t.SetNoDelay(true)
 	}
+	conn, alpn, err := c.handshakeTLS(ctx, raw)
+	if err != nil {
+		raw.Close()
+		return nil, nil, "", classifyHandshake(raw, err)
+	}
+	return conn, raw, alpn, nil
+}
+
+// handshakeTLS runs the carrier's TLS handshake over raw: the plain
+// carrier (spec §16.3) with verified identity and ALPN arc/1, or the
+// camouflage profile, which hands the whole outer handshake its shape.
+func (c *Client) handshakeTLS(ctx context.Context, raw *trackingConn) (net.Conn, string, error) {
 	if cam := c.opts.Camouflage; cam != nil {
-		return cam.dial(ctx, raw, c.opts.Addr, c.opts.TLS)
+		return cam.Handshake(ctx, raw, c.opts.Addr, c.opts.TLS)
 	}
 	config := c.opts.TLS
 	if config == nil {
@@ -157,10 +170,10 @@ func (c *Client) dialTLS(ctx context.Context) (_ net.Conn, raw net.Conn, alpn st
 	cfg.MinVersion = tls.VersionTLS13
 	cfg.NextProtos = []string{ALPN}
 	conn := tls.Client(raw, cfg)
-	if err = conn.HandshakeContext(ctx); err != nil {
-		return nil, nil, "", err
+	if err := conn.HandshakeContext(ctx); err != nil {
+		return nil, "", err
 	}
-	return conn, raw, conn.ConnectionState().NegotiatedProtocol, nil
+	return conn, conn.ConnectionState().NegotiatedProtocol, nil
 }
 
 func (c *Client) setLink(l *link) {

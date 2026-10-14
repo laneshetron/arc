@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/laneshetron/arc/internal/bufpool"
@@ -25,17 +26,27 @@ type inbound struct {
 // link runs one connection: a reader goroutine delivering packets to in,
 // and a writer goroutine draining a bounded queue.
 type link struct {
-	conn net.Conn
-	addr netip.AddrPort // reported as the source of its packets
-	out  chan []byte
-	done chan struct{}
-	once sync.Once
+	conn  net.Conn
+	addr  netip.AddrPort // reported as the source of its packets
+	out   chan []byte
+	done  chan struct{}
+	once  sync.Once
+	death atomic.Pointer[error] // first fatal transport error, for classification
 
 	idle time.Duration // close after this long without a received packet; 0: never
 }
 
 func newLink(conn net.Conn, addr netip.AddrPort, queue int, idle time.Duration) *link {
 	return &link{conn: conn, addr: addr, out: make(chan []byte, queue), done: make(chan struct{}), idle: idle}
+}
+
+// stopWith records the link's first fatal error, if any, and closes it.
+// The reader and writer goroutines race; the first error wins.
+func (l *link) stopWith(err error) {
+	if err != nil {
+		l.death.CompareAndSwap(nil, &err)
+	}
+	l.close()
 }
 
 // send queues a copy of pkt, reporting false if the queue is full or the
@@ -69,11 +80,16 @@ func (l *link) close() {
 }
 
 // run starts the goroutines and returns when the connection fails or the
-// link is closed. Received packets go to in.
-func (l *link) run(in chan<- inbound) {
+// link is closed, with the first fatal transport error if there was one.
+// Received packets go to in.
+func (l *link) run(in chan<- inbound) error {
 	go l.write()
 	l.read(in)
 	l.close()
+	if p := l.death.Load(); p != nil {
+		return *p
+	}
+	return nil
 }
 
 func (l *link) read(in chan<- inbound) {
@@ -85,6 +101,7 @@ func (l *link) read(in chan<- inbound) {
 		}
 		n, err := fr.next(buf)
 		if err != nil {
+			l.stopWith(err)
 			return
 		}
 		var pkt []byte
@@ -118,7 +135,7 @@ func (l *link) write() {
 			frame = appendFrame(frame[:0], pkt)
 			bufpool.Put(pkt)
 			if _, err := w.Write(frame); err != nil {
-				l.close()
+				l.stopWith(err)
 				return
 			}
 			select {
@@ -129,7 +146,7 @@ func (l *link) write() {
 			break
 		}
 		if err := w.Flush(); err != nil {
-			l.close()
+			l.stopWith(err)
 			return
 		}
 	}
