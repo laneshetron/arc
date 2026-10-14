@@ -3,19 +3,17 @@ package stream
 import (
 	"context"
 	"crypto/tls"
-	"encoding/binary"
 	"errors"
 	"net"
 	"net/netip"
 	"slices"
-	"sync"
 	"time"
 )
 
 // ListenerOptions configures the relay side.
 type ListenerOptions struct {
 	// TLS holds the relay's certificate. The listener requires TLS 1.3
-	// and ALPN "arc/1".
+	// and, unless Camouflage is set, ALPN "arc/1".
 	TLS *tls.Config
 	// Camouflage accepts carrier connections that present a browser's
 	// ALPN ("h2" or "http/1.1") instead of "arc/1", as the client
@@ -40,23 +38,16 @@ type ListenerOptions struct {
 // a client that reconnects arrives from a new address and is revalidated
 // as after NAT rebinding (§14.5). It implements the engine's DatagramConn.
 type Listener struct {
-	ln   net.Listener
-	opts ListenerOptions
-	in   chan inbound
-	ctx  context.Context
-	stop context.CancelFunc
-
-	mu    sync.Mutex
-	links map[netip.AddrPort]*link
-	next  uint64
+	ln         net.Listener
+	reg        *registry
+	camouflage bool // browser ALPN admitted, per ListenerOptions.Camouflage
 }
 
 // streamPrefix is the first 8 bytes of synthetic addresses: a unique
 // local IPv6 prefix spelling "arc/1" that no UDP client can have.
 var streamPrefix = [8]byte{0xfd, 'a', 'r', 'c', '/', '1', 0, 0}
 
-// IsStreamAddr reports whether a is a Listener connection's synthetic
-// address.
+// IsStreamAddr reports whether a is a stream carrier's synthetic address.
 func IsStreamAddr(a netip.AddrPort) bool {
 	b := a.Addr().As16()
 	return a.Addr().Is6() && [8]byte(b[:8]) == streamPrefix
@@ -64,15 +55,6 @@ func IsStreamAddr(a netip.AddrPort) bool {
 
 // Listen starts accepting on addr.
 func Listen(addr string, opts ListenerOptions) (*Listener, error) {
-	if opts.MaxConns == 0 {
-		opts.MaxConns = 4096
-	}
-	if opts.Idle == 0 {
-		opts.Idle = 5 * time.Minute
-	}
-	if opts.Queue == 0 {
-		opts.Queue = DefaultQueue
-	}
 	cfg := opts.TLS.Clone()
 	cfg.MinVersion = tls.VersionTLS13
 	cfg.NextProtos = []string{ALPN}
@@ -83,10 +65,10 @@ func Listen(addr string, opts ListenerOptions) (*Listener, error) {
 	if err != nil {
 		return nil, err
 	}
-	ctx, stop := context.WithCancel(context.Background())
 	l := &Listener{
-		ln: tls.NewListener(tcp, cfg), opts: opts, in: make(chan inbound, opts.Queue),
-		ctx: ctx, stop: stop, links: make(map[netip.AddrPort]*link),
+		ln:         tls.NewListener(tcp, cfg),
+		reg:        newRegistry(opts.MaxConns, opts.Queue, opts.Idle),
+		camouflage: opts.Camouflage,
 	}
 	go l.accept()
 	return l, nil
@@ -110,7 +92,7 @@ func (l *Listener) accept() {
 }
 
 func (l *Listener) serve(conn *tls.Conn) {
-	ctx, cancel := context.WithTimeout(l.ctx, 10*time.Second)
+	ctx, cancel := context.WithTimeout(l.reg.ctx, 10*time.Second)
 	err := conn.HandshakeContext(ctx)
 	cancel()
 	if err != nil {
@@ -119,71 +101,33 @@ func (l *Listener) serve(conn *tls.Conn) {
 	// The camouflage profile lets clients offer a browser's ALPN; the
 	// label does not affect framing, and the ARC session inside
 	// authenticates the client.
-	switch p := conn.ConnectionState().NegotiatedProtocol; {
-	case p == ALPN:
-	case l.opts.Camouflage && slices.Contains(browserALPN, p):
-	default:
+	p := conn.ConnectionState().NegotiatedProtocol
+	if p != ALPN && !(l.camouflage && slices.Contains(browserALPN, p)) {
 		conn.Close()
 		return
 	}
 	if tcp, ok := conn.NetConn().(*net.TCPConn); ok {
 		tcp.SetNoDelay(true)
 	}
-	l.mu.Lock()
-	if len(l.links) >= l.opts.MaxConns || l.ctx.Err() != nil {
-		l.mu.Unlock()
-		conn.Close()
-		return
-	}
-	l.next++
-	var a [16]byte
-	copy(a[:8], streamPrefix[:])
-	binary.BigEndian.PutUint64(a[8:], l.next)
-	addr := netip.AddrPortFrom(netip.AddrFrom16(a), 0)
-	k := newLink(conn, addr, l.opts.Queue, l.opts.Idle)
-	l.links[addr] = k
-	l.mu.Unlock()
-
-	k.run(l.in)
-
-	l.mu.Lock()
-	delete(l.links, addr)
-	l.mu.Unlock()
+	l.reg.serve(conn)
 }
 
 // WriteBatch queues each packet for the connection its address names.
 // Packets for unknown addresses or full queues are dropped.
 func (l *Listener) WriteBatch(pkts [][]byte, addrs []netip.AddrPort) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	for i, p := range pkts {
-		if k := l.links[addrs[i]]; k != nil {
-			k.send(p)
-		}
-	}
-	return nil
+	return l.reg.writeBatch(pkts, addrs)
 }
 
 // ReadBatch reads received packets, blocking until at least one arrives.
 func (l *Listener) ReadBatch(bufs [][]byte, sizes []int, addrs []netip.AddrPort) (int, error) {
-	return readBatch(l.in, l.ctx.Done(), bufs, sizes, addrs)
+	return l.reg.readBatch(bufs, sizes, addrs)
 }
 
 // Conns returns the number of open connections.
-func (l *Listener) Conns() int {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return len(l.links)
-}
+func (l *Listener) Conns() int { return l.reg.conns() }
 
 // Close stops accepting and closes every connection.
 func (l *Listener) Close() error {
-	l.stop()
-	err := l.ln.Close()
-	l.mu.Lock()
-	for _, k := range l.links {
-		k.close()
-	}
-	l.mu.Unlock()
-	return err
+	l.reg.close()
+	return l.ln.Close()
 }

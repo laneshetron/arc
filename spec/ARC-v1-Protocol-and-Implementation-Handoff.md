@@ -833,6 +833,8 @@ type Capabilities struct {
 - Do not assume arbitrary HTTP endpoints are relays. Authenticate both proxy access and ARC relay identity.
 - Frame ARC packets across the approved stream or datagram mechanism. HTTP proxy support is a compatibility layer, not a pretext to ignore network policies.
 
+**Relay front (fail-closed persona, experimental).** A relay MAY terminate its stream carriers behind a front: one TLS endpoint with a publicly valid certificate for the operator's own domain that serves cover content to every unauthenticated request, while a request authenticated by a client access token upgrades into the stream carrier framing (§12.2). The front is SNI-blind and never refuses a connection for its shape, so a certificate-checking, replaying, or behavioral prober observes an ordinary website; it is therefore also the relay's own reachability canary (§7 of the profiler design, `network-profiling.md`). The carrier upgrade uses HTTP/1.1 over the TLS session (h2 is served to visitors for cover realism); the ARC session inside authenticates the client either way (§D2). This profile does not borrow third parties' names and does not survive its own domain being blocked; front rotation belongs to rendezvous, which is deferred. Being TLS-borne, carriers through a front carry no split-TCP streams under a censorship profile (see the mapping table in `network-profiling.md`).
+
 ### 16.5 DNS request/response adapter (experimental, feature-gated)
 
 **Model:** Client issues queries for a subdomain delegated to the operator's authoritative DNS service. That authoritative endpoint can receive upstream encoded cells and supply downstream encoded cells as DNS answers, when permitted by the resolver and network.
