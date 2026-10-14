@@ -465,3 +465,58 @@ func TestStreamRTTRise(t *testing.T) {
 		t.Errorf("%.1f s after the RTT rose, against %.1f s; want at most 1.5x", risen, steady)
 	}
 }
+
+func TestStreamLossAfterRTTRise(t *testing.T) {
+	// As in test/netns/split.sh, the link turns slower and lossy (40 ms
+	// RTT, 5% loss each way, uniform or in bursts of 10) a second before a
+	// transfer on a 50 Mbit/s link. Rate control first takes the higher
+	// RTT for a queue; once it adopts the new base it must find the rate
+	// again, not creep up from where the false backoffs left it.
+	for _, burst := range []float64{1, 10} {
+		n, s := streamNetwork(t, 91)
+		for _, l := range []*link{n.up, n.down} {
+			l.rate, l.delay = 6_250_000, 20*time.Millisecond
+			if burst == 1 {
+				l.loss = 0.05
+			} else {
+				l.bursty(0.05, burst)
+			}
+		}
+		n.runFor(time.Second)
+		data := randomBytes(11, 16<<20)
+		start := n.now
+		sp := openPair(t, n, s, nil, data)
+		if !sp.run(60*time.Second) || !bytes.Equal(sp.client.got, data) {
+			t.Fatalf("burst %v: transfer incomplete: %d/%d", burst, len(sp.client.got), len(data))
+		}
+		goodput := float64(len(data)) / sp.client.eofAt.Sub(start).Seconds()
+		t.Logf("mean burst %v: 16 MiB at %.1f Mbit/s", burst, goodput*8/1e6)
+		if goodput < 0.5*6_250_000 {
+			t.Errorf("mean burst %v: goodput %.1f Mbit/s; want at least half the 50 Mbit/s link", burst, goodput*8/1e6)
+		}
+	}
+}
+
+func TestStreamBurstyLoss(t *testing.T) {
+	// 5% loss in bursts of 10 each way on a 50 Mbit/s link with a steady
+	// 40 ms RTT.
+	n := newNetwork(t, 91, defaultRelayConfig(), ClientConfig{})
+	n.up.delay, n.down.delay = 20*time.Millisecond, 20*time.Millisecond
+	s := n.establish()
+	n.runFor(time.Second)
+	for _, l := range []*link{n.up, n.down} {
+		l.rate = 6_250_000
+		l.bursty(0.05, 10)
+	}
+	data := randomBytes(11, 16<<20)
+	start := n.now
+	sp := openPair(t, n, s, nil, data)
+	if !sp.run(60*time.Second) || !bytes.Equal(sp.client.got, data) {
+		t.Fatalf("transfer incomplete: %d/%d", len(sp.client.got), len(data))
+	}
+	goodput := float64(len(data)) / sp.client.eofAt.Sub(start).Seconds()
+	t.Logf("16 MiB at %.1f Mbit/s", goodput*8/1e6)
+	if goodput < 0.5*6_250_000 {
+		t.Errorf("goodput %.1f Mbit/s; want at least half the 50 Mbit/s link", goodput*8/1e6)
+	}
+}

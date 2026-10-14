@@ -41,8 +41,9 @@ const (
 	ccLossSample = 20
 	// A loss spike is a round's loss this far above the baseline (or three
 	// standard deviations of the sample, if more).
-	ccLossSpike = 0.1
-	ccMaxAckGap = time.Second
+	ccLossSpike  = 0.1
+	ccLossWarmup = 3
+	ccMaxAckGap  = time.Second
 	// ccBaseWindow is how long an RTT sample counts toward the base RTT
 	// that queueing delay is measured from, in two halves. The path's own
 	// minimum lasts a minute (recovery.go), so a path whose RTT rose, as
@@ -89,6 +90,7 @@ type streamCC struct {
 	acked, lost int     // stream packet outcomes not yet judged
 	baseLoss    float64 // loss rate without congestion
 	baseSet     bool
+	baseN       int // judgments so far, up to ccLossWarmup
 
 	lastAck time.Time
 	ackGap  time.Duration // smoothed interval between acknowledgements
@@ -225,6 +227,10 @@ func (cc *streamCC) update(now time.Time, minRTT, srtt time.Duration, mss int) {
 			cc.baseStart, cc.baseCur, cc.basePrev = now, cc.delayMin, 0
 			cc.delayRounds, cc.delayMin = 0, 0
 			delay, settling = false, true
+			// The backoffs that led here answered a queue that was not
+			// there, and the capacity measured then is the cut rate's:
+			// find the rate afresh.
+			cc.slowStart, cc.capacity = true, 0
 		}
 	} else {
 		cc.delayRounds, cc.delayMin = 0, 0
@@ -282,7 +288,9 @@ func (cc *streamCC) lossy() bool { return cc.baseSet && cc.baseLoss >= ccLossy }
 // any rate and becomes the baseline after a few backoffs, while overrunning
 // a policer raises the loss again each time the rate recovers. Loss while
 // the queue shows delay is the queue overflowing and leaves the baseline
-// alone.
+// alone. The first ccLossWarmup judgments only set the baseline, as their
+// mean: a baseline from one judgment of 20 outcomes made the next judgment
+// a spike often enough to end slow start early.
 func (cc *streamCC) judgeLoss(delay bool) (spike, judged bool) {
 	n := cc.acked + cc.lost
 	if n < ccLossSample {
@@ -293,8 +301,10 @@ func (cc *streamCC) judgeLoss(delay bool) (spike, judged bool) {
 	if delay {
 		return false, true
 	}
-	if !cc.baseSet {
-		cc.baseLoss, cc.baseSet = f, true
+	if cc.baseN < ccLossWarmup {
+		cc.baseN++
+		cc.baseLoss += (f - cc.baseLoss) / float64(cc.baseN)
+		cc.baseSet = true
 		return false, true
 	}
 	sigma := math.Sqrt(max(cc.baseLoss*(1-cc.baseLoss), 0.01) / float64(n))
