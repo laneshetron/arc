@@ -457,6 +457,7 @@ func (c *conn) onAck(now time.Time, ack *wire.Ack) {
 	res := p.sent.onAck(now, ack, intervals, c.send.Epoch(), max(lossDelay, time.Millisecond))
 	if res.hasRTT {
 		p.rtt.update(now, res.rttSample, time.Duration(ack.AckDelayMicros)*time.Microsecond)
+		p.cc.observeRTT(now, res.rttSample)
 	}
 	if res.ackedProbe > p.maxPacket {
 		p.maxPacket = res.ackedProbe
@@ -550,7 +551,7 @@ func (c *conn) sendStreams(now time.Time) {
 		return
 	}
 	srtt := p.rtt.srtt()
-	p.cc.update(now, p.rtt.minRTT(), srtt, p.maxPacket)
+	p.cc.update(now, p.cc.baseRTT(p.rtt.minRTT()), srtt, p.maxPacket)
 	budget := p.maxPacket - wire.DataHeaderLen - wire.AEADTagLen
 	for {
 		ok, wake := p.cc.canSend(now, p.sent.streamBytes, srtt, p.maxPacket)

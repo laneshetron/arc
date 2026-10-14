@@ -43,6 +43,19 @@ const (
 	// standard deviations of the sample, if more).
 	ccLossSpike = 0.1
 	ccMaxAckGap = time.Second
+	// ccBaseWindow is how long an RTT sample counts toward the base RTT
+	// that queueing delay is measured from, in two halves. The path's own
+	// minimum lasts a minute (recovery.go), so a path whose RTT rose, as
+	// when a network change adds delay, would look queued, and rate
+	// control would hold at its floor for that long. The controller
+	// drains its own queue at every backoff, so a short window does not
+	// mistake its queue for the base.
+	ccBaseWindow = 10 * time.Second
+	// ccRebaseRounds is how many rounds in a row may show queueing delay
+	// before the lowest RTT among them becomes the base: by then backoffs
+	// would have drained a queue of the controller's own making, so the
+	// delay is the path's.
+	ccRebaseRounds = 8
 	// ccLossy is the baseline loss at which spare sending capacity goes to
 	// repeating stream data in flight (see conn.nextRepeatFrame).
 	ccLossy = 0.5
@@ -79,6 +92,37 @@ type streamCC struct {
 
 	lastAck time.Time
 	ackGap  time.Duration // smoothed interval between acknowledgements
+
+	// The lowest RTT sample in the current and previous half of
+	// ccBaseWindow.
+	baseStart         time.Time
+	baseCur, basePrev time.Duration
+	delayRounds       int           // consecutive rounds showing delay
+	delayMin          time.Duration // lowest RTT sample in them
+}
+
+// observeRTT records an RTT sample of any packet on the path.
+func (cc *streamCC) observeRTT(now time.Time, rtt time.Duration) {
+	half := ccBaseWindow / 2
+	switch {
+	case cc.baseStart.IsZero() || now.Sub(cc.baseStart) >= 2*half:
+		cc.baseStart, cc.baseCur, cc.basePrev = now, rtt, 0
+	case now.Sub(cc.baseStart) >= half:
+		cc.baseStart, cc.basePrev, cc.baseCur = cc.baseStart.Add(half), cc.baseCur, rtt
+	}
+	cc.baseCur = min(cc.baseCur, rtt)
+}
+
+// baseRTT is the lowest RTT sample of the last ccBaseWindow or so, or
+// fallback without one.
+func (cc *streamCC) baseRTT(fallback time.Duration) time.Duration {
+	switch {
+	case cc.baseStart.IsZero():
+		return fallback
+	case cc.basePrev > 0:
+		return min(cc.baseCur, cc.basePrev)
+	}
+	return cc.baseCur
 }
 
 func (cc *streamCC) start(now time.Time, srtt time.Duration, mss int) {
@@ -172,6 +216,19 @@ func (cc *streamCC) update(now time.Time, minRTT, srtt time.Duration, mss int) {
 	settling := cc.backedOff || delay && cc.lastDelay &&
 		cc.roundMin < cc.lastMin-max(time.Millisecond, (cc.lastMin-minRTT)/8)
 	cc.lastDelay, cc.lastMin, cc.backedOff = delay, cc.roundMin, false
+	if delay {
+		cc.delayRounds++
+		if cc.delayMin == 0 || cc.roundMin > 0 && cc.roundMin < cc.delayMin {
+			cc.delayMin = cc.roundMin
+		}
+		if cc.delayRounds >= ccRebaseRounds && cc.delayMin > 0 {
+			cc.baseStart, cc.baseCur, cc.basePrev = now, cc.delayMin, 0
+			cc.delayRounds, cc.delayMin = 0, 0
+			delay, settling = false, true
+		}
+	} else {
+		cc.delayRounds, cc.delayMin = 0, 0
+	}
 	switch {
 	case (delay || spike) && settling:
 	case delay || spike:

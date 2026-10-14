@@ -430,3 +430,38 @@ func TestStreamReassembly(t *testing.T) {
 		t.Fatalf("reassembled %d bytes (%d segments left)", len(s.recv.data), len(s.recv.segs))
 	}
 }
+
+func TestStreamRTTRise(t *testing.T) {
+	// The link's delay rises from 10 to 50 ms each way, as when a network
+	// change adds latency: the path's minimum RTT remembers the old delay
+	// for a minute, and rate control must not take the difference for a
+	// queue and hold at its floor. The comparison is the same transfer on
+	// a link that had the higher delay all along.
+	transfer := func(rise bool) float64 {
+		n, s := streamNetwork(t, 69)
+		for _, l := range []*link{n.up, n.down} {
+			l.rate = 1_250_000
+			if !rise {
+				l.delay = 50 * time.Millisecond
+			}
+		}
+		sp := openPair(t, n, s, nil, randomBytes(9, 1<<20))
+		if !sp.run(30 * time.Second) {
+			t.Fatal("first transfer incomplete")
+		}
+		n.up.delay, n.down.delay = 50*time.Millisecond, 50*time.Millisecond
+		n.runFor(time.Second)
+		down := randomBytes(10, 4<<20)
+		start := n.now
+		sp = openPair(t, n, s, nil, down)
+		if !sp.run(60*time.Second) || !bytes.Equal(sp.client.got, down) {
+			t.Fatalf("transfer incomplete: %d/%d", len(sp.client.got), len(down))
+		}
+		return sp.client.eofAt.Sub(start).Seconds()
+	}
+	risen, steady := transfer(true), transfer(false)
+	t.Logf("4 MiB at 100 ms RTT: %.1f s after the RTT rose, %.1f s on a link that always had it", risen, steady)
+	if risen > 1.5*steady {
+		t.Errorf("%.1f s after the RTT rose, against %.1f s; want at most 1.5x", risen, steady)
+	}
+}
