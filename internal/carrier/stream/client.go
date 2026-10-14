@@ -17,8 +17,15 @@ type ClientOptions struct {
 	// Addr is the relay's TLS endpoint, host:port.
 	Addr string
 	// TLS verifies the relay's certificate (ServerName, RootCAs). The
-	// carrier requires TLS 1.3 and ALPN "arc/1".
+	// carrier requires TLS 1.3 and ALPN "arc/1", unless Camouflage is
+	// set: then the outer handshake is cover and the ARC session
+	// underneath provides security.
 	TLS *tls.Config
+	// Camouflage, when set, presents the outer TLS as ordinary browser
+	// traffic (cover server name, optional browser fingerprint, optional
+	// ClientHello segmentation) instead of verifying the relay and
+	// negotiating ALPN "arc/1".
+	Camouflage *Camouflage
 	// Socket options for the TCP connection.
 	Sockopt sockopt.Options
 	// Peer is reported as the source of received packets, so the engine
@@ -105,23 +112,55 @@ func (c *Client) connectLoop() {
 func (c *Client) connect() (*link, error) {
 	ctx, cancel := context.WithTimeout(c.ctx, 10*time.Second)
 	defer cancel()
-	cfg := c.opts.TLS.Clone()
-	cfg.MinVersion = tls.VersionTLS13
-	cfg.NextProtos = []string{ALPN}
-	d := tls.Dialer{
-		NetDialer: &net.Dialer{Control: sockopt.Control(c.opts.Sockopt), KeepAlive: 15 * time.Second},
-		Config:    cfg,
-	}
-	conn, err := d.DialContext(ctx, "tcp", c.opts.Addr)
+	conn, _, alpn, err := c.dialTLS(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if p := conn.(*tls.Conn).ConnectionState().NegotiatedProtocol; p != ALPN {
+	// The camouflage profile offers a browser's ALPN, so the negotiated
+	// label is not the carrier's; the ARC session authenticates the peer.
+	if c.opts.Camouflage == nil && alpn != ALPN {
 		conn.Close()
 		return nil, errors.New("stream: relay did not negotiate ALPN " + ALPN)
 	}
-	conn.(*tls.Conn).NetConn().(*net.TCPConn).SetNoDelay(true)
 	return newLink(conn, c.opts.Peer, c.opts.Queue, 0), nil
+}
+
+// dialTLS connects to the relay endpoint and runs the TLS handshake,
+// returning the TLS connection, its underlying transport, and the
+// negotiated protocol. SetNoDelay runs before the handshake: the
+// camouflage profile needs its ClientHello fragments to leave as TCP
+// segments at once.
+func (c *Client) dialTLS(ctx context.Context) (_ net.Conn, raw net.Conn, alpn string, err error) {
+	raw, err = (&net.Dialer{
+		Control:   sockopt.Control(c.opts.Sockopt),
+		KeepAlive: 15 * time.Second,
+	}).DialContext(ctx, "tcp", c.opts.Addr)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	defer func() {
+		if err != nil && raw != nil {
+			raw.Close()
+		}
+	}()
+	if tcp, ok := raw.(*net.TCPConn); ok {
+		tcp.SetNoDelay(true)
+	}
+	if cam := c.opts.Camouflage; cam != nil {
+		return cam.dial(ctx, raw, c.opts.Addr, c.opts.TLS)
+	}
+	config := c.opts.TLS
+	if config == nil {
+		config = &tls.Config{}
+	}
+	cfg := config.Clone()
+	cfg.MinVersion = tls.VersionTLS13
+	cfg.NextProtos = []string{ALPN}
+	conn := tls.Client(raw, cfg)
+	if err = conn.HandshakeContext(ctx); err != nil {
+		return nil, nil, "", err
+	}
+	return conn, raw, conn.ConnectionState().NegotiatedProtocol, nil
 }
 
 func (c *Client) setLink(l *link) {

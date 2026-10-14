@@ -14,8 +14,11 @@ require (
 )
 
 require (
+	github.com/andybalholm/brotli v1.0.6 // indirect
 	github.com/google/btree v1.1.2 // indirect
+	github.com/klauspost/compress v1.17.4 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
+	github.com/refraction-networking/utls v1.8.2 // indirect
 	github.com/vishvananda/netns v0.0.5 // indirect
 	golang.org/x/time v0.7.0 // indirect
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect

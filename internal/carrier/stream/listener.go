@@ -16,6 +16,12 @@ type ListenerOptions struct {
 	// TLS holds the relay's certificate. The listener requires TLS 1.3
 	// and ALPN "arc/1".
 	TLS *tls.Config
+	// Camouflage accepts carrier connections that present a browser's
+	// ALPN ("h2" or "http/1.1") instead of "arc/1", as the client
+	// camouflage profile does. The negotiated label does not affect
+	// framing. A relay so configured should hold a certificate covering
+	// the cover names its clients present.
+	Camouflage bool
 	// MaxConns bounds concurrent connections (default 4096).
 	MaxConns int
 	// Idle closes a connection that receives nothing for this long
@@ -69,6 +75,9 @@ func Listen(addr string, opts ListenerOptions) (*Listener, error) {
 	cfg := opts.TLS.Clone()
 	cfg.MinVersion = tls.VersionTLS13
 	cfg.NextProtos = []string{ALPN}
+	if opts.Camouflage {
+		cfg.NextProtos = append(cfg.NextProtos, browserALPN...)
+	}
 	tcp, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, err
@@ -103,7 +112,16 @@ func (l *Listener) serve(conn *tls.Conn) {
 	ctx, cancel := context.WithTimeout(l.ctx, 10*time.Second)
 	err := conn.HandshakeContext(ctx)
 	cancel()
-	if err != nil || conn.ConnectionState().NegotiatedProtocol != ALPN {
+	if err != nil {
+		return
+	}
+	// The camouflage profile lets clients offer a browser's ALPN; the
+	// label does not affect framing, and the ARC session inside
+	// authenticates the client.
+	switch p := conn.ConnectionState().NegotiatedProtocol; {
+	case p == ALPN:
+	case l.opts.Camouflage && (p == "h2" || p == "http/1.1"):
+	default:
 		conn.Close()
 		return
 	}
