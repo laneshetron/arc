@@ -86,6 +86,7 @@ type PathInfo struct {
 	SRTT      time.Duration
 	MinRTT    time.Duration
 	Loss      float64 // worse direction's recent loss rate; 0 if unmeasured
+	Burst     float64 // mean length of loss runs in the send direction; 0 if none seen
 	MaxPacket int
 	LastRecv  time.Time
 	Flows     int     // flows pinned to the path (§15.2)
@@ -359,7 +360,7 @@ func (c *conn) pathInfo(now time.Time) []PathInfo {
 		info := PathInfo{
 			ID: p.id, Validated: p.validated, Healthy: p.healthy(now, c.keepalive), Primary: p == prim,
 			SRTT: p.rtt.srtt(), MinRTT: p.rtt.minRTT(), Loss: loss, MaxPacket: p.maxPacket, LastRecv: p.lastRecv,
-			Flows: p.flows, Capacity: p.capacity(now),
+			Flows: p.flows, Capacity: p.capacity(now), Burst: p.burst,
 		}
 		if prim != nil {
 			info.Eligible = c.eligible(now, p, prim)

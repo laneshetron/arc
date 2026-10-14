@@ -36,5 +36,10 @@ func binomialTail(n int, p float64, m int) float64 {
 // one burst's worth, so a typical burst costs each block one packet,
 // within MaxDepth.
 func DepthFor(meanBurst float64) int {
-	return min(max(int(math.Round(meanBurst)), 1), 8)
+	return min(max(int(math.Round(meanBurst)), 1), MaxUsefulDepth)
 }
+
+// MaxUsefulDepth caps the interleaving depth DepthFor chooses. Deeper
+// groups take longer to fill than rebuilt packets stay useful at moderate
+// rates.
+const MaxUsefulDepth = 8

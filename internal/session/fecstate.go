@@ -32,6 +32,13 @@ const (
 	// and auto mode needs a group to span fecMinBursts mean bursts.
 	fecMaxBurstWindow = 50 * time.Millisecond
 	fecMinBursts      = 4
+	// fecMaxBurst is the longest mean burst auto mode protects against:
+	// interleaving spreads a burst over at most fec.MaxUsefulDepth blocks,
+	// and beyond twice that each block loses more than its repairs cover.
+	// netem, which drops whole GSO batches of up to 64 datagrams, measures
+	// bursts of 12-47 under "uniform" 5% loss at a few hundred Mbit/s;
+	// protecting them cost 27% of TCP goodput with redundancy on.
+	fecMaxBurst = 2 * fec.MaxUsefulDepth
 	// fecHeld is how long a receiver keeps sources for rebuilding after
 	// the last repair it saw; it keeps none while no repairs arrive.
 	fecHeld = 5 * time.Second
@@ -117,7 +124,7 @@ func (c *conn) fecSending(now time.Time) bool {
 	// window, auto mode stays off rather than spend repairs the bursts
 	// would mostly take with them (on one path, 5% loss in bursts of 10 at
 	// 1000 packets/s cost 48% overhead for half a point of delivery).
-	if f.mode == wire.FECAuto && f.burst > 2 && rate*limit.Seconds() < fecMinBursts*f.burst {
+	if f.mode == wire.FECAuto && f.burst > 2 && (rate*limit.Seconds() < fecMinBursts*f.burst || f.burst > fecMaxBurst) {
 		if wasActive {
 			c.sendRepairs(now, f.enc.Flush(now.Add(fecMaxBurstWindow)))
 		}
