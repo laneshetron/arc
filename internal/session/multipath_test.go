@@ -466,3 +466,34 @@ func TestRecoveryAfterOutageIsPrompt(t *testing.T) {
 		t.Errorf("path 1 healthy for good only after %v", stableFrom)
 	}
 }
+
+// TestRelayRecoveryAfterOutageIsPrompt: packets the relay sent on a path
+// during an outage stayed outstanding afterwards, since the relay sends
+// nothing acknowledged on an idle path, so it judged the path suspect
+// except just after each of the client's keepalives and kept new downlink
+// flows off it. A relay that hears from such a path now pings it.
+func TestRelayRecoveryAfterOutageIsPrompt(t *testing.T) {
+	n, s, c := rateLimitedPaths(t, 132, 1_000_000, 1_000_000, ClientConfig{})
+	c.up.queue, c.down.queue = 200*time.Millisecond, 200*time.Millisecond
+	n.client.SetFallback(0, true)                      // the relay's downlink follows the uplink to path 1
+	flowLoad(n, s, 4, time.Millisecond, 3*time.Second) // a standing queue inflates its RTT
+	c.up.down, c.down.down = true, true                // cut while the relay still sends there
+	n.client.SetFallback(0, false)
+	flowLoad(n, s, 1, 10*time.Millisecond, 15*time.Second)
+	c.up.down, c.down.down = false, false
+	start, stableFrom := n.now, time.Duration(-1)
+	for n.now.Sub(start) < 15*time.Second {
+		n.runFor(20 * time.Millisecond)
+		healthy := s.conn.path(1).healthy(n.now, s.conn.keepalive)
+		switch {
+		case !healthy:
+			stableFrom = -1
+		case stableFrom < 0:
+			stableFrom = n.now.Sub(start)
+		}
+	}
+	t.Logf("relay: path 1 healthy for good %v after the outage ended (srtt %v)", stableFrom, s.conn.path(1).rtt.srtt())
+	if stableFrom < 0 || stableFrom > 2*time.Second {
+		t.Errorf("relay: path 1 healthy for good only after %v", stableFrom)
+	}
+}

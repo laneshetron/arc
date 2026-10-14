@@ -274,6 +274,7 @@ func (r *Relay) handleData(now time.Time, from netip.AddrPort, b []byte) {
 		return
 	}
 	s.onAddress(now, p, from, len(b))
+	s.probeIfStale(now, p)
 
 	for _, f := range frames {
 		switch f := f.(type) {
@@ -379,6 +380,23 @@ func (s *RelaySession) onUplink(p *path) {
 	if p.joined && p.validated {
 		s.lastUplink = p
 	}
+}
+
+// probeIfStale pings a path that hears from the client while packets sent
+// on it have gone unanswered for the suspect limit. The relay sends nothing
+// acknowledged on an idle path, so packets lost in an outage would stay
+// outstanding and keep the path suspect, but for a moment after each of the
+// client's keepalives, until they expire; the PING's acknowledgement
+// declares them lost by time threshold. At most one PING per PTO.
+func (s *RelaySession) probeIfStale(now time.Time, p *path) {
+	if s.state != StateActive || !p.joined || !p.validated {
+		return
+	}
+	t0, ok := p.sent.oldestOutstanding()
+	if !ok || now.Sub(t0) < suspectPTOs*p.rtt.pto() || now.Sub(p.lastSend) < p.rtt.pto() {
+		return
+	}
+	s.conn.transmit(now, p, []wire.Frame{wire.Ping{}})
 }
 
 // onAddress tracks where an authenticated packet came from. A new path
