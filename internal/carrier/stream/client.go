@@ -66,12 +66,14 @@ func (c *Client) connectLoop() {
 	backoff := 500 * time.Millisecond
 	for c.ctx.Err() == nil {
 		l, err := c.connect()
+		if err == nil {
+			c.setLink(l) // before OnState, so a write it prompts is not dropped
+		}
 		if c.opts.OnState != nil {
 			c.opts.OnState(err)
 		}
 		if err == nil {
 			start := time.Now()
-			c.setLink(l)
 			go func() { // Close may have missed a link that was still dialing
 				select {
 				case <-c.ctx.Done():
