@@ -22,6 +22,13 @@ const (
 	// and under heavy loss a longer wait only delays the frames that
 	// recover the session, such as REDUNDANCY and PATH_ABANDON.
 	maxPTOBackoff = 3
+	// deliveryHorizon bounds how long after sending an acknowledged
+	// packet still counts toward the path's delivery rate. After an
+	// outage, the first ACK can also cover packets sent before it that
+	// arrived while their ACKs were lost; counted as delivered at once,
+	// they made an idle path look measured and slow (about 1.5 Mbit/s on
+	// CI, sched.go), and new flows avoided it.
+	deliveryHorizon = 2 * time.Second
 )
 
 // ackTracker records received packet numbers on one path and decides when
@@ -331,7 +338,9 @@ func (s *sentLog) onAck(now time.Time, ack *wire.Ack, intervals []wire.PacketRan
 			if p.probe == 0 {
 				if !p.ping {
 					res.delivered++
-					res.deliveredBytes += p.size
+					if now.Sub(p.sentAt) <= deliveryHorizon {
+						res.deliveredBytes += p.size
+					}
 				}
 			}
 			res.ackedProbe = max(res.ackedProbe, p.probe)
