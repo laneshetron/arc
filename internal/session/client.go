@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"io"
+	"net/netip"
 	"slices"
 	"time"
 
@@ -92,11 +93,17 @@ type PathClosed struct {
 // Closed reports that the session ended.
 type Closed struct{ Err error }
 
+// StreamUpdate reports news on a stream: bytes to read, room to write, the
+// end of either, or a reset. StreamInfo says which; until it is called,
+// further news raises no further StreamUpdate for the stream.
+type StreamUpdate struct{ ID uint32 }
+
 func (Established) clientEvent()       {}
 func (PathValidated) clientEvent()     {}
 func (PathClosed) clientEvent()        {}
 func (Closed) clientEvent()            {}
 func (RedundancyChanged) clientEvent() {}
+func (StreamUpdate) clientEvent()      {}
 
 // MaxCredentialLen is the largest credential whose AUTH frame fits in one
 // packet on a path that has not been MTU-probed.
@@ -417,12 +424,99 @@ func (c *Client) handleData(now time.Time, b []byte) {
 			if q := c.conn.path(f.PathID); q != nil {
 				c.dropPath(q, ErrPathAbandoned)
 			}
+		case wire.Stream:
+			if !c.conn.onStream(f) {
+				c.violation(now)
+				return
+			}
+		case wire.MaxStreamData:
+			c.conn.onMaxStreamData(f)
+		case wire.MaxData:
+			c.conn.onMaxData(f)
+		case wire.StreamReset:
+			if !c.conn.onStreamReset(f) {
+				c.violation(now)
+				return
+			}
 		case wire.CloseFrame:
 			c.close(now, &PeerClosedError{Code: f.Code}, false)
 			return
 		}
 	}
 	c.conn.flush(now)
+}
+
+// violation ends the session over a peer's protocol violation.
+func (c *Client) violation(now time.Time) {
+	if p := c.conn.primary(now); p != nil {
+		c.conn.transmit(now, p, []wire.Frame{wire.CloseFrame{Code: wire.CodeProtocolViolation}})
+	}
+	c.close(now, ErrProtocolViolation, false)
+}
+
+// streamEvents turns stream news into events.
+func (c *Client) streamEvents() {
+	for _, id := range c.conn.streams.updates {
+		c.events = append(c.events, StreamUpdate{ID: id})
+	}
+	c.conn.streams.updates = c.conn.streams.updates[:0]
+}
+
+// OpenStream asks the relay to connect a new stream to a TCP destination
+// and returns its ID (§11.3). Bytes may be written at once; if the relay
+// cannot connect, the stream is reset.
+func (c *Client) OpenStream(now time.Time, dst netip.AddrPort) (uint32, error) {
+	c.observe(now)
+	if c.state != StateActive {
+		return 0, ErrNotActive
+	}
+	return c.conn.openStream(now, dst)
+}
+
+// StreamWrite queues bytes for a stream and returns how many it accepted,
+// which StreamInfo's Writable bounds. It copies them.
+func (c *Client) StreamWrite(now time.Time, id uint32, p []byte) (int, error) {
+	c.observe(now)
+	if c.state != StateActive {
+		return 0, ErrNotActive
+	}
+	return c.conn.streamWrite(now, id, p)
+}
+
+// StreamRead reads received stream bytes, returning io.EOF once the peer
+// finished sending and everything was read.
+func (c *Client) StreamRead(now time.Time, id uint32, p []byte) (int, error) {
+	c.observe(now)
+	if c.state != StateActive {
+		return 0, ErrNotActive
+	}
+	return c.conn.streamRead(now, id, p)
+}
+
+// StreamCloseWrite ends what this end sends on a stream, after the bytes
+// already written.
+func (c *Client) StreamCloseWrite(now time.Time, id uint32) error {
+	c.observe(now)
+	if c.state != StateActive {
+		return ErrNotActive
+	}
+	return c.conn.streamCloseWrite(now, id)
+}
+
+// StreamReset abandons a stream in both directions.
+func (c *Client) StreamReset(now time.Time, id uint32, code wire.ErrorCode) {
+	c.observe(now)
+	if c.state == StateActive {
+		c.conn.streamReset(now, id, code)
+	}
+}
+
+// StreamInfo reports a stream's state. A stream reported Done is gone.
+func (c *Client) StreamInfo(id uint32) StreamInfo {
+	if c.conn == nil {
+		return StreamInfo{Done: true, Err: ErrStreamClosed}
+	}
+	return c.conn.streamInfo(id)
 }
 
 // onChallenge answers a PATH_CHALLENGE. An authenticated challenge on a
@@ -458,6 +552,9 @@ func (c *Client) onAuthResult(now time.Time, r wire.AuthResult) {
 	if r.Features&wire.FeatureFEC != 0 && c.cfg.FEC != wire.FECOff {
 		c.conn.fec.mode = c.cfg.FEC
 		c.conn.queue(wire.FEC{Seq: 1, Mode: c.cfg.FEC}) // the relay protects the downlink likewise
+	}
+	if r.Features&wire.FeatureStreams != 0 {
+		c.conn.streams.init(true)
 	}
 	c.conn.keepalive = c.keepalive()
 	c.conn.probe(now, p0)
@@ -756,6 +853,9 @@ func (c *Client) PollIP() ([]byte, bool) {
 
 // PollEvent returns the next event.
 func (c *Client) PollEvent() (ClientEvent, bool) {
+	if c.conn != nil {
+		c.streamEvents()
+	}
 	if len(c.events) == 0 {
 		return nil, false
 	}

@@ -3,6 +3,7 @@ package wire
 import (
 	"encoding/binary"
 	"fmt"
+	"net/netip"
 )
 
 // FrameType identifies a TLV frame inside a decrypted DATA payload (§10.1).
@@ -27,6 +28,11 @@ const (
 	FrameRedundancy    FrameType = 0x0F
 	FrameFECRepair     FrameType = 0x10
 	FrameFEC           FrameType = 0x11
+	FrameStreamOpen    FrameType = 0x12
+	FrameStream        FrameType = 0x13
+	FrameMaxStreamData FrameType = 0x14
+	FrameMaxData       FrameType = 0x15
+	FrameStreamReset   FrameType = 0x16
 
 	// Frame types at or above FirstExtensionFrame are optional extensions
 	// that receivers may ignore; unknown types below it are required.
@@ -36,7 +42,8 @@ const (
 var frameNames = [...]string{
 	"PADDING", "AUTH", "AUTH_RESULT", "IP_PACKET", "IP_FRAGMENT", "NEW_PATH", "PATH_JOIN",
 	"PATH_CHALLENGE", "PATH_RESPONSE", "PATH_ABANDON", "PING", "ACK", "CLOSE", "ERROR",
-	"IP_DATAGRAM", "REDUNDANCY", "FEC_REPAIR", "FEC",
+	"IP_DATAGRAM", "REDUNDANCY", "FEC_REPAIR", "FEC", "STREAM_OPEN", "STREAM", "MAX_STREAM_DATA",
+	"MAX_DATA", "STREAM_RESET",
 }
 
 func (t FrameType) String() string {
@@ -69,6 +76,9 @@ const (
 	CodeUnsupported       ErrorCode = 6
 	CodeSessionExpired    ErrorCode = 7
 	CodeProtocolViolation ErrorCode = 8
+	// Stream reset codes (§11.3).
+	CodeConnectFailed ErrorCode = 9  // the relay could not connect to the destination
+	CodeAborted       ErrorCode = 10 // the TCP connection failed or was reset
 )
 
 const (
@@ -83,6 +93,10 @@ const (
 	redundancyLen   = 5
 	fecRepairFixed  = 8
 	fecLen          = 5
+	streamFixed     = 13
+	maxStreamData   = 12
+	maxDataLen      = 8
+	streamResetLen  = 14
 	ackFixed        = 21
 )
 
@@ -123,7 +137,48 @@ const (
 	FeatureRedundancy uint64 = 1 << 0
 	// FeatureFEC: the relay accepts FEC_REPAIR and FEC (§11.2).
 	FeatureFEC uint64 = 1 << 1
+	// FeatureStreams: the relay accepts STREAM_OPEN and carries streams to
+	// TCP destinations (§11.3).
+	FeatureStreams uint64 = 1 << 2
 )
+
+// MaxStreamOffset bounds stream offsets and flow control limits, so that
+// offset plus length never overflows (§11.3).
+const MaxStreamOffset = 1<<62 - 1
+
+// StreamOpen asks the relay to connect stream ID to a TCP destination
+// (§11.3). Client to relay only.
+type StreamOpen struct {
+	ID  uint32
+	Dst netip.AddrPort
+}
+
+// Stream carries bytes of a stream starting at Offset. Fin marks the end of
+// the sender's data at Offset+len(Data).
+type Stream struct {
+	ID     uint32
+	Offset uint64
+	Fin    bool
+	Data   []byte
+}
+
+// MaxStreamData raises the number of bytes the peer may send on a stream:
+// offsets below Max.
+type MaxStreamData struct {
+	ID  uint32
+	Max uint64
+}
+
+// MaxData raises the total the peer may send across all streams.
+type MaxData struct{ Max uint64 }
+
+// StreamReset abandons a stream in both directions. Final is the size of
+// what the sender sent on it, for connection flow control.
+type StreamReset struct {
+	ID    uint32
+	Code  ErrorCode
+	Final uint64
+}
 
 // FECRepair is one forward-error-correction repair symbol (§11.2) for the
 // block of K datagrams with IDs First, First+Stride, ..., of which only
@@ -239,6 +294,11 @@ func (IPDatagram) Type() FrameType    { return FrameIPDatagram }
 func (Redundancy) Type() FrameType    { return FrameRedundancy }
 func (FECRepair) Type() FrameType     { return FrameFECRepair }
 func (FEC) Type() FrameType           { return FrameFEC }
+func (StreamOpen) Type() FrameType    { return FrameStreamOpen }
+func (Stream) Type() FrameType        { return FrameStream }
+func (MaxStreamData) Type() FrameType { return FrameMaxStreamData }
+func (MaxData) Type() FrameType       { return FrameMaxData }
+func (StreamReset) Type() FrameType   { return FrameStreamReset }
 func (u Unknown) Type() FrameType     { return u.FrameType }
 
 // AppendFrame appends the TLV encoding of f to b. It panics if the encoded
@@ -318,6 +378,35 @@ func (r FECRepair) appendValue(b []byte) []byte {
 func (f FEC) appendValue(b []byte) []byte {
 	b = binary.BigEndian.AppendUint32(b, f.Seq)
 	return append(b, byte(f.Mode))
+}
+
+func (o StreamOpen) appendValue(b []byte) []byte {
+	b = binary.BigEndian.AppendUint32(b, o.ID)
+	b = binary.BigEndian.AppendUint16(b, o.Dst.Port())
+	return append(b, o.Dst.Addr().AsSlice()...)
+}
+
+func (f Stream) appendValue(b []byte) []byte {
+	b = binary.BigEndian.AppendUint32(b, f.ID)
+	b = binary.BigEndian.AppendUint64(b, f.Offset)
+	var flags byte
+	if f.Fin {
+		flags = 1
+	}
+	return append(append(b, flags), f.Data...)
+}
+
+func (m MaxStreamData) appendValue(b []byte) []byte {
+	b = binary.BigEndian.AppendUint32(b, m.ID)
+	return binary.BigEndian.AppendUint64(b, m.Max)
+}
+
+func (m MaxData) appendValue(b []byte) []byte { return binary.BigEndian.AppendUint64(b, m.Max) }
+
+func (r StreamReset) appendValue(b []byte) []byte {
+	b = binary.BigEndian.AppendUint32(b, r.ID)
+	b = binary.BigEndian.AppendUint16(b, uint16(r.Code))
+	return binary.BigEndian.AppendUint64(b, r.Final)
 }
 
 func (f IPFragment) appendValue(b []byte) []byte {
@@ -402,6 +491,10 @@ var (
 	errRedundancyMode   = malformed("REDUNDANCY unknown mode")
 	errFECRepair        = malformed("FEC_REPAIR geometry invalid")
 	errFECMode          = malformed("FEC unknown mode")
+	errStreamOpen       = malformed("STREAM_OPEN destination invalid")
+	errStreamID         = malformed("stream ID zero")
+	errStreamFlags      = malformed("STREAM unknown flags")
+	errStreamOffset     = malformed("stream offset or limit too large")
 	errIPVersion        = malformed("IP_PACKET has unknown IP version")
 	errIPLength         = malformed("IP_PACKET length does not match IP header")
 	errFragmentRange    = malformed("IP_FRAGMENT range invalid")
@@ -525,6 +618,73 @@ func parseValue(t FrameType, v []byte) (Frame, error) {
 			return nil, errFECMode
 		}
 		return f, nil
+
+	case FrameStreamOpen:
+		if len(v) != 10 && len(v) != 22 {
+			return nil, errFrameSize
+		}
+		addr, _ := netip.AddrFromSlice(v[6:])
+		o := StreamOpen{ID: binary.BigEndian.Uint32(v), Dst: netip.AddrPortFrom(addr, binary.BigEndian.Uint16(v[4:6]))}
+		if o.ID == 0 {
+			return nil, errStreamID
+		}
+		if o.Dst.Port() == 0 || addr.IsUnspecified() {
+			return nil, errStreamOpen
+		}
+		return o, nil
+
+	case FrameStream:
+		if len(v) < streamFixed {
+			return nil, errFrameSize
+		}
+		f := Stream{ID: binary.BigEndian.Uint32(v), Offset: binary.BigEndian.Uint64(v[4:12]), Fin: v[12] == 1,
+			Data: v[streamFixed:]}
+		switch {
+		case f.ID == 0:
+			return nil, errStreamID
+		case v[12] > 1:
+			return nil, errStreamFlags
+		case f.Offset+uint64(len(f.Data)) > MaxStreamOffset:
+			return nil, errStreamOffset
+		}
+		return f, nil
+
+	case FrameMaxStreamData:
+		if len(v) != maxStreamData {
+			return nil, errFrameSize
+		}
+		m := MaxStreamData{ID: binary.BigEndian.Uint32(v), Max: binary.BigEndian.Uint64(v[4:])}
+		if m.ID == 0 {
+			return nil, errStreamID
+		}
+		if m.Max > MaxStreamOffset {
+			return nil, errStreamOffset
+		}
+		return m, nil
+
+	case FrameMaxData:
+		if len(v) != maxDataLen {
+			return nil, errFrameSize
+		}
+		m := MaxData{Max: binary.BigEndian.Uint64(v)}
+		if m.Max > MaxStreamOffset {
+			return nil, errStreamOffset
+		}
+		return m, nil
+
+	case FrameStreamReset:
+		if len(v) != streamResetLen {
+			return nil, errFrameSize
+		}
+		r := StreamReset{ID: binary.BigEndian.Uint32(v), Code: ErrorCode(binary.BigEndian.Uint16(v[4:6])),
+			Final: binary.BigEndian.Uint64(v[6:])}
+		if r.ID == 0 {
+			return nil, errStreamID
+		}
+		if r.Final > MaxStreamOffset {
+			return nil, errStreamOffset
+		}
+		return r, nil
 
 	case FrameNewPath:
 		if len(v) != newPathLen {

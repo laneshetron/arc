@@ -1,0 +1,432 @@
+package session
+
+import (
+	"bytes"
+	"errors"
+	"io"
+	"math/rand/v2"
+	"net/netip"
+	"testing"
+	"time"
+
+	"github.com/laneshetron/arc/internal/wire"
+)
+
+var tcpDst = netip.MustParseAddrPort("198.51.100.7:443")
+
+// streamEnd is one end of a stream in a test: what it sends and what it
+// has received.
+type streamEnd struct {
+	send     []byte
+	sent     int
+	closed   bool // FIN queued
+	got      []byte
+	eof      bool
+	eofAt    time.Time
+	err      error
+	maxBufed int // most bytes received and not yet read, if reading is paused
+}
+
+// streamPair drives one stream's two ends through a network.
+type streamPair struct {
+	n             *network
+	s             *RelaySession
+	id            uint32
+	client, relay streamEnd
+	relayReads    bool // the relay reads what arrives
+	relayOpen     bool // the relay has reported the stream
+}
+
+// openPair opens a stream from the client and waits for the relay's
+// StreamOpened.
+func openPair(t *testing.T, n *network, s *RelaySession, up, down []byte) *streamPair {
+	t.Helper()
+	id, err := n.client.OpenStream(n.now, tcpDst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sp := &streamPair{n: n, s: s, id: id, relayReads: true}
+	sp.client.send, sp.relay.send = up, down
+	if !n.runUntil(10*time.Second, func() bool { sp.pump(); return sp.opened() }) {
+		t.Fatal("relay never reported the stream")
+	}
+	return sp
+}
+
+func (sp *streamPair) opened() bool {
+	if sp.relayOpen {
+		return true
+	}
+	for _, e := range sp.n.relayEvents {
+		if e, ok := e.(StreamOpened); ok && e.ID == sp.id {
+			if e.Dst != tcpDst {
+				sp.n.t.Fatalf("opened to %v, want %v", e.Dst, tcpDst)
+			}
+			sp.relayOpen = true
+		}
+	}
+	return sp.relayOpen
+}
+
+// pump writes and reads what each end can.
+func (sp *streamPair) pump() {
+	now := sp.n.now
+	ends := []struct {
+		e     *streamEnd
+		write func([]byte) (int, error)
+		read  func([]byte) (int, error)
+		close func() error
+		reads bool
+	}{
+		{&sp.client, func(p []byte) (int, error) { return sp.n.client.StreamWrite(now, sp.id, p) },
+			func(p []byte) (int, error) { return sp.n.client.StreamRead(now, sp.id, p) },
+			func() error { return sp.n.client.StreamCloseWrite(now, sp.id) }, true},
+		{&sp.relay, func(p []byte) (int, error) { return sp.s.StreamWrite(now, sp.id, p) },
+			func(p []byte) (int, error) { return sp.s.StreamRead(now, sp.id, p) },
+			func() error { return sp.s.StreamCloseWrite(now, sp.id) }, sp.relayReads},
+	}
+	var buf [32 << 10]byte
+	for i, x := range ends {
+		e := x.e
+		if e.err != nil || i == 1 && !sp.opened() {
+			continue
+		}
+		for e.sent < len(e.send) {
+			k, err := x.write(e.send[e.sent:])
+			if err != nil {
+				e.err = err
+				break
+			}
+			if k == 0 {
+				break
+			}
+			e.sent += k
+		}
+		if e.sent == len(e.send) && !e.closed && e.err == nil {
+			if err := x.close(); err != nil {
+				e.err = err
+			}
+			e.closed = true
+		}
+		for x.reads && !e.eof && e.err == nil {
+			k, err := x.read(buf[:])
+			e.got = append(e.got, buf[:k]...)
+			if err == io.EOF {
+				e.eof, e.eofAt = true, now
+			} else if err != nil {
+				e.err = err
+			}
+			if k == 0 {
+				break
+			}
+		}
+	}
+	sp.n.pump()
+}
+
+// run drives the pair until both ends have everything or the simulated
+// limit passes, and reports whether they finished.
+func (sp *streamPair) run(limit time.Duration) bool {
+	return sp.n.runUntil(limit, func() bool {
+		sp.pump()
+		return (sp.client.eof && sp.relay.eof) || sp.client.err != nil || sp.relay.err != nil
+	})
+}
+
+func randomBytes(seed uint64, n int) []byte {
+	b := make([]byte, n)
+	r := rand.New(rand.NewPCG(seed, 1))
+	for i := range b {
+		b[i] = byte(r.Uint32())
+	}
+	return b
+}
+
+func streamNetwork(t *testing.T, seed uint64) (*network, *RelaySession) {
+	t.Helper()
+	n := newNetwork(t, seed, defaultRelayConfig(), ClientConfig{})
+	s := n.establish()
+	n.runFor(time.Second) // MTU probes complete
+	return n, s
+}
+
+func TestStreamTransfer(t *testing.T) {
+	n, s := streamNetwork(t, 60)
+	up, down := randomBytes(1, 300_000), randomBytes(2, 1_000_000)
+	sp := openPair(t, n, s, up, down)
+	if !sp.run(30 * time.Second) {
+		t.Fatalf("transfer incomplete: client got %d/%d, relay %d/%d (errors %v, %v)",
+			len(sp.client.got), len(down), len(sp.relay.got), len(up), sp.client.err, sp.relay.err)
+	}
+	if !bytes.Equal(sp.relay.got, up) || !bytes.Equal(sp.client.got, down) {
+		t.Fatal("stream bytes corrupted")
+	}
+	// Both ends finished both directions: the stream goes away.
+	n.runFor(time.Second)
+	if info := n.client.StreamInfo(sp.id); !info.Done || info.Err != nil {
+		t.Errorf("client stream info %+v, want done", info)
+	}
+	if info := s.StreamInfo(sp.id); !info.Done || info.Err != nil {
+		t.Errorf("relay stream info %+v, want done", info)
+	}
+	if len(n.client.conn.streams.streams) != 0 || len(s.conn.streams.streams) != 0 {
+		t.Errorf("%d client and %d relay streams left", len(n.client.conn.streams.streams), len(s.conn.streams.streams))
+	}
+	if st := n.client.Stats(); st.StreamBytesRetransmitted != 0 {
+		t.Errorf("%d bytes retransmitted on a clean link", st.StreamBytesRetransmitted)
+	}
+}
+
+func TestStreamReset(t *testing.T) {
+	n, s := streamNetwork(t, 61)
+	sp := openPair(t, n, s, randomBytes(1, 100_000), nil)
+	// The relay could not connect.
+	s.StreamReset(n.now, sp.id, wire.CodeConnectFailed)
+	sp.relay.err = ErrStreamClosed // the relay is done with it
+	n.runUntil(5*time.Second, func() bool { sp.pump(); return sp.client.err != nil })
+	var rerr *StreamResetError
+	if !errors.As(sp.client.err, &rerr) || rerr.Code != wire.CodeConnectFailed {
+		t.Fatalf("client error %v, want a reset with CONNECT_FAILED", sp.client.err)
+	}
+	if info := n.client.StreamInfo(sp.id); !info.Done {
+		t.Errorf("client stream info %+v", info)
+	}
+	n.runFor(2 * time.Second)
+	cs, rs := &n.client.conn.streams, &s.conn.streams
+	if len(cs.streams) != 0 || len(rs.streams) != 0 {
+		t.Errorf("%d client and %d relay streams left", len(cs.streams), len(rs.streams))
+	}
+	// Each end counted the other's final size, so connection credit
+	// lines up.
+	if cs.sendUsed != rs.recvHigh || rs.sendUsed != cs.recvHigh || rs.recvTaken != rs.recvHigh {
+		t.Errorf("flow control: client sent %d, relay counted %d (taken %d); relay sent %d, client counted %d",
+			cs.sendUsed, rs.recvHigh, rs.recvTaken, rs.sendUsed, cs.recvHigh)
+	}
+	// Streams opened later work.
+	sp2 := openPair(t, n, s, []byte("hello"), []byte("world"))
+	if !sp2.run(5*time.Second) || string(sp2.relay.got) != "hello" || string(sp2.client.got) != "world" {
+		t.Fatalf("second stream: relay got %q, client %q", sp2.relay.got, sp2.client.got)
+	}
+}
+
+func TestStreamFlowControl(t *testing.T) {
+	n, s := streamNetwork(t, 62)
+	up := randomBytes(3, 3*streamWindow)
+	sp := openPair(t, n, s, up, nil)
+	sp.relayReads = false
+	n.runUntil(10*time.Second, func() bool { sp.pump(); return false })
+	r := s.conn.streams.streams[sp.id]
+	buffered := len(r.recv.data)
+	for _, sg := range r.recv.segs {
+		buffered += len(sg.data)
+	}
+	if buffered > streamWindow || r.recv.high > streamWindow {
+		t.Fatalf("relay buffers %d bytes (high %d) of an unread stream; window %d", buffered, r.recv.high, streamWindow)
+	}
+	if buffered < streamWindow/2 {
+		t.Fatalf("only %d bytes arrived while the relay was not reading", buffered)
+	}
+	sp.relayReads = true
+	if !sp.run(30*time.Second) || !bytes.Equal(sp.relay.got, up) {
+		t.Fatalf("relay got %d/%d bytes after resuming", len(sp.relay.got), len(up))
+	}
+}
+
+func TestStreamsUnsupported(t *testing.T) {
+	rc := defaultRelayConfig()
+	rc.NoStreams = true
+	n := newNetwork(t, 63, rc, ClientConfig{})
+	n.establish()
+	if _, err := n.client.OpenStream(n.now, tcpDst); !errors.Is(err, ErrStreamsUnsupported) {
+		t.Fatalf("OpenStream: %v", err)
+	}
+}
+
+// TestStreamLoss measures stream goodput on a 10 Mbit/s link with a 40 ms
+// RTT under uniform loss in both directions, with loss before the link (as
+// netem on egress) and after it (as on a lossy radio hop, where lost
+// packets cost capacity too).
+func TestStreamLoss(t *testing.T) {
+	const rate = 1_250_000 // bytes per second
+	for _, tc := range []struct {
+		loss    float64
+		size    int
+		atLeast float64 // goodput as a fraction of rate*(1-loss)
+	}{
+		{0, 4 << 20, 0.8},
+		{0.1, 2 << 20, 0.6},
+		{0.5, 1 << 20, 0.4},
+		{0.9, 256 << 10, 0.1},
+	} {
+		for _, after := range []bool{false, true} {
+			if after && tc.loss == 0 {
+				continue
+			}
+			where := "before"
+			if after {
+				where = "after"
+			}
+			n, s := streamNetwork(t, 64)
+			for _, l := range []*link{n.up, n.down} {
+				l.rate, l.loss, l.lossAfterQueue = rate, tc.loss, after
+			}
+			down := randomBytes(5, tc.size)
+			start := n.now
+			sp := openPair(t, n, s, []byte("GET"), down)
+			if !sp.run(120 * time.Second) {
+				t.Errorf("loss %.0f%% %s: incomplete after 120 s: %d/%d bytes (errors %v, %v)",
+					tc.loss*100, where, len(sp.client.got), tc.size, sp.client.err, sp.relay.err)
+				continue
+			}
+			if !bytes.Equal(sp.client.got, down) {
+				t.Fatalf("loss %.0f%%: corrupted", tc.loss*100)
+			}
+			secs := sp.client.eofAt.Sub(start).Seconds()
+			goodput := float64(tc.size) / secs
+			st := s.Stats()
+			t.Logf("loss %.0f%% %s the link: %d KiB in %.1f s: %.0f kbit/s (%.0f%% of the link's share); sent %.1fx the data (%.1fx retransmitted, %.1fx repeats)",
+				tc.loss*100, where, tc.size>>10, secs, goodput*8/1000, 100*goodput/(rate*(1-tc.loss)),
+				float64(st.StreamBytesSent)/float64(tc.size), float64(st.StreamBytesRetransmitted)/float64(tc.size),
+				float64(st.StreamBytesRepeated)/float64(tc.size))
+			if goodput < tc.atLeast*rate*(1-tc.loss) {
+				t.Errorf("loss %.0f%% %s: goodput %.0f kbit/s, want at least %.0f%% of %.0f kbit/s",
+					tc.loss*100, where, goodput*8/1000, tc.atLeast*100, rate*(1-tc.loss)*8/1000)
+			}
+		}
+	}
+}
+
+// runPairs drives several streams until all finish or the limit passes.
+func runPairs(n *network, pairs []*streamPair, limit time.Duration) bool {
+	return n.runUntil(limit, func() bool {
+		done := true
+		for _, sp := range pairs {
+			sp.pump()
+			done = done && sp.client.eof && sp.relay.eof
+		}
+		return done
+	})
+}
+
+func TestStreamQueueBounded(t *testing.T) {
+	// A deep buffer (300 ms at 10 Mbit/s) lets loss-based TCP build a
+	// standing queue; stream rate control keeps it near queueTarget.
+	n, s := streamNetwork(t, 65)
+	for _, l := range []*link{n.up, n.down} {
+		l.rate, l.queue = 1_250_000, 300*time.Millisecond
+	}
+	down := randomBytes(6, 8<<20)
+	sp := openPair(t, n, s, nil, down)
+	var queued time.Duration
+	samples := 0
+	start := n.now
+	next := n.now
+	ok := n.runUntil(60*time.Second, func() bool {
+		sp.pump()
+		if p := s.conn.paths[0]; n.now.Sub(start) > 2*time.Second && !n.now.Before(next) {
+			queued += p.rtt.latest - p.rtt.minRTT()
+			samples++
+			next = n.now.Add(10 * time.Millisecond)
+		}
+		return sp.client.eof
+	})
+	if !ok || !bytes.Equal(sp.client.got, down) {
+		t.Fatalf("transfer incomplete: %d/%d", len(sp.client.got), len(down))
+	}
+	secs := sp.client.eofAt.Sub(start).Seconds()
+	mean := queued / time.Duration(samples)
+	t.Logf("%.1f s, %.0f%% of the link; mean queueing delay %v", secs, 100*float64(len(down))/secs/1_250_000, mean)
+	if mean > 25*time.Millisecond {
+		t.Errorf("mean queueing delay %v; want at most 25 ms", mean)
+	}
+	if float64(len(down))/secs < 0.8*1_250_000 {
+		t.Errorf("goodput %.0f B/s; want at least 80%% of the link", float64(len(down))/secs)
+	}
+}
+
+func TestStreamsShare(t *testing.T) {
+	n, s := streamNetwork(t, 66)
+	for _, l := range []*link{n.up, n.down} {
+		l.rate = 1_250_000
+	}
+	var pairs []*streamPair
+	for i := range 4 {
+		pairs = append(pairs, openPair(t, n, s, nil, randomBytes(uint64(10+i), 1<<20)))
+	}
+	start := n.now
+	if !runPairs(n, pairs, 30*time.Second) {
+		t.Fatal("transfers incomplete")
+	}
+	var first, last time.Duration
+	for i, sp := range pairs {
+		if !bytes.Equal(sp.client.got, sp.relay.send) {
+			t.Fatalf("stream %d corrupted", i)
+		}
+		d := sp.client.eofAt.Sub(start)
+		if i == 0 || d < first {
+			first = d
+		}
+		last = max(last, d)
+	}
+	t.Logf("4 x 1 MiB: first done after %v, last after %v", first, last)
+	if last > 2*first {
+		t.Errorf("first stream done after %v, last after %v; want them sharing the link", first, last)
+	}
+}
+
+func TestStreamSurvivesOutage(t *testing.T) {
+	n, s := streamNetwork(t, 67)
+	for _, l := range []*link{n.up, n.down} {
+		l.rate = 1_250_000
+	}
+	down := randomBytes(7, 4<<20)
+	sp := openPair(t, n, s, nil, down)
+	n.runUntil(10*time.Second, func() bool { sp.pump(); return len(sp.client.got) > 1<<20 })
+	n.up.down, n.down.down = true, true
+	n.runUntil(5*time.Second, func() bool { sp.pump(); return false })
+	n.up.down, n.down.down = false, false
+	resumed := n.now
+	if !sp.run(30*time.Second) || !bytes.Equal(sp.client.got, down) {
+		t.Fatalf("transfer incomplete after the outage: %d/%d", len(sp.client.got), len(down))
+	}
+	// About 3 MiB remained: 2.5 s at the link rate.
+	if d := sp.client.eofAt.Sub(resumed); d > 6*time.Second {
+		t.Errorf("took %v after the outage ended", d)
+	}
+}
+
+func TestStreamMovesToAnotherPath(t *testing.T) {
+	n, s, _, _ := establishTwoPaths(t, 68, 20*time.Millisecond)
+	down := randomBytes(8, 4<<20)
+	sp := openPair(t, n, s, []byte("GET"), down)
+	n.runUntil(10*time.Second, func() bool { sp.pump(); return len(sp.client.got) > 1<<20 })
+	n.up.down, n.down.down = true, true // path 0 fails for good
+	if !sp.run(30*time.Second) || !bytes.Equal(sp.client.got, down) {
+		t.Fatalf("transfer incomplete after path 0 failed: %d/%d", len(sp.client.got), len(down))
+	}
+}
+
+func TestStreamReassembly(t *testing.T) {
+	c := &conn{}
+	c.streams.init(false)
+	s := c.streams.newStream(1, tcpDst)
+	data := randomBytes(9, 100)
+	// Overlapping pieces out of order, as retransmissions and repeats with
+	// different frame boundaries produce.
+	for _, r := range [][2]int{{50, 70}, {60, 90}, {80, 100}, {55, 65}, {20, 40}, {30, 60}, {10, 20}, {0, 15}} {
+		c.insert(s, uint64(r[0]), data[r[0]:r[1]])
+		held := len(s.recv.data)
+		for i, sg := range s.recv.segs {
+			held += len(sg.data)
+			if i > 0 && s.recv.segs[i-1].off+uint64(len(s.recv.segs[i-1].data)) > sg.off {
+				t.Fatalf("after %v: segments overlap: %+v", r, s.recv.segs)
+			}
+		}
+		if held > 100 {
+			t.Fatalf("after %v: %d bytes held for 100", r, held)
+		}
+	}
+	if !bytes.Equal(s.recv.data, data) || len(s.recv.segs) != 0 {
+		t.Fatalf("reassembled %d bytes (%d segments left)", len(s.recv.data), len(s.recv.segs))
+	}
+}

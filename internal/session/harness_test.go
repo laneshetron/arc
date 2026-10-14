@@ -28,6 +28,10 @@ type link struct {
 	rate      int
 	queue     time.Duration
 	busyUntil time.Time
+	// lossAfterQueue loses datagrams after they cross the rate-limited
+	// bottleneck, so lost ones use its capacity too, as on a lossy radio
+	// hop; by default loss comes first, as with netem's loss on egress.
+	lossAfterQueue bool
 
 	// Bursty loss (Gilbert-Elliott, as netem's gemodel): per datagram the
 	// link enters a bad state with probability burstP and leaves it with
@@ -183,7 +187,7 @@ func (n *network) send(toRelay bool, pathID uint32, data []byte) {
 		copies = 2
 	}
 	for range copies {
-		if l.lost(n.rng) || (l.mtu > 0 && len(data) > l.mtu) {
+		if !l.lossAfterQueue && l.lost(n.rng) || (l.mtu > 0 && len(data) > l.mtu) {
 			continue
 		}
 		at := n.now
@@ -201,6 +205,9 @@ func (n *network) send(toRelay bool, pathID uint32, data []byte) {
 			}
 			l.busyUntil = start.Add(time.Duration(len(data)) * time.Second / time.Duration(l.rate))
 			at = l.busyUntil
+		}
+		if l.lossAfterQueue && l.lost(n.rng) {
+			continue
 		}
 		at = at.Add(l.delay)
 		if l.jitter > 0 {

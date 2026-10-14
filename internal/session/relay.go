@@ -43,6 +43,11 @@ type RelayConfig struct {
 	// client. Without the feature advertised, clients send uplink copies
 	// neither.
 	NoRedundancy bool
+
+	// NoStreams declines streams (§11.3): the relay does not connect TCP
+	// streams for clients. The caller must otherwise answer each
+	// StreamOpened, connecting or resetting the stream.
+	NoStreams bool
 }
 
 // RelayDatagram is an outgoing packet for a client address.
@@ -51,8 +56,9 @@ type RelayDatagram struct {
 	Data []byte
 }
 
-// RelayEvent is reported by Relay.PollEvent: SessionEstablished or
-// SessionClosed. IP packets from clients come from Relay.PollIP.
+// RelayEvent is reported by Relay.PollEvent: SessionEstablished,
+// SessionClosed, StreamOpened, or RelayStreamUpdate. IP packets from
+// clients come from Relay.PollIP.
 type RelayEvent interface{ relayEvent() }
 
 type SessionEstablished struct{ Session *RelaySession }
@@ -62,8 +68,25 @@ type SessionClosed struct {
 	Err     error
 }
 
+// StreamOpened asks the relay to connect a client's stream to Dst (§11.3).
+// Bytes the client already sent wait in the stream until read.
+type StreamOpened struct {
+	Session *RelaySession
+	ID      uint32
+	Dst     netip.AddrPort
+}
+
+// RelayStreamUpdate reports news on a stream, as StreamUpdate does for
+// the client.
+type RelayStreamUpdate struct {
+	Session *RelaySession
+	ID      uint32
+}
+
 func (SessionEstablished) relayEvent() {}
 func (SessionClosed) relayEvent()      {}
+func (StreamOpened) relayEvent()       {}
+func (RelayStreamUpdate) relayEvent()  {}
 
 // RelayStats counts relay-wide events.
 type RelayStats struct {
@@ -303,6 +326,24 @@ func (r *Relay) handleData(now time.Time, from netip.AddrPort, b []byte) {
 			}
 		case wire.FEC:
 			s.onFEC(f)
+		case wire.StreamOpen:
+			s.onUplink(p)
+			s.conn.onStreamOpen(f)
+		case wire.Stream:
+			s.onUplink(p)
+			if !s.conn.onStream(f) {
+				s.violation(now)
+				return
+			}
+		case wire.MaxStreamData:
+			s.conn.onMaxStreamData(f)
+		case wire.MaxData:
+			s.conn.onMaxData(f)
+		case wire.StreamReset:
+			if !s.conn.onStreamReset(f) {
+				s.violation(now)
+				return
+			}
 		case wire.Redundancy:
 			s.onRedundancy(f)
 		case wire.IPFragment:
@@ -556,6 +597,10 @@ func (s *RelaySession) onAuth(now time.Time, credential []byte) bool {
 	if !r.cfg.NoFEC {
 		result.Features |= wire.FeatureFEC
 	}
+	if !r.cfg.NoStreams {
+		result.Features |= wire.FeatureStreams
+		s.conn.streams.init(false)
+	}
 	s.result = result
 	s.state = StateActive
 	r.leavePending(s)
@@ -679,6 +724,48 @@ func (s *RelaySession) SendIP(now time.Time, pkt []byte) error {
 // Close ends the session, telling the client.
 func (s *RelaySession) Close(now time.Time) { s.relay.closeSession(now, s, ErrClosed, true) }
 
+// violation ends the session over a client's protocol violation.
+func (s *RelaySession) violation(now time.Time) {
+	if p := s.primary(now); p != nil {
+		s.conn.transmit(now, p, []wire.Frame{wire.CloseFrame{Code: wire.CodeProtocolViolation}})
+	}
+	s.relay.closeSession(now, s, ErrProtocolViolation, false)
+}
+
+// StreamWrite queues bytes for a stream, as Client.StreamWrite does.
+func (s *RelaySession) StreamWrite(now time.Time, id uint32, p []byte) (int, error) {
+	if s.state != StateActive {
+		return 0, ErrClosed
+	}
+	return s.conn.streamWrite(now, id, p)
+}
+
+// StreamRead reads received stream bytes, as Client.StreamRead does.
+func (s *RelaySession) StreamRead(now time.Time, id uint32, p []byte) (int, error) {
+	if s.state != StateActive {
+		return 0, ErrClosed
+	}
+	return s.conn.streamRead(now, id, p)
+}
+
+// StreamCloseWrite ends what the relay sends on a stream.
+func (s *RelaySession) StreamCloseWrite(now time.Time, id uint32) error {
+	if s.state != StateActive {
+		return ErrClosed
+	}
+	return s.conn.streamCloseWrite(now, id)
+}
+
+// StreamReset abandons a stream, such as one the relay could not connect.
+func (s *RelaySession) StreamReset(now time.Time, id uint32, code wire.ErrorCode) {
+	if s.state == StateActive {
+		s.conn.streamReset(now, id, code)
+	}
+}
+
+// StreamInfo reports a stream's state. A stream reported Done is gone.
+func (s *RelaySession) StreamInfo(id uint32) StreamInfo { return s.conn.streamInfo(id) }
+
 // Tick runs expired timers for every session.
 func (r *Relay) Tick(now time.Time) {
 	for _, s := range slices.Clone(r.live) {
@@ -753,6 +840,16 @@ func (r *Relay) PollIP() (*RelaySession, []byte, bool) {
 
 // PollEvent returns the next event.
 func (r *Relay) PollEvent() (RelayEvent, bool) {
+	for _, s := range r.live {
+		ss := &s.conn.streams
+		for _, f := range ss.opened {
+			r.events = append(r.events, StreamOpened{Session: s, ID: f.ID, Dst: f.Dst})
+		}
+		for _, id := range ss.updates {
+			r.events = append(r.events, RelayStreamUpdate{Session: s, ID: id})
+		}
+		ss.opened, ss.updates = ss.opened[:0], ss.updates[:0]
+	}
 	if len(r.events) == 0 {
 		return nil, false
 	}

@@ -103,16 +103,21 @@ func (c *conn) fecSending(now time.Time) bool {
 		// widens its reordering tolerance.
 		limit = max(limit, min(srtt, fecMaxBurstWindow))
 	}
+	// Interleaving spreads a burst only across a group spanning several
+	// bursts, so the window collects that many packets too, if it can.
+	group := float64(fecMinBlock * depth)
+	if f.burst > 2 {
+		group = max(group, fecMinBursts*f.burst)
+	}
 	if rate > 0 {
-		window = max(window, time.Duration(float64(fecMinBlock*depth)/rate*float64(time.Second)))
+		window = max(window, time.Duration(group/rate*float64(time.Second)))
 	}
 	f.enc.Window = min(max(window, fecMinWindow), limit)
-	// Interleaving spreads a burst only across a group spanning several
-	// bursts. When the send rate cannot fill one within the window, auto
-	// mode stays off rather than spend repairs the bursts would mostly
-	// take with them (on one path, 5% loss in bursts of 10 at 1000
-	// packets/s cost 48% overhead for half a point of delivery).
-	if f.mode == wire.FECAuto && f.burst > 2 && rate*f.enc.Window.Seconds() < fecMinBursts*f.burst {
+	// When the send rate cannot fill such a group within the longest
+	// window, auto mode stays off rather than spend repairs the bursts
+	// would mostly take with them (on one path, 5% loss in bursts of 10 at
+	// 1000 packets/s cost 48% overhead for half a point of delivery).
+	if f.mode == wire.FECAuto && f.burst > 2 && rate*limit.Seconds() < fecMinBursts*f.burst {
 		if wasActive {
 			c.sendRepairs(now, f.enc.Flush(now.Add(fecMaxBurstWindow)))
 		}

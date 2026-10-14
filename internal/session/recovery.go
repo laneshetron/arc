@@ -31,9 +31,16 @@ type ackTracker struct {
 	largestAt    time.Time          // when the largest packet number arrived
 	unacked      int                // ack-eliciting packets not yet acknowledged
 	firstUnacked time.Time
+	// immediate asks for an acknowledgement without delay: an
+	// ack-eliciting packet arrived after a gap, so the sender should learn
+	// of the loss promptly (RFC 9000 §13.2.1). On a link losing most
+	// packets that is nearly every packet, which is what keeps stream
+	// retransmission timely when most acknowledgements are lost too.
+	immediate bool
 }
 
 func (a *ackTracker) onReceive(pn uint64, now time.Time, ackEliciting bool) {
+	gap := len(a.ranges) > 0 && pn > a.ranges[0].Hi+1
 	if len(a.ranges) == 0 || pn > a.ranges[0].Hi {
 		a.largestAt = now
 	}
@@ -43,6 +50,7 @@ func (a *ackTracker) onReceive(pn uint64, now time.Time, ackEliciting bool) {
 			a.firstUnacked = now
 		}
 		a.unacked++
+		a.immediate = a.immediate || gap
 	}
 }
 
@@ -79,12 +87,15 @@ func (a *ackTracker) largest() (uint64, bool) {
 }
 
 func (a *ackTracker) due(now time.Time) bool {
-	return a.unacked >= 2 || (a.unacked > 0 && !now.Before(a.firstUnacked.Add(MaxAckDelay)))
+	return a.unacked >= 2 || (a.unacked > 0 && (a.immediate || !now.Before(a.firstUnacked.Add(MaxAckDelay))))
 }
 
 func (a *ackTracker) deadline() time.Time {
 	if a.unacked == 0 {
 		return time.Time{}
+	}
+	if a.immediate {
+		return a.firstUnacked
 	}
 	return a.firstUnacked.Add(MaxAckDelay)
 }
@@ -97,7 +108,7 @@ func (a *ackTracker) frame(now time.Time, pathID uint32) wire.Ack {
 }
 
 // sent resets the acknowledgement timer after an ACK goes out.
-func (a *ackTracker) sent() { a.unacked = 0 }
+func (a *ackTracker) sent() { a.unacked, a.immediate = 0, false }
 
 // peek builds an ACK frame without resetting the timer.
 func (a *ackTracker) peek(now time.Time, pathID uint32) wire.Ack {
@@ -207,8 +218,8 @@ func (r *rttEstimator) pto() time.Duration {
 	return r.smoothed + max(4*r.variance, time.Millisecond) + MaxAckDelay
 }
 
-// sentPacket is an ack-eliciting packet awaiting acknowledgement. Only
-// control frames are retransmitted; IP payloads never are (§11).
+// sentPacket is an ack-eliciting packet awaiting acknowledgement. Control
+// and stream frames are retransmitted; IP payloads never are (§11).
 type sentPacket struct {
 	pn     uint64
 	sentAt time.Time
@@ -221,8 +232,12 @@ type sentPacket struct {
 	// count for path health but not for loss or delivery rate: those sent
 	// into an outage are all declared lost once the path recovers, which
 	// would leave the path looking lossy long after health says it is back.
-	ping  bool
-	acked bool
+	ping bool
+	lost bool // retired as lost
+	// stream marks a packet carrying STREAM frames, which count toward
+	// the path's stream bytes in flight (streamcc.go).
+	stream bool
+	acked  bool
 }
 
 // sentLog holds a path's outstanding ack-eliciting packets in packet-number
@@ -237,18 +252,22 @@ type sentLog struct {
 	anyAcked     bool
 	ptoCount     int
 	control      int // outstanding packets that carry control frames
+	streamBytes  int // outstanding packets that carry STREAM frames, in bytes
 
-	// The run of lost packets in progress, for burst length: a run grows
-	// with each loss until a later packet is acknowledged, which ends it.
-	// One burst may be declared lost over several ACKs, and packets that
-	// are not tracked here (acknowledgement-only ones) do not split it.
-	runEnd uint64
-	runLen int
+	// Loss runs, for burst length: retired packets leave the log in
+	// packet-number order (trim), so a run is the lost packets between two
+	// that got through, however many ACKs declared them lost. Packets not
+	// tracked here (acknowledgement-only ones) do not split a run.
+	runLen           int
+	runSum, runCount int // runs ended since onAck last reported them
 }
 
 func (s *sentLog) add(p sentPacket) {
 	if len(p.frames) > 0 {
 		s.control++
+	}
+	if p.stream {
+		s.streamBytes += p.size
 	}
 	s.packets = append(s.packets, p)
 }
@@ -258,6 +277,9 @@ func (s *sentLog) retire(p *sentPacket) {
 	p.acked = true
 	if len(p.frames) > 0 {
 		s.control--
+	}
+	if p.stream {
+		s.streamBytes -= p.size
 	}
 }
 
@@ -271,8 +293,13 @@ type ackResult struct {
 	hasRTT            bool
 	lost              []wire.Frame
 	lostCount         int
-	runSum, runCount  int // lengths and number of loss runs that ended
-	ackedProbe        int // largest MTU probe acknowledged
+	// For stream rate control: frames of acknowledged stream packets, and
+	// how many stream packets were acknowledged and declared lost.
+	streamFrames            []wire.Frame
+	streamAcked, streamLost int
+	streamAckedBytes        int
+	runSum, runCount        int // lengths and number of loss runs that ended
+	ackedProbe              int // largest MTU probe acknowledged
 }
 
 // onAck marks acknowledged packets and declares older ones lost by the
@@ -293,15 +320,15 @@ func (s *sentLog) onAck(now time.Time, ack *wire.Ack, intervals []wire.PacketRan
 			}
 			s.retire(p)
 			res.newlyAcked++
+			if p.stream {
+				res.streamFrames = append(res.streamFrames, p.frames...)
+				res.streamAcked++
+				res.streamAckedBytes += p.size
+			}
 			if p.probe == 0 {
 				if !p.ping {
 					res.delivered++
 					res.deliveredBytes += p.size
-					if s.runLen > 0 && p.pn > s.runEnd {
-						res.runSum += s.runLen // a later packet got through
-						res.runCount++
-						s.runLen = 0
-					}
 				}
 			}
 			res.ackedProbe = max(res.ackedProbe, p.probe)
@@ -334,15 +361,18 @@ func (s *sentLog) onAck(now time.Time, ack *wire.Ack, intervals []wire.PacketRan
 		if p.acked {
 			continue
 		}
-		s.retire(p) // lost
+		s.retire(p)
+		p.lost = true
+		if p.stream {
+			res.streamLost++
+		}
 		if p.probe == 0 && !p.ping {
 			res.lostCount++
-			s.runLen++
-			s.runEnd = p.pn
 		}
 		res.lost = append(res.lost, p.frames...)
 	}
 	s.trim()
+	res.runSum, res.runCount, s.runSum, s.runCount = s.runSum, s.runCount, 0, 0
 	return res
 }
 
@@ -411,6 +441,18 @@ func (s *sentLog) expire(now time.Time, horizon time.Duration) {
 func (s *sentLog) trim() {
 	i := 0
 	for i < len(s.packets) && s.packets[i].acked {
+		if p := &s.packets[i]; p.probe == 0 && !p.ping {
+			switch {
+			case p.lost:
+				s.runLen++
+			case s.runLen > 0:
+				// A later packet got through, or expired unanswered, which
+				// ends the run all the same.
+				s.runSum += s.runLen
+				s.runCount++
+				s.runLen = 0
+			}
+		}
 		s.packets[i] = sentPacket{} // release frame references
 		i++
 	}

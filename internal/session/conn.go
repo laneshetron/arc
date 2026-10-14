@@ -66,7 +66,10 @@ var (
 	ErrPathTimeout      = errors.New("session: path timed out")
 	ErrPathAbandoned    = errors.New("session: path abandoned by peer")
 	ErrIntegrityLimit   = errors.New("session: too many authentication failures")
-	errReplay           = errors.New("session: replayed or stale packet")
+	// ErrProtocolViolation ends a session whose peer broke the protocol,
+	// such as by sending beyond a stream's flow control limit.
+	ErrProtocolViolation = errors.New("session: peer violated the protocol")
+	errReplay            = errors.New("session: replayed or stale packet")
 )
 
 // PeerClosedError reports a CLOSE frame from the peer.
@@ -109,6 +112,7 @@ type path struct {
 	recvLoss   lossEstimator // from gaps in received packet numbers
 	sendRate   rateMax       // acknowledged bytes per second; see sched.go
 	recvRate   rateMax       // received bytes per second
+	cc         streamCC      // paces stream data; see streamcc.go
 	flows      int           // active flows pinned to this path (sched.go)
 	// fallback marks a path to use only when no other path is healthy,
 	// such as one over TLS/TCP, where tunneled TCP suffers head-of-line
@@ -227,12 +231,17 @@ type conn struct {
 	second    *path // cached second path; see secondPath
 	fec       fecState
 	secondAt  time.Time
+	streams   streamSet // see stream.go
+	// streamWake is when pacing next lets stream data go, if it is waiting.
+	streamWake time.Time
 
-	plaintext []byte
-	ptScratch []byte // reused to build each outgoing packet's plaintext
-	ivScratch []wire.PacketRange
-	frameBuf  []wire.Frame
-	fragBuf   []wire.IPFragment
+	plaintext    []byte
+	ptScratch    []byte // reused to build each outgoing packet's plaintext
+	streamFrames []wire.Frame
+	ackScratch   []byte
+	ivScratch    []wire.PacketRange
+	frameBuf     []wire.Frame
+	fragBuf      []wire.IPFragment
 
 	stats Stats
 }
@@ -249,6 +258,9 @@ type Stats struct {
 	DuplicatesDropped            uint64 // received copies already delivered
 	FECRepairsSent               uint64 // FEC repair symbols sent
 	FECRecovered                 uint64 // IP packets rebuilt from FEC repairs
+	StreamBytesSent              uint64 // stream data sent, counting retransmissions
+	StreamBytesRetransmitted     uint64 // sent again because they were lost
+	StreamBytesRepeated          uint64 // sent again while in flight, on a very lossy path
 }
 
 func newConn(keys crypto.TrafficKeys, now time.Time) *conn {
@@ -276,7 +288,7 @@ func (c *conn) removePath(p *path) {
 		if !sp.acked {
 			for _, f := range sp.frames {
 				if !pathBound(f) {
-					c.control = append(c.control, f)
+					c.requeueFrame(p, f)
 				}
 			}
 		}
@@ -466,6 +478,18 @@ func (c *conn) onAck(now time.Time, ack *wire.Ack) {
 		p.sendRate.add(now, res.deliveredBytes)
 	}
 	c.stats.PacketsLost += uint64(res.lostCount)
+	if res.streamAcked > 0 || res.streamLost > 0 {
+		var rtt time.Duration
+		if res.hasRTT {
+			rtt = res.rttSample
+		}
+		p.cc.onAck(now, res.streamAcked, res.streamLost, res.streamAckedBytes, rtt)
+		for _, f := range res.streamFrames {
+			if sf, ok := f.(wire.Stream); ok {
+				c.onStreamAcked(sf)
+			}
+		}
+	}
 	c.requeue(p, res.lost)
 }
 
@@ -474,9 +498,19 @@ func (c *conn) requeue(p *path, frames []wire.Frame) {
 		if pathBound(f) {
 			p.control = append(p.control, f)
 		} else {
-			c.control = append(c.control, f)
+			c.requeueFrame(p, f)
 		}
 	}
+}
+
+// requeueFrame retransmits an unbound frame that p lost: stream data
+// through its stream, anything else as a control frame.
+func (c *conn) requeueFrame(p *path, f wire.Frame) {
+	if sf, ok := f.(wire.Stream); ok {
+		c.onStreamLost(sf)
+		return
+	}
+	c.control = append(c.control, f)
 }
 
 // queue adds a control frame that may travel on any path and is
@@ -499,6 +533,50 @@ func (c *conn) flush(now time.Time) {
 				break
 			}
 		}
+	}
+	c.sendStreams(now)
+}
+
+// sendStreams sends stream data on the primary path while its rate
+// control allows (streamcc.go), noting when pacing will next allow more.
+func (c *conn) sendStreams(now time.Time) {
+	c.streamWake = time.Time{}
+	if !c.streams.enabled {
+		return
+	}
+	p := c.primary(now)
+	if p == nil || !p.validated || len(c.streams.ready) == 0 && !p.cc.lossy() {
+		return
+	}
+	srtt := p.rtt.srtt()
+	p.cc.update(now, p.rtt.minRTT(), srtt, p.maxPacket)
+	budget := p.maxPacket - wire.DataHeaderLen - wire.AEADTagLen
+	for {
+		ok, wake := p.cc.canSend(now, p.sent.streamBytes, srtt, p.maxPacket)
+		if !ok {
+			c.streamWake = wake
+			return
+		}
+		frames, used := c.streamFrames[:0], 0
+		next := c.nextStreamFrame
+		for budget-used > wire.FrameHeaderLen+13 {
+			f, ok := next(budget - used)
+			if !ok && len(frames) == 0 && p.cc.lossy() {
+				next = c.nextRepeatFrame
+				f, ok = next(budget - used)
+			}
+			if !ok {
+				break
+			}
+			frames = append(frames, f)
+			used += wire.FrameHeaderLen + 13 + len(f.Data)
+		}
+		c.streamFrames = frames[:0]
+		if len(frames) == 0 {
+			return
+		}
+		// The sent packet keeps the frames for retransmission.
+		c.transmitPacket(now, p, nil, slices.Clone(frames), ipPayload{}, false)
 	}
 }
 
@@ -528,6 +606,12 @@ func (ip ipPayload) frameLen() int {
 // sent. toCandidate directs a relay's packet to the path's unvalidated new
 // address.
 func (c *conn) transmitTo(now time.Time, p *path, extra []wire.Frame, ip ipPayload, toCandidate bool) bool {
+	return c.transmitPacket(now, p, extra, nil, ip, toCandidate)
+}
+
+// transmitPacket is transmitTo with stream frames first, which (unlike
+// extra) are retransmitted if lost, and which together with extra must fit.
+func (c *conn) transmitPacket(now time.Time, p *path, extra, stream []wire.Frame, ip ipPayload, toCandidate bool) bool {
 	if !p.joined {
 		return false
 	}
@@ -539,19 +623,24 @@ func (c *conn) transmitTo(now time.Time, p *path, extra []wire.Frame, ip ipPaylo
 	case ip.pkt != nil:
 		pt = wire.AppendIPPacket(pt, ip.pkt)
 	}
+	for _, f := range stream {
+		pt = wire.AppendFrame(pt, f)
+	}
 	for _, f := range extra {
 		pt = wire.AppendFrame(pt, f)
 	}
 	if len(pt) > budget {
 		panic("session: frames exceed path budget")
 	}
+	acked := false
 	if p.acks.unacked > 0 { // piggyback a pending acknowledgement if it fits
 		if next := wire.AppendFrame(pt, p.acks.peek(now, p.id)); len(next) <= budget {
 			pt = next
 			p.acks.sent()
+			acked = true
 		}
 	}
-	var retx []wire.Frame
+	retx := stream
 	pt, retx = takeFrames(pt, retx, &p.control, budget)
 	pathBound := len(retx)
 	if !toCandidate && len(c.control) > 0 && p == c.primary(now) {
@@ -565,11 +654,41 @@ func (c *conn) transmitTo(now time.Time, p *path, extra []wire.Frame, ip ipPaylo
 	for _, f := range extra {
 		ackEliciting = ackEliciting || f.Type().AckEliciting()
 	}
-	c.sealPacket(now, p, pt, retx, ackEliciting, 0, ip.pkt == nil && len(retx) == 0 && !carriesRepair(extra), toCandidate)
+	ping := ip.pkt == nil && len(retx) == 0 && !carriesRepair(extra)
+	c.sealPacket(now, p, pt, retx, ackEliciting, 0, ping, len(stream) > 0, toCandidate)
+	if acked && !toCandidate {
+		c.copyAck(now, p)
+	}
+	if len(stream) > 0 {
+		n := 0
+		for _, f := range stream {
+			n += len(f.(wire.Stream).Data)
+		}
+		c.stats.StreamBytesSent += uint64(n)
+	}
 	if unbound := retx[pathBound:]; len(unbound) > 0 && !p.healthy(now, c.keepalive) {
 		c.copyControl(now, p, unbound)
 	}
 	return true
+}
+
+// ackCopies is how many more times each acknowledgement goes out on a path
+// losing at least half its packets: the peer learns of losses, and its
+// stream rate control of anything, only from the acknowledgements that
+// arrive, and at 90% loss one in ten does.
+const ackCopies = 2
+
+// copyAck sends ackCopies extra copies of the acknowledgement just sent on
+// p, if p is that lossy.
+func (c *conn) copyAck(now time.Time, p *path) {
+	if loss, ok := p.loss(now); !ok || loss < ccLossy {
+		return
+	}
+	pt := wire.AppendFrame(c.ackScratch[:0], p.acks.peek(now, p.id))
+	c.ackScratch = pt
+	for range ackCopies {
+		c.seal(now, p, pt, nil, false, 0, false)
+	}
 }
 
 // copyControl sends copies of unbound control frames on every validated
@@ -605,19 +724,23 @@ func takeFrames(pt []byte, retx []wire.Frame, q *[]wire.Frame, budget int) ([]by
 }
 
 func (c *conn) seal(now time.Time, p *path, pt []byte, retx []wire.Frame, ackEliciting bool, probe int, toCandidate bool) {
-	c.sealPacket(now, p, pt, retx, ackEliciting, probe, false, toCandidate)
+	c.sealPacket(now, p, pt, retx, ackEliciting, probe, false, false, toCandidate)
 }
 
 // sealPacket encrypts and sends one packet; ping marks a packet that
-// carries no IP payload or control frame (see sentPacket.ping).
-func (c *conn) sealPacket(now time.Time, p *path, pt []byte, retx []wire.Frame, ackEliciting bool, probe int, ping, toCandidate bool) {
+// carries no IP payload or control frame (see sentPacket.ping), and stream
+// one that carries STREAM frames.
+func (c *conn) sealPacket(now time.Time, p *path, pt []byte, retx []wire.Frame, ackEliciting bool, probe int, ping, stream, toCandidate bool) {
 	pn := p.nextPN
 	p.nextPN++
 	epoch := c.send.Epoch()
 	// The packet buffer comes from the pool; whoever sends it returns it.
 	pkt := c.send.Seal(bufpool.Get(), wire.DataHeader{DestCID: p.remoteCID, PacketNumber: pn}, p.id, pt)
 	if ackEliciting {
-		p.sent.add(sentPacket{pn: pn, sentAt: now, epoch: epoch, frames: retx, probe: probe, size: len(pkt), ping: ping})
+		p.sent.add(sentPacket{pn: pn, sentAt: now, epoch: epoch, frames: retx, probe: probe, size: len(pkt), ping: ping, stream: stream})
+	}
+	if stream {
+		p.cc.onSent(len(pkt))
 	}
 	p.lastSend = now
 	c.stats.PacketsSent++
@@ -796,7 +919,7 @@ func (c *conn) onTimers(now time.Time) {
 }
 
 func (c *conn) nextDeadline() time.Time {
-	d := c.fecDeadline()
+	d := earliest(c.fecDeadline(), c.streamWake)
 	for _, p := range c.paths {
 		d = earliest(d, p.acks.deadline(), p.sent.ptoDeadline(&p.rtt))
 	}

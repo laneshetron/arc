@@ -29,7 +29,8 @@ HANDSHAKE_INIT, HANDSHAKE_RESP, COOKIE_REPLY, DATA, STATELESS_RESET, CELL = 1, 2
 F = dict(PADDING=0x00, AUTH=0x01, AUTH_RESULT=0x02, IP_PACKET=0x03, IP_FRAGMENT=0x04,
          NEW_PATH=0x05, PATH_JOIN=0x06, PATH_CHALLENGE=0x07, PATH_RESPONSE=0x08,
          PATH_ABANDON=0x09, PING=0x0A, ACK=0x0B, CLOSE=0x0C, ERROR=0x0D,
-         IP_DATAGRAM=0x0E, REDUNDANCY=0x0F, FEC_REPAIR=0x10, FEC=0x11)
+         IP_DATAGRAM=0x0E, REDUNDANCY=0x0F, FEC_REPAIR=0x10, FEC=0x11, STREAM_OPEN=0x12,
+         STREAM=0x13, MAX_STREAM_DATA=0x14, MAX_DATA=0x15, STREAM_RESET=0x16)
 
 CLIENT_CID = bytes.fromhex("c1c2c3c4c5c6c7c8")
 RELAY_CID = bytes.fromhex("a1a2a3a4a5a6a7a8")
@@ -188,8 +189,9 @@ def build():
 
     # --- Frames --------------------------------------------------------------
     ip = ipv4_packet(b"hello arc")
-    # features bit 0: redundancy (IP_DATAGRAM and REDUNDANCY); bit 1: FEC.
-    auth_result = struct.pack("!BIBHIIIQ", 0, 0x0A4D0002, 16, 1280, 0x0A4D0001, 10000, 120000, 3)
+    # features bit 0: redundancy (IP_DATAGRAM and REDUNDANCY); bit 1: FEC;
+    # bit 2: streams.
+    auth_result = struct.pack("!BIBHIIIQ", 0, 0x0A4D0002, 16, 1280, 0x0A4D0001, 10000, 120000, 7)
     assert len(auth_result) == 28
     new_path = struct.pack("!I", 1) + bytes.fromhex("b1b2b3b4b5b6b7b8") + bytes(range(0x40, 0x50))
     ack_ranges = [(1, 3), (0, 0)]
@@ -199,7 +201,7 @@ def build():
         ("AUTH", F["AUTH"], b"test-credential", {"credential_hex": b"test-credential".hex()}),
         ("AUTH_RESULT", F["AUTH_RESULT"], auth_result,
          {"status": 0, "ipv4": "10.77.0.2", "prefix4": 16, "tun_mtu": 1280, "dns_ipv4": "10.77.0.1",
-          "keepalive_ms": 10000, "idle_ms": 120000, "features": 3}),
+          "keepalive_ms": 10000, "idle_ms": 120000, "features": 7}),
         ("IP_PACKET", F["IP_PACKET"], ip, {"ip_packet_hex": ip.hex()}),
         ("IP_FRAGMENT", F["IP_FRAGMENT"], struct.pack("!QHH", 42, len(ip), 8) + ip[8:20],
          {"datagram_id": 42, "total_len": len(ip), "offset": 8, "data_hex": ip[8:20].hex()}),
@@ -222,6 +224,15 @@ def build():
         ("FEC_REPAIR", F["FEC_REPAIR"], struct.pack("!IBBBB", 43, 4, 16, 3, 2) + bytes(range(40)),
          {"first32": 43, "stride": 4, "k": 16, "m": 3, "index": 2, "data_hex": bytes(range(40)).hex()}),
         ("FEC", F["FEC"], struct.pack("!IB", 8, 1), {"seq": 8, "mode": 1}),
+        ("STREAM_OPEN", F["STREAM_OPEN"], struct.pack("!IH", 3, 443) + bytes([198, 51, 100, 7]),
+         {"stream_id": 3, "dst": "198.51.100.7:443"}),
+        ("STREAM_OPEN_V6", F["STREAM_OPEN"], struct.pack("!IH", 4, 80) + bytes.fromhex("20010db8" + "00" * 11 + "01"),
+         {"stream_id": 4, "dst": "[2001:db8::1]:80"}),
+        ("STREAM", F["STREAM"], struct.pack("!IQB", 3, 70000, 1) + b"GET / HTTP/1.1\r\n",
+         {"stream_id": 3, "offset": 70000, "fin": True, "data_hex": b"GET / HTTP/1.1\r\n".hex()}),
+        ("MAX_STREAM_DATA", F["MAX_STREAM_DATA"], struct.pack("!IQ", 3, 3 << 20), {"stream_id": 3, "max": 3 << 20}),
+        ("MAX_DATA", F["MAX_DATA"], struct.pack("!Q", 24 << 20), {"max": 24 << 20}),
+        ("STREAM_RESET", F["STREAM_RESET"], struct.pack("!IHQ", 3, 9, 1234), {"stream_id": 3, "code": 9, "final": 1234}),
         ("UNKNOWN_EXTENSION", 0x9F, b"\xAA\xBB", {"ignorable": True}),
     ]
     fixtures["frames"] = [
@@ -328,6 +339,16 @@ def build():
         {"name": "fec_repair index past m", "hex": frame(0x10, struct.pack("!IBBBB", 1, 1, 4, 2, 2) + b"\x00" * 20).hex()},
         {"name": "fec_repair stride zero", "hex": frame(0x10, struct.pack("!IBBBB", 1, 0, 4, 2, 0) + b"\x00" * 20).hex()},
         {"name": "fec unknown mode", "hex": frame(0x11, struct.pack("!IB", 1, 3)).hex()},
+        {"name": "stream_open stream zero", "hex": frame(0x12, struct.pack("!IH", 0, 443) + bytes(4 * [7])).hex()},
+        {"name": "stream_open port zero", "hex": frame(0x12, struct.pack("!IH", 1, 0) + bytes(4 * [7])).hex()},
+        {"name": "stream_open unspecified address", "hex": frame(0x12, struct.pack("!IH", 1, 443) + bytes(4)).hex()},
+        {"name": "stream_open address size", "hex": frame(0x12, struct.pack("!IH", 1, 443) + bytes(8 * [7])).hex()},
+        {"name": "stream truncated", "hex": frame(0x13, struct.pack("!IQ", 1, 0)).hex()},
+        {"name": "stream unknown flags", "hex": frame(0x13, struct.pack("!IQB", 1, 0, 2)).hex()},
+        {"name": "stream past max offset", "hex": frame(0x13, struct.pack("!IQB", 1, 2**62 - 1, 0) + b"x").hex()},
+        {"name": "max_stream_data past max offset", "hex": frame(0x14, struct.pack("!IQ", 1, 2**62)).hex()},
+        {"name": "max_data wrong size", "hex": frame(0x15, struct.pack("!I", 1)).hex()},
+        {"name": "stream_reset wrong size", "hex": frame(0x16, struct.pack("!IH", 1, 9)).hex()},
         {"name": "redundancy unknown mode", "hex": frame(0x0F, struct.pack("!IB", 1, 2)).hex()},
         {"name": "path_join wrong size", "hex": "06000700000000000000"},
         {"name": "ping with value", "hex": "0a000100"},
