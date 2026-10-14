@@ -106,6 +106,21 @@ func run(args []string) error {
 		}
 		return nil
 	})
+	splitMode := engine.SplitOff
+	fs.Func("split-tcp", "carry TCP connections as streams, ended here and opened by the relay (spec §11.3): "+
+		"off (default), auto (new connections while the link loses at least 10%), or always", func(v string) error {
+		switch v {
+		case "off":
+			splitMode = engine.SplitOff
+		case "auto":
+			splitMode = engine.SplitAuto
+		case "always":
+			splitMode = engine.SplitAlways
+		default:
+			return errors.New("want off, auto, or always")
+		}
+		return nil
+	})
 	mark := fs.Uint("mark", 0x5243, "fwmark for carrier sockets, used by -full-tunnel")
 	table := fs.Int("table", 5243, "routing table for -full-tunnel")
 	prof := profiling.Register(fs)
@@ -238,7 +253,7 @@ func run(args []string) error {
 			Static: static, RelayPublic: pin[:], Credential: []byte(tokens[0]), Redundancy: redundancy, FEC: fecMode,
 		},
 		Relay: relayAddr, Carriers: carriers, TUN: dev, OnEstablished: onEstablished, Logger: log,
-		StatusInterval: *status,
+		StatusInterval: *status, SplitTCP: splitMode,
 	})
 	if errors.Is(err, context.Canceled) {
 		return nil

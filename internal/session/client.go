@@ -462,6 +462,12 @@ func (c *Client) streamEvents() {
 	c.conn.streams.updates = c.conn.streams.updates[:0]
 }
 
+// StreamsSupported reports whether the active session's relay carries
+// streams (§11.3).
+func (c *Client) StreamsSupported() bool {
+	return c.state == StateActive && c.conn.streams.enabled
+}
+
 // OpenStream asks the relay to connect a new stream to a TCP destination
 // and returns its ID (§11.3). Bytes may be written at once; if the relay
 // cannot connect, the stream is reset.

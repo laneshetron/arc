@@ -10,6 +10,7 @@ import (
 
 	"github.com/laneshetron/arc/internal/bufpool"
 	"github.com/laneshetron/arc/internal/session"
+	"github.com/laneshetron/arc/internal/splittcp"
 	"github.com/laneshetron/arc/internal/wire"
 )
 
@@ -49,7 +50,38 @@ type ClientConfig struct {
 
 	// StatusInterval, if nonzero, logs each path's state that often.
 	StatusInterval time.Duration
+
+	// SplitTCP selects the new TCP connections the client terminates
+	// locally and carries as streams (spec §11.3), if the relay supports
+	// them.
+	SplitTCP SplitMode
 }
+
+// SplitMode selects which TCP connections become streams.
+type SplitMode uint8
+
+const (
+	SplitOff SplitMode = iota
+	// SplitAuto splits connections opened while the primary path loses
+	// at least SplitAutoLoss of its packets in either direction.
+	SplitAuto
+	SplitAlways
+)
+
+// SplitAutoLoss is the loss rate at which SplitAuto splits new
+// connections.
+const SplitAutoLoss = 0.1
+
+// splitFlow is a TCP connection sent to the userspace stack: its packets
+// keep going there for as long as it lives.
+type splitFlow struct {
+	bridge *bridge
+	last   time.Time // last packet from the application
+}
+
+// splitIdle is how long a split flow whose connection is gone keeps
+// steering its packets to the stack, which answers late ones.
+const splitIdle = 2 * time.Minute
 
 // carrierState records which session path, if any, a carrier carries.
 type carrierState struct {
@@ -131,6 +163,37 @@ func RunClient(ctx context.Context, cfg ClientConfig) error {
 	var reconnectAt time.Time
 	var toTUN [][]byte
 
+	// Split TCP: the userspace stack, created with the first session.
+	var split *splittcp.Stack
+	var accepts <-chan *splittcp.Conn
+	splitOut := make(chan [][]byte, 16)
+	flows := map[splittcp.Flow]*splitFlow{}
+	bridges := map[uint32]*bridge{}
+	bridgeEvents := make(chan bridgeEvent, 64)
+	var sweepAt time.Time
+	defer func() {
+		for _, b := range bridges {
+			b.finish(true)
+		}
+		if split != nil {
+			split.Close()
+		}
+	}()
+	wantSplit := func(now time.Time) bool {
+		switch {
+		case split == nil || !c.StreamsSupported():
+			return false
+		case cfg.SplitTCP == SplitAlways:
+			return true
+		}
+		for _, p := range c.Paths(now) {
+			if p.Primary {
+				return p.Loss >= SplitAutoLoss
+			}
+		}
+		return false
+	}
+
 	for {
 		hs.update(c, carriers)
 		joinCarriers(c, carriers, cfg.RejoinDelay, log)
@@ -147,6 +210,25 @@ func RunClient(ctx context.Context, cfg ClientConfig) error {
 						return err
 					}
 				}
+				if cfg.SplitTCP != SplitOff && split == nil {
+					if split, err = splittcp.New(uint32(e.Config.TunMTU)); err != nil {
+						return err
+					}
+					accepts = split.Accept()
+					go func() {
+						for {
+							pkts, err := split.ReadOutbound(ctx, readBatch)
+							if err != nil {
+								return
+							}
+							select {
+							case splitOut <- pkts:
+							case <-ctx.Done():
+								return
+							}
+						}
+					}()
+				}
 			case session.PathValidated:
 				log.Info("path validated", "path", e.ID)
 			case session.RedundancyChanged:
@@ -160,7 +242,14 @@ func RunClient(ctx context.Context, cfg ClientConfig) error {
 						break
 					}
 				}
+			case session.StreamUpdate:
+				if b := bridges[e.ID]; b != nil {
+					b.service(time.Now())
+				}
 			case session.Closed:
+				for _, b := range bridges {
+					b.finish(true) // the session's streams are gone
+				}
 				if errors.Is(e.Err, session.ErrAuthFailed) {
 					return e.Err
 				}
@@ -223,9 +312,42 @@ func RunClient(ctx context.Context, cfg ClientConfig) error {
 		case pkts := <-tunCh:
 			now := time.Now()
 			for _, p := range pkts {
-				c.SendIP(now, p) // dropped while not active, like an unplugged link
-				bufpool.Put(p)   // SendIP copied what it needed
+				if split != nil && splitPacket(now, p, flows, wantSplit) {
+					split.Inject(p)
+				} else {
+					c.SendIP(now, p) // dropped while not active, like an unplugged link
+				}
+				bufpool.Put(p) // both copied what they needed
 			}
+			if split != nil && now.After(sweepAt) {
+				sweepAt = now.Add(splitIdle / 4)
+				for f, sf := range flows {
+					if (sf.bridge == nil || sf.bridge.finished) && now.Sub(sf.last) > splitIdle {
+						delete(flows, f)
+					}
+				}
+			}
+		case pkts := <-splitOut:
+			if err := cfg.TUN.Write(pkts); err != nil {
+				log.Warn("tun write failed", "err", err)
+			}
+		case conn := <-accepts:
+			now := time.Now()
+			id, err := c.OpenStream(now, conn.Dst)
+			if err != nil {
+				conn.Abort()
+				break
+			}
+			b := newBridge(id, c, conn, conn.Abort)
+			bridges[id] = b
+			b.forget = func() { delete(bridges, id) }
+			if sf := flows[splittcp.Flow{Src: conn.Src, Dst: conn.Dst}]; sf != nil {
+				sf.bridge = b
+			}
+			b.start(ctx, bridgeEvents)
+			b.service(now)
+		case e := <-bridgeEvents:
+			e.b.handle(time.Now(), e)
 		case <-status:
 			logPaths(log, c, carriers, time.Now())
 		case <-timer.C:
@@ -365,4 +487,23 @@ func logPaths(log *slog.Logger, c *session.Client, carriers []*carrierState, now
 			"flows", p.Flows, "min_rtt", p.MinRTT.Round(100*time.Microsecond), "srtt", p.SRTT.Round(100*time.Microsecond),
 			"loss", fmt.Sprintf("%.3f", p.Loss), "burst", fmt.Sprintf("%.1f", p.Burst), "capacity_mbit", fmt.Sprintf("%.1f", p.Capacity*8/1e6))
 	}
+}
+
+// splitPacket reports whether an IPv4 packet from the TUN belongs to the
+// userspace stack: a TCP packet of a split connection, or a SYN opening
+// one that should be split.
+func splitPacket(now time.Time, p []byte, flows map[splittcp.Flow]*splitFlow, want func(time.Time) bool) bool {
+	f, syn, ok := splittcp.TCPFlow(p)
+	if !ok {
+		return false
+	}
+	if sf := flows[f]; sf != nil {
+		sf.last = now
+		return true
+	}
+	if !syn || !want(now) {
+		return false
+	}
+	flows[f] = &splitFlow{last: now}
+	return true
 }

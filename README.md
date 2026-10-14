@@ -63,6 +63,12 @@ sudo bin/arc-client run ... -tls RELAY_HOST:443
 # 0.5% or more, repair packets let the far end rebuild losses without TCP
 # retransmitting; -fec off disables it, -fec always keeps it on
 
+# On links losing tens of percent, TCP over any tunnel stalls. Split TCP ends
+# TCP connections at the client and carries their bytes reliably to the
+# relay, which opens the real connection ("auto" splits new connections
+# while the link loses 10% or more; the relay declines with -no-split-tcp)
+sudo bin/arc-client run ... -split-tcp auto
+
 # When every link is lossy, send each packet on two links while the best one
 # loses over 1% (doubles traffic while on; "always" duplicates everything)
 sudo bin/arc-client run ... -bind wlan0 -bind wwan0 -redundancy auto
@@ -80,6 +86,8 @@ bandwidth limits, and measures ARC's failover across two links, whether it moves
 link, and what redundancy does when both links are lossy (`docker run --rm --privileged arc-e2e degraded`).
 `test/netns/fec.sh` compares FEC off, auto, and always under uniform and bursty loss, as medians of
 repeated runs (`docker run --rm --privileged arc-e2e fec [SECONDS] [REPS]`).
+`test/netns/split.sh` compares TCP through ARC with split TCP off and on, from a clean link to 90%
+loss (`docker run --rm --privileged arc-e2e split [SECONDS] [REPS]`).
 `test/netns/bench.sh` compares ARC's throughput with kernel WireGuard over the same topology
 (`docker run --rm --privileged arc-e2e bench` on macOS). Treat its numbers as relative: both ends
 share one machine.
