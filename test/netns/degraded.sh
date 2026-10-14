@@ -522,7 +522,8 @@ for mode in plain off always; do
     SPLIT_ROWS+=("$(printf '%-26s %-16s %10s %10s' "$name" "$tunnel" "$up" "$down")")
     echo "measured: $name, $tunnel" >&2
   done
-  [[ $mode == plain ]] && $C ip route replace 192.168.20.0/24 dev arc0
+  # The ARC client installs its own route when it connects.
+  [[ $mode == plain ]] && $C ip route del 192.168.20.0/24
 done
 for name in "rtt 40ms, loss 50%" "rtt 40ms, loss 90%"; do
   on=${SPLIT["$name/always"]} off=${SPLIT["$name/off"]}
