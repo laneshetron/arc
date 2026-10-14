@@ -423,9 +423,10 @@ func (c *conn) open(now time.Time, p *path, h wire.DataHeader, aad, ct []byte) (
 		return nil, err
 	}
 	c.frameBuf = frames
-	ackEliciting := false
+	ackEliciting, stream := false, false
 	for _, f := range frames {
 		ackEliciting = ackEliciting || f.Type().AckEliciting()
+		stream = stream || f.Type() == wire.FrameStream
 	}
 	if top, ok := p.acks.largest(); !ok {
 		p.recvLoss.record(now, 1, 0)
@@ -438,7 +439,7 @@ func (c *conn) open(now time.Time, p *path, h wire.DataHeader, aad, ct []byte) (
 	} else {
 		p.recvLoss.record(now, 0, -1) // late: counted as lost when the gap opened
 	}
-	p.acks.onReceive(h.PacketNumber, now, ackEliciting)
+	p.acks.onReceive(h.PacketNumber, now, ackEliciting, stream)
 	return frames, nil
 }
 

@@ -31,15 +31,18 @@ type ackTracker struct {
 	largestAt    time.Time          // when the largest packet number arrived
 	unacked      int                // ack-eliciting packets not yet acknowledged
 	firstUnacked time.Time
-	// immediate asks for an acknowledgement without delay: an
-	// ack-eliciting packet arrived after a gap, so the sender should learn
-	// of the loss promptly (RFC 9000 §13.2.1). On a link losing most
-	// packets that is nearly every packet, which is what keeps stream
-	// retransmission timely when most acknowledgements are lost too.
+	// immediate asks for an acknowledgement without delay: a packet of
+	// stream data arrived after a gap, so the sender should learn of the
+	// loss promptly (RFC 9000 §13.2.1). On a link losing most packets
+	// that is nearly every packet, which is what keeps stream
+	// retransmission timely when most acknowledgements are lost too. Only
+	// stream data asks: IP packets are not retransmitted, and with every
+	// packet asking, multipath IP traffic lost its spread across paths on
+	// CI's runners (degraded.sh's 4-flow downlink failed 5 of 9 runs).
 	immediate bool
 }
 
-func (a *ackTracker) onReceive(pn uint64, now time.Time, ackEliciting bool) {
+func (a *ackTracker) onReceive(pn uint64, now time.Time, ackEliciting, stream bool) {
 	gap := len(a.ranges) > 0 && pn > a.ranges[0].Hi+1
 	if len(a.ranges) == 0 || pn > a.ranges[0].Hi {
 		a.largestAt = now
@@ -50,7 +53,7 @@ func (a *ackTracker) onReceive(pn uint64, now time.Time, ackEliciting bool) {
 			a.firstUnacked = now
 		}
 		a.unacked++
-		a.immediate = a.immediate || gap
+		a.immediate = a.immediate || gap && stream
 	}
 }
 

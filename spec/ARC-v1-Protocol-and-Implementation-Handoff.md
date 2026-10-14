@@ -413,7 +413,7 @@ The ranges follow QUIC (RFC 9000 §19.3.1):
 
 Behavior:
 - An `ACK` MAY travel on any path. For example, the fast path can carry ACKs for the DNS path.
-- Receivers SHOULD acknowledge ack-eliciting packets within `max_ack_delay` (default 25 ms), or after every second ack-eliciting packet, whichever comes first. An ack-eliciting packet that arrives after a gap in packet numbers SHOULD be acknowledged at once (RFC 9000 §13.2.1), so the sender learns of the loss promptly.
+- Receivers SHOULD acknowledge ack-eliciting packets within `max_ack_delay` (default 25 ms), or after every second ack-eliciting packet, whichever comes first. A packet carrying stream data (§11.3) that arrives after a gap in packet numbers SHOULD be acknowledged at once (RFC 9000 §13.2.1), so the sender learns of the loss and retransmits promptly. IP payloads are not retransmitted and keep the usual delay.
 - On a path whose loss estimate (§15.2) is at least 50%, the reference implementation sends each acknowledgement three times, in separate packets: the sender learns of losses only from acknowledgements that arrive.
 - A packet that contains only non-ack-eliciting frames MUST NOT be acknowledged on its own.
 - ACKs are **measurements only** for IP payloads. An ACK of an ARC packet does not guarantee application delivery, and a missing ACK does not trigger retransmission of IP payloads. Control frames with a nonce or ID are safe to resend in a fresh packet, and stream data is retransmitted (§11.3).

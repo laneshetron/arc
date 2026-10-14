@@ -317,7 +317,7 @@ func TestAckTrackerRanges(t *testing.T) {
 	var a ackTracker
 	now := time.Unix(0, 0)
 	for _, pn := range []uint64{1, 2, 3, 7, 5, 9, 8, 0, 3} {
-		a.onReceive(pn, now, true)
+		a.onReceive(pn, now, true, false)
 	}
 	got := a.ranges
 	want := []wire.PacketRange{{Lo: 7, Hi: 9}, {Lo: 5, Hi: 5}, {Lo: 0, Hi: 3}}
