@@ -497,3 +497,24 @@ func TestRelayRecoveryAfterOutageIsPrompt(t *testing.T) {
 		t.Errorf("relay: path 1 healthy for good only after %v", stableFrom)
 	}
 }
+
+func TestCapacityForgottenAfterOutage(t *testing.T) {
+	// Flows run on path 1 until it goes dark for 12 s, longer than the
+	// capacity estimate's window. Coming back, it must count as unmeasured:
+	// keeping its old rate made it look measured and slow next to the busy
+	// path, and new flows avoided it (degraded.sh's 4-flow downlink).
+	n, _, id, c := establishTwoPaths(t, 80, 10*time.Millisecond)
+	for i := range 5000 {
+		n.client.SendIP(n.now, flowPacket(lease, internet, uint16(40000+i%4), 4000, 1200, uint32(i)))
+		n.runFor(500 * time.Microsecond)
+	}
+	c.up.down, c.down.down = true, true
+	n.runFor(12 * time.Second)
+	c.up.down, c.down.down = false, false
+	for range 12 {
+		n.runFor(250 * time.Millisecond)
+		if p, _ := pathByID(n.client.Paths(n.now), id); p.Capacity >= measuredRate {
+			t.Fatalf("path %d measured at %.2f Mbit/s right after an outage", id, p.Capacity*8/1e6)
+		}
+	}
+}
