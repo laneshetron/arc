@@ -64,7 +64,12 @@ SCENARIOS=(
   "clean|delay 20ms"
   "loss 1%|delay 20ms loss 1%"
   "loss 5%|delay 20ms loss 5%"
+  # Gilbert-Elliott bursts at the same average rates (mean burst 1/r):
+  # p = loss * r / (1 - loss).
+  "bursty 1% (4)|delay 20ms loss gemodel 0.25% 25%"
   "bursty 5% (10)|delay 20ms loss gemodel 0.53% 10%"
+  "bursty 5% (30)|delay 20ms loss gemodel 0.175% 3.33%"
+  "bursty 20% (10)|delay 20ms loss gemodel 2.5% 10%"
   "loss 20%|delay 20ms loss 20%"
   "loss 50%|delay 20ms loss 50%"
   "loss 90%|delay 20ms loss 90%"
