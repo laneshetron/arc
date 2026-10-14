@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"os"
 	"testing"
 	"time"
 
@@ -184,12 +185,12 @@ func TestSplitTCP(t *testing.T) {
 
 	// A connection the relay cannot make is reset. The client's stack
 	// accepted it first, so the application sees a reset, not a refusal.
-	conn, err = dial(refused)
-	if err != nil {
-		t.Fatal(err)
+	// The reset may even arrive before the application's dial returns.
+	if conn, err = dial(refused); err == nil {
+		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		_, err = conn.Read(make([]byte, 1))
 	}
-	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-	if _, err := conn.Read(make([]byte, 1)); err == nil || errors.Is(err, io.EOF) {
-		t.Errorf("read on a refused connection: %v, want a reset", err)
+	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Errorf("connection to a refused destination: %v, want a reset", err)
 	}
 }

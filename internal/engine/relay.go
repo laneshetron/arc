@@ -230,7 +230,8 @@ func RunRelay(ctx context.Context, cfg RelayConfig) error {
 				lease := netip.AddrFrom4(s.Config().IPv4)
 				for _, p := range s.Paths(now) {
 					log.Info("path", "session", lease, "id", p.ID, "downlink", p.Primary, "healthy", p.Healthy,
-						"flows", p.Flows, "srtt", p.SRTT.Round(100*time.Microsecond), "loss", fmt.Sprintf("%.3f", p.Loss))
+						"flows", p.Flows, "srtt", p.SRTT.Round(100*time.Microsecond), "loss", fmt.Sprintf("%.3f", p.Loss),
+						"stream_mbit", fmt.Sprintf("%.2f", p.StreamRate*8/1e6), "stream_inflight", p.StreamInflight)
 				}
 			}
 		case <-timer.C:
