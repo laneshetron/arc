@@ -7,6 +7,8 @@
 # is for deciding FEC's default, not for CI.
 #
 # Usage: fec.sh BIN_DIR [SECONDS] [REPS]   (defaults 10 and 3)
+# Environment: ONLY, an extended regex, limits the scenarios to those whose
+# names match; MODES (default "off auto always") the FEC modes.
 set -euo pipefail
 
 BIN=$(cd "${1:?usage: fec.sh BIN_DIR [SECONDS] [REPS]}" && pwd)
@@ -72,7 +74,8 @@ SCENARIOS=(
 ROWS=()
 for sc in "${SCENARIOS[@]}"; do
   name=${sc%%|*} args=${sc#*|}
-  for mode in off auto always; do
+  [[ -z ${ONLY:-} || $name =~ $ONLY ]] || continue
+  for mode in ${MODES:-off auto always}; do
     ups=() downs=() pings=() over_up=() over_down=()
     for rep in $(seq "$REPS"); do
       start_client "$mode"
