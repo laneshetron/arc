@@ -7,7 +7,8 @@
 #
 # Usage: split.sh BIN_DIR [SECONDS] [REPS]   (defaults 10 and 3)
 # Environment: ONLY, an extended regex, limits the scenarios to those whose
-# names match; MODES (default "off always") the -split-tcp modes.
+# names match; MODES (default "off always") the -split-tcp modes, and
+# "plain" for plain routing as a control.
 set -euo pipefail
 
 BIN=$(cd "${1:?usage: split.sh BIN_DIR [SECONDS] [REPS]}" && pwd)
@@ -37,8 +38,13 @@ PIDS+=($!)
 wait_until 10 $R ip addr show arc0
 
 CLIENT=
-start_client() { # start_client SPLIT_MODE
-  if [[ -n $CLIENT ]]; then kill "$CLIENT"; wait "$CLIENT" 2>/dev/null || true; fi
+start_client() { # start_client SPLIT_MODE, or plain for plain routing (no tunnel)
+  if [[ -n $CLIENT ]]; then kill "$CLIENT"; wait "$CLIENT" 2>/dev/null || true; CLIENT=; fi
+  $C ip route del 192.168.20.0/24 2>/dev/null || true
+  if [[ $1 == plain ]]; then
+    $C ip route add 192.168.20.0/24 via 192.168.10.2 dev c0 onlink
+    return
+  fi
   $C "$BIN/arc-client" run -relay 192.168.10.2:4433 -relay-key "$RELAY_PUB" \
     -token-file "$WORK/token" -route 192.168.20.0/24 -bind c0 -split-tcp "$1" >"$WORK/client.log" 2>&1 &
   CLIENT=$!
