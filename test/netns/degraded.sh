@@ -313,25 +313,28 @@ sleep 1
 # Both links lossy: there is no clean path to move to. Redundancy sends
 # each packet on both links, so with independent 5% loss about 0.25% of
 # packets are lost instead of 5% (spec §11.1). Ping loss counts both
-# directions; 300 pings resolve it to about 0.3%.
-both_lossy() { # both_lossy NAME REDUNDANCY NETEM_ARGS...: sets BL_MBPS and BL_LOSS
-  local name=$1 mode=$2 avg
-  shift 2
+# directions; 300 pings resolve it to about 0.3%. Bursty loss takes pings
+# in runs of several, so 300 pings see only a few bursts either way, and
+# one overlap of bursts on both links can cost redundancy its margin; those
+# scenarios send 1000.
+both_lossy() { # both_lossy NAME REDUNDANCY PINGS NETEM_ARGS...: sets BL_MBPS and BL_LOSS
+  local name=$1 mode=$2 pings=$3 avg
+  shift 3
   start_multipath_client "$mode" "client-$mode.log"
   impair 0 "$@"
   impair 1 "$@"
   BL_MBPS=$(tcp_up)
-  read -r BL_LOSS avg <<<"$(ping_stats 300)"
+  read -r BL_LOSS avg <<<"$(ping_stats "$pings")"
   unimpair 0
   unimpair 1
   MP_ROWS+=("$(printf '%-34s redundancy %-6s TCP %6s Mbit/s, ping loss %s%%' "$name" "$mode" "$BL_MBPS" "$BL_LOSS")")
 }
-compare_redundancy() { # compare_redundancy NAME NETEM_ARGS...
-  local name=$1 off_mbps off_loss
-  shift
-  both_lossy "$name" off "$@"
+compare_redundancy() { # compare_redundancy NAME PINGS NETEM_ARGS...
+  local name=$1 pings=$2 off_mbps off_loss
+  shift 2
+  both_lossy "$name" off "$pings" "$@"
   off_mbps=$BL_MBPS off_loss=$BL_LOSS
-  both_lossy "$name" auto "$@"
+  both_lossy "$name" auto "$pings" "$@"
   if awk -v o="$off_loss" 'BEGIN { exit !(o < 2) }'; then
     # Bursty loss can miss a 300-ping run entirely; then there is nothing
     # to halve, and the goodput check below carries the comparison.
@@ -347,9 +350,9 @@ compare_redundancy() { # compare_redundancy NAME NETEM_ARGS...
     fail "redundancy gave $BL_MBPS Mbit/s TCP goodput, against $off_mbps without ($name)"
   fi
 }
-compare_redundancy "both links at 5% loss" loss 5%
-compare_redundancy "both at 5% loss, rtt 40ms" delay 20ms loss 5%
-compare_redundancy "both bursty 5% (10), rtt 40ms" delay 20ms loss gemodel 0.53% 10%
+compare_redundancy "both links at 5% loss" 300 loss 5%
+compare_redundancy "both at 5% loss, rtt 40ms" 300 delay 20ms loss 5%
+compare_redundancy "both bursty 5% (10), rtt 40ms" 1000 delay 20ms loss gemodel 0.53% 10%
 
 # Connecting through heavy loss (spec §9.2): the client repeats its
 # handshake on both links and its AUTH every 100 ms, so a session comes up
