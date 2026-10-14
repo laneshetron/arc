@@ -62,8 +62,9 @@ sudo bin/arc-client run ... -tls RELAY_HOST:443
 # Where the network watches TLS, pose the TLS carrier as a host the network
 # permits: -tls-cover presents that name instead of the relay's own, and
 # -tls-fingerprint chrome shapes the ClientHello like a browser's (with
-# -tls-fragment N, the ClientHello is sent in small TCP segments). No -tls-ca
-# is needed: ARC's own session authenticates the relay underneath. The relay
+# -tls-fragment N, the ClientHello is sent in small TCP segments). With
+# -tls-cover, no -tls-ca is needed: ARC's own session authenticates the relay
+# underneath. Without it, the relay's certificate is verified as usual. The relay
 # runs -tls-camouflage to accept browser-alike carrier connections, and its
 # certificate should list the cover name: arc-relay gencert -hosts COVER_HOST
 sudo bin/arc-client run ... -tls RELAY_HOST:443 -tls-cover COVER_HOST -tls-fingerprint chrome

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"io"
 	"net"
 	"net/netip"
@@ -134,6 +135,11 @@ func TestCamouflagedClientNeedsCamouflageListener(t *testing.T) {
 		if err == nil {
 			t.Fatal("camouflaged client connected to a strict listener")
 		}
+		// The relay's refusal is a configuration fault, not interference.
+		var f *Failure
+		if errors.As(err, &f) && f.Mode == ModeKilledAfterServerHello {
+			t.Fatalf("relay refusal blamed on the network: %v", err)
+		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("no dial result")
 	}
@@ -206,3 +212,71 @@ func (c *fakeConn) RemoteAddr() net.Addr               { return nil }
 func (c *fakeConn) SetDeadline(t time.Time) error      { return nil }
 func (c *fakeConn) SetReadDeadline(t time.Time) error  { return nil }
 func (c *fakeConn) SetWriteDeadline(t time.Time) error { return nil }
+
+// Without a cover name the camouflaged client presents the relay's own
+// name and verifies it as the plain carrier does: a fingerprint or
+// fragmentation alone must not turn verification off.
+func TestCamouflageWithoutCoverVerifies(t *testing.T) {
+	certPEM, keyPEM, err := SelfSigned([]string{"127.0.0.1"}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := Listen("127.0.0.1:0", ListenerOptions{
+		TLS: &tls.Config{Certificates: []tls.Certificate{cert}}, Camouflage: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	roots := x509.NewCertPool()
+	roots.AppendCertsFromPEM(certPEM)
+	for _, camo := range []*Camouflage{{Fingerprint: "chrome"}, {Fragment: 64}} {
+		dial := func(cfg *tls.Config) error {
+			states := make(chan error, 4)
+			c := Dial(ClientOptions{Addr: ln.Addr().String(), TLS: cfg, Camouflage: camo,
+				OnState: func(err error) { states <- err }})
+			defer c.Close()
+			select {
+			case err := <-states:
+				return err
+			case <-time.After(5 * time.Second):
+				t.Fatal("no dial result")
+				return nil
+			}
+		}
+		// Untrusted certificate: refused here, and not blamed on the network.
+		err := dial(&tls.Config{})
+		var f *Failure
+		if !errors.As(err, &f) || f.Mode != ModeDied {
+			t.Errorf("%+v with an untrusted relay: %v, want a %s Failure", camo, err, ModeDied)
+		}
+		if err := dial(&tls.Config{RootCAs: roots}); err != nil {
+			t.Errorf("%+v with a pinned CA: %v", camo, err)
+		}
+	}
+}
+
+// Configuration a fingerprinted handshake cannot honor is refused, not
+// silently dropped.
+func TestUTLSConfigRefusesVerifyConnection(t *testing.T) {
+	_, err := utlsConfig(&tls.Config{VerifyConnection: func(tls.ConnectionState) error { return nil }})
+	if err == nil {
+		t.Fatal("VerifyConnection silently dropped")
+	}
+	called := false
+	u, err := utlsConfig(&tls.Config{VerifyPeerCertificate: func([][]byte, [][]*x509.Certificate) error {
+		called = true
+		return nil
+	}})
+	if err != nil || u.VerifyPeerCertificate == nil {
+		t.Fatalf("VerifyPeerCertificate not carried: %v", err)
+	}
+	u.VerifyPeerCertificate(nil, nil)
+	if !called {
+		t.Fatal("wrong VerifyPeerCertificate carried")
+	}
+}

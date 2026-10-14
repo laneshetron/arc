@@ -63,7 +63,8 @@ func pair(t *testing.T) (*Listener, *Client, chan error) {
 	roots.AppendCertsFromPEM(certPEM)
 	states := make(chan error, 16)
 	c := Dial(ClientOptions{
-		Addr: ln.Addr().String(), TLS: &tls.Config{RootCAs: roots, ServerName: "127.0.0.1"},
+		// No ServerName: it defaults to Addr's host, as with tls.Dial.
+		Addr: ln.Addr().String(), TLS: &tls.Config{RootCAs: roots},
 		Peer: netip.MustParseAddrPort("192.0.2.1:4433"), OnState: func(err error) { states <- err },
 	})
 	t.Cleanup(func() { c.Close() })

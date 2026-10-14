@@ -15,16 +15,18 @@ import (
 // the outer TLS presents itself as ordinary browser traffic to the relay
 // endpoint rather than as an ARC carrier. The outer TLS is cover only —
 // ARC's own authenticated session carries all security (spec D2) — so
-// certificate verification may be skipped where no CA is pinned. This
+// certificate verification is skipped under a cover name where no CA is
+// pinned. This
 // defeats passive filtering by observers of the ClientHello; it does not
 // by itself survive an active prober, which must be answered by a
 // fail-closed relay (a later profile).
 type Camouflage struct {
 	// Name is presented as the TLS server name (SNI): a host the network
 	// permits, not the relay's own name. Empty means the TLS
-	// configuration's server name, or the endpoint's host. A pinned CA
-	// (if any) still verifies against this name, so a relay's certificate
-	// must list it.
+	// configuration's server name, or the endpoint's host, verified as by
+	// the plain carrier. With a Name, verification is skipped unless a CA
+	// is pinned, which then verifies against this name, so a relay's
+	// certificate must list it.
 	Name string
 	// Fingerprint shapes the ClientHello as a browser's: "chrome",
 	// "edge", "safari", "ios", or "firefox". Empty uses Go's ordinary
@@ -86,63 +88,85 @@ func (cam *Camouflage) Validate() error {
 // classification. The profiler uses this as the probe client for
 // canaries (network-profiling.md §5); relays are never probed (its P1).
 func (cam *Camouflage) Handshake(ctx context.Context, raw net.Conn, addr string, base *tls.Config) (net.Conn, string, error) {
-	if err := cam.Validate(); err != nil {
+	if cam.Fragment < 0 {
+		return nil, "", errors.New("stream: negative TLS fragment size")
+	}
+	cfg, err := clientConfig(base, addr)
+	if err != nil {
 		return nil, "", err
 	}
-	if base == nil {
-		base = &tls.Config{}
-	}
-	cfg := base.Clone()
 	if cam.Name != "" {
 		cfg.ServerName = cam.Name
-	}
-	if cfg.ServerName == "" {
-		host, _, err := net.SplitHostPort(addr)
-		if err != nil {
-			return nil, "", fmt.Errorf("stream: camouflage needs a server name: %w", err)
+		// A cover name is not the relay's, so no public CA vouches for
+		// it; the ARC session authenticates the relay (spec D2), so an
+		// unverified outer handshake costs no security. A pinned CA still
+		// verifies, and the certificate must then list the cover name.
+		// Without a cover name the relay's own name is presented and
+		// verified as by the plain carrier.
+		if cfg.RootCAs == nil {
+			cfg.InsecureSkipVerify = true
 		}
-		cfg.ServerName = host
 	}
-	// The ARC session authenticates the relay (spec D2), so an unverified
-	// outer handshake costs no security. Keep verification where a CA is
-	// pinned; the certificate must then match the cover name.
-	if cfg.RootCAs == nil {
-		cfg.InsecureSkipVerify = true
-	}
+	cfg.MinVersion = tls.VersionTLS13
+	cfg.NextProtos = browserALPN
 	var hconn net.Conn = raw
+	var frag *fragmentConn
 	if cam.Fragment > 0 {
-		hconn = &fragmentConn{Conn: raw, n: cam.Fragment}
+		frag = &fragmentConn{Conn: raw, n: cam.Fragment}
+		hconn = frag
 	}
+	var (
+		conn interface {
+			net.Conn
+			HandshakeContext(context.Context) error
+		}
+		alpn func() string
+	)
 	if cam.Fingerprint != "" {
 		id, err := FingerprintID(cam.Fingerprint)
 		if err != nil {
 			return nil, "", err
 		}
-		uconn := utls.UClient(hconn, &utls.Config{
-			ServerName:         cfg.ServerName,
-			RootCAs:            cfg.RootCAs,
-			InsecureSkipVerify: cfg.InsecureSkipVerify,
-			MinVersion:         utls.VersionTLS13,
-			NextProtos:         browserALPN,
-		}, id)
-		if err := uconn.HandshakeContext(ctx); err != nil {
+		ucfg, err := utlsConfig(cfg)
+		if err != nil {
 			return nil, "", err
 		}
-		if f, ok := hconn.(*fragmentConn); ok {
-			f.clear = true // post-handshake writes pass whole
-		}
-		return uconn, uconn.ConnectionState().NegotiatedProtocol, nil
+		uconn := utls.UClient(hconn, ucfg, id)
+		conn, alpn = uconn, func() string { return uconn.ConnectionState().NegotiatedProtocol }
+	} else {
+		tconn := tls.Client(hconn, cfg)
+		conn, alpn = tconn, func() string { return tconn.ConnectionState().NegotiatedProtocol }
 	}
-	cfg.MinVersion = tls.VersionTLS13
-	cfg.NextProtos = browserALPN
-	conn := tls.Client(hconn, cfg)
 	if err := conn.HandshakeContext(ctx); err != nil {
 		return nil, "", err
 	}
-	if f, ok := hconn.(*fragmentConn); ok {
-		f.clear = true // post-handshake writes pass whole
+	if frag != nil {
+		frag.clear = true // post-handshake writes pass whole
 	}
-	return conn, conn.ConnectionState().NegotiatedProtocol, nil
+	return conn, alpn(), nil
+}
+
+// utlsConfig carries cfg over to uTLS, whose configuration is a separate
+// type. Fields that cannot be carried and would weaken or change the
+// handshake if dropped are refused rather than silently ignored.
+func utlsConfig(cfg *tls.Config) (*utls.Config, error) {
+	switch {
+	case cfg.VerifyConnection != nil:
+		return nil, errors.New("stream: TLS fingerprint cannot honor VerifyConnection; use VerifyPeerCertificate")
+	case len(cfg.Certificates) > 0, cfg.GetClientCertificate != nil:
+		return nil, errors.New("stream: TLS fingerprint does not support client certificates")
+	}
+	return &utls.Config{
+		ServerName:            cfg.ServerName,
+		RootCAs:               cfg.RootCAs,
+		InsecureSkipVerify:    cfg.InsecureSkipVerify,
+		VerifyPeerCertificate: cfg.VerifyPeerCertificate,
+		KeyLogWriter:          cfg.KeyLogWriter,
+		Rand:                  cfg.Rand,
+		Time:                  cfg.Time,
+		MinVersion:            cfg.MinVersion,
+		NextProtos:            cfg.NextProtos,
+	}, nil
 }
 
 // fragmentConn splits every write into pieces of at most n bytes while its

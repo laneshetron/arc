@@ -2,8 +2,11 @@ package stream
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -33,7 +36,23 @@ func TestClassifyConnect(t *testing.T) {
 		t.Errorf("timeout dial classified %q", f.Mode)
 	}
 	if f := classifyConnect(resetOp("dial")); f.Mode != ModeConnectRefused {
+		t.Errorf("reset dial classified %q", f.Mode)
+	}
+	refused := &net.OpError{Op: "dial", Err: &os.SyscallError{Syscall: "connect", Err: syscall.ECONNREFUSED}}
+	if f := classifyConnect(refused); f.Mode != ModeConnectRefused {
 		t.Errorf("refused dial classified %q", f.Mode)
+	}
+	// Local and resolution failures are not network evidence.
+	for _, err := range []error{
+		&net.OpError{Op: "dial", Err: &net.DNSError{Err: "no such host", Name: "relay.invalid", IsNotFound: true}},
+		&net.OpError{Op: "dial", Err: &net.DNSError{Err: "timeout", Name: "relay.example", IsTimeout: true}},
+		&net.OpError{Op: "dial", Err: &os.SyscallError{Syscall: "connect", Err: syscall.ENETUNREACH}},
+		&net.OpError{Op: "dial", Err: &os.SyscallError{Syscall: "connect", Err: syscall.EHOSTUNREACH}},
+		context.Canceled,
+	} {
+		if f := classifyConnect(err); f.Mode != ModeDied {
+			t.Errorf("%v classified %q, want %q", err, f.Mode, ModeDied)
+		}
 	}
 }
 
@@ -50,6 +69,10 @@ func TestClassifyHandshake(t *testing.T) {
 		{"EOF after hello", 0, 300, io.EOF, ModeEOFAfterClientHello},
 		{"killed after server hello", 64, 300, resetOp("read"), ModeKilledAfterServerHello},
 		{"killed after server hello, timeout", 64, 300, timeoutOp("read"), ModeKilledAfterServerHello},
+		{"alert from the peer", 7, 300, &net.OpError{Op: "remote error", Err: errors.New("tls: no application protocol")}, ModeDied},
+		{"certificate rejected here", 900, 300, &tls.CertificateVerificationError{Err: x509.UnknownAuthorityError{}}, ModeDied},
+		{"hostname mismatch", 900, 300, &tls.CertificateVerificationError{Err: x509.HostnameError{Host: "cover.example"}}, ModeDied},
+		{"closed mid-dial", 0, 300, fmt.Errorf("handshake: %w", context.Canceled), ModeDied},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -72,6 +95,16 @@ func TestClassifyDeath(t *testing.T) {
 	f = classifyDeath(tracked(500, 500), timeoutOp("read"))
 	if f.Mode != ModeTimeoutAtNBytes {
 		t.Errorf("timeout death classified %q", f.Mode)
+	}
+	epipe := &net.OpError{Op: "write", Err: &os.SyscallError{Syscall: "write", Err: syscall.EPIPE}}
+	if f := classifyDeath(tracked(500, 500), epipe); f.Mode != ModeResetAtNBytes {
+		t.Errorf("EPIPE death classified %q", f.Mode)
+	}
+	if f := classifyDeath(tracked(500, 500), fmt.Errorf("%w: 3", errFrameLen)); f.Mode != ModeDied {
+		t.Errorf("garbled frame classified %q", f.Mode)
+	}
+	if f := classifyDeath(tracked(500, 500), io.ErrUnexpectedEOF); f.Mode != ModeClosedAtNBytes {
+		t.Errorf("truncated frame classified %q", f.Mode)
 	}
 	f = classifyDeath(tracked(500, 500), io.EOF)
 	if f.Mode != ModeClosedAtNBytes {

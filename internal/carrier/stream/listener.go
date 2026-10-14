@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"slices"
 	"sync"
 	"time"
 )
@@ -120,7 +121,7 @@ func (l *Listener) serve(conn *tls.Conn) {
 	// authenticates the client.
 	switch p := conn.ConnectionState().NegotiatedProtocol; {
 	case p == ALPN:
-	case l.opts.Camouflage && (p == "h2" || p == "http/1.1"):
+	case l.opts.Camouflage && slices.Contains(browserALPN, p):
 	default:
 		conn.Close()
 		return

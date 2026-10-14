@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"sync"
@@ -73,6 +74,12 @@ func (c *Client) connectLoop() {
 	backoff := 500 * time.Millisecond
 	for c.ctx.Err() == nil {
 		l, track, err := c.connect()
+		if c.ctx.Err() != nil { // closed mid-dial: nothing to report
+			if l != nil {
+				l.close()
+			}
+			return
+		}
 		if err == nil {
 			c.setLink(l) // before OnState, so a write it prompts is not dropped
 		}
@@ -124,7 +131,8 @@ func (c *Client) connect() (*link, *trackingConn, error) {
 	// label is not the carrier's; the ARC session authenticates the peer.
 	if c.opts.Camouflage == nil && alpn != ALPN {
 		conn.Close()
-		return nil, nil, errors.New("stream: relay did not negotiate ALPN " + ALPN)
+		return nil, nil, &Failure{Mode: ModeDied, At: raw.total(),
+			Err: errors.New("stream: relay did not negotiate ALPN " + ALPN)}
 	}
 	return newLink(conn, c.opts.Peer, c.opts.Queue, 0), raw, nil
 }
@@ -162,11 +170,10 @@ func (c *Client) handshakeTLS(ctx context.Context, raw *trackingConn) (net.Conn,
 	if cam := c.opts.Camouflage; cam != nil {
 		return cam.Handshake(ctx, raw, c.opts.Addr, c.opts.TLS)
 	}
-	config := c.opts.TLS
-	if config == nil {
-		config = &tls.Config{}
+	cfg, err := clientConfig(c.opts.TLS, c.opts.Addr)
+	if err != nil {
+		return nil, "", err
 	}
-	cfg := config.Clone()
 	cfg.MinVersion = tls.VersionTLS13
 	cfg.NextProtos = []string{ALPN}
 	conn := tls.Client(raw, cfg)
@@ -174,6 +181,23 @@ func (c *Client) handshakeTLS(ctx context.Context, raw *trackingConn) (net.Conn,
 		return nil, "", err
 	}
 	return conn, conn.ConnectionState().NegotiatedProtocol, nil
+}
+
+// clientConfig clones base (nil for defaults) and, like tls.Dial, fills
+// an empty server name from addr's host.
+func clientConfig(base *tls.Config, addr string) (*tls.Config, error) {
+	if base == nil {
+		base = &tls.Config{}
+	}
+	cfg := base.Clone()
+	if cfg.ServerName == "" {
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, fmt.Errorf("stream: no TLS server name: %w", err)
+		}
+		cfg.ServerName = host
+	}
+	return cfg, nil
 }
 
 func (c *Client) setLink(l *link) {

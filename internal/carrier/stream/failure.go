@@ -2,8 +2,10 @@ package stream
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"sync/atomic"
@@ -52,12 +54,20 @@ func (f *Failure) Error() string {
 func (f *Failure) Unwrap() error { return f.Err }
 
 // classifyConnect classifies a failure of the TCP dial itself, before any
-// TLS byte left the host.
+// TLS byte left the host. Only a refused or reset SYN and an unanswered one
+// are network evidence; name resolution and local routing failures (no
+// such host, unreachable network) are not.
 func classifyConnect(err error) *Failure {
-	if isTimeout(err) {
+	var dns *net.DNSError
+	switch {
+	case errors.As(err, &dns), errors.Is(err, context.Canceled):
+		return &Failure{Mode: ModeDied, Err: err}
+	case errors.Is(err, syscall.ECONNREFUSED), errors.Is(err, syscall.ECONNRESET):
+		return &Failure{Mode: ModeConnectRefused, Err: err}
+	case isTimeout(err):
 		return &Failure{Mode: ModeConnectTimeout, Err: err}
 	}
-	return &Failure{Mode: ModeConnectRefused, Err: err}
+	return &Failure{Mode: ModeDied, Err: err}
 }
 
 // classifyHandshake classifies a TLS failure on a connection that came
@@ -66,8 +76,13 @@ func classifyHandshake(c *trackingConn, err error) *Failure {
 	f := &Failure{Mode: ModeDied, At: c.total(), Err: err}
 	read, wrote := c.counts()
 	switch {
-	case wrote == 0:
-		// Nothing left the host: a local failure, not network evidence.
+	case wrote == 0, errors.Is(err, context.Canceled):
+		// Nothing left the host, or the carrier was closed mid-dial: a
+		// local outcome, not network evidence.
+	case isPeerOrLocalRejection(err):
+		// The far end answered with a TLS alert (say, a relay without
+		// camouflage refusing a browser ALPN), or this host rejected the
+		// certificate: a configuration fault, not interference.
 	case read == 0:
 		switch {
 		case errors.Is(err, syscall.ECONNRESET), errors.Is(err, syscall.ECONNABORTED):
@@ -84,15 +99,38 @@ func classifyHandshake(c *trackingConn, err error) *Failure {
 }
 
 // classifyDeath classifies the end of an established carrier connection.
+// A write failing with EPIPE means a reset already arrived: the writer can
+// see it before the reader does.
 func classifyDeath(c *trackingConn, err error) *Failure {
-	f := &Failure{Mode: ModeClosedAtNBytes, At: c.total(), Err: err}
+	f := &Failure{Mode: ModeDied, At: c.total(), Err: err}
 	switch {
-	case errors.Is(err, syscall.ECONNRESET), errors.Is(err, syscall.ECONNABORTED):
+	case errors.Is(err, syscall.ECONNRESET), errors.Is(err, syscall.ECONNABORTED),
+		errors.Is(err, syscall.EPIPE):
 		f.Mode = ModeResetAtNBytes
 	case isTimeout(err):
 		f.Mode = ModeTimeoutAtNBytes
+	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+		f.Mode = ModeClosedAtNBytes
 	}
 	return f
+}
+
+// isPeerOrLocalRejection reports whether a handshake failed on a TLS alert
+// received from the peer or on this host's certificate verification,
+// rather than on the transport.
+func isPeerOrLocalRejection(err error) bool {
+	var op *net.OpError
+	if errors.As(err, &op) && op.Op == "remote error" {
+		return true // crypto/tls and utls both report received alerts so
+	}
+	var (
+		unknown   x509.UnknownAuthorityError
+		hostname  x509.HostnameError
+		invalid   x509.CertificateInvalidError
+		systemErr x509.SystemRootsError
+	)
+	return errors.As(err, &unknown) || errors.As(err, &hostname) ||
+		errors.As(err, &invalid) || errors.As(err, &systemErr)
 }
 
 func isTimeout(err error) bool {
