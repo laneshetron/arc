@@ -24,7 +24,13 @@ type ListenerOptions struct {
 	// IP before any synthetic ARC address is assigned (defaults 64 and 4).
 	MaxConnsPerSource   int
 	MaxPendingPerSource int
-	// HandshakeTimeout bounds a pending handshake (default 3 seconds).
+	// HandshakeTimeout bounds a pending handshake (default 10 seconds,
+	// as the client allows). TLS is the carrier for networks that block
+	// UDP, which are often lossy as well: a lost ClientHello waits out
+	// TCP's retransmission timeout, doubling with each loss, and a shorter
+	// limit would fail the fallback exactly where it is needed. The
+	// pending budgets, not this timeout, bound the work an attacker can
+	// hold.
 	HandshakeTimeout time.Duration
 	// Idle closes a connection that receives nothing for this long
 	// (default 5 minutes: well past keepalives and the session idle
@@ -87,7 +93,7 @@ func Listen(addr string, opts ListenerOptions) (*Listener, error) {
 		opts.MaxPendingPerSource = 4
 	}
 	if opts.HandshakeTimeout == 0 {
-		opts.HandshakeTimeout = 3 * time.Second
+		opts.HandshakeTimeout = 10 * time.Second
 	}
 	if opts.MaxConns < 0 || opts.MaxPending < 0 || opts.MaxConnsPerSource < 0 || opts.MaxPendingPerSource < 0 || opts.HandshakeTimeout < 0 || opts.Queue < 0 || opts.Idle < 0 {
 		return nil, errors.New("stream: connection, queue and idle limits must not be negative")

@@ -143,9 +143,10 @@ func run(args []string) error {
 	maxTLS := fs.Int("max-tls-conns", 4096, "maximum pending and established TLS carrier connections combined")
 	maxTLSHandshakes := fs.Int("max-tls-handshakes", 128, "maximum pending TLS handshakes")
 	maxTLSPerSource := fs.Int("max-tls-conns-per-source", 64, "maximum TLS carrier connections per TCP peer IP")
+	tlsHandshakeTimeout := fs.Duration("tls-handshake-timeout", 10*time.Second, "time allowed for a TLS carrier handshake; lossy networks need several seconds")
 	prof := profiling.Register(fs)
 	fs.Parse(args)
-	if *maxSessions <= 0 || *maxPending <= 0 || *handshakeRate <= 0 || *sourceRate <= 0 || *maxTLS <= 0 || *maxTLSHandshakes <= 0 || *maxTLSPerSource <= 0 {
+	if *maxSessions <= 0 || *maxPending <= 0 || *handshakeRate <= 0 || *sourceRate <= 0 || *maxTLS <= 0 || *maxTLSHandshakes <= 0 || *maxTLSPerSource <= 0 || *tlsHandshakeTimeout <= 0 {
 		return errors.New("session, handshake and TLS limits must be positive")
 	}
 	stopProfiles, err := prof.Start()
@@ -216,7 +217,8 @@ func run(args []string) error {
 		if err != nil {
 			return fmt.Errorf("-tls-listen: %w", err)
 		}
-		ln, err := stream.Listen(*tlsListen, stream.ListenerOptions{TLS: &tls.Config{Certificates: []tls.Certificate{cert}}, MaxConns: *maxTLS, MaxPending: *maxTLSHandshakes, MaxConnsPerSource: *maxTLSPerSource})
+		ln, err := stream.Listen(*tlsListen, stream.ListenerOptions{TLS: &tls.Config{Certificates: []tls.Certificate{cert}}, MaxConns: *maxTLS, MaxPending: *maxTLSHandshakes, MaxConnsPerSource: *maxTLSPerSource,
+			HandshakeTimeout: *tlsHandshakeTimeout})
 		if err != nil {
 			return err
 		}
