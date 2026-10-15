@@ -481,6 +481,15 @@ func (s *RelaySession) onJoin(now time.Time, p *path, f wire.PathJoin) bool {
 	}
 	p.remoteCID, p.joined = f.CID, true
 	p.control = append(p.control, wire.PathChallenge{Data: p.challenge})
+	// The client opens slots lowest first, so unjoined slots below this
+	// one are lost to it (their NEW_PATH arrived too late, or never):
+	// retire them, so issueSlots replaces them rather than counting them
+	// as spares forever.
+	for _, q := range slices.Clone(s.conn.paths) {
+		if !q.joined && q.id < p.id {
+			s.removePath(q)
+		}
+	}
 	s.issueSlots(now)
 	return s.state != StateClosed
 }

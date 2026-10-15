@@ -239,3 +239,58 @@ func TestCapacityResultRemainsRetryable(t *testing.T) {
 		t.Fatal("capacity rejection became a permanent auth failure")
 	}
 }
+
+func TestReorderedNewPathKeepsBothSlots(t *testing.T) {
+	// A NEW_PATH retransmitted after a later one still gives a slot, and
+	// slots open lowest first.
+	n := newNetwork(t, 307, defaultRelayConfig(), ClientConfig{})
+	n.establish()
+	c := n.client
+	if len(c.slots) != 2 {
+		t.Fatalf("%d slots", len(c.slots))
+	}
+	a, b := c.slots[0], c.slots[1]
+	c.slots = nil
+	for _, sl := range []pathSlot{b, a, b} { // later first, then a duplicate
+		c.conn.transmit(n.now, c.conn.path(0), nil) // keep the harness moving
+		s := n.relaySession()
+		s.conn.transmit(n.now, s.conn.path(0), []wire.Frame{wire.NewPath{PathID: sl.id, CID: sl.cid, ResetToken: sl.token}})
+		for d, ok := n.relay.PollTransmit(); ok; d, ok = n.relay.PollTransmit() {
+			c.HandlePacket(n.now, 0, d.Data)
+		}
+	}
+	if len(c.slots) != 2 || c.slots[0].id != a.id || c.slots[1].id != b.id {
+		t.Fatalf("slots %+v, want %d then %d", c.slots, a.id, b.id)
+	}
+}
+
+func TestRelayReplacesSlotsTheClientNeverGot(t *testing.T) {
+	// The client never received the first slot (its NEW_PATH was lost
+	// for good, or arrived after the client opened a later one) and
+	// joins the second: the relay retires the first rather than counting
+	// it as a spare forever, and keeps two spares outstanding.
+	n := newNetwork(t, 308, defaultRelayConfig(), ClientConfig{})
+	s := n.establish()
+	n.runFor(200 * time.Millisecond)
+	lost := n.client.slots[0].id
+	n.client.slots = n.client.slots[1:]
+	id, _ := n.openPath("198.51.100.20:5000", 10*time.Millisecond)
+	if !n.runUntil(2*time.Second, func() bool {
+		return n.clientEventsOf(func(e ClientEvent) bool { v, ok := e.(PathValidated); return ok && v.ID == id }) == 1
+	}) {
+		t.Fatal("path not validated")
+	}
+	n.runFor(500 * time.Millisecond)
+	spare := 0
+	for _, p := range s.conn.paths {
+		if p.id == lost {
+			t.Fatalf("slot %d the client never got is still held", lost)
+		}
+		if !p.joined {
+			spare++
+		}
+	}
+	if spare != spareSlots || len(n.client.slots) != spareSlots {
+		t.Fatalf("relay holds %d spare slots and the client %d, want %d", spare, len(n.client.slots), spareSlots)
+	}
+}

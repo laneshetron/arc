@@ -1,6 +1,7 @@
 package session
 
 import (
+	"cmp"
 	"crypto/rand"
 	"errors"
 	"io"
@@ -126,12 +127,10 @@ type Client struct {
 	nextInit      time.Time // next HANDSHAKE_INIT, or next AUTH while authenticating
 	authenticated time.Time
 
-	conn   *conn
-	config wire.AuthResult
-	slots  []pathSlot
-	// highestSlot is the highest path ID the relay has announced.
-	highestSlot uint32
-	current     *path // primary path
+	conn    *conn
+	config  wire.AuthResult
+	slots   []pathSlot
+	current *path // primary path
 	// Loss-driven moves of the primary (loss.go): when the next check is
 	// due and the earliest the primary may move again.
 	lossCheckAt, lossMoveAt time.Time
@@ -211,7 +210,6 @@ func (c *Client) startHandshake(now time.Time) error {
 		return err
 	}
 	c.state, c.hs, c.cookie, c.conn, c.slots, c.current = StateHandshaking, hs, nil, nil, nil, nil
-	c.highestSlot = 0
 	c.flows = flowTable{}
 	c.attemptStart = now
 	c.attempts++
@@ -412,13 +410,13 @@ func (c *Client) handleData(now time.Time, b []byte) {
 			}
 		case wire.NewPath:
 			// Control frames may be retransmitted in fresh DATA packets,
-			// and the relay issues path IDs in increasing order: accept
-			// only a slot above every one seen, so no path ID, and so no
-			// nonce space, is used twice. A slot announced out of order
-			// is lost, which costs only a spare.
-			if len(c.slots) < maxPaths && f.PathID > c.highestSlot {
-				c.highestSlot = f.PathID
-				c.slots = append(c.slots, pathSlot{id: f.PathID, cid: f.CID, token: f.ResetToken})
+			// possibly after later ones. Paths open in increasing ID order
+			// (the lowest slot first), so a slot at or below the highest
+			// path opened is stale and a queued one a duplicate: no path
+			// ID, and so no nonce space, is used twice.
+			i, queued := slices.BinarySearchFunc(c.slots, f.PathID, func(s pathSlot, id uint32) int { return cmp.Compare(s.id, id) })
+			if len(c.slots) < maxPaths && !queued && f.PathID > c.conn.highestPathID {
+				c.slots = slices.Insert(c.slots, i, pathSlot{id: f.PathID, cid: f.CID, token: f.ResetToken})
 			}
 		case wire.PathChallenge:
 			c.onChallenge(now, p, f)
