@@ -1,6 +1,7 @@
 package session
 
 import (
+	"cmp"
 	"crypto/rand"
 	"errors"
 	"io"
@@ -408,8 +409,14 @@ func (c *Client) handleData(now time.Time, b []byte) {
 				c.deliverRecovered(c.conn.fecRepair(now, f))
 			}
 		case wire.NewPath:
-			if len(c.slots) < maxPaths && c.conn.path(f.PathID) == nil {
-				c.slots = append(c.slots, pathSlot{id: f.PathID, cid: f.CID, token: f.ResetToken})
+			// Control frames may be retransmitted in fresh DATA packets,
+			// possibly after later ones. Paths open in increasing ID order
+			// (the lowest slot first), so a slot at or below the highest
+			// path opened is stale and a queued one a duplicate: no path
+			// ID, and so no nonce space, is used twice.
+			i, queued := slices.BinarySearchFunc(c.slots, f.PathID, func(s pathSlot, id uint32) int { return cmp.Compare(s.id, id) })
+			if len(c.slots) < maxPaths && !queued && f.PathID > c.conn.highestPathID {
+				c.slots = slices.Insert(c.slots, i, pathSlot{id: f.PathID, cid: f.CID, token: f.ResetToken})
 			}
 		case wire.PathChallenge:
 			c.onChallenge(now, p, f)
@@ -446,8 +453,12 @@ func (c *Client) onAuthResult(now time.Time, r wire.AuthResult) {
 		return // duplicate or a credential refresh acknowledgement
 	}
 	if r.Status != 0 {
-		c.state, c.err = StateClosed, ErrAuthFailed
-		c.events = append(c.events, Closed{Err: ErrAuthFailed})
+		err := ErrAuthFailed
+		if r.Status == uint8(wire.CodeCapacity) {
+			err = ErrCapacity
+		}
+		c.state, c.err = StateClosed, err
+		c.events = append(c.events, Closed{Err: err})
 		return
 	}
 	c.config = r
@@ -537,6 +548,10 @@ func (c *Client) OpenPath(now time.Time) (uint32, error) {
 	if c.state != StateActive {
 		return 0, ErrNotActive
 	}
+	// Defensive against a stale slot queued before its path was opened.
+	for len(c.slots) > 0 && c.slots[0].id <= c.conn.highestPathID {
+		c.slots = c.slots[1:]
+	}
 	if len(c.slots) == 0 {
 		return 0, ErrNoPathSlots
 	}
@@ -554,7 +569,10 @@ func (c *Client) OpenPath(now time.Time) (uint32, error) {
 	p := newPath(slot.id, cid, slot.cid, now)
 	p.resetToken, p.joined = slot.token, true
 	p.control = []wire.Frame{wire.PathJoin{CID: cid}}
-	c.conn.addPath(p)
+	if !c.conn.addPath(p) {
+		c.close(now, ErrPathLimit, true)
+		return 0, ErrPathLimit
+	}
 	c.conn.flush(now)
 	return p.id, nil
 }

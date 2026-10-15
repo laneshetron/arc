@@ -66,6 +66,8 @@ var (
 	ErrPathTimeout      = errors.New("session: path timed out")
 	ErrPathAbandoned    = errors.New("session: path abandoned by peer")
 	ErrIntegrityLimit   = errors.New("session: too many authentication failures")
+	ErrPathLimit        = errors.New("session: path IDs exhausted; establish a new session")
+	ErrCapacity         = errors.New("session: authenticated session limit reached")
 	errReplay           = errors.New("session: replayed or stale packet")
 )
 
@@ -203,6 +205,11 @@ type conn struct {
 	recv  *crypto.RecvKeys
 	paths []*path // ordered by ID for deterministic iteration
 	byCID map[wire.CID]*path
+	// highestPathID is the highest path ID ever added. Path IDs only
+	// increase, so a path's nonce space (path ID and packet number under
+	// the session's keys) is never recreated, without remembering every
+	// retired path: a session's paths can come and go indefinitely.
+	highestPathID uint32
 
 	// primary chooses the path for unbound control frames, and pathFor
 	// the path for each IP packet (the primary when nil); see sched.go.
@@ -261,10 +268,15 @@ func newConn(keys crypto.TrafficKeys, now time.Time) *conn {
 	}
 }
 
-func (c *conn) addPath(p *path) {
+func (c *conn) addPath(p *path) bool {
+	if (len(c.paths) > 0 || c.highestPathID > 0) && p.id <= c.highestPathID || c.byCID[p.localCID] != nil {
+		return false
+	}
+	c.highestPathID = p.id
 	i, _ := slices.BinarySearchFunc(c.paths, p.id, func(q *path, id uint32) int { return int(q.id) - int(id) })
 	c.paths = slices.Insert(c.paths, i, p)
 	c.byCID[p.localCID] = p
+	return true
 }
 
 func (c *conn) removePath(p *path) {
