@@ -219,7 +219,9 @@ func run(args []string) error {
 		tlsEndpoints, err := stream.ResolveEndpoints(bootstrap, *tlsAddr)
 		cancel()
 		if err != nil {
-			return fmt.Errorf("bootstrap TLS relay: %w", err)
+			// The UDP carriers may work regardless; the TLS carrier keeps
+			// resolving the relay until it can.
+			log.Warn("resolving the TLS relay; retrying when the carrier connects", "relay", *tlsAddr, "err", err)
 		}
 		for _, iface := range binds {
 			name := iface

@@ -19,6 +19,10 @@ type ClientOptions struct {
 	// Endpoints, when set, are bootstrap-resolved dial targets. The TLS
 	// ServerName still refers to the original hostname. Reconnects rotate
 	// through these targets without depending on DNS inside the tunnel.
+	// Without them the client resolves Addr before each attempt until a
+	// lookup succeeds, then keeps those addresses, so a lookup that fails
+	// at startup (DNS not up yet) delays the carrier instead of stopping
+	// the client.
 	Endpoints []netip.AddrPort
 	// TLS verifies the relay's certificate (ServerName, RootCAs). The
 	// carrier requires TLS 1.3 and ALPN "arc/1".
@@ -47,9 +51,13 @@ type Client struct {
 	ctx  context.Context
 	stop context.CancelFunc
 
-	mu           sync.Mutex
-	cur          *link
+	mu  sync.Mutex
+	cur *link
+
+	// Used by the connecting goroutine only.
+	endpoints    []netip.AddrPort
 	nextEndpoint int
+	lookup       func(context.Context, string, string) ([]netip.Addr, error) // nil: the system resolver
 }
 
 // Dial starts a client carrier. It returns at once; the connection comes
@@ -117,11 +125,22 @@ func (c *Client) connect() (*link, error) {
 		NetDialer: &net.Dialer{Control: sockopt.Control(c.opts.Sockopt), KeepAlive: 15 * time.Second},
 		Config:    cfg,
 	}
-	addr := c.opts.Addr
-	if len(c.opts.Endpoints) > 0 {
-		addr = c.opts.Endpoints[c.nextEndpoint].String()
-		c.nextEndpoint = (c.nextEndpoint + 1) % len(c.opts.Endpoints)
+	if len(c.endpoints) == 0 {
+		c.endpoints = c.opts.Endpoints
 	}
+	if len(c.endpoints) == 0 {
+		lookup := c.lookup
+		if lookup == nil {
+			lookup = net.DefaultResolver.LookupNetIP
+		}
+		eps, err := resolveEndpoints(ctx, c.opts.Addr, lookup)
+		if err != nil {
+			return nil, err
+		}
+		c.endpoints = eps
+	}
+	addr := c.endpoints[c.nextEndpoint%len(c.endpoints)].String()
+	c.nextEndpoint = (c.nextEndpoint + 1) % len(c.endpoints)
 	conn, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, err

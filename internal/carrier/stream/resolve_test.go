@@ -71,3 +71,49 @@ func TestResolveEndpointLiteralSkipsDNS(t *testing.T) {
 		t.Fatalf("literal: %v %v", out, err)
 	}
 }
+
+func TestResolvesLaterWhenStartupLookupFailed(t *testing.T) {
+	// The startup lookup failed (no Endpoints): the carrier keeps trying
+	// with each connection attempt and, once a lookup succeeds, connects
+	// and keeps the addresses.
+	certPEM, keyPEM, err := SelfSigned([]string{"relay.invalid"}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l, err := Listen("127.0.0.1:0", ListenerOptions{TLS: &tls.Config{Certificates: []tls.Certificate{cert}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	endpoint := net.JoinHostPort("relay.invalid", strconv.Itoa(l.Addr().(*net.TCPAddr).Port))
+	roots := x509.NewCertPool()
+	roots.AppendCertsFromPEM(certPEM)
+	lookups, dnsUp := 0, false
+	c := &Client{ctx: context.Background(), opts: ClientOptions{Addr: endpoint,
+		TLS: &tls.Config{ServerName: "relay.invalid", RootCAs: roots}, Queue: 1},
+		lookup: func(context.Context, string, string) ([]netip.Addr, error) {
+			lookups++
+			if !dnsUp {
+				return nil, errors.New("no DNS yet")
+			}
+			return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil
+		}}
+	if _, err := c.connect(); err == nil {
+		t.Fatal("connected without an address")
+	}
+	dnsUp = true
+	for range 2 {
+		link, err := c.connect()
+		if err != nil {
+			t.Fatalf("connect after DNS came up: %v", err)
+		}
+		link.close()
+	}
+	if lookups != 2 {
+		t.Fatalf("%d lookups, want 2: one failed, then one kept", lookups)
+	}
+}
