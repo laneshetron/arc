@@ -16,6 +16,10 @@ import (
 type ClientOptions struct {
 	// Addr is the relay's TLS endpoint, host:port.
 	Addr string
+	// Endpoints, when set, are bootstrap-resolved dial targets. The TLS
+	// ServerName still refers to the original hostname. Reconnects rotate
+	// through these targets without depending on DNS inside the tunnel.
+	Endpoints []netip.AddrPort
 	// TLS verifies the relay's certificate (ServerName, RootCAs). The
 	// carrier requires TLS 1.3 and ALPN "arc/1".
 	TLS *tls.Config
@@ -43,8 +47,9 @@ type Client struct {
 	ctx  context.Context
 	stop context.CancelFunc
 
-	mu  sync.Mutex
-	cur *link
+	mu           sync.Mutex
+	cur          *link
+	nextEndpoint int
 }
 
 // Dial starts a client carrier. It returns at once; the connection comes
@@ -112,7 +117,12 @@ func (c *Client) connect() (*link, error) {
 		NetDialer: &net.Dialer{Control: sockopt.Control(c.opts.Sockopt), KeepAlive: 15 * time.Second},
 		Config:    cfg,
 	}
-	conn, err := d.DialContext(ctx, "tcp", c.opts.Addr)
+	addr := c.opts.Addr
+	if len(c.opts.Endpoints) > 0 {
+		addr = c.opts.Endpoints[c.nextEndpoint].String()
+		c.nextEndpoint = (c.nextEndpoint + 1) % len(c.opts.Endpoints)
+	}
+	conn, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, err
 	}

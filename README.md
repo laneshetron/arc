@@ -86,16 +86,36 @@ carrier sockets bypass it. Local-network access is available in split
 tunnel mode with explicit `-route` prefixes. Existing custom routing rules
 with higher priority remain the administrator's responsibility.
 
-The relay caps pending and active sessions together (`-max-sessions 1024`),
+The relay caps authenticated sessions (`-max-sessions 1024`) independently
+of pending Noise handshakes (`-max-pending 4096`),
 global Noise handshake work (`-handshakes-per-second 256`), per-source UDP-IP
 handshake work (`-handshakes-per-source 8`), and pending plus established
-TLS connections (`-max-tls-conns 4096`). Handshake limits use token buckets
+TLS connections (`-max-tls-conns 4096`). TLS handshakes have a smaller
+separate budget (`-max-tls-handshakes 128`), a three-second timeout, and
+at most four pending handshakes per actual TCP peer IP. Total TLS
+connections per peer IP are capped by `-max-tls-conns-per-source 64`.
+Handshake limits use token buckets
 with a burst equal to the rate; tune the per-source rate for clients sharing
 a NAT. TLS carriers use distinct synthetic source addresses and share the
 global work limit. Failed handshakes consume the same budget as successful attempts.
+Refilled source buckets are discarded. At source-table saturation, a new
+source must prove reachability with a cookie before replacing the oldest
+bucket. A cookie-validated, valid Noise handshake may replace the oldest
+unauthenticated session when the pending budget is full; active sessions
+are never displaced. Authentication rechecks active capacity before leasing
+an address.
 FEC decoders cap repair bytes and block metadata independently of source
 storage. A session reconnects after 4096 allocated path IDs so that retired
 nonce spaces are never reused and their history stays bounded.
+
+The client resolves a TLS relay hostname once before installing tunnel
+routes, then rotates through the cached IP endpoints on reconnect while
+still verifying the original TLS hostname. This lets fallback recover when
+tunnel DNS is unavailable. Restart the client to refresh endpoints after
+the operator changes the relay's DNS records. Managed DNS reconnects with
+the same resolver are no-ops; resolver changes update the link in place
+and restore the previous resolver on failure. `-dns` and `-dns-mode` are
+rejected in split-tunnel mode; configure that mode's DNS externally.
 
 These bounds do not replace operator firewall policy. Static bearer tokens
 still require operator rotation/restart for revocation; this pre-alpha does

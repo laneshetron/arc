@@ -449,8 +449,12 @@ func (c *Client) onAuthResult(now time.Time, r wire.AuthResult) {
 		return // duplicate or a credential refresh acknowledgement
 	}
 	if r.Status != 0 {
-		c.state, c.err = StateClosed, ErrAuthFailed
-		c.events = append(c.events, Closed{Err: ErrAuthFailed})
+		err := ErrAuthFailed
+		if r.Status == uint8(wire.CodeCapacity) {
+			err = ErrCapacity
+		}
+		c.state, c.err = StateClosed, err
+		c.events = append(c.events, Closed{Err: err})
 		return
 	}
 	c.config = r

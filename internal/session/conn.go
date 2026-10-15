@@ -68,6 +68,7 @@ var (
 	ErrPathAbandoned    = errors.New("session: path abandoned by peer")
 	ErrIntegrityLimit   = errors.New("session: too many authentication failures")
 	ErrPathLimit        = errors.New("session: path ID budget exhausted; establish a new session")
+	ErrCapacity         = errors.New("session: authenticated session limit reached")
 	errReplay           = errors.New("session: replayed or stale packet")
 )
 

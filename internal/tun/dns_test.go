@@ -45,3 +45,49 @@ func TestInvalidDNSRejectedBeforeSetup(t *testing.T) {
 		}
 	}
 }
+
+func TestDNSReconnectSkipsUnchangedSettingsAndUpdatesInPlace(t *testing.T) {
+	var s dnsState
+	var calls [][]string
+	run := func(args ...string) error { calls = append(calls, append([]string(nil), args...)); return nil }
+	first := netip.MustParseAddr("1.1.1.1")
+	second := netip.MustParseAddr("9.9.9.9")
+	if _, err := s.configure(run, "arc0", first); err != nil {
+		t.Fatal(err)
+	}
+	calls = nil
+	if _, err := s.configure(run, "arc0", first); err != nil || len(calls) != 0 {
+		t.Fatal("unchanged reconnect touched DNS")
+	}
+	if _, err := s.configure(run, "arc0", second); err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 3 || calls[0][2] != second.String() {
+		t.Fatalf("update calls: %v", calls)
+	}
+	for _, args := range calls {
+		if args[0] == "revert" {
+			t.Fatal("update reverted DNS")
+		}
+	}
+	calls = nil
+	failure := errors.New("new resolver failed")
+	failedRun := func(args ...string) error {
+		calls = append(calls, append([]string(nil), args...))
+		if args[0] == "dns" && args[2] == first.String() {
+			return failure
+		}
+		return nil
+	}
+	if _, err := s.configure(failedRun, "arc0", first); !errors.Is(err, failure) {
+		t.Fatal("expected update failure")
+	}
+	if s.current != second || len(calls) != 4 || calls[1][2] != second.String() {
+		t.Fatalf("old resolver not restored: %v", calls)
+	}
+	for _, args := range calls {
+		if args[0] == "revert" {
+			t.Fatal("failed update reverted prior DNS")
+		}
+	}
+}

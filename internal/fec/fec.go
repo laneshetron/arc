@@ -9,6 +9,7 @@
 package fec
 
 import (
+	"container/list"
 	"encoding/binary"
 	"errors"
 	"time"
@@ -209,6 +210,7 @@ type Decoder struct {
 	repairBytes int
 	blocks      map[uint64]*block
 	done        map[uint64]time.Time // blocks finished, for ignoring late repairs
+	doneOrder   list.List            // bounded FIFO; always retain the newest completed blocks
 	codecs      codecs
 }
 
@@ -361,9 +363,16 @@ func (d *Decoder) try(now time.Time, first uint64, b *block) []Recovered {
 
 func (d *Decoder) finish(now time.Time, first uint64) {
 	d.dropBlock(first)
-	if len(d.done) < d.cfg.MaxDone {
-		d.done[first] = now
+	if _, ok := d.done[first]; ok {
+		return
 	}
+	if len(d.done) >= d.cfg.MaxDone {
+		old := d.doneOrder.Front()
+		delete(d.done, old.Value.(uint64))
+		d.doneOrder.Remove(old)
+	}
+	d.done[first] = now
+	d.doneOrder.PushBack(first)
 }
 
 func (d *Decoder) dropBlock(first uint64) {
@@ -396,10 +405,13 @@ func (d *Decoder) expire(now time.Time) {
 			d.dropBlock(first)
 		}
 	}
-	for first, at := range d.done {
-		if now.Sub(at) >= d.cfg.BlockAge {
-			delete(d.done, first)
+	for e := d.doneOrder.Front(); e != nil; e = d.doneOrder.Front() {
+		first := e.Value.(uint64)
+		if now.Sub(d.done[first]) < d.cfg.BlockAge {
+			break
 		}
+		delete(d.done, first)
+		d.doneOrder.Remove(e)
 	}
 }
 

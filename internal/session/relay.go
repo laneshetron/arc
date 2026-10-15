@@ -29,8 +29,8 @@ type RelayConfig struct {
 	// (default 64), or always if AlwaysRequireCookie is set (§9.3).
 	CookieThreshold     int
 	AlwaysRequireCookie bool
-	MaxPending          int // default 4096; INITs beyond this are dropped
-	MaxSessions         int // default 1024; pending and active sessions combined
+	MaxPending          int // default 4096; cookie-validated newcomers may replace the oldest pending session
+	MaxSessions         int // default 1024; authenticated sessions only
 	HandshakesPerSecond int // default 256; global DH admission rate and burst
 	HandshakesPerSource int // default 8; per-IP DH admission rate and burst
 	ResetsPerSecond     int // stateless reset rate limit; default 100
@@ -142,7 +142,7 @@ func NewRelay(cfg RelayConfig, now time.Time) *Relay {
 	if cfg.CookieThreshold == 0 {
 		cfg.CookieThreshold = 64
 	}
-	if cfg.MaxPending == 0 {
+	if cfg.MaxPending <= 0 {
 		cfg.MaxPending = 4096
 	}
 	if cfg.MaxSessions <= 0 {
@@ -206,11 +206,14 @@ func (r *Relay) handleInit(now time.Time, from netip.AddrPort, b []byte) {
 		r.out = append(r.out, RelayDatagram{Addr: from, Data: s.resp})
 		return
 	}
-	if r.pending >= r.cfg.MaxPending || len(r.live) >= r.cfg.MaxSessions {
+	if len(r.live)-r.pending >= r.cfg.MaxSessions {
 		return
 	}
-	if r.cfg.AlwaysRequireCookie || r.pending >= r.cfg.CookieThreshold {
-		if !r.cookies.Verify(now, from, init.SenderCID, init.Cookie) {
+	source := from.Addr().Unmap()
+	cookieValid := false
+	if r.cfg.AlwaysRequireCookie || r.pending >= r.cfg.CookieThreshold || r.pending >= r.cfg.MaxPending || r.admission.needsCookie(source) {
+		cookieValid = r.cookies.Verify(now, from, init.SenderCID, init.Cookie)
+		if !cookieValid {
 			reply := wire.CookieReply{DestCID: init.SenderCID, Cookie: r.cookies.Make(now, from, init.SenderCID)}
 			r.stats.CookiesSent++
 			r.out = append(r.out, RelayDatagram{Addr: from, Data: reply.Append(nil)})
@@ -221,7 +224,7 @@ func (r *Relay) handleInit(now time.Time, from netip.AddrPort, b []byte) {
 	// Charge every expensive attempt, including ones whose Noise message
 	// fails. Failed handshakes do not increase pending and cannot be used
 	// as the only measure of cryptographic work under load.
-	if !r.admission.allow(now, from.Addr().Unmap(), r.cfg.HandshakesPerSecond, r.cfg.HandshakesPerSource) {
+	if !r.admission.allow(now, source, r.cfg.HandshakesPerSecond, r.cfg.HandshakesPerSource, cookieValid) {
 		return
 	}
 	relayCID, ok := r.newCID()
@@ -234,6 +237,16 @@ func (r *Relay) handleInit(now time.Time, from netip.AddrPort, b []byte) {
 	if err != nil {
 		r.stats.HandshakeFailures++
 		return
+	}
+	if r.pending >= r.cfg.MaxPending {
+		// Only cookie-validated, valid Noise handshakes can replace an
+		// unauthenticated session. Active sessions are never evicted.
+		for _, old := range r.live {
+			if old.state == StateAuthenticating {
+				r.closeSession(now, old, ErrHandshakeTimeout, false)
+				break
+			}
+		}
 	}
 	s := &RelaySession{
 		relay:        r,
@@ -559,6 +572,13 @@ func (s *RelaySession) onAuth(now time.Time, credential []byte) bool {
 	if s.state == StateActive && bytes.Equal(credential, s.credential) {
 		s.conn.queue(s.result) // duplicate AUTH: repeat the answer
 		return true
+	}
+	// Several pending handshakes may race for the last active slot.
+	// Reject before Authorize, which can allocate an address lease.
+	if s.state != StateActive && len(r.live)-r.pending >= r.cfg.MaxSessions {
+		s.conn.transmit(now, s.conn.path(0), []wire.Frame{wire.AuthResult{Status: uint8(wire.CodeCapacity)}, wire.CloseFrame{Code: wire.CodeCapacity}})
+		r.closeSession(now, s, ErrCapacity, false)
+		return false
 	}
 	result, err := r.cfg.Authorize(credential, s.clientStatic, s.state == StateActive)
 	if err != nil || result.Status != 0 {

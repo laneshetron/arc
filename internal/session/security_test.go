@@ -100,7 +100,7 @@ func TestHandshakeAdmissionGlobalLimitAndBoundedSources(t *testing.T) {
 	now := time.Unix(1000, 0)
 	for i := range 1000 {
 		ip := netip.AddrFrom4([4]byte{192, 0, byte(i >> 8), byte(i)})
-		if got := a.allow(now, ip, 10, 2); got != (i < 10) {
+		if got := a.allow(now, ip, 10, 2, false); got != (i < 10) {
 			t.Fatalf("global admission %d = %v", i, got)
 		}
 	}
@@ -110,12 +110,12 @@ func TestHandshakeAdmissionGlobalLimitAndBoundedSources(t *testing.T) {
 	a = handshakeAdmission{}
 	for i := range maxHandshakeSources + 100 {
 		ip := netip.AddrFrom4([4]byte{192, 0, byte(i >> 8), byte(i)})
-		a.allow(now, ip, maxHandshakeSources+100, 1)
+		a.allow(now, ip, maxHandshakeSources+100, 1, false)
 	}
 	if len(a.sources) != maxHandshakeSources {
 		t.Fatalf("source entries = %d", len(a.sources))
 	}
-	if !a.allow(now.Add(2*time.Minute), netip.MustParseAddr("203.0.113.1"), maxHandshakeSources+100, 1) {
+	if !a.allow(now.Add(2*time.Minute), netip.MustParseAddr("203.0.113.1"), maxHandshakeSources+100, 1, false) {
 		t.Fatal("stale source entries did not expire")
 	}
 }
@@ -145,5 +145,94 @@ func TestRelayReconnectsWhenPathHistoryIsExhausted(t *testing.T) {
 	}
 	if s.State() != StateClosed || n.relay.Sessions() != 0 {
 		t.Fatal("exhausted session was not released")
+	}
+}
+
+func TestFullSourceTableChallengesAndAdmitsReachableNewcomer(t *testing.T) {
+	n := newNetwork(t, 306, defaultRelayConfig(), ClientConfig{})
+	r := n.relay
+	r.admission.sources = make(map[netip.Addr]*handshakeBucket)
+	for i := range maxHandshakeSources {
+		r.admission.sources[netip.AddrFrom4([4]byte{198, 18, byte(i >> 8), byte(i)})] = &handshakeBucket{tokens: 0, at: n.now}
+	}
+	d, _ := n.client.PollTransmit()
+	r.HandlePacket(n.now, n.clientAddr, d.Data)
+	reply, ok := r.PollTransmit()
+	if !ok || reply.Data[0] != byte(wire.TypeCookieReply) || r.Stats().Handshakes != 0 {
+		t.Fatal("unknown source was not challenged before DH")
+	}
+	n.client.HandlePacket(n.now, 0, reply.Data)
+	retried, _ := n.client.PollTransmit()
+	r.HandlePacket(n.now, n.clientAddr, retried.Data)
+	if r.pending != 1 || r.Stats().Handshakes != 1 || len(r.admission.sources) > maxHandshakeSources {
+		t.Fatal("cookie-valid newcomer was locked out or exceeded source budget")
+	}
+}
+
+func TestFullyRefilledSourceBucketsExpireAfterOneSecond(t *testing.T) {
+	now := time.Unix(1000, 0)
+	a := handshakeAdmission{}
+	for i := range maxHandshakeSources {
+		a.allow(now, netip.AddrFrom4([4]byte{198, 18, byte(i >> 8), byte(i)}), 10000, 8, false)
+	}
+	if !a.allow(now.Add(time.Second), netip.MustParseAddr("203.0.113.1"), 10000, 8, false) || len(a.sources) != 1 {
+		t.Fatalf("refilled buckets retained: %d", len(a.sources))
+	}
+}
+
+func TestPendingBudgetReplacementLeavesActiveCapacityAvailable(t *testing.T) {
+	cfg := defaultRelayConfig()
+	cfg.MaxSessions = 1
+	cfg.MaxPending = 1
+	n := newNetwork(t, 307, cfg, ClientConfig{})
+	init, _ := n.client.PollTransmit()
+	n.relay.HandlePacket(n.now, n.clientAddr, init.Data)
+	n.relay.PollTransmit() // old unauthenticated handshake's response
+	old := n.relay.live[0]
+	c := n.newClient(ClientConfig{})
+	d, _ := c.PollTransmit()
+	n.relay.HandlePacket(n.now, n.clientAddr, d.Data)
+	cookie, _ := n.relay.PollTransmit()
+	c.HandlePacket(n.now, 0, cookie.Data)
+	d, _ = c.PollTransmit()
+	n.relay.HandlePacket(n.now, n.clientAddr, d.Data)
+	resp, _ := n.relay.PollTransmit()
+	c.HandlePacket(n.now, 0, resp.Data)
+	auth, _ := c.PollTransmit()
+	n.relay.HandlePacket(n.now, n.clientAddr, auth.Data)
+	if old.State() != StateClosed || n.relay.pending != 0 || len(n.relay.live) != 1 || n.relay.live[0].State() != StateActive {
+		t.Fatal("pending handshakes blocked authenticated capacity")
+	}
+}
+
+func TestAuthChecksActiveCapacityBeforeLeasing(t *testing.T) {
+	calls := 0
+	cfg := defaultRelayConfig()
+	cfg.MaxSessions = 1
+	cfg.Authorize = func(c, k []byte, refresh bool) (wire.AuthResult, error) {
+		calls++
+		return testAuthorizer(c, k, refresh)
+	}
+	n := newNetwork(t, 308, cfg, ClientConfig{})
+	first, _ := n.client.PollTransmit()
+	n.relay.HandlePacket(n.now, n.clientAddr, first.Data)
+	c := n.newClient(ClientConfig{})
+	second, _ := c.PollTransmit()
+	n.relay.HandlePacket(n.now, n.clientAddr, second.Data)
+	s1, s2 := n.relay.live[0], n.relay.live[1]
+	if !s1.onAuth(n.now, []byte("good")) {
+		t.Fatal("first authorization failed")
+	}
+	if s2.onAuth(n.now, []byte("good")) || calls != 1 || s2.State() != StateClosed {
+		t.Fatal("capacity race allocated another lease")
+	}
+}
+
+func TestCapacityResultRemainsRetryable(t *testing.T) {
+	n := newNetwork(t, 309, defaultRelayConfig(), ClientConfig{})
+	n.client.state = StateAuthenticating
+	n.client.onAuthResult(n.now, wire.AuthResult{Status: uint8(wire.CodeCapacity)})
+	if n.client.err != ErrCapacity || n.client.State() != StateClosed {
+		t.Fatal("capacity rejection became a permanent auth failure")
 	}
 }

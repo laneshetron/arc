@@ -19,6 +19,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/laneshetron/arc/internal/carrier/sockopt"
 	"github.com/laneshetron/arc/internal/carrier/stream"
@@ -112,6 +113,17 @@ func run(args []string) error {
 	table := fs.Int("table", 5243, "routing table for -full-tunnel")
 	prof := profiling.Register(fs)
 	fs.Parse(args)
+	if !*fullTunnel {
+		var dnsFlag bool
+		fs.Visit(func(f *flag.Flag) {
+			if f.Name == "dns" || f.Name == "dns-mode" {
+				dnsFlag = true
+			}
+		})
+		if dnsFlag {
+			return errors.New("-dns and -dns-mode require -full-tunnel; configure split-tunnel DNS with your resolver manager")
+		}
+	}
 	if *fullTunnel && (*mark == 0 || uint64(*mark) > 1<<32-1 || *table <= 0 || (*table >= 253 && *table <= 255)) {
 		return errors.New("-full-tunnel requires a nonzero 32-bit -mark and a dedicated routing -table (not 253, 254 or 255)")
 	}
@@ -203,13 +215,19 @@ func run(args []string) error {
 		if err != nil {
 			return err
 		}
+		bootstrap, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		tlsEndpoints, err := stream.ResolveEndpoints(bootstrap, *tlsAddr)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("bootstrap TLS relay: %w", err)
+		}
 		for _, iface := range binds {
 			name := iface
 			if name == "" {
 				name = "default"
 			}
 			conn := stream.Dial(stream.ClientOptions{
-				Addr: *tlsAddr, TLS: tlsConfig, Peer: relayAddr,
+				Addr: *tlsAddr, Endpoints: tlsEndpoints, TLS: tlsConfig, Peer: relayAddr,
 				Sockopt: sockopt.Options{Mark: sockOpts.Mark, Device: iface},
 				OnState: func(err error) {
 					if err != nil {
@@ -261,19 +279,15 @@ func run(args []string) error {
 			}
 		}
 		if *fullTunnel && *dnsMode == "systemd-resolved" {
-			if cleanupDNS != nil {
-				if err := cleanupDNS(); err != nil {
-					return fmt.Errorf("restore previous DNS: %w", err)
-				}
-				cleanupDNS = nil
-			}
-			var err error
-			cleanupDNS, err = dev.ConfigureDNS(resolver)
+			nextCleanup, err := dev.ConfigureDNS(resolver)
 			if err != nil {
 				return err
 			}
+			cleanupDNS = nextCleanup
 		} else if *fullTunnel {
 			log.Info("using externally configured DNS", "resolver", resolver)
+		} else if !resolver.IsUnspecified() {
+			log.Info("relay offers a resolver; configure split-tunnel DNS with your resolver manager", "dns", resolver)
 		}
 		return nil
 	}

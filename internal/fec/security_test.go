@@ -69,3 +69,31 @@ func TestCodecCacheBounded(t *testing.T) {
 		}
 	}
 }
+
+func TestRecentFinishedBlocksSurviveMetadataSaturation(t *testing.T) {
+	d := NewDecoder(DecoderConfig{MaxDone: 2})
+	e := Encoder{MaxK: 1, Repairs: fixed(2)}
+	var last []Repair
+	for id := range uint64(10) {
+		last = e.Add(t0, id, packet(id, 100))
+		if len(d.Repair(t0, last[0])) != 1 {
+			t.Fatal("repair did not recover")
+		}
+	}
+	if _, ok := d.done[9]; !ok {
+		t.Fatal("newest completion not remembered")
+	}
+	if _, ok := d.done[8]; !ok {
+		t.Fatal("second-newest completion not remembered")
+	}
+	if _, ok := d.done[0]; ok {
+		t.Fatal("oldest completion not evicted")
+	}
+	if got := d.Repair(t0, last[1]); len(got) != 0 || len(d.blocks) != 0 || d.repairBytes != 0 {
+		t.Fatal("late repair reconstructed an already completed block")
+	}
+	d.expire(t0.Add(3 * time.Second))
+	if len(d.done) != 0 || d.doneOrder.Len() != 0 {
+		t.Fatal("completed metadata did not expire")
+	}
+}
