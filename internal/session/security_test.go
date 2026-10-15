@@ -323,3 +323,26 @@ func TestReorderedJoinsKeepBothPaths(t *testing.T) {
 		t.Errorf("relay holds %d spare slots, want %d", spare, spareSlots)
 	}
 }
+
+func TestSkippedSlotsRefillAfterExpiry(t *testing.T) {
+	// Skipped slots fill maxPaths, and the client uses its last slot.
+	// When they expire, the relay must issue new spares: the client has
+	// no slot left to send the JOIN that would otherwise refill them.
+	n := newNetwork(t, 902, defaultRelayConfig(), ClientConfig{})
+	s := n.establish()
+	n.runFor(200 * time.Millisecond)
+	for range 3 {
+		if len(n.client.slots) < 2 {
+			t.Fatalf("need two slots, got %d", len(n.client.slots))
+		}
+		n.client.slots = n.client.slots[1:] // the first NEW_PATH never reached the client
+		n.openPath("198.51.100.20:5000", time.Millisecond)
+		n.runFor(500 * time.Millisecond)
+	}
+	n.openPath("198.51.100.21:5000", time.Millisecond)
+	n.runFor(500 * time.Millisecond)
+	n.runFor(DefaultPathTimeout + time.Second)
+	if s.State() != StateActive || len(n.client.slots) != spareSlots {
+		t.Fatalf("session %v with %d client slots after expiry, want active with %d", s.State(), len(n.client.slots), spareSlots)
+	}
+}

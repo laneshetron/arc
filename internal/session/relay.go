@@ -744,12 +744,22 @@ func (r *Relay) Tick(now time.Time) {
 		case !now.Before(s.conn.lastRecv().Add(r.cfg.IdleTimeout)):
 			r.closeSession(now, s, ErrIdleTimeout, false)
 		default:
+			removed := false
 			for _, p := range slices.Clone(s.conn.paths) {
 				if at := s.conn.abandonAt(p, DefaultPathTimeout); p.joined && !at.IsZero() && !now.Before(at) {
 					s.conn.queue(wire.PathAbandon{PathID: p.id, Code: wire.CodePathUnavailable})
 					s.removePath(p)
+					removed = true
 				} else if !p.joined && !p.skippedAt.IsZero() && !now.Before(p.skippedAt.Add(DefaultPathTimeout)) {
 					s.removePath(p)
+					removed = true
+				}
+			}
+			// Freed capacity may be needed for spares: a client whose slots
+			// ran out cannot send the JOIN that would otherwise refill them.
+			if removed {
+				if s.issueSlots(now); s.state == StateClosed {
+					continue
 				}
 			}
 			s.conn.onTimers(now)
