@@ -121,6 +121,13 @@ func (c *Client) connect() (*link, error) {
 	cfg := c.opts.TLS.Clone()
 	cfg.MinVersion = tls.VersionTLS13
 	cfg.NextProtos = []string{ALPN}
+	if cfg.ServerName == "" {
+		// The dial target below is a resolved IP, so tls.Dialer would
+		// infer the IP as the name to verify; keep the original host.
+		if host, _, err := net.SplitHostPort(c.opts.Addr); err == nil {
+			cfg.ServerName = host
+		}
+	}
 	d := tls.Dialer{
 		NetDialer: &net.Dialer{Control: sockopt.Control(c.opts.Sockopt), KeepAlive: 15 * time.Second},
 		Config:    cfg,

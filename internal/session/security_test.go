@@ -267,8 +267,8 @@ func TestReorderedNewPathKeepsBothSlots(t *testing.T) {
 func TestRelayReplacesSlotsTheClientNeverGot(t *testing.T) {
 	// The client never received the first slot (its NEW_PATH was lost
 	// for good, or arrived after the client opened a later one) and
-	// joins the second: the relay retires the first rather than counting
-	// it as a spare forever, and keeps two spares outstanding.
+	// joins the second: the relay stops counting the first as a spare,
+	// keeps two spares outstanding, and retires it after the path timeout.
 	n := newNetwork(t, 308, defaultRelayConfig(), ClientConfig{})
 	s := n.establish()
 	n.runFor(200 * time.Millisecond)
@@ -283,14 +283,43 @@ func TestRelayReplacesSlotsTheClientNeverGot(t *testing.T) {
 	n.runFor(500 * time.Millisecond)
 	spare := 0
 	for _, p := range s.conn.paths {
-		if p.id == lost {
-			t.Fatalf("slot %d the client never got is still held", lost)
-		}
-		if !p.joined {
+		if !p.joined && p.skippedAt.IsZero() {
 			spare++
 		}
 	}
 	if spare != spareSlots || len(n.client.slots) != spareSlots {
 		t.Fatalf("relay holds %d spare slots and the client %d, want %d", spare, len(n.client.slots), spareSlots)
+	}
+	n.runFor(DefaultPathTimeout)
+	for _, p := range s.conn.paths {
+		if p.id == lost {
+			t.Fatalf("slot %d the client never got is still held after the path timeout", lost)
+		}
+	}
+}
+
+func TestReorderedJoinsKeepBothPaths(t *testing.T) {
+	// JOINs travel over independent carriers: the second path's JOIN can
+	// arrive first. The relay must not retire the first path's slot while
+	// its JOIN is still in flight.
+	n := newNetwork(t, 309, defaultRelayConfig(), ClientConfig{})
+	s := n.establish()
+	n.runFor(200 * time.Millisecond)
+	slow, _ := n.openPath("198.51.100.30:5000", 200*time.Millisecond)
+	fast, _ := n.openPath("198.51.100.31:5000", time.Millisecond)
+	n.runFor(3 * time.Second)
+	for _, id := range []uint32{slow, fast} {
+		if n.clientEventsOf(func(e ClientEvent) bool { v, ok := e.(PathValidated); return ok && v.ID == id }) != 1 {
+			t.Errorf("path %d not validated", id)
+		}
+	}
+	spare := 0
+	for _, p := range s.conn.paths {
+		if !p.joined && p.skippedAt.IsZero() {
+			spare++
+		}
+	}
+	if spare != spareSlots {
+		t.Errorf("relay holds %d spare slots, want %d", spare, spareSlots)
 	}
 }

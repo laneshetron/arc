@@ -3,6 +3,7 @@ package stream
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"net"
 	"net/netip"
 	"sync"
@@ -166,5 +167,41 @@ func TestPendingTLSTimeoutReleasesAllBudgets(t *testing.T) {
 		default:
 			time.Sleep(time.Millisecond)
 		}
+	}
+}
+
+func TestServerNameInferredFromAddr(t *testing.T) {
+	// With no explicit ServerName, the certificate is verified against
+	// the host in Addr, not the IP the carrier resolved it to.
+	certPEM, keyPEM, err := SelfSigned([]string{"localhost"}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := Listen("127.0.0.1:0", ListenerOptions{TLS: &tls.Config{Certificates: []tls.Certificate{cert}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	_, port, _ := net.SplitHostPort(ln.Addr().String())
+	roots := x509.NewCertPool()
+	roots.AppendCertsFromPEM(certPEM)
+	states := make(chan error, 16)
+	c := Dial(ClientOptions{
+		Addr: net.JoinHostPort("localhost", port), TLS: &tls.Config{RootCAs: roots},
+		Endpoints: []netip.AddrPort{netip.MustParseAddrPort(ln.Addr().String())},
+		Peer:      netip.MustParseAddrPort("192.0.2.1:4433"), OnState: func(err error) { states <- err },
+	})
+	t.Cleanup(func() { c.Close() })
+	select {
+	case err := <-states:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("client did not connect")
 	}
 }
