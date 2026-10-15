@@ -59,7 +59,7 @@ func TestNewPathRetransmissionCannotReuseNonce(t *testing.T) {
 	}
 }
 
-func TestPathHistoryIsBoundedAndNeverReused(t *testing.T) {
+func TestPathIDsNeverReusedWithoutHistory(t *testing.T) {
 	n := newNetwork(t, 303, defaultRelayConfig(), ClientConfig{})
 	n.establish()
 	c := n.client.conn
@@ -71,11 +71,16 @@ func TestPathHistoryIsBoundedAndNeverReused(t *testing.T) {
 	if c.addPath(newPath(100, wire.CID{102}, wire.CID{103}, n.now)) {
 		t.Fatal("retired nonce space recreated")
 	}
-	for id := uint32(1000); len(c.usedPathIDs) < maxSessionPathIDs; id++ {
-		c.usedPathIDs[id] = true
+	if c.addPath(newPath(50, wire.CID{104}, wire.CID{105}, n.now)) {
+		t.Fatal("lower path ID accepted")
 	}
-	if _, err := n.client.OpenPath(n.now); err != ErrPathLimit || n.client.State() != StateClosed {
-		t.Fatalf("path budget: %v, %v", err, n.client.State())
+	// Paths can come and go indefinitely: no history accumulates.
+	for id := uint32(101); id < 101+20000; id++ {
+		q := newPath(id, wire.CID{byte(id), byte(id >> 8), 1}, wire.CID{2}, n.now)
+		if !c.addPath(q) {
+			t.Fatalf("path %d rejected", id)
+		}
+		c.removePath(q)
 	}
 }
 
@@ -133,15 +138,13 @@ func TestRelayTotalSessionLimit(t *testing.T) {
 	}
 }
 
-func TestRelayReconnectsWhenPathHistoryIsExhausted(t *testing.T) {
+func TestRelayReconnectsWhenPathIDsAreExhausted(t *testing.T) {
 	n := newNetwork(t, 305, defaultRelayConfig(), ClientConfig{})
 	s := n.establish()
-	for id := uint32(1000); len(s.conn.usedPathIDs) < maxSessionPathIDs; id++ {
-		s.conn.usedPathIDs[id] = true
-	}
+	s.conn.highestPathID = ^uint32(0) // the next slot's ID would wrap
 	p := s.conn.path(1)
 	if s.onJoin(n.now, p, wire.PathJoin{CID: wire.CID{77}}) {
-		t.Fatal("relay kept session after exhausting path nonce-space history")
+		t.Fatal("relay kept session after exhausting path IDs")
 	}
 	if s.State() != StateClosed || n.relay.Sessions() != 0 {
 		t.Fatal("exhausted session was not released")

@@ -126,10 +126,12 @@ type Client struct {
 	nextInit      time.Time // next HANDSHAKE_INIT, or next AUTH while authenticating
 	authenticated time.Time
 
-	conn    *conn
-	config  wire.AuthResult
-	slots   []pathSlot
-	current *path // primary path
+	conn   *conn
+	config wire.AuthResult
+	slots  []pathSlot
+	// highestSlot is the highest path ID the relay has announced.
+	highestSlot uint32
+	current     *path // primary path
 	// Loss-driven moves of the primary (loss.go): when the next check is
 	// due and the earliest the primary may move again.
 	lossCheckAt, lossMoveAt time.Time
@@ -209,6 +211,7 @@ func (c *Client) startHandshake(now time.Time) error {
 		return err
 	}
 	c.state, c.hs, c.cookie, c.conn, c.slots, c.current = StateHandshaking, hs, nil, nil, nil, nil
+	c.highestSlot = 0
 	c.flows = flowTable{}
 	c.attemptStart = now
 	c.attempts++
@@ -408,10 +411,13 @@ func (c *Client) handleData(now time.Time, b []byte) {
 				c.deliverRecovered(c.conn.fecRepair(now, f))
 			}
 		case wire.NewPath:
-			// Control frames may be retransmitted in fresh DATA packets.
-			// Deduplicate both queued slots and every consumed nonce space.
-			queued := slices.ContainsFunc(c.slots, func(s pathSlot) bool { return s.id == f.PathID })
-			if len(c.slots) < maxPaths && !queued && !c.conn.usedPathIDs[f.PathID] {
+			// Control frames may be retransmitted in fresh DATA packets,
+			// and the relay issues path IDs in increasing order: accept
+			// only a slot above every one seen, so no path ID, and so no
+			// nonce space, is used twice. A slot announced out of order
+			// is lost, which costs only a spare.
+			if len(c.slots) < maxPaths && f.PathID > c.highestSlot {
+				c.highestSlot = f.PathID
 				c.slots = append(c.slots, pathSlot{id: f.PathID, cid: f.CID, token: f.ResetToken})
 			}
 		case wire.PathChallenge:
@@ -544,12 +550,8 @@ func (c *Client) OpenPath(now time.Time) (uint32, error) {
 	if c.state != StateActive {
 		return 0, ErrNotActive
 	}
-	if len(c.conn.usedPathIDs) >= maxSessionPathIDs {
-		c.close(now, ErrPathLimit, true)
-		return 0, ErrPathLimit
-	}
 	// Defensive against a stale slot queued before its path was opened.
-	for len(c.slots) > 0 && c.conn.usedPathIDs[c.slots[0].id] {
+	for len(c.slots) > 0 && c.slots[0].id <= c.conn.highestPathID {
 		c.slots = c.slots[1:]
 	}
 	if len(c.slots) == 0 {

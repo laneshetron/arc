@@ -44,8 +44,7 @@ const (
 	outageSilence        = time.Second
 	maxRetiredCIDs       = 2 * maxPaths // per session; see Relay.retired
 	suspectPTOs          = 3
-	maxPaths             = 8    // joined paths plus unused slots (§14.3)
-	maxSessionPathIDs    = 4096 // bounded nonce-space history; reconnect when exhausted
+	maxPaths             = 8 // joined paths plus unused slots (§14.3)
 	spareSlots           = 2
 	amplificationFactor  = 3
 	dataOverhead         = wire.DataHeaderLen + wire.AEADTagLen + wire.FrameHeaderLen
@@ -67,7 +66,7 @@ var (
 	ErrPathTimeout      = errors.New("session: path timed out")
 	ErrPathAbandoned    = errors.New("session: path abandoned by peer")
 	ErrIntegrityLimit   = errors.New("session: too many authentication failures")
-	ErrPathLimit        = errors.New("session: path ID budget exhausted; establish a new session")
+	ErrPathLimit        = errors.New("session: path IDs exhausted; establish a new session")
 	ErrCapacity         = errors.New("session: authenticated session limit reached")
 	errReplay           = errors.New("session: replayed or stale packet")
 )
@@ -202,11 +201,15 @@ func pathBound(f wire.Frame) bool {
 
 // conn is the state shared by both roles once traffic keys exist.
 type conn struct {
-	send        *crypto.SendKeys
-	recv        *crypto.RecvKeys
-	paths       []*path // ordered by ID for deterministic iteration
-	byCID       map[wire.CID]*path
-	usedPathIDs map[uint32]bool // includes retired paths: nonce spaces are never recreated
+	send  *crypto.SendKeys
+	recv  *crypto.RecvKeys
+	paths []*path // ordered by ID for deterministic iteration
+	byCID map[wire.CID]*path
+	// highestPathID is the highest path ID ever added. Path IDs only
+	// increase, so a path's nonce space (path ID and packet number under
+	// the session's keys) is never recreated, without remembering every
+	// retired path: a session's paths can come and go indefinitely.
+	highestPathID uint32
 
 	// primary chooses the path for unbound control frames, and pathFor
 	// the path for each IP packet (the primary when nil); see sched.go.
@@ -257,20 +260,19 @@ type Stats struct {
 
 func newConn(keys crypto.TrafficKeys, now time.Time) *conn {
 	return &conn{
-		send:        crypto.NewSendKeys(keys.Send, now),
-		recv:        crypto.NewRecvKeys(keys.Recv),
-		byCID:       make(map[wire.CID]*path),
-		usedPathIDs: make(map[uint32]bool),
-		reasm:       reassembly.New(reassembly.DefaultConfig()),
-		keepalive:   DefaultKeepalive,
+		send:      crypto.NewSendKeys(keys.Send, now),
+		recv:      crypto.NewRecvKeys(keys.Recv),
+		byCID:     make(map[wire.CID]*path),
+		reasm:     reassembly.New(reassembly.DefaultConfig()),
+		keepalive: DefaultKeepalive,
 	}
 }
 
 func (c *conn) addPath(p *path) bool {
-	if c.usedPathIDs[p.id] || c.byCID[p.localCID] != nil || len(c.usedPathIDs) >= maxSessionPathIDs {
+	if (len(c.paths) > 0 || c.highestPathID > 0) && p.id <= c.highestPathID || c.byCID[p.localCID] != nil {
 		return false
 	}
-	c.usedPathIDs[p.id] = true
+	c.highestPathID = p.id
 	i, _ := slices.BinarySearchFunc(c.paths, p.id, func(q *path, id uint32) int { return int(q.id) - int(id) })
 	c.paths = slices.Insert(c.paths, i, p)
 	c.byCID[p.localCID] = p
