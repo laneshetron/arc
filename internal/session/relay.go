@@ -30,6 +30,9 @@ type RelayConfig struct {
 	CookieThreshold     int
 	AlwaysRequireCookie bool
 	MaxPending          int // default 4096; INITs beyond this are dropped
+	MaxSessions         int // default 1024; pending and active sessions combined
+	HandshakesPerSecond int // default 256; global DH admission rate and burst
+	HandshakesPerSource int // default 8; per-IP DH admission rate and burst
 	ResetsPerSecond     int // stateless reset rate limit; default 100
 	IdleTimeout         time.Duration
 	Rand                io.Reader
@@ -99,10 +102,11 @@ type Relay struct {
 	resetTokens float64
 	resetRefill time.Time
 
-	out    []RelayDatagram
-	events []RelayEvent
-	ips    []relayIP // kept apart from events to avoid boxing per packet
-	stats  RelayStats
+	out       []RelayDatagram
+	events    []RelayEvent
+	ips       []relayIP // kept apart from events to avoid boxing per packet
+	stats     RelayStats
+	admission handshakeAdmission
 }
 
 type relayIP struct {
@@ -140,6 +144,15 @@ func NewRelay(cfg RelayConfig, now time.Time) *Relay {
 	}
 	if cfg.MaxPending == 0 {
 		cfg.MaxPending = 4096
+	}
+	if cfg.MaxSessions <= 0 {
+		cfg.MaxSessions = 1024
+	}
+	if cfg.HandshakesPerSecond <= 0 {
+		cfg.HandshakesPerSecond = 256
+	}
+	if cfg.HandshakesPerSource <= 0 {
+		cfg.HandshakesPerSource = 8
 	}
 	if cfg.ResetsPerSecond == 0 {
 		cfg.ResetsPerSecond = 100
@@ -193,7 +206,7 @@ func (r *Relay) handleInit(now time.Time, from netip.AddrPort, b []byte) {
 		r.out = append(r.out, RelayDatagram{Addr: from, Data: s.resp})
 		return
 	}
-	if r.pending >= r.cfg.MaxPending {
+	if r.pending >= r.cfg.MaxPending || len(r.live) >= r.cfg.MaxSessions {
 		return
 	}
 	if r.cfg.AlwaysRequireCookie || r.pending >= r.cfg.CookieThreshold {
@@ -205,6 +218,12 @@ func (r *Relay) handleInit(now time.Time, from netip.AddrPort, b []byte) {
 		}
 	}
 
+	// Charge every expensive attempt, including ones whose Noise message
+	// fails. Failed handshakes do not increase pending and cannot be used
+	// as the only measure of cryptographic work under load.
+	if !r.admission.allow(now, from.Addr().Unmap(), r.cfg.HandshakesPerSecond, r.cfg.HandshakesPerSource) {
+		return
+	}
 	relayCID, ok := r.newCID()
 	if !ok {
 		return
@@ -449,8 +468,8 @@ func (s *RelaySession) onJoin(now time.Time, p *path, f wire.PathJoin) bool {
 	}
 	p.remoteCID, p.joined = f.CID, true
 	p.control = append(p.control, wire.PathChallenge{Data: p.challenge})
-	s.issueSlots()
-	return true
+	s.issueSlots(now)
+	return s.state != StateClosed
 }
 
 func (s *RelaySession) onResponse(now time.Time, p *path, from netip.AddrPort, f wire.PathResponse) {
@@ -466,7 +485,7 @@ func (s *RelaySession) onResponse(now time.Time, p *path, from netip.AddrPort, f
 }
 
 // issueSlots keeps spare NEW_PATH slots outstanding (§14.3).
-func (s *RelaySession) issueSlots() {
+func (s *RelaySession) issueSlots(now time.Time) {
 	r := s.relay
 	spare := 0
 	for _, p := range s.conn.paths {
@@ -482,7 +501,10 @@ func (s *RelaySession) issueSlots() {
 		p := newPath(s.nextPathID, cid, wire.CID{}, time.Time{})
 		s.nextPathID++
 		token := crypto.ResetToken(r.cfg.ResetSecret, cid)
-		s.conn.addPath(p)
+		if !s.conn.addPath(p) {
+			r.closeSession(now, s, ErrPathLimit, true)
+			return
+		}
 		r.sessions[cid] = s
 		s.conn.queue(wire.NewPath{PathID: p.id, CID: cid, ResetToken: token})
 		spare++
@@ -565,7 +587,10 @@ func (s *RelaySession) onAuth(now time.Time, credential []byte) bool {
 		s.conn.keepalive = time.Duration(result.KeepaliveMS) * time.Millisecond
 	}
 	s.conn.probe(now, s.conn.path(0))
-	s.issueSlots()
+	s.issueSlots(now)
+	if s.state == StateClosed {
+		return false
+	}
 	r.events = append(r.events, SessionEstablished{Session: s})
 	return true
 }

@@ -136,8 +136,15 @@ func run(args []string) error {
 	tlsKey := fs.String("tls-key", "relay.tls.key", "TLS private key (PEM) for -tls-listen")
 	noFEC := fs.Bool("no-fec", false, "decline forward error correction for clients' traffic")
 	noRedundancy := fs.Bool("no-redundancy", false, "decline clients' requests to duplicate downlink traffic on two paths")
+	maxSessions := fs.Int("max-sessions", 1024, "maximum pending and active sessions combined")
+	handshakeRate := fs.Int("handshakes-per-second", 256, "global Noise handshake work rate and burst")
+	sourceRate := fs.Int("handshakes-per-source", 8, "per-source-IP Noise handshake work rate and burst")
+	maxTLS := fs.Int("max-tls-conns", 4096, "maximum pending and established TLS carrier connections combined")
 	prof := profiling.Register(fs)
 	fs.Parse(args)
+	if *maxSessions <= 0 || *handshakeRate <= 0 || *sourceRate <= 0 || *maxTLS <= 0 {
+		return errors.New("session, handshake and TLS limits must be positive")
+	}
 	stopProfiles, err := prof.Start()
 	if err != nil {
 		return err
@@ -206,7 +213,7 @@ func run(args []string) error {
 		if err != nil {
 			return fmt.Errorf("-tls-listen: %w", err)
 		}
-		ln, err := stream.Listen(*tlsListen, stream.ListenerOptions{TLS: &tls.Config{Certificates: []tls.Certificate{cert}}})
+		ln, err := stream.Listen(*tlsListen, stream.ListenerOptions{TLS: &tls.Config{Certificates: []tls.Certificate{cert}}, MaxConns: *maxTLS})
 		if err != nil {
 			return err
 		}
@@ -222,6 +229,7 @@ func run(args []string) error {
 		Session: session.RelayConfig{
 			Static: static, ResetSecret: resetSecret, IdleTimeout: gwCfg.Idle + 10*time.Second,
 			NoRedundancy: *noRedundancy, NoFEC: *noFEC,
+			MaxSessions: *maxSessions, HandshakesPerSecond: *handshakeRate, HandshakesPerSource: *sourceRate,
 		},
 		Conn: conn, Streams: streams, TUN: dev, Gateway: gw, Logger: log, StatusInterval: *status,
 	})

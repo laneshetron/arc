@@ -63,6 +63,8 @@ func run(args []string) error {
 	keyFile := fs.String("key-file", "", "client static private key; a new one is generated if empty")
 	tunName := fs.String("tun", "arc0", "TUN interface name")
 	fullTunnel := fs.Bool("full-tunnel", false, "route all traffic through the tunnel")
+	dns := fs.String("dns", "", "trusted IPv4 DNS resolver (overrides the relay's resolver)")
+	dnsMode := fs.String("dns-mode", "systemd-resolved", "full-tunnel DNS setup: systemd-resolved or manual (requires -dns and an externally configured resolver)")
 	var routes prefixList
 	fs.Var(&routes, "route", "route this prefix through the tunnel (repeatable)")
 	var binds []string
@@ -110,6 +112,26 @@ func run(args []string) error {
 	table := fs.Int("table", 5243, "routing table for -full-tunnel")
 	prof := profiling.Register(fs)
 	fs.Parse(args)
+	if *fullTunnel && (*mark == 0 || uint64(*mark) > 1<<32-1 || *table <= 0 || (*table >= 253 && *table <= 255)) {
+		return errors.New("-full-tunnel requires a nonzero 32-bit -mark and a dedicated routing -table (not 253, 254 or 255)")
+	}
+	if *dnsMode != "systemd-resolved" && *dnsMode != "manual" {
+		return errors.New("-dns-mode must be systemd-resolved or manual")
+	}
+	var trustedDNS netip.Addr
+	if *dns != "" {
+		var err error
+		trustedDNS, err = netip.ParseAddr(*dns)
+		if err != nil {
+			return fmt.Errorf("-dns: %w", err)
+		}
+		if err := tun.ValidateDNS(trustedDNS); err != nil {
+			return err
+		}
+	}
+	if *fullTunnel && *dnsMode == "manual" && !trustedDNS.IsValid() {
+		return errors.New("-full-tunnel -dns-mode manual requires an explicit trusted -dns ADDRESS and external resolver configuration")
+	}
 	stopProfiles, err := prof.Start()
 	if err != nil {
 		return err
@@ -201,7 +223,13 @@ func run(args []string) error {
 	}
 
 	var cleanup func() error
+	var cleanupDNS func() error
 	defer func() {
+		if cleanupDNS != nil {
+			if err := cleanupDNS(); err != nil {
+				log.Warn("restoring DNS", "err", err)
+			}
+		}
 		if cleanup != nil {
 			if err := cleanup(); err != nil {
 				log.Warn("removing routing rules", "err", err)
@@ -209,6 +237,15 @@ func run(args []string) error {
 		}
 	}()
 	onEstablished := func(r wire.AuthResult) error {
+		resolver := trustedDNS
+		if !resolver.IsValid() {
+			resolver = netip.AddrFrom4(r.DNSv4)
+		}
+		if *fullTunnel {
+			if err := tun.ValidateDNS(resolver); err != nil {
+				return fmt.Errorf("full tunnel requires -dns ADDRESS or an authenticated relay resolver: %w", err)
+			}
+		}
 		addr := netip.PrefixFrom(netip.AddrFrom4(r.IPv4), int(r.Prefix4))
 		if err := dev.Configure(addr, int(r.TunMTU)); err != nil {
 			return fmt.Errorf("configure %s: %w", dev.Name(), err)
@@ -223,8 +260,20 @@ func run(args []string) error {
 				return err
 			}
 		}
-		if r.DNSv4 != [4]byte{} {
-			log.Info("relay offers a resolver; configure it to avoid DNS leaks", "dns", netip.AddrFrom4(r.DNSv4))
+		if *fullTunnel && *dnsMode == "systemd-resolved" {
+			if cleanupDNS != nil {
+				if err := cleanupDNS(); err != nil {
+					return fmt.Errorf("restore previous DNS: %w", err)
+				}
+				cleanupDNS = nil
+			}
+			var err error
+			cleanupDNS, err = dev.ConfigureDNS(resolver)
+			if err != nil {
+				return err
+			}
+		} else if *fullTunnel {
+			log.Info("using externally configured DNS", "resolver", resolver)
 		}
 		return nil
 	}

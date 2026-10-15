@@ -20,8 +20,9 @@ import (
 // stay within one byte's index space, and within what the codec handles
 // quickly.
 const (
-	MaxK = 64
-	MaxM = 32
+	MaxK            = 64
+	MaxM            = 32
+	maxCachedCodecs = 32
 )
 
 // Repair is one repair symbol: index Index of M for the block of K
@@ -49,6 +50,9 @@ func (c codecs) get(k, m int) (reedsolomon.Encoder, error) {
 	enc, err := reedsolomon.New(k, m)
 	if err != nil {
 		return nil, err
+	}
+	if len(c) >= maxCachedCodecs {
+		clear(c)
 	}
 	c[key] = enc
 	return enc, nil
@@ -188,17 +192,24 @@ type DecoderConfig struct {
 	// BlockAge is how long a block's repairs wait for enough symbols
 	// (default 2 s).
 	BlockAge time.Duration
+	// RepairBytes bounds copied repair payloads independently of sources
+	// (default 1 MiB). MaxBlocks and MaxDone cap metadata and per-input
+	// expiry work (defaults 256 and 1024).
+	RepairBytes int
+	MaxBlocks   int
+	MaxDone     int
 }
 
 // Decoder rebuilds lost packets from received sources and repairs.
 type Decoder struct {
-	cfg    DecoderConfig
-	store  map[uint64]stored
-	order  []uint64 // store keys, oldest first
-	bytes  int
-	blocks map[uint64]*block
-	done   map[uint64]time.Time // blocks finished, for ignoring late repairs
-	codecs codecs
+	cfg         DecoderConfig
+	store       map[uint64]stored
+	order       []uint64 // store keys, oldest first
+	bytes       int
+	repairBytes int
+	blocks      map[uint64]*block
+	done        map[uint64]time.Time // blocks finished, for ignoring late repairs
+	codecs      codecs
 }
 
 type stored struct {
@@ -211,6 +222,7 @@ type block struct {
 	stride     uint64
 	repairs    map[int][]byte
 	created    time.Time
+	bytes      int
 }
 
 // NewDecoder returns a Decoder.
@@ -223,6 +235,15 @@ func NewDecoder(cfg DecoderConfig) *Decoder {
 	}
 	if cfg.BlockAge == 0 {
 		cfg.BlockAge = 2 * time.Second
+	}
+	if cfg.RepairBytes <= 0 {
+		cfg.RepairBytes = 1 << 20
+	}
+	if cfg.MaxBlocks <= 0 {
+		cfg.MaxBlocks = 256
+	}
+	if cfg.MaxDone <= 0 {
+		cfg.MaxDone = 1024
 	}
 	return &Decoder{cfg: cfg, store: map[uint64]stored{}, blocks: map[uint64]*block{},
 		done: map[uint64]time.Time{}, codecs: codecs{}}
@@ -267,8 +288,16 @@ func (d *Decoder) Repair(now time.Time, r Repair) []Recovered {
 	if _, ok := d.done[r.First]; ok {
 		return nil
 	}
+	// Check before either metadata or payload allocation. A timeout alone
+	// bounds lifetime, not memory at an adversarial arrival rate.
+	if len(r.Data) > d.cfg.RepairBytes-d.repairBytes {
+		return nil
+	}
 	b := d.blocks[r.First]
 	if b == nil {
+		if len(d.blocks) >= d.cfg.MaxBlocks {
+			return nil
+		}
 		b = &block{k: r.K, m: r.M, size: len(r.Data), stride: uint64(r.Stride), repairs: map[int][]byte{}, created: now}
 		d.blocks[r.First] = b
 	} else if b.k != r.K || b.m != r.M || b.size != len(r.Data) || b.stride != uint64(r.Stride) {
@@ -276,6 +305,8 @@ func (d *Decoder) Repair(now time.Time, r Repair) []Recovered {
 	}
 	if _, ok := b.repairs[r.Index]; !ok {
 		b.repairs[r.Index] = append([]byte(nil), r.Data...)
+		b.bytes += len(r.Data)
+		d.repairBytes += len(r.Data)
 	}
 	return d.try(now, r.First, b)
 }
@@ -329,8 +360,17 @@ func (d *Decoder) try(now time.Time, first uint64, b *block) []Recovered {
 }
 
 func (d *Decoder) finish(now time.Time, first uint64) {
-	delete(d.blocks, first)
-	d.done[first] = now
+	d.dropBlock(first)
+	if len(d.done) < d.cfg.MaxDone {
+		d.done[first] = now
+	}
+}
+
+func (d *Decoder) dropBlock(first uint64) {
+	if b := d.blocks[first]; b != nil {
+		d.repairBytes -= b.bytes
+		delete(d.blocks, first)
+	}
 }
 
 func (d *Decoder) evict() {
@@ -353,7 +393,7 @@ func (d *Decoder) expire(now time.Time) {
 	}
 	for first, b := range d.blocks {
 		if now.Sub(b.created) >= d.cfg.BlockAge {
-			delete(d.blocks, first)
+			d.dropBlock(first)
 		}
 	}
 	for first, at := range d.done {

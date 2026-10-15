@@ -16,7 +16,7 @@ type ListenerOptions struct {
 	// TLS holds the relay's certificate. The listener requires TLS 1.3
 	// and ALPN "arc/1".
 	TLS *tls.Config
-	// MaxConns bounds concurrent connections (default 4096).
+	// MaxConns bounds pending handshakes and established connections together (default 4096).
 	MaxConns int
 	// Idle closes a connection that receives nothing for this long
 	// (default 5 minutes: well past keepalives and the session idle
@@ -39,9 +39,10 @@ type Listener struct {
 	ctx  context.Context
 	stop context.CancelFunc
 
-	mu    sync.Mutex
-	links map[netip.AddrPort]*link
-	next  uint64
+	mu          sync.Mutex
+	links       map[netip.AddrPort]*link
+	connections map[*tls.Conn]struct{} // admitted before starting TLS; also closed during shutdown
+	next        uint64
 }
 
 // streamPrefix is the first 8 bytes of synthetic addresses: a unique
@@ -60,6 +61,9 @@ func Listen(addr string, opts ListenerOptions) (*Listener, error) {
 	if opts.MaxConns == 0 {
 		opts.MaxConns = 4096
 	}
+	if opts.MaxConns < 0 || opts.Queue < 0 || opts.Idle < 0 {
+		return nil, errors.New("stream: connection, queue and idle limits must not be negative")
+	}
 	if opts.Idle == 0 {
 		opts.Idle = 5 * time.Minute
 	}
@@ -77,6 +81,7 @@ func Listen(addr string, opts ListenerOptions) (*Listener, error) {
 	l := &Listener{
 		ln: tls.NewListener(tcp, cfg), opts: opts, in: make(chan inbound, opts.Queue),
 		ctx: ctx, stop: stop, links: make(map[netip.AddrPort]*link),
+		connections: make(map[*tls.Conn]struct{}),
 	}
 	go l.accept()
 	return l, nil
@@ -95,11 +100,26 @@ func (l *Listener) accept() {
 			time.Sleep(10 * time.Millisecond) // e.g. out of file descriptors
 			continue
 		}
-		go l.serve(conn.(*tls.Conn))
+		tc := conn.(*tls.Conn)
+		l.mu.Lock()
+		if len(l.connections) >= l.opts.MaxConns || l.ctx.Err() != nil {
+			l.mu.Unlock()
+			tc.Close()
+			continue
+		}
+		l.connections[tc] = struct{}{}
+		l.mu.Unlock()
+		go l.serve(tc)
 	}
 }
 
 func (l *Listener) serve(conn *tls.Conn) {
+	defer func() {
+		conn.Close()
+		l.mu.Lock()
+		delete(l.connections, conn)
+		l.mu.Unlock()
+	}()
 	ctx, cancel := context.WithTimeout(l.ctx, 10*time.Second)
 	err := conn.HandshakeContext(ctx)
 	cancel()
@@ -111,7 +131,7 @@ func (l *Listener) serve(conn *tls.Conn) {
 		tcp.SetNoDelay(true)
 	}
 	l.mu.Lock()
-	if len(l.links) >= l.opts.MaxConns || l.ctx.Err() != nil {
+	if l.ctx.Err() != nil {
 		l.mu.Unlock()
 		conn.Close()
 		return
@@ -162,6 +182,9 @@ func (l *Listener) Close() error {
 	l.stop()
 	err := l.ln.Close()
 	l.mu.Lock()
+	for conn := range l.connections {
+		conn.Close()
+	}
 	for _, k := range l.links {
 		k.close()
 	}

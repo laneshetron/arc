@@ -17,6 +17,8 @@ jobs:
       - name: gofmt
         run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
       - run: go vet ./...
+      - name: reachable vulnerability scan
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
       - run: go test -race ./...
       - name: benchmarks compile and run
         run: go test -run='^$' -bench=. -benchtime=1x ./...
@@ -71,3 +73,4 @@ jobs:
       - run: pip install -r spec/requirements.txt
       - name: fixtures are up to date
         run: python spec/generate_arc_fixtures.py --check
+

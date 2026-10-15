@@ -408,7 +408,10 @@ func (c *Client) handleData(now time.Time, b []byte) {
 				c.deliverRecovered(c.conn.fecRepair(now, f))
 			}
 		case wire.NewPath:
-			if len(c.slots) < maxPaths && c.conn.path(f.PathID) == nil {
+			// Control frames may be retransmitted in fresh DATA packets.
+			// Deduplicate both queued slots and every consumed nonce space.
+			queued := slices.ContainsFunc(c.slots, func(s pathSlot) bool { return s.id == f.PathID })
+			if len(c.slots) < maxPaths && !queued && !c.conn.usedPathIDs[f.PathID] {
 				c.slots = append(c.slots, pathSlot{id: f.PathID, cid: f.CID, token: f.ResetToken})
 			}
 		case wire.PathChallenge:
@@ -537,6 +540,14 @@ func (c *Client) OpenPath(now time.Time) (uint32, error) {
 	if c.state != StateActive {
 		return 0, ErrNotActive
 	}
+	if len(c.conn.usedPathIDs) >= maxSessionPathIDs {
+		c.close(now, ErrPathLimit, true)
+		return 0, ErrPathLimit
+	}
+	// Defensive against a stale slot queued before its path was opened.
+	for len(c.slots) > 0 && c.conn.usedPathIDs[c.slots[0].id] {
+		c.slots = c.slots[1:]
+	}
 	if len(c.slots) == 0 {
 		return 0, ErrNoPathSlots
 	}
@@ -554,7 +565,10 @@ func (c *Client) OpenPath(now time.Time) (uint32, error) {
 	p := newPath(slot.id, cid, slot.cid, now)
 	p.resetToken, p.joined = slot.token, true
 	p.control = []wire.Frame{wire.PathJoin{CID: cid}}
-	c.conn.addPath(p)
+	if !c.conn.addPath(p) {
+		c.close(now, ErrPathLimit, true)
+		return 0, ErrPathLimit
+	}
 	c.conn.flush(now)
 	return p.id, nil
 }
