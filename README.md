@@ -165,6 +165,9 @@ link, and what redundancy does when both links are lossy (`docker run --rm --pri
 repeated runs (`docker run --rm --privileged arc-e2e fec [SECONDS] [REPS]`).
 `test/netns/split.sh` compares TCP through ARC with split TCP off and on, from a clean link to 90%
 loss (`docker run --rm --privileged arc-e2e split [SECONDS] [REPS]`).
+`test/netns/stall.sh` compares TCP downloads through plain routing and ARC while the client's link
+stalls periodically, as Wi-Fi does when AWDL takes the radio off-channel, with the access point
+holding only a few frames meanwhile (`docker run --rm --privileged arc-e2e stall [SECONDS] [REPS]`).
 `test/netns/bench.sh` compares ARC's throughput with kernel WireGuard over the same topology
 (`docker run --rm --privileged arc-e2e bench` on macOS). Treat its numbers as relative: both ends
 share one machine.
