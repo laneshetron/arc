@@ -150,7 +150,7 @@ for s in "${SCENARIOS[@]}"; do
     mbps=$(tcp_up)
     GOODPUT["$name/$tunnel"]=$mbps
     ROWS+=("$(printf '%-26s %-10s %10s %10s %10s' "$name" "$tunnel" "$mbps" "$loss" "$avg")")
-    if [[ $mbps == 0 || $loss == 100 ]]; then
+    if awk -v m="$mbps" -v l="$loss" 'BEGIN { exit !(m <= 0 || l >= 100) }'; then
       fail "$tunnel carried no traffic under '$name'"
     fi
   done
