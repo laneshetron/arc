@@ -14,7 +14,10 @@
 # Usage: stall.sh BIN_DIR [SECONDS] [REPS]   (defaults 10 and 3)
 # Environment: STALL (90ms), PERIOD (455ms), HOLD (frames the access point
 # holds during a stall, 64), CCS (congestion controls to try, default
-# "cubic bbr"), MODES (default "plain arc arc-fecoff").
+# "cubic bbr"), MODES (default "plain arc arc-fecoff"), UDP (a rate, such
+# as 20M: report the loss % of a constant-rate UDP download instead of TCP
+# goodput), SHOW_LOGS (print the sender's TCP retransmission counters per
+# run, and the last relay and client status lines).
 set -euo pipefail
 
 BIN=$(cd "${1:?usage: stall.sh BIN_DIR [SECONDS] [REPS]}" && pwd)
@@ -41,11 +44,22 @@ $I iperf3 -s -D --logfile "$WORK/iperf-server.log"
 echo stall-token >"$WORK/tokens"
 cp "$WORK/tokens" "$WORK/token"
 RELAY_PUB=$("$BIN/arc-relay" pubkey <"$WORK/relay.key")
-$R "$BIN/arc-relay" run -listen 192.168.10.2:4433 -key-file "$WORK/relay.key" \
-  -reset-secret-file "$WORK/reset.secret" -tokens-file "$WORK/tokens" \
-  -network 10.77.0.1/16 >"$WORK/relay.log" 2>&1 &
-PIDS+=($!)
-wait_until 10 $R ip addr show arc0
+RELAY= RELAY_ARGS=unset
+start_relay() { # start_relay [ARC_RELAY_FLAGS...]: (re)starts the relay unless already running with these flags
+  [[ $RELAY_ARGS == "$*" ]] && return
+  stop_client
+  if [[ -n $RELAY ]]; then
+    kill "$RELAY"; wait "$RELAY" 2>/dev/null || true
+    wait_until 5 sh -c "! ip netns exec arc-r ip link show arc0"
+  fi
+  $R "$BIN/arc-relay" run -listen 192.168.10.2:4433 -key-file "$WORK/relay.key" \
+    -reset-secret-file "$WORK/reset.secret" -tokens-file "$WORK/tokens" \
+    -network 10.77.0.1/16 -status 1s "$@" >"$WORK/relay.log" 2>&1 &
+  RELAY=$!
+  PIDS+=("$RELAY")
+  RELAY_ARGS="$*"
+  wait_until 10 $R ip addr show arc0
+}
 
 CLIENT=
 start_client() { # start_client FEC_MODE
@@ -74,7 +88,7 @@ use_plain() { $C ip route replace 192.168.20.0/24 via 192.168.10.2 dev c0 onlink
 $I tc qdisc replace dev i0 root netem delay 20ms rate 400mbit limit 100000
 $R tc qdisc replace dev r1 root netem delay 20ms limit 100000
 RUN="rate 800mbit burst 200kb"
-STOP="rate 8kbit burst 1600"
+STOP="rate 8bit burst 1600" # 1 byte/s: nothing more gets through
 # A tbf change resets its fifo's limit to the tbf's own (here, in packets),
 # so the stall shrinks the fifo after stopping the bucket.
 $R tc qdisc replace dev r0 root handle 10: tbf $RUN limit 10000
@@ -115,6 +129,10 @@ tcp() { # tcp [IPERF_ARGS...]: prints goodput in Mbit/s, or 0
   done
   echo 0
 }
+udp_loss() { # udp_loss RATE: prints the loss % of a constant-rate UDP download
+  $C timeout $((DURATION + 30)) iperf3 -c "$TARGET" -u -b "$1" -l 1200 -t "$DURATION" -R -f m >"$WORK/iperf.log" 2>&1 || { echo 100; return; }
+  grep receiver "$WORK/iperf.log" | tail -1 | grep -oE '\(([0-9.e+-]+)%\)' | tr -d '(%)'
+}
 r0_drops() { $R tc -s qdisc show dev r0 | awk '/dropped/ { for (i = 1; i <= NF; i++) if ($i == "(dropped") { gsub(",", "", $(i + 1)); print $(i + 1); exit } }'; }
 median() { sort -g | awk '{v[NR] = $1} END {print (NR ? v[int((NR + 1) / 2)] : "-")}'; }
 
@@ -131,13 +149,21 @@ for cc in ${CCS:-cubic bbr}; do
       for rep in $(seq "$REPS"); do
         case $mode in
           plain) stop_client; use_plain ;;
-          arc) start_client auto ;;
-          arc-fecoff) start_client off ;;
+          arc) start_relay; start_client auto ;;
+          arc-fecoff) start_relay; start_client off ;;
         esac
         [[ $stalls == on ]] && start_stalls
         d0=$(r0_drops)
-        downs+=("$(tcp -R -C "$cc")")
+        [[ -n ${SHOW_LOGS:-} ]] && $I nstat -n
+        if [[ -n ${UDP:-} ]]; then
+          downs+=("$(udp_loss "$UDP")")
+        else
+          downs+=("$(tcp -R -C "$cc")")
+        fi
         drops+=("$(($(r0_drops) - d0))")
+        if [[ -n ${SHOW_LOGS:-} ]]; then
+          echo "sender TCP, $mode stalls $stalls: $($I nstat -z TcpRetransSegs TcpExtTCPTimeouts TcpExtTCPLossProbes TcpExtTCPSpuriousRTOs TcpExtTCPSackRecovery 2>/dev/null | awk 'NR > 1 { printf "%s=%s ", $1, $2 }')"
+        fi
         stop_stalls
       done
       ROWS+=("$(printf '%-6s %-11s %-7s %12s %10s' "$cc" "$mode" "$stalls" \
@@ -147,6 +173,10 @@ for cc in ${CCS:-cubic bbr}; do
   done
 done
 stop_client
+if [[ -n ${SHOW_LOGS:-} ]]; then
+  grep -E "path" "$WORK/relay.log" | tail -20
+  tail -20 "$WORK/client.log"
+fi
 
 echo
 echo "Download at 40 ms RTT through a 400 Mbit/s ISP and 800 Mbit/s Wi-Fi, stalls of $STALL every $PERIOD with $HOLD frames held at the AP;"
