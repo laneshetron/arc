@@ -67,7 +67,7 @@ wait_for 10 "relay up" $R ip addr show arc0
 # --- client --------------------------------------------------------------
 # Each link also gets a TLS/TCP carrier, used only while UDP does not work.
 CLIENT_ARGS=(-relay 192.168.10.2:4433 -relay-key "$RELAY_PUB" -token-file "$WORK/token"
-  -full-tunnel -bind c0 -bind c1 -tls 192.168.10.2:8443 -tls-ca "$WORK/relay.crt")
+  -full-tunnel -dns-mode manual -dns 10.77.0.1 -bind c0 -bind c1 -tls 192.168.10.2:8443 -tls-ca "$WORK/relay.crt")
 $C "$BIN/arc-client" run "${CLIENT_ARGS[@]}" >"$WORK/client.log" 2>&1 &
 CLIENT_PID=$!
 PIDS+=("$CLIENT_PID")
@@ -75,6 +75,14 @@ wait_for 10 "client established" grep -q "session established" "$WORK/client.log
   pass "session established"
 
 # --- checks --------------------------------------------------------------
+# A LAN resolver (or any other LAN unicast destination) must not bypass
+# the full tunnel's policy rule. Marked carrier packets still use c0.
+if $C ip -4 route get 192.168.10.2 | grep -q 'dev arc0' &&
+  $C ip -4 route get 192.168.10.2 mark 0x5243 | grep -q 'dev c0'; then
+  pass "LAN DNS routes through the tunnel; marked carrier bypasses it"
+else
+  fail "full-tunnel LAN/DNS routing bypass"
+fi
 if $C timeout 60 ping -c5 -i0.2 -W2 192.168.20.2 >"$WORK/ping.log" 2>&1; then
   pass "ping through the tunnel ($(grep -o 'rtt.*' "$WORK/ping.log"))"
 else
@@ -216,3 +224,4 @@ fi
 
 echo
 if [[ $failures -eq 0 ]]; then echo "e2e: all checks passed"; else echo "e2e: $failures check(s) failed"; exit 1; fi
+
