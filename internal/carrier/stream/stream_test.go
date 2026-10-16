@@ -122,9 +122,9 @@ func TestClientReconnects(t *testing.T) {
 	_, first := readOne(t, ln)
 	// The relay drops the connection; the client redials and arrives from
 	// a new address.
-	ln.mu.Lock()
-	ln.links[first].close()
-	ln.mu.Unlock()
+	ln.reg.mu.Lock()
+	ln.reg.links[first].close()
+	ln.reg.mu.Unlock()
 	deadline := time.After(10 * time.Second)
 	for {
 		select {

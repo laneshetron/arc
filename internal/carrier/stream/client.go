@@ -13,6 +13,20 @@ import (
 	"github.com/laneshetron/arc/internal/carrier/sockopt"
 )
 
+// FrontDialOptions configures a client carrier over the relay's front:
+// the TLS session is ordinary HTTPS, and the carrier rides an
+// authenticated HTTP upgrade inside it. The session itself still
+// authenticates the relay (spec D2); the front's admission token only
+// gates the upgrade.
+type FrontDialOptions struct {
+	// Token is the admission token, one of the deployment's client
+	// access tokens. A wrong or missing token gets cover content, and
+	// the dial reports ModeFrontRefused.
+	Token string
+	// Path is requested in the upgrade; default "/".
+	Path string
+}
+
 // ClientOptions configures a client carrier.
 type ClientOptions struct {
 	// Addr is the relay's TLS endpoint, host:port.
@@ -35,6 +49,10 @@ type ClientOptions struct {
 	// ClientHello segmentation) instead of verifying the relay and
 	// negotiating ALPN "arc/1".
 	Camouflage *Camouflage
+	// Front, when set, upgrades the TLS session into the stream carrier
+	// through the relay's fail-closed HTTPS front, rather than speaking
+	// the carrier's own ALPN.
+	Front *FrontDialOptions
 	// Socket options for the TCP connection.
 	Sockopt sockopt.Options
 	// Peer is reported as the source of received packets, so the engine
@@ -140,12 +158,21 @@ func (c *Client) connect() (*link, *trackingConn, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	// The camouflage profile offers a browser's ALPN, so the negotiated
-	// label is not the carrier's; the ARC session authenticates the peer.
-	if c.opts.Camouflage == nil && alpn != ALPN {
+	// The camouflage and front profiles offer web ALPN, so the
+	// negotiated label is not the carrier's; the ARC session
+	// authenticates the peer.
+	if c.opts.Camouflage == nil && c.opts.Front == nil && alpn != ALPN {
 		conn.Close()
 		return nil, nil, &Failure{Mode: ModeDied, At: raw.total(),
 			Err: errors.New("stream: relay did not negotiate ALPN " + ALPN)}
+	}
+	if c.opts.Front != nil {
+		uconn, err := upgradeFront(conn, c.opts.Addr, c.opts.Front)
+		if err != nil {
+			conn.Close()
+			return nil, nil, &Failure{Mode: ModeFrontRefused, At: raw.total(), Err: err}
+		}
+		conn = uconn
 	}
 	return newLink(conn, c.opts.Peer, c.opts.Queue, 0), raw, nil
 }
@@ -194,10 +221,16 @@ func (c *Client) dialTLS(ctx context.Context) (net.Conn, *trackingConn, string, 
 }
 
 // handshakeTLS runs the carrier's TLS handshake over raw: the plain
-// carrier (spec §16.3) with verified identity and ALPN arc/1, or the
-// camouflage profile, which hands the whole outer handshake its shape.
+// carrier (spec §16.3) with verified identity and ALPN arc/1, the
+// camouflage profile, which hands the whole outer handshake its shape,
+// or the front, which negotiates HTTP/1.1 for its upgrade.
 func (c *Client) handshakeTLS(ctx context.Context, raw *trackingConn) (net.Conn, string, error) {
 	if cam := c.opts.Camouflage; cam != nil {
+		if c.opts.Front != nil { // per-dial override, not a mutation of the caller's
+			clone := *cam
+			clone.ALPN = []string{"http/1.1"} // the upgrade is an HTTP/1.1 mechanism
+			return clone.Handshake(ctx, raw, c.opts.Addr, c.opts.TLS)
+		}
 		return cam.Handshake(ctx, raw, c.opts.Addr, c.opts.TLS)
 	}
 	cfg, err := clientConfig(c.opts.TLS, c.opts.Addr)
@@ -205,7 +238,11 @@ func (c *Client) handshakeTLS(ctx context.Context, raw *trackingConn) (net.Conn,
 		return nil, "", err
 	}
 	cfg.MinVersion = tls.VersionTLS13
-	cfg.NextProtos = []string{ALPN}
+	if c.opts.Front != nil {
+		cfg.NextProtos = []string{"http/1.1"} // the upgrade is an HTTP/1.1 mechanism
+	} else {
+		cfg.NextProtos = []string{ALPN}
+	}
 	conn := tls.Client(raw, cfg)
 	if err := conn.HandshakeContext(ctx); err != nil {
 		return nil, "", err

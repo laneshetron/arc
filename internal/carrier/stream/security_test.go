@@ -1,7 +1,6 @@
 package stream
 
 import (
-	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"net"
@@ -38,8 +37,6 @@ func (c *handshakeReadConn) Read(b []byte) (int, error) {
 }
 
 func TestPendingTLSHandshakesCountTowardAdmissionLimit(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	ln := &admissionListener{conns: make(chan net.Conn, 3)}
 	started := make(chan struct{}, 3)
 	peers := make([]net.Conn, 0, 3)
@@ -51,7 +48,8 @@ func TestPendingTLSHandshakesCountTowardAdmissionLimit(t *testing.T) {
 		ln.conns <- tls.Server(&handshakeReadConn{Conn: server, started: started, peer: netip.MustParseAddrPort("192.0.2.1:1234")}, &tls.Config{MinVersion: tls.VersionTLS13})
 	}
 	close(ln.conns)
-	l := &Listener{ln: ln, opts: ListenerOptions{MaxConns: 1, MaxPending: 1, MaxConnsPerSource: 4, MaxPendingPerSource: 4, HandshakeTimeout: 3 * time.Second}, ctx: ctx, stop: cancel, links: map[netip.AddrPort]*link{}, connections: map[*tls.Conn]*acceptedConn{}, sources: map[netip.Addr]int{}, pendingSources: map[netip.Addr]int{}}
+	opts := ListenerOptions{MaxConns: 1, MaxPending: 1, MaxConnsPerSource: 4, MaxPendingPerSource: 4, HandshakeTimeout: 3 * time.Second}
+	l := &Listener{ln: ln, opts: opts, reg: newRegistry(0, 0, 0), adm: newAdmission(opts.limits())}
 	// accept returns after all three attempts have either reserved a permit
 	// or been rejected. No sleep or real sockets are needed to count them.
 	l.accept()
@@ -60,9 +58,7 @@ func TestPendingTLSHandshakesCountTowardAdmissionLimit(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("first handshake did not start")
 	}
-	l.mu.Lock()
-	admitted := len(l.connections)
-	l.mu.Unlock()
+	admitted, _, _, _ := l.adm.counts()
 	if admitted != 1 {
 		t.Fatalf("admitted %d connections, limit 1", admitted)
 	}
@@ -79,9 +75,7 @@ func TestPendingTLSHandshakesCountTowardAdmissionLimit(t *testing.T) {
 	}
 	deadline := time.After(time.Second)
 	for {
-		l.mu.Lock()
-		n := len(l.connections)
-		l.mu.Unlock()
+		n, _, _, _ := l.adm.counts()
 		if n == 0 {
 			break
 		}
@@ -107,8 +101,6 @@ func TestTLSSeparatePendingAndPeerBudgets(t *testing.T) {
 		{"pending", 2, 10, 1, 2}, {"all-connections-per-peer", 10, 1, 10, 3},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
 			ln := &admissionListener{conns: make(chan net.Conn, 4)}
 			started := make(chan struct{}, 4)
 			for _, ip := range []string{"192.0.2.1:1", "192.0.2.1:2", "192.0.2.2:1", "192.0.2.3:1"} {
@@ -118,13 +110,13 @@ func TestTLSSeparatePendingAndPeerBudgets(t *testing.T) {
 				ln.conns <- tls.Server(&handshakeReadConn{Conn: server, started: started, peer: netip.MustParseAddrPort(ip)}, &tls.Config{MinVersion: tls.VersionTLS13})
 			}
 			close(ln.conns)
-			l := &Listener{ln: ln, opts: ListenerOptions{MaxConns: 10, MaxPending: tc.maxPending, MaxConnsPerSource: tc.maxPerPeer, MaxPendingPerSource: tc.pendingPerPeer, HandshakeTimeout: 3 * time.Second}, ctx: ctx, stop: cancel, links: map[netip.AddrPort]*link{}, connections: map[*tls.Conn]*acceptedConn{}, sources: map[netip.Addr]int{}, pendingSources: map[netip.Addr]int{}}
+			opts := ListenerOptions{MaxConns: 10, MaxPending: tc.maxPending, MaxConnsPerSource: tc.maxPerPeer, MaxPendingPerSource: tc.pendingPerPeer, HandshakeTimeout: 3 * time.Second}
+			l := &Listener{ln: ln, opts: opts, reg: newRegistry(0, 0, 0), adm: newAdmission(opts.limits())}
 			l.accept()
-			l.mu.Lock()
-			got := len(l.connections)
-			pending := l.pending
-			first := l.sources[netip.MustParseAddr("192.0.2.1")]
-			l.mu.Unlock()
+			got, pending, _, _ := l.adm.counts()
+			l.adm.mu.Lock()
+			first := l.adm.sources[netip.MustParseAddr("192.0.2.1")]
+			l.adm.mu.Unlock()
 			if got != tc.want || pending != tc.want || first != 1 {
 				t.Fatalf("admitted=%d pending=%d first-peer=%d", got, pending, first)
 			}
@@ -141,8 +133,6 @@ func TestTLSSeparatePendingAndPeerBudgets(t *testing.T) {
 }
 
 func TestPendingTLSTimeoutReleasesAllBudgets(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	server, peer := net.Pipe()
 	defer peer.Close()
 	defer server.Close()
@@ -150,14 +140,14 @@ func TestPendingTLSTimeoutReleasesAllBudgets(t *testing.T) {
 	started := make(chan struct{}, 1)
 	ln.conns <- tls.Server(&handshakeReadConn{Conn: server, started: started, peer: netip.MustParseAddrPort("192.0.2.1:1")}, &tls.Config{MinVersion: tls.VersionTLS13})
 	close(ln.conns)
-	l := &Listener{ln: ln, opts: ListenerOptions{MaxConns: 1, MaxPending: 1, MaxConnsPerSource: 1, MaxPendingPerSource: 1, HandshakeTimeout: 30 * time.Millisecond}, ctx: ctx, stop: cancel, links: map[netip.AddrPort]*link{}, connections: map[*tls.Conn]*acceptedConn{}, sources: map[netip.Addr]int{}, pendingSources: map[netip.Addr]int{}}
+	opts := ListenerOptions{MaxConns: 1, MaxPending: 1, MaxConnsPerSource: 1, MaxPendingPerSource: 1, HandshakeTimeout: 30 * time.Millisecond}
+	l := &Listener{ln: ln, opts: opts, reg: newRegistry(0, 0, 0), adm: newAdmission(opts.limits())}
 	l.accept()
 	defer l.Close()
 	deadline := time.After(time.Second)
 	for {
-		l.mu.Lock()
-		empty := len(l.connections) == 0 && l.pending == 0 && len(l.sources) == 0 && len(l.pendingSources) == 0
-		l.mu.Unlock()
+		conns, pending, sources, pendingSources := l.adm.counts()
+		empty := conns == 0 && pending == 0 && sources == 0 && pendingSources == 0
 		if empty {
 			break
 		}

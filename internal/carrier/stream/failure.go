@@ -33,6 +33,8 @@ const (
 	ModeTimeoutAtNBytes = "timeout-at-N-bytes"
 	// A death that is none of the above.
 	ModeDied = "stream-died"
+	// A front that served cover content instead of upgrading.
+	ModeFrontRefused = "front-upgrade-refused"
 )
 
 // A Failure is a classified carrier outcome. OnState carries it for dial

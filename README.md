@@ -72,6 +72,15 @@ sudo bin/arc-client run ... -tls RELAY_HOST:443
 # certificate should list the cover name: arc-relay gencert -hosts COVER_HOST
 sudo bin/arc-client run ... -tls RELAY_HOST:443 -tls-cover COVER_HOST -tls-fingerprint chrome
 
+# The relay can also present itself as an ordinary HTTPS site: with
+# -front-listen 0.0.0.0:443 (instead of -tls-listen), every visitor gets
+# cover content (from -front-site, or a minimal page), while the client's
+# carrier rides an authenticated HTTP upgrade through it, so an active
+# prober sees only a website. The certificate should be publicly valid for
+# the domain clients dial; the admission token is the client's ordinary
+# -token-file token.
+sudo bin/arc-client run ... -front cdn.example.com:443 -tls-fingerprint chrome
+
 # Forward error correction is on by default (-fec auto): while a link loses
 # 0.5% or more, repair packets let the far end rebuild losses without TCP
 # retransmitting; -fec off disables it, -fec always keeps it on

@@ -3,19 +3,17 @@ package stream
 import (
 	"context"
 	"crypto/tls"
-	"encoding/binary"
 	"errors"
 	"net"
 	"net/netip"
 	"slices"
-	"sync"
 	"time"
 )
 
 // ListenerOptions configures the relay side.
 type ListenerOptions struct {
 	// TLS holds the relay's certificate. The listener requires TLS 1.3
-	// and ALPN "arc/1".
+	// and, unless Camouflage is set, ALPN "arc/1".
 	TLS *tls.Config
 	// Camouflage accepts carrier connections that present a browser's
 	// ALPN ("h2" or "http/1.1") instead of "arc/1", as the client
@@ -56,30 +54,15 @@ type ListenerOptions struct {
 type Listener struct {
 	ln   net.Listener
 	opts ListenerOptions
-	in   chan inbound
-	ctx  context.Context
-	stop context.CancelFunc
-
-	mu             sync.Mutex
-	links          map[netip.AddrPort]*link
-	connections    map[*tls.Conn]*acceptedConn // includes pending TLS work
-	pending        int
-	sources        map[netip.Addr]int
-	pendingSources map[netip.Addr]int
-	next           uint64
-}
-
-type acceptedConn struct {
-	source  netip.Addr
-	pending bool
+	reg  *registry  // established carriers, by synthetic address
+	adm  *admission // every accepted connection, pending or established
 }
 
 // streamPrefix is the first 8 bytes of synthetic addresses: a unique
 // local IPv6 prefix spelling "arc/1" that no UDP client can have.
 var streamPrefix = [8]byte{0xfd, 'a', 'r', 'c', '/', '1', 0, 0}
 
-// IsStreamAddr reports whether a is a Listener connection's synthetic
-// address.
+// IsStreamAddr reports whether a is a stream carrier's synthetic address.
 func IsStreamAddr(a netip.AddrPort) bool {
 	b := a.Addr().As16()
 	return a.Addr().Is6() && [8]byte(b[:8]) == streamPrefix
@@ -121,14 +104,19 @@ func Listen(addr string, opts ListenerOptions) (*Listener, error) {
 	if err != nil {
 		return nil, err
 	}
-	ctx, stop := context.WithCancel(context.Background())
 	l := &Listener{
-		ln: tls.NewListener(tcp, cfg), opts: opts, in: make(chan inbound, opts.Queue),
-		ctx: ctx, stop: stop, links: make(map[netip.AddrPort]*link),
-		connections: make(map[*tls.Conn]*acceptedConn), sources: make(map[netip.Addr]int), pendingSources: make(map[netip.Addr]int),
+		ln: tls.NewListener(tcp, cfg), opts: opts, reg: newRegistry(opts.MaxConns, opts.Queue, opts.Idle),
+		adm: newAdmission(opts.limits()),
 	}
 	go l.accept()
 	return l, nil
+}
+
+func (o ListenerOptions) limits() admissionLimits {
+	return admissionLimits{
+		maxConns: o.MaxConns, maxPending: o.MaxPending,
+		maxConnsPerSource: o.MaxConnsPerSource, maxPendingPerSource: o.MaxPendingPerSource,
+	}
 }
 
 // Addr returns the listening address.
@@ -145,44 +133,21 @@ func (l *Listener) accept() {
 			continue
 		}
 		tc := conn.(*tls.Conn)
-		peer, err := netip.ParseAddrPort(tc.RemoteAddr().String())
-		if err != nil {
+		p := l.adm.admit(tc)
+		if p == nil {
 			tc.Close()
 			continue
 		}
-		source := peer.Addr().Unmap()
-		l.mu.Lock()
-		if len(l.connections) >= l.opts.MaxConns || l.pending >= l.opts.MaxPending ||
-			l.sources[source] >= l.opts.MaxConnsPerSource || l.pendingSources[source] >= l.opts.MaxPendingPerSource || l.ctx.Err() != nil {
-			l.mu.Unlock()
-			tc.Close()
-			continue
-		}
-		l.connections[tc] = &acceptedConn{source: source, pending: true}
-		l.sources[source]++
-		l.pendingSources[source]++
-		l.pending++
-		l.mu.Unlock()
-		go l.serve(tc)
+		go l.serve(tc, p)
 	}
 }
 
-func (l *Listener) serve(conn *tls.Conn) {
+func (l *Listener) serve(conn *tls.Conn, p *permit) {
 	defer func() {
 		conn.Close()
-		l.mu.Lock()
-		entry := l.connections[conn]
-		if entry.pending {
-			l.finishPending(entry)
-		}
-		l.sources[entry.source]--
-		if l.sources[entry.source] == 0 {
-			delete(l.sources, entry.source)
-		}
-		delete(l.connections, conn)
-		l.mu.Unlock()
+		p.release()
 	}()
-	ctx, cancel := context.WithTimeout(l.ctx, l.opts.HandshakeTimeout)
+	ctx, cancel := context.WithTimeout(l.reg.ctx, l.opts.HandshakeTimeout)
 	err := conn.HandshakeContext(ctx)
 	cancel()
 	if err != nil {
@@ -191,86 +156,39 @@ func (l *Listener) serve(conn *tls.Conn) {
 	// The camouflage profile lets clients offer a browser's ALPN; the
 	// label does not affect framing, and the ARC session inside
 	// authenticates the client.
-	switch p := conn.ConnectionState().NegotiatedProtocol; {
-	case p == ALPN:
-	case l.opts.Camouflage && slices.Contains(browserALPN, p):
-	default:
+	proto := conn.ConnectionState().NegotiatedProtocol
+	if proto != ALPN && !(l.opts.Camouflage && slices.Contains(browserALPN, proto)) {
 		conn.Close()
 		return
 	}
 	if tcp, ok := conn.NetConn().(*net.TCPConn); ok {
 		tcp.SetNoDelay(true)
 	}
-	l.mu.Lock()
-	if l.ctx.Err() != nil {
-		l.mu.Unlock()
-		conn.Close()
+	if l.reg.ctx.Err() != nil {
 		return
 	}
-	l.finishPending(l.connections[conn])
-	l.next++
-	var a [16]byte
-	copy(a[:8], streamPrefix[:])
-	binary.BigEndian.PutUint64(a[8:], l.next)
-	addr := netip.AddrPortFrom(netip.AddrFrom16(a), 0)
-	k := newLink(conn, addr, l.opts.Queue, l.opts.Idle)
-	l.links[addr] = k
-	l.mu.Unlock()
-
-	k.run(l.in)
-
-	l.mu.Lock()
-	delete(l.links, addr)
-	l.mu.Unlock()
-}
-
-// finishPending runs under mu. The total and per-source connection
-// permits remain held until the established carrier closes.
-func (l *Listener) finishPending(entry *acceptedConn) {
-	entry.pending = false
-	l.pending--
-	l.pendingSources[entry.source]--
-	if l.pendingSources[entry.source] == 0 {
-		delete(l.pendingSources, entry.source)
-	}
+	p.established()
+	l.reg.serve(conn)
 }
 
 // WriteBatch queues each packet for the connection its address names.
 // Packets for unknown addresses or full queues are dropped.
 func (l *Listener) WriteBatch(pkts [][]byte, addrs []netip.AddrPort) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	for i, p := range pkts {
-		if k := l.links[addrs[i]]; k != nil {
-			k.send(p)
-		}
-	}
-	return nil
+	return l.reg.writeBatch(pkts, addrs)
 }
 
 // ReadBatch reads received packets, blocking until at least one arrives.
 func (l *Listener) ReadBatch(bufs [][]byte, sizes []int, addrs []netip.AddrPort) (int, error) {
-	return readBatch(l.in, l.ctx.Done(), bufs, sizes, addrs)
+	return l.reg.readBatch(bufs, sizes, addrs)
 }
 
 // Conns returns the number of open connections.
-func (l *Listener) Conns() int {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return len(l.links)
-}
+func (l *Listener) Conns() int { return l.reg.conns() }
 
 // Close stops accepting and closes every connection.
 func (l *Listener) Close() error {
-	l.stop()
+	l.reg.close()
 	err := l.ln.Close()
-	l.mu.Lock()
-	for conn := range l.connections {
-		conn.Close()
-	}
-	for _, k := range l.links {
-		k.close()
-	}
-	l.mu.Unlock()
+	l.adm.closeAll() // including pending handshakes
 	return err
 }

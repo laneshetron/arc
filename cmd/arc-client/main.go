@@ -97,6 +97,7 @@ func run(args []string) error {
 	tlsCover := fs.String("tls-cover", "", "pose the TLS carrier as this host instead of the -tls host: present it as the server name (SNI); with no -tls-ca, certificate verification is skipped, since ARC authenticates the relay itself (spec D2)")
 	tlsFingerprint := fs.String("tls-fingerprint", "", "shape the TLS ClientHello as a browser's: chrome, edge, safari, ios, or firefox (optional; the relay certificate is still verified unless -tls-cover is set)")
 	tlsFragment := fs.Int("tls-fragment", 0, "send the TLS ClientHello in TCP segments of at most this many bytes (optional; the relay certificate is still verified unless -tls-cover is set)")
+	frontAddr := fs.String("front", "", "relay HTTPS front endpoint, host:port: like -tls, but the carrier rides an authenticated HTTP upgrade inside an ordinary HTTPS session; the relay's front serves cover content to everyone else. The admission token is the session's -token-file token. -tls-cover, -tls-fingerprint, and -tls-fragment shape the outer handshake as for -tls")
 	noOffload := fs.Bool("no-offload", false, "send and receive without UDP GSO/GRO, for comparison")
 	fecMode := wire.FECAuto
 	fs.Func("fec", "forward error correction: auto (default; while loss is at least 0.5%), off, or always", func(v string) error {
@@ -228,21 +229,21 @@ func run(args []string) error {
 		}
 		carriers = append(carriers, engine.Carrier{Name: name, Conn: conn})
 	}
+	var camo *stream.Camouflage
+	if *tlsCover != "" || *tlsFingerprint != "" || *tlsFragment != 0 {
+		camo = &stream.Camouflage{
+			Name: *tlsCover, Fingerprint: *tlsFingerprint, Fragment: *tlsFragment,
+		}
+		if err := camo.Validate(); err != nil {
+			return fmt.Errorf("-tls-fingerprint/-tls-fragment: %w", err)
+		}
+		log.Info("tls carrier will pose as ordinary web traffic",
+			"cover", camo.Name, "fingerprint", camo.Fingerprint, "fragment", camo.Fragment)
+	}
 	if *tlsAddr != "" {
 		tlsConfig, err := clientTLS(*tlsAddr, *tlsCA, *tlsName)
 		if err != nil {
 			return err
-		}
-		var camo *stream.Camouflage
-		if *tlsCover != "" || *tlsFingerprint != "" || *tlsFragment != 0 {
-			camo = &stream.Camouflage{
-				Name: *tlsCover, Fingerprint: *tlsFingerprint, Fragment: *tlsFragment,
-			}
-			if err := camo.Validate(); err != nil {
-				return fmt.Errorf("-tls-fingerprint/-tls-fragment: %w", err)
-			}
-			log.Info("tls carrier will pose as ordinary web traffic",
-				"cover", camo.Name, "fingerprint", camo.Fingerprint, "fragment", camo.Fragment)
 		}
 		bootstrap, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		tlsEndpoints, err := stream.ResolveEndpoints(bootstrap, *tlsAddr)
@@ -269,6 +270,38 @@ func run(args []string) error {
 			})
 			defer conn.Close()
 			carriers = append(carriers, engine.Carrier{Name: name + "/tls", Conn: conn, Fallback: true})
+		}
+	}
+	if *frontAddr != "" {
+		frontTLS, err := clientTLS(*frontAddr, *tlsCA, *tlsName)
+		if err != nil {
+			return err
+		}
+		// As for -tls: resolve before full-tunnel DNS can route lookups
+		// into the tunnel the carrier exists to rescue.
+		bootstrap, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		frontEndpoints, err := stream.ResolveEndpoints(bootstrap, *frontAddr)
+		cancel()
+		if err != nil {
+			log.Warn("resolving the relay front; retrying when the carrier connects", "front", *frontAddr, "err", err)
+		}
+		for _, iface := range binds {
+			name := iface
+			if name == "" {
+				name = "default"
+			}
+			conn := stream.Dial(stream.ClientOptions{
+				Addr: *frontAddr, Endpoints: frontEndpoints, TLS: frontTLS, Peer: relayAddr,
+				Camouflage: camo, Front: &stream.FrontDialOptions{Token: tokens[0]},
+				Sockopt: sockopt.Options{Mark: sockOpts.Mark, Device: iface},
+				OnState: func(err error) {
+					if err != nil {
+						log.Debug("front carrier", "carrier", name+"/front", "err", err)
+					}
+				},
+			})
+			defer conn.Close()
+			carriers = append(carriers, engine.Carrier{Name: name + "/front", Conn: conn, Fallback: true})
 		}
 	}
 

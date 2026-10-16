@@ -36,6 +36,9 @@ type Camouflage struct {
 	// at most this many bytes, defeating middleboxes that read the whole
 	// server name out of the first segment.
 	Fragment int
+	// ALPN overrides the browser offer. The front client needs HTTP/1.1
+	// negotiated, for its upgrade; nil offers the browser set.
+	ALPN []string
 }
 
 // browserALPN is what a camouflage client offers instead of the carrier's
@@ -107,8 +110,14 @@ func (cam *Camouflage) Handshake(ctx context.Context, raw net.Conn, addr string,
 			cfg.InsecureSkipVerify = true
 		}
 	}
+	// The front client overrides the ALPN offer (it needs HTTP/1.1
+	// negotiated); everyone else offers the browser set.
+	protos := cam.ALPN
+	if protos == nil {
+		protos = browserALPN
+	}
 	cfg.MinVersion = tls.VersionTLS13
-	cfg.NextProtos = browserALPN
+	cfg.NextProtos = protos
 	var hconn net.Conn = raw
 	var frag *fragmentConn
 	if cam.Fragment > 0 {

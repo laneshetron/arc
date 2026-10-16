@@ -158,9 +158,9 @@ func TestClientClassifiesSessionDeath(t *testing.T) {
 	ln, c, states := pair(t)
 	c.WriteBatch([][]byte{bytes.Repeat([]byte{7}, 100)}, nil)
 	_, from := readOne(t, ln)
-	ln.mu.Lock()
-	ln.links[from].close() // clean TLS close
-	ln.mu.Unlock()
+	ln.reg.mu.Lock()
+	ln.reg.links[from].close() // clean TLS close
+	ln.reg.mu.Unlock()
 	deadline := time.After(5 * time.Second)
 	for {
 		select {

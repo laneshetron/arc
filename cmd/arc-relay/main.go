@@ -11,6 +11,12 @@
 //	arc-relay gencert -hosts relay.example.com,203.0.113.5
 //	arc-relay run ... -tls-listen 0.0.0.0:443
 //
+// Or front the carriers with an ordinary HTTPS site (clients use -front):
+// every visitor gets cover content, and an authenticated client's request
+// upgrades into the stream carrier.
+//
+//	arc-relay run ... -front-listen 0.0.0.0:443 -front-site cover/
+//
 // The relay does not configure forwarding or NAT for the tunnel network;
 // enable net.ipv4.ip_forward and add a masquerade rule for the network on
 // the egress interface (see test/netns/e2e.sh), along with whatever egress
@@ -25,6 +31,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"net/netip"
 	"os"
 	"os/signal"
@@ -133,6 +140,8 @@ func run(args []string) error {
 	status := fs.Duration("status", 0, "log each session's paths at this interval (0: off)")
 	tlsListen := fs.String("tls-listen", "", "TCP address for TLS/TCP carriers, e.g. 0.0.0.0:443 (default: off)")
 	tlsCamouflage := fs.Bool("tls-camouflage", false, "accept TLS carrier connections that present a browser's ALPN (h2, http/1.1) instead of arc/1, as clients posing as browsers do; the certificate should cover those cover names")
+	frontListen := fs.String("front-listen", "", "TCP address for the fail-closed HTTPS front, e.g. 0.0.0.0:443 (default: off; exclusive with -tls-listen): an ordinary HTTPS site to everyone, the stream carrier to requests authenticated by a token from -tokens-file")
+	frontSite := fs.String("front-site", "", "directory of cover content for -front-listen (default: a minimal built-in page)")
 	tlsCert := fs.String("tls-cert", "relay.crt", "TLS certificate (PEM) for -tls-listen")
 	tlsKey := fs.String("tls-key", "relay.tls.key", "TLS private key (PEM) for -tls-listen")
 	noFEC := fs.Bool("no-fec", false, "decline forward error correction for clients' traffic")
@@ -142,10 +151,10 @@ func run(args []string) error {
 	maxPending := fs.Int("max-pending", 4096, "maximum pending Noise handshakes")
 	handshakeRate := fs.Int("handshakes-per-second", 256, "global Noise handshake work rate and burst")
 	sourceRate := fs.Int("handshakes-per-source", 8, "per-source-IP Noise handshake work rate and burst")
-	maxTLS := fs.Int("max-tls-conns", 4096, "maximum pending and established TLS carrier connections combined")
-	maxTLSHandshakes := fs.Int("max-tls-handshakes", 128, "maximum pending TLS handshakes")
-	maxTLSPerSource := fs.Int("max-tls-conns-per-source", 64, "maximum TLS carrier connections per TCP peer IP")
-	tlsHandshakeTimeout := fs.Duration("tls-handshake-timeout", 10*time.Second, "time allowed for a TLS carrier handshake; lossy networks need several seconds")
+	maxTLS := fs.Int("max-tls-conns", 4096, "maximum pending and established TLS carrier connections combined (with -front-listen: all front connections, visitors included)")
+	maxTLSHandshakes := fs.Int("max-tls-handshakes", 128, "maximum pending TLS handshakes (with -front-listen: front connections that are not carriers, visitors included)")
+	maxTLSPerSource := fs.Int("max-tls-conns-per-source", 64, "maximum TLS carrier connections per TCP peer IP (with -front-listen: front connections, visitors included)")
+	tlsHandshakeTimeout := fs.Duration("tls-handshake-timeout", 10*time.Second, "time allowed for a TLS carrier handshake (with -front-listen: also each request's headers); lossy networks need several seconds")
 	prof := profiling.Register(fs)
 	fs.Parse(args)
 	if *maxSessions <= 0 || *maxPending <= 0 || *handshakeRate <= 0 || *sourceRate <= 0 || *maxTLS <= 0 || *maxTLSHandshakes <= 0 || *maxTLSPerSource <= 0 || *tlsHandshakeTimeout <= 0 {
@@ -214,6 +223,9 @@ func run(args []string) error {
 
 	var streams engine.DatagramConn
 	tlsAddr := ""
+	if *tlsListen != "" && *frontListen != "" {
+		return errors.New("-tls-listen and -front-listen are mutually exclusive: the engine carries one stream carrier")
+	}
 	if *tlsListen != "" {
 		cert, err := tls.LoadX509KeyPair(*tlsCert, *tlsKey)
 		if err != nil {
@@ -229,6 +241,26 @@ func run(args []string) error {
 		}
 		defer ln.Close()
 		streams, tlsAddr = ln, ln.Addr().String()
+	} else if *frontListen != "" {
+		cert, err := tls.LoadX509KeyPair(*tlsCert, *tlsKey)
+		if err != nil {
+			return fmt.Errorf("-front-listen: %w", err)
+		}
+		var site http.Handler
+		if *frontSite != "" {
+			site = http.FileServer(http.Dir(*frontSite))
+		}
+		front, err := stream.ListenFront(*frontListen, stream.FrontOptions{
+			TLS:    &tls.Config{Certificates: []tls.Certificate{cert}},
+			Tokens: gwCfg.Tokens, Site: site,
+			MaxConns: *maxTLS, MaxPending: *maxTLSHandshakes, MaxConnsPerSource: *maxTLSPerSource,
+			HandshakeTimeout: *tlsHandshakeTimeout,
+		})
+		if err != nil {
+			return err
+		}
+		defer front.Close()
+		streams, tlsAddr = front, front.Addr().String()
 	}
 
 	log.Info("relay listening", "addr", conn.LocalAddr(), "tls", tlsAddr, "tun", dev.Name(), "network", netPrefix,
