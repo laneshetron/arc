@@ -94,6 +94,9 @@ func run(args []string) error {
 	tlsAddr := fs.String("tls", "", "relay TLS/TCP endpoint, host:port: adds a TLS carrier per interface, used only while no UDP path works")
 	tlsCA := fs.String("tls-ca", "", "PEM certificates to trust for -tls (default: the system roots)")
 	tlsName := fs.String("tls-server-name", "", "name to verify the relay's TLS certificate against (default: the -tls host)")
+	tlsCover := fs.String("tls-cover", "", "pose the TLS carrier as this host instead of the -tls host: present it as the server name (SNI); with no -tls-ca, certificate verification is skipped, since ARC authenticates the relay itself (spec D2)")
+	tlsFingerprint := fs.String("tls-fingerprint", "", "shape the TLS ClientHello as a browser's: chrome, edge, safari, ios, or firefox (optional; the relay certificate is still verified unless -tls-cover is set)")
+	tlsFragment := fs.Int("tls-fragment", 0, "send the TLS ClientHello in TCP segments of at most this many bytes (optional; the relay certificate is still verified unless -tls-cover is set)")
 	noOffload := fs.Bool("no-offload", false, "send and receive without UDP GSO/GRO, for comparison")
 	fecMode := wire.FECAuto
 	fs.Func("fec", "forward error correction: auto (default; while loss is at least 0.5%), off, or always", func(v string) error {
@@ -230,6 +233,17 @@ func run(args []string) error {
 		if err != nil {
 			return err
 		}
+		var camo *stream.Camouflage
+		if *tlsCover != "" || *tlsFingerprint != "" || *tlsFragment != 0 {
+			camo = &stream.Camouflage{
+				Name: *tlsCover, Fingerprint: *tlsFingerprint, Fragment: *tlsFragment,
+			}
+			if err := camo.Validate(); err != nil {
+				return fmt.Errorf("-tls-fingerprint/-tls-fragment: %w", err)
+			}
+			log.Info("tls carrier will pose as ordinary web traffic",
+				"cover", camo.Name, "fingerprint", camo.Fingerprint, "fragment", camo.Fragment)
+		}
 		bootstrap, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		tlsEndpoints, err := stream.ResolveEndpoints(bootstrap, *tlsAddr)
 		cancel()
@@ -245,7 +259,8 @@ func run(args []string) error {
 			}
 			conn := stream.Dial(stream.ClientOptions{
 				Addr: *tlsAddr, Endpoints: tlsEndpoints, TLS: tlsConfig, Peer: relayAddr,
-				Sockopt: sockopt.Options{Mark: sockOpts.Mark, Device: iface},
+				Camouflage: camo,
+				Sockopt:    sockopt.Options{Mark: sockOpts.Mark, Device: iface},
 				OnState: func(err error) {
 					if err != nil {
 						log.Debug("tls carrier", "carrier", name+"/tls", "err", err)

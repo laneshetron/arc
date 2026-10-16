@@ -62,6 +62,16 @@ sudo bin/arc-client run -relay RELAY_IP:4433 -relay-key RELAY_PUBLIC_KEY -full-t
 # `arc-relay gencert -hosts ...` makes a certificate for -tls-ca if needed
 sudo bin/arc-client run ... -tls RELAY_HOST:443
 
+# Where the network watches TLS, pose the TLS carrier as a host the network
+# permits: -tls-cover presents that name instead of the relay's own, and
+# -tls-fingerprint chrome shapes the ClientHello like a browser's (with
+# -tls-fragment N, the ClientHello is sent in small TCP segments). With
+# -tls-cover, no -tls-ca is needed: ARC's own session authenticates the relay
+# underneath. Without it, the relay's certificate is verified as usual. The relay
+# runs -tls-camouflage to accept browser-alike carrier connections, and its
+# certificate should list the cover name: arc-relay gencert -hosts COVER_HOST
+sudo bin/arc-client run ... -tls RELAY_HOST:443 -tls-cover COVER_HOST -tls-fingerprint chrome
+
 # Forward error correction is on by default (-fec auto): while a link loses
 # 0.5% or more, repair packets let the far end rebuild losses without TCP
 # retransmitting; -fec off disables it, -fec always keeps it on

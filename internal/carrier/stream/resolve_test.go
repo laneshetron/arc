@@ -51,7 +51,7 @@ func TestBootstrapEndpointsKeepTLSReconnectIndependentOfDNS(t *testing.T) {
 	defer func() { net.DefaultResolver = oldResolver }()
 	c := &Client{ctx: context.Background(), opts: ClientOptions{Addr: endpoint, Endpoints: endpoints, TLS: &tls.Config{ServerName: "relay.invalid", RootCAs: roots}, Queue: 1}}
 	for range 2 {
-		link, err := c.connect()
+		link, _, err := c.connect()
 		if err != nil {
 			t.Fatalf("cached endpoint TLS dial: %v", err)
 		}
@@ -102,12 +102,12 @@ func TestResolvesLaterWhenStartupLookupFailed(t *testing.T) {
 			}
 			return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil
 		}}
-	if _, err := c.connect(); err == nil {
+	if _, _, err := c.connect(); err == nil {
 		t.Fatal("connected without an address")
 	}
 	dnsUp = true
 	for range 2 {
-		link, err := c.connect()
+		link, _, err := c.connect()
 		if err != nil {
 			t.Fatalf("connect after DNS came up: %v", err)
 		}

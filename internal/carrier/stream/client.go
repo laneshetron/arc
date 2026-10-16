@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"sync"
@@ -25,8 +26,15 @@ type ClientOptions struct {
 	// the client.
 	Endpoints []netip.AddrPort
 	// TLS verifies the relay's certificate (ServerName, RootCAs). The
-	// carrier requires TLS 1.3 and ALPN "arc/1".
+	// carrier requires TLS 1.3 and ALPN "arc/1", unless Camouflage is
+	// set: then the outer handshake is cover and the ARC session
+	// underneath provides security.
 	TLS *tls.Config
+	// Camouflage, when set, presents the outer TLS as ordinary browser
+	// traffic (cover server name, optional browser fingerprint, optional
+	// ClientHello segmentation) instead of verifying the relay and
+	// negotiating ALPN "arc/1".
+	Camouflage *Camouflage
 	// Socket options for the TCP connection.
 	Sockopt sockopt.Options
 	// Peer is reported as the source of received packets, so the engine
@@ -78,7 +86,13 @@ func Dial(opts ClientOptions) *Client {
 func (c *Client) connectLoop() {
 	backoff := 500 * time.Millisecond
 	for c.ctx.Err() == nil {
-		l, err := c.connect()
+		l, track, err := c.connect()
+		if c.ctx.Err() != nil { // closed mid-dial: nothing to report
+			if l != nil {
+				l.close()
+			}
+			return
+		}
 		if err == nil {
 			c.setLink(l) // before OnState, so a write it prompts is not dropped
 		}
@@ -94,13 +108,17 @@ func (c *Client) connectLoop() {
 				case <-l.done:
 				}
 			}()
-			l.run(c.in)
+			derr := l.run(c.in)
 			c.setLink(nil)
 			if c.ctx.Err() != nil {
 				return
 			}
 			if c.opts.OnState != nil {
-				c.opts.OnState(errors.New("stream: connection closed"))
+				if derr != nil {
+					c.opts.OnState(classifyDeath(track, derr))
+				} else {
+					c.opts.OnState(errors.New("stream: connection closed"))
+				}
 			}
 			if time.Since(start) > 10*time.Second {
 				backoff = 500 * time.Millisecond // it worked for a while
@@ -115,23 +133,30 @@ func (c *Client) connectLoop() {
 	}
 }
 
-func (c *Client) connect() (*link, error) {
+func (c *Client) connect() (*link, *trackingConn, error) {
 	ctx, cancel := context.WithTimeout(c.ctx, 10*time.Second)
 	defer cancel()
-	cfg := c.opts.TLS.Clone()
-	cfg.MinVersion = tls.VersionTLS13
-	cfg.NextProtos = []string{ALPN}
-	if cfg.ServerName == "" {
-		// The dial target below is a resolved IP, so tls.Dialer would
-		// infer the IP as the name to verify; keep the original host.
-		if host, _, err := net.SplitHostPort(c.opts.Addr); err == nil {
-			cfg.ServerName = host
-		}
+	conn, raw, alpn, err := c.dialTLS(ctx)
+	if err != nil {
+		return nil, nil, err
 	}
-	d := tls.Dialer{
-		NetDialer: &net.Dialer{Control: sockopt.Control(c.opts.Sockopt), KeepAlive: 15 * time.Second},
-		Config:    cfg,
+	// The camouflage profile offers a browser's ALPN, so the negotiated
+	// label is not the carrier's; the ARC session authenticates the peer.
+	if c.opts.Camouflage == nil && alpn != ALPN {
+		conn.Close()
+		return nil, nil, &Failure{Mode: ModeDied, At: raw.total(),
+			Err: errors.New("stream: relay did not negotiate ALPN " + ALPN)}
 	}
+	return newLink(conn, c.opts.Peer, c.opts.Queue, 0), raw, nil
+}
+
+// dialTLS connects to the relay endpoint and runs the TLS handshake,
+// returning the TLS connection, its tracked transport (whose byte counts
+// classify any later death), and the negotiated protocol. Failures are
+// classified (§8 taxonomy): OnState receives a *Failure, not a bare
+// error. SetNoDelay runs before the handshake: the camouflage profile
+// needs its ClientHello fragments to leave as TCP segments at once.
+func (c *Client) dialTLS(ctx context.Context) (net.Conn, *trackingConn, string, error) {
 	if len(c.endpoints) == 0 {
 		c.endpoints = c.opts.Endpoints
 	}
@@ -142,22 +167,67 @@ func (c *Client) connect() (*link, error) {
 		}
 		eps, err := resolveEndpoints(ctx, c.opts.Addr, lookup)
 		if err != nil {
-			return nil, err
+			return nil, nil, "", classifyConnect(err)
 		}
 		c.endpoints = eps
 	}
+	// The TLS server name still comes from Addr (see handshakeTLS).
 	addr := c.endpoints[c.nextEndpoint%len(c.endpoints)].String()
 	c.nextEndpoint = (c.nextEndpoint + 1) % len(c.endpoints)
-	conn, err := d.DialContext(ctx, "tcp", addr)
+	tcp, err := (&net.Dialer{
+		Control:   sockopt.Control(c.opts.Sockopt),
+		KeepAlive: 15 * time.Second,
+	}).DialContext(ctx, "tcp", addr)
 	if err != nil {
-		return nil, err
+		return nil, nil, "", classifyConnect(err)
 	}
-	if p := conn.(*tls.Conn).ConnectionState().NegotiatedProtocol; p != ALPN {
-		conn.Close()
-		return nil, errors.New("stream: relay did not negotiate ALPN " + ALPN)
+	raw := &trackingConn{Conn: tcp}
+	if t, ok := tcp.(*net.TCPConn); ok {
+		t.SetNoDelay(true)
 	}
-	conn.(*tls.Conn).NetConn().(*net.TCPConn).SetNoDelay(true)
-	return newLink(conn, c.opts.Peer, c.opts.Queue, 0), nil
+	conn, alpn, err := c.handshakeTLS(ctx, raw)
+	if err != nil {
+		raw.Close()
+		return nil, nil, "", classifyHandshake(raw, err)
+	}
+	return conn, raw, alpn, nil
+}
+
+// handshakeTLS runs the carrier's TLS handshake over raw: the plain
+// carrier (spec §16.3) with verified identity and ALPN arc/1, or the
+// camouflage profile, which hands the whole outer handshake its shape.
+func (c *Client) handshakeTLS(ctx context.Context, raw *trackingConn) (net.Conn, string, error) {
+	if cam := c.opts.Camouflage; cam != nil {
+		return cam.Handshake(ctx, raw, c.opts.Addr, c.opts.TLS)
+	}
+	cfg, err := clientConfig(c.opts.TLS, c.opts.Addr)
+	if err != nil {
+		return nil, "", err
+	}
+	cfg.MinVersion = tls.VersionTLS13
+	cfg.NextProtos = []string{ALPN}
+	conn := tls.Client(raw, cfg)
+	if err := conn.HandshakeContext(ctx); err != nil {
+		return nil, "", err
+	}
+	return conn, conn.ConnectionState().NegotiatedProtocol, nil
+}
+
+// clientConfig clones base (nil for defaults) and, like tls.Dial, fills
+// an empty server name from addr's host.
+func clientConfig(base *tls.Config, addr string) (*tls.Config, error) {
+	if base == nil {
+		base = &tls.Config{}
+	}
+	cfg := base.Clone()
+	if cfg.ServerName == "" {
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, fmt.Errorf("stream: no TLS server name: %w", err)
+		}
+		cfg.ServerName = host
+	}
+	return cfg, nil
 }
 
 func (c *Client) setLink(l *link) {

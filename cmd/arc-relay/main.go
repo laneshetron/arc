@@ -132,6 +132,7 @@ func run(args []string) error {
 	noOffload := fs.Bool("no-offload", false, "send and receive without UDP GSO/GRO, for comparison")
 	status := fs.Duration("status", 0, "log each session's paths at this interval (0: off)")
 	tlsListen := fs.String("tls-listen", "", "TCP address for TLS/TCP carriers, e.g. 0.0.0.0:443 (default: off)")
+	tlsCamouflage := fs.Bool("tls-camouflage", false, "accept TLS carrier connections that present a browser's ALPN (h2, http/1.1) instead of arc/1, as clients posing as browsers do; the certificate should cover those cover names")
 	tlsCert := fs.String("tls-cert", "relay.crt", "TLS certificate (PEM) for -tls-listen")
 	tlsKey := fs.String("tls-key", "relay.tls.key", "TLS private key (PEM) for -tls-listen")
 	noFEC := fs.Bool("no-fec", false, "decline forward error correction for clients' traffic")
@@ -218,8 +219,11 @@ func run(args []string) error {
 		if err != nil {
 			return fmt.Errorf("-tls-listen: %w", err)
 		}
-		ln, err := stream.Listen(*tlsListen, stream.ListenerOptions{TLS: &tls.Config{Certificates: []tls.Certificate{cert}}, MaxConns: *maxTLS, MaxPending: *maxTLSHandshakes, MaxConnsPerSource: *maxTLSPerSource,
-			HandshakeTimeout: *tlsHandshakeTimeout})
+		ln, err := stream.Listen(*tlsListen, stream.ListenerOptions{
+			TLS: &tls.Config{Certificates: []tls.Certificate{cert}}, Camouflage: *tlsCamouflage,
+			MaxConns: *maxTLS, MaxPending: *maxTLSHandshakes, MaxConnsPerSource: *maxTLSPerSource,
+			HandshakeTimeout: *tlsHandshakeTimeout,
+		})
 		if err != nil {
 			return err
 		}
