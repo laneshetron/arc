@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"crypto/subtle"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -38,9 +39,23 @@ type FrontOptions struct {
 	// Site serves cover content; nil serves a minimal built-in page.
 	// Operators should point it at an innocuous real site.
 	Site http.Handler
-	// MaxConns bounds concurrent carrier connections (default 4096);
-	// cover visitors are the HTTP server's concern, not counted here.
+	// MaxConns bounds all concurrent connections, visitors and carriers
+	// together (default 4096).
 	MaxConns int
+	// MaxPending bounds connections that are not carriers: TLS
+	// handshakes, and HTTP visitors until they close (default 128).
+	MaxPending int
+	// MaxConnsPerSource and MaxPendingPerSource apply to the TCP peer's
+	// IP (defaults 64 and 8; browsers open up to 6 HTTP/1.1 connections
+	// to a site, so a visitor stays within the pending budget).
+	MaxConnsPerSource   int
+	MaxPendingPerSource int
+	// HandshakeTimeout bounds the TLS handshake, and then reading each
+	// request's headers (default 10 seconds, as ListenerOptions).
+	HandshakeTimeout time.Duration
+	// VisitorIdle closes a visitor's keep-alive connection after this
+	// long without a request (default 60 seconds).
+	VisitorIdle time.Duration
 	// Idle closes a carrier connection that receives nothing for this
 	// long (default 5 minutes).
 	Idle time.Duration
@@ -55,12 +70,35 @@ type Front struct {
 	ln     net.Listener
 	srv    *http.Server
 	reg    *registry
+	adm    *admission
 	cover  http.Handler
 	tokens [][]byte
 }
 
 // ListenFront starts the front on addr.
 func ListenFront(addr string, opts FrontOptions) (*Front, error) {
+	if opts.MaxConns == 0 {
+		opts.MaxConns = 4096
+	}
+	if opts.MaxPending == 0 {
+		opts.MaxPending = 128
+	}
+	if opts.MaxConnsPerSource == 0 {
+		opts.MaxConnsPerSource = 64
+	}
+	if opts.MaxPendingPerSource == 0 {
+		opts.MaxPendingPerSource = 8
+	}
+	if opts.HandshakeTimeout == 0 {
+		opts.HandshakeTimeout = 10 * time.Second
+	}
+	if opts.VisitorIdle == 0 {
+		opts.VisitorIdle = 60 * time.Second
+	}
+	if opts.MaxConns < 0 || opts.MaxPending < 0 || opts.MaxConnsPerSource < 0 || opts.MaxPendingPerSource < 0 ||
+		opts.HandshakeTimeout < 0 || opts.VisitorIdle < 0 || opts.Queue < 0 || opts.Idle < 0 {
+		return nil, errors.New("stream: front connection, timeout, queue and idle limits must not be negative")
+	}
 	cfg := opts.TLS.Clone()
 	cfg.MinVersion = tls.VersionTLS13
 	// A browser-alike offer must succeed: the cover site is ordinary
@@ -70,16 +108,25 @@ func ListenFront(addr string, opts FrontOptions) (*Front, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Limits apply as each TCP connection arrives, before any TLS work.
+	adm := newAdmission(admissionLimits{
+		maxConns: opts.MaxConns, maxPending: opts.MaxPending,
+		maxConnsPerSource: opts.MaxConnsPerSource, maxPendingPerSource: opts.MaxPendingPerSource,
+	})
 	f := &Front{
-		ln:     tls.NewListener(tcp, cfg),
+		ln:     tls.NewListener(&admittedListener{Listener: tcp, adm: adm}, cfg),
 		reg:    newRegistry(opts.MaxConns, opts.Queue, opts.Idle),
+		adm:    adm,
 		cover:  opts.Site,
 		tokens: opts.Tokens,
 	}
 	if f.cover == nil {
 		f.cover = http.HandlerFunc(defaultCover)
 	}
-	f.srv = &http.Server{Handler: http.HandlerFunc(f.handle), ReadHeaderTimeout: 10 * time.Second}
+	// ReadHeaderTimeout also bounds the TLS handshake (net/http uses the
+	// shortest of its read and write timeouts); IdleTimeout frees the
+	// pending permits idle visitors hold.
+	f.srv = &http.Server{Handler: http.HandlerFunc(f.handle), ReadHeaderTimeout: opts.HandshakeTimeout, IdleTimeout: opts.VisitorIdle}
 	go func() {
 		f.srv.Serve(f.ln) // returns ErrServerClosed on Close; nothing else to do
 	}()
@@ -108,8 +155,11 @@ func (f *Front) handle(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		conn.SetDeadline(time.Time{}) // the header timeout must not govern the carrier
-		if tcp, ok := conn.(*tls.Conn).NetConn().(*net.TCPConn); ok {
-			tcp.SetNoDelay(true)
+		if ac, ok := conn.(*tls.Conn).NetConn().(*admittedConn); ok {
+			if tcp, ok := ac.Conn.(*net.TCPConn); ok {
+				tcp.SetNoDelay(true)
+			}
+			ac.permit.established() // a carrier now, off the visitor budgets
 		}
 		// Bytes past the client's request may already sit in the hijacked
 		// buffer; the carrier's frames must not lose them.
@@ -170,7 +220,9 @@ func (f *Front) Conns() int { return f.reg.conns() }
 // Close stops accepting and closes every carrier connection.
 func (f *Front) Close() error {
 	f.reg.close()
-	return f.srv.Close()
+	err := f.srv.Close()
+	f.adm.closeAll() // hijacked carriers are no longer the server's to close
+	return err
 }
 
 // upgradeFront sends the front's upgrade request over the client's TLS

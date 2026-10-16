@@ -151,10 +151,10 @@ func run(args []string) error {
 	maxPending := fs.Int("max-pending", 4096, "maximum pending Noise handshakes")
 	handshakeRate := fs.Int("handshakes-per-second", 256, "global Noise handshake work rate and burst")
 	sourceRate := fs.Int("handshakes-per-source", 8, "per-source-IP Noise handshake work rate and burst")
-	maxTLS := fs.Int("max-tls-conns", 4096, "maximum pending and established TLS carrier connections combined")
-	maxTLSHandshakes := fs.Int("max-tls-handshakes", 128, "maximum pending TLS handshakes")
-	maxTLSPerSource := fs.Int("max-tls-conns-per-source", 64, "maximum TLS carrier connections per TCP peer IP")
-	tlsHandshakeTimeout := fs.Duration("tls-handshake-timeout", 10*time.Second, "time allowed for a TLS carrier handshake; lossy networks need several seconds")
+	maxTLS := fs.Int("max-tls-conns", 4096, "maximum pending and established TLS carrier connections combined (with -front-listen: all front connections, visitors included)")
+	maxTLSHandshakes := fs.Int("max-tls-handshakes", 128, "maximum pending TLS handshakes (with -front-listen: front connections that are not carriers, visitors included)")
+	maxTLSPerSource := fs.Int("max-tls-conns-per-source", 64, "maximum TLS carrier connections per TCP peer IP (with -front-listen: front connections, visitors included)")
+	tlsHandshakeTimeout := fs.Duration("tls-handshake-timeout", 10*time.Second, "time allowed for a TLS carrier handshake (with -front-listen: also each request's headers); lossy networks need several seconds")
 	prof := profiling.Register(fs)
 	fs.Parse(args)
 	if *maxSessions <= 0 || *maxPending <= 0 || *handshakeRate <= 0 || *sourceRate <= 0 || *maxTLS <= 0 || *maxTLSHandshakes <= 0 || *maxTLSPerSource <= 0 || *tlsHandshakeTimeout <= 0 {
@@ -253,6 +253,8 @@ func run(args []string) error {
 		front, err := stream.ListenFront(*frontListen, stream.FrontOptions{
 			TLS:    &tls.Config{Certificates: []tls.Certificate{cert}},
 			Tokens: gwCfg.Tokens, Site: site,
+			MaxConns: *maxTLS, MaxPending: *maxTLSHandshakes, MaxConnsPerSource: *maxTLSPerSource,
+			HandshakeTimeout: *tlsHandshakeTimeout,
 		})
 		if err != nil {
 			return err

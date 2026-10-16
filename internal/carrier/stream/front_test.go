@@ -18,7 +18,8 @@ const frontToken = "some-token"
 
 // startFront starts a front with the test token and a certificate for
 // the cover name, returning it with the certificate PEM for pinning.
-func startFront(t *testing.T) (*Front, []byte) {
+// mods adjust the options before the front starts.
+func startFront(t *testing.T, mods ...func(*FrontOptions)) (*Front, []byte) {
 	t.Helper()
 	certPEM, keyPEM, err := SelfSigned([]string{"cdn.example"}, time.Hour)
 	if err != nil {
@@ -28,10 +29,14 @@ func startFront(t *testing.T) (*Front, []byte) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f, err := ListenFront("127.0.0.1:0", FrontOptions{
+	opts := FrontOptions{
 		TLS:    &tls.Config{Certificates: []tls.Certificate{cert}},
 		Tokens: [][]byte{[]byte(frontToken)},
-	})
+	}
+	for _, mod := range mods {
+		mod(&opts)
+	}
+	f, err := ListenFront("127.0.0.1:0", opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,9 +45,9 @@ func startFront(t *testing.T) (*Front, []byte) {
 }
 
 // frontPair starts a front and a client carrier riding its upgrade.
-func frontPair(t *testing.T) (*Front, *Client, chan error) {
+func frontPair(t *testing.T, mods ...func(*FrontOptions)) (*Front, *Client, chan error) {
 	t.Helper()
-	f, certPEM := startFront(t)
+	f, certPEM := startFront(t, mods...)
 	roots := x509.NewCertPool()
 	roots.AppendCertsFromPEM(certPEM)
 	states := make(chan error, 16)
