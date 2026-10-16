@@ -37,10 +37,15 @@ All other type values are reserved: drop them silently.
 | `0x0F` | `REDUNDANCY` | 5 (`seq:u32; mode:u8`, mode 0 or 1) | yes |
 | `0x10` | `FEC_REPAIR` | 9+ (`first32:u32; stride:u8; k:u8; m:u8; index:u8` + symbol) | yes |
 | `0x11` | `FEC` | 5 (`seq:u32; mode:u8`, mode 0–2) | yes |
-| `0x12`–`0x7F` | reserved, required | — | reject the packet |
+| `0x12` | `STREAM_OPEN` | 10 or 22 (`stream_id:u32; port:u16; addr[4 or 16]`) | yes |
+| `0x13` | `STREAM` | 13+ (`stream_id:u32; offset:u64; flags:u8` + data; flags bit 0 `FIN`) | yes |
+| `0x14` | `MAX_STREAM_DATA` | 12 (`stream_id:u32; max:u64`) | yes |
+| `0x15` | `MAX_DATA` | 8 (`max:u64`) | yes |
+| `0x16` | `STREAM_RESET` | 14 (`stream_id:u32; code:u16; final:u64`) | yes |
+| `0x17`–`0x7F` | reserved, required | — | reject the packet |
 | `0x80`–`0xFF` | extensions, ignorable | — | ignore |
 
-`IP_DATAGRAM` and `REDUNDANCY` are sent only when `AUTH_RESULT` advertises features bit 0 (§11.1), and `FEC_REPAIR` and `FEC` only with bit 1 (§11.2), which also allows `IP_DATAGRAM`.
+`IP_DATAGRAM` and `REDUNDANCY` are sent only when `AUTH_RESULT` advertises features bit 0 (§11.1), and `FEC_REPAIR` and `FEC` only with bit 1 (§11.2), which also allows `IP_DATAGRAM`. The stream frames (`0x12`–`0x16`) are sent only with bit 2 (§11.3). Stream IDs are never 0, and stream offsets and limits stay below 2^62.
 
 ## AUTH_RESULT features (§10.1)
 
@@ -48,12 +53,13 @@ All other type values are reserved: drop them silently.
 |---|---|---|
 | 0 | `REDUNDANCY` | relay accepts `IP_DATAGRAM` and `REDUNDANCY` (§11.1) |
 | 1 | `FEC` | relay accepts `IP_DATAGRAM`, `FEC_REPAIR` and `FEC` (§11.2) |
+| 2 | `STREAMS` | relay accepts `STREAM_OPEN` and carries streams to TCP destinations (§11.3) |
 
 Other bits are sent as zero and ignored on receipt.
 
 ## Error / close codes (§10.1)
 
-`0 NO_ERROR` · `1 MALFORMED` · `2 AUTH_FAILED` · `3 UNAUTHORIZED` · `4 PATH_UNAVAILABLE` · `5 CAPACITY` · `6 UNSUPPORTED` · `7 SESSION_EXPIRED` · `8 PROTOCOL_VIOLATION`
+`0 NO_ERROR` · `1 MALFORMED` · `2 AUTH_FAILED` · `3 UNAUTHORIZED` · `4 PATH_UNAVAILABLE` · `5 CAPACITY` · `6 UNSUPPORTED` · `7 SESSION_EXPIRED` · `8 PROTOCOL_VIOLATION` · `9 CONNECT_FAILED` · `10 ABORTED` (9 and 10 in `STREAM_RESET`)
 
 ## Cryptography (§8.6, §9, §13, §14.7)
 

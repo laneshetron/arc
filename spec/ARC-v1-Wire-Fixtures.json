@@ -68,7 +68,7 @@
     {
       "name": "AUTH_RESULT",
       "type": 2,
-      "frame_hex": "02001c000a4d00021005000a4d0001000027100001d4c00000000000000003",
+      "frame_hex": "02001c000a4d00021005000a4d0001000027100001d4c00000000000000007",
       "fields": {
         "status": 0,
         "ipv4": "10.77.0.2",
@@ -77,7 +77,7 @@
         "dns_ipv4": "10.77.0.1",
         "keepalive_ms": 10000,
         "idle_ms": 120000,
-        "features": 3
+        "features": 7
       }
     },
     {
@@ -237,6 +237,62 @@
       "fields": {
         "seq": 8,
         "mode": 1
+      }
+    },
+    {
+      "name": "STREAM_OPEN",
+      "type": 18,
+      "frame_hex": "12000a0000000301bbc6336407",
+      "fields": {
+        "stream_id": 3,
+        "dst": "198.51.100.7:443"
+      }
+    },
+    {
+      "name": "STREAM_OPEN_V6",
+      "type": 18,
+      "frame_hex": "12001600000004005020010db8000000000000000000000001",
+      "fields": {
+        "stream_id": 4,
+        "dst": "[2001:db8::1]:80"
+      }
+    },
+    {
+      "name": "STREAM",
+      "type": 19,
+      "frame_hex": "13001d00000003000000000001117001474554202f20485454502f312e310d0a",
+      "fields": {
+        "stream_id": 3,
+        "offset": 70000,
+        "fin": true,
+        "data_hex": "474554202f20485454502f312e310d0a"
+      }
+    },
+    {
+      "name": "MAX_STREAM_DATA",
+      "type": 20,
+      "frame_hex": "14000c000000030000000000300000",
+      "fields": {
+        "stream_id": 3,
+        "max": 3145728
+      }
+    },
+    {
+      "name": "MAX_DATA",
+      "type": 21,
+      "frame_hex": "1500080000000001800000",
+      "fields": {
+        "max": 25165824
+      }
+    },
+    {
+      "name": "STREAM_RESET",
+      "type": 22,
+      "frame_hex": "16000e00000003000900000000000004d2",
+      "fields": {
+        "stream_id": 3,
+        "code": 9,
+        "final": 1234
       }
     },
     {
@@ -432,6 +488,46 @@
     {
       "name": "fec unknown mode",
       "hex": "1100050000000103"
+    },
+    {
+      "name": "stream_open stream zero",
+      "hex": "12000a0000000001bb07070707"
+    },
+    {
+      "name": "stream_open port zero",
+      "hex": "12000a00000001000007070707"
+    },
+    {
+      "name": "stream_open unspecified address",
+      "hex": "12000a0000000101bb00000000"
+    },
+    {
+      "name": "stream_open address size",
+      "hex": "12000e0000000101bb0707070707070707"
+    },
+    {
+      "name": "stream truncated",
+      "hex": "13000c000000010000000000000000"
+    },
+    {
+      "name": "stream unknown flags",
+      "hex": "13000d00000001000000000000000002"
+    },
+    {
+      "name": "stream past max offset",
+      "hex": "13000e000000013fffffffffffffff0078"
+    },
+    {
+      "name": "max_stream_data past max offset",
+      "hex": "14000c000000014000000000000000"
+    },
+    {
+      "name": "max_data wrong size",
+      "hex": "15000400000001"
+    },
+    {
+      "name": "stream_reset wrong size",
+      "hex": "160006000000010009"
     },
     {
       "name": "redundancy unknown mode",

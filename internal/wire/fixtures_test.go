@@ -244,6 +244,27 @@ func checkFrameFields(t *testing.T, fr Frame, fields map[string]any) {
 		if v.Seq != uint32(num("seq")) || v.Mode != RedundancyMode(num("mode")) {
 			t.Errorf("REDUNDANCY = %+v", v)
 		}
+	case StreamOpen:
+		if v.ID != uint32(num("stream_id")) || v.Dst.String() != fields["dst"] {
+			t.Errorf("STREAM_OPEN = %+v", v)
+		}
+	case Stream:
+		if v.ID != uint32(num("stream_id")) || v.Offset != num("offset") || v.Fin != fields["fin"] ||
+			hex.EncodeToString(v.Data) != fields["data_hex"] {
+			t.Errorf("STREAM = %+v", v)
+		}
+	case MaxStreamData:
+		if v.ID != uint32(num("stream_id")) || v.Max != num("max") {
+			t.Errorf("MAX_STREAM_DATA = %+v", v)
+		}
+	case MaxData:
+		if v.Max != num("max") {
+			t.Errorf("MAX_DATA = %+v", v)
+		}
+	case StreamReset:
+		if v.ID != uint32(num("stream_id")) || v.Code != ErrorCode(num("code")) || v.Final != num("final") {
+			t.Errorf("STREAM_RESET = %+v", v)
+		}
 	case NewPath:
 		if v.PathID != uint32(num("path_id")) || hex.EncodeToString(v.CID[:]) != fields["cid_hex"] ||
 			hex.EncodeToString(v.ResetToken[:]) != fields["reset_token_hex"] {

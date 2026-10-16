@@ -96,3 +96,26 @@ func TestMinRTTWindow(t *testing.T) {
 		t.Fatalf("new lower sample: min %v, want 30ms", got)
 	}
 }
+
+func TestLateAckNotDelivery(t *testing.T) {
+	// An ACK arriving long after its packets were sent, as the first one
+	// after an outage can, acknowledges them without counting them toward
+	// the delivery rate.
+	var s sentLog
+	t0 := time.Unix(1_000_000, 0)
+	for pn := range uint64(10) {
+		s.add(sentPacket{pn: pn, sentAt: t0, size: 1200})
+	}
+	ack := wire.Ack{Largest: 9, FirstRange: 9}
+	iv, _ := ack.AppendIntervals(nil)
+	if res := s.onAck(t0.Add(12*time.Second), &ack, iv, 0, time.Second); res.newlyAcked != 10 || res.deliveredBytes != 0 {
+		t.Fatalf("late ACK: %d acknowledged, %d bytes delivered; want 10 and 0", res.newlyAcked, res.deliveredBytes)
+	}
+	s = sentLog{}
+	for pn := range uint64(10) {
+		s.add(sentPacket{pn: pn, sentAt: t0, size: 1200})
+	}
+	if res := s.onAck(t0.Add(50*time.Millisecond), &ack, iv, 0, time.Second); res.deliveredBytes != 12000 {
+		t.Fatalf("prompt ACK: %d bytes delivered, want 12000", res.deliveredBytes)
+	}
+}

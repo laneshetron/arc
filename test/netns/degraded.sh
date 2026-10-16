@@ -285,9 +285,12 @@ aggregate() { # aggregate NAME IPERF_ARGS...: sets AGG_ONE and AGG_TWO
   impair 1 loss 100%
   sleep 2
   AGG_ONE=$(tcp_up "$@")
+  AGG_CLIENT_LINE=$(wc -l <"$WORK/client-agg.log") AGG_RELAY_LINE=$(wc -l <"$WORK/relay.log")
+  local c1tx c1rx
+  c1tx=$($C cat /sys/class/net/c1/statistics/tx_bytes) c1rx=$($C cat /sys/class/net/c1/statistics/rx_bytes)
   impair 1 rate 50mbit delay 10ms limit 500
   sleep 3 # link 1 answers its probes and turns healthy
-  AGG_CLIENT_LINE=$(wc -l <"$WORK/client-agg.log") AGG_RELAY_LINE=$(wc -l <"$WORK/relay.log")
+  AGG_RESTORE="link 1 while turning healthy: $(($($C cat /sys/class/net/c1/statistics/tx_bytes) - c1tx)) bytes out, $(($($C cat /sys/class/net/c1/statistics/rx_bytes) - c1rx)) in"
   AGG_TWO=$(tcp_up "$@")
   unimpair 0
   unimpair 1
@@ -302,7 +305,8 @@ for dir in up down; do
     pass "4 flows $dir over two links: $AGG_TWO Mbit/s against $AGG_ONE on one"
   else
     fail "4 flows $dir over two links: $AGG_TWO Mbit/s, not 1.4x the $AGG_ONE of one link"
-    echo "  path state during the two-link run (client, then relay), from -status:"
+    echo "  $AGG_RESTORE"
+    echo "  path state from link 1's restoration through the two-link run (client, then relay), from -status:"
     tail -n +"$AGG_CLIENT_LINE" "$WORK/client-agg.log" | grep 'msg=path ' | sed 's/^/    /'
     tail -n +"$AGG_RELAY_LINE" "$WORK/relay.log" | grep 'msg=path ' | sed 's/^/    /'
   fi

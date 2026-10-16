@@ -116,7 +116,7 @@ The data plane does **not** depend on control messages being sent on the same ca
 
 **D2 — Client↔relay overlay encryption, independent of adapter.** TLS/QUIC may encrypt the outer transport, but an ARC packet is encrypted before passing to any adapter. DNS/ICMP adapters never receive plaintext IP packets.
 
-**D3 — Packet-oriented overlay.** The default payload is an unreliable IP datagram. TCP already provides application reliability where applicable. Avoid blanket retransmission of all tunneled packets, which can amplify head-of-line blocking and congestion collapse.
+**D3 — Packet-oriented overlay.** The default payload is an unreliable IP datagram. TCP already provides application reliability where applicable. Avoid blanket retransmission of all tunneled packets, which can amplify head-of-line blocking and congestion collapse. Streams (§11.3) are the opt-in exception for degraded links: they end TCP connections at the client and carry their bytes reliably, rather than retransmitting their packets.
 
 **D4 — Narrow carrier contract.** A path transmits and receives bounded cells and reports observed constraints. It does not decide how to split application flows or which packets are valuable.
 
@@ -370,12 +370,17 @@ frame_value:  frame_length bytes
 | `0F` | `REDUNDANCY` | 5 bytes: `seq:u32; mode:u8` (§11.1) | Client → relay, if negotiated | Yes |
 | `10` | `FEC_REPAIR` | `first32:u32; stride:u8; k:u8; m:u8; index:u8; symbol` (§11.2) | Both, after AUTH, if negotiated | Yes |
 | `11` | `FEC` | 5 bytes: `seq:u32; mode:u8` (§11.2) | Client → relay, if negotiated | Yes |
+| `12` | `STREAM_OPEN` | `stream_id:u32; port:u16; addr` (4 or 16 bytes) (§11.3) | Client → relay, if negotiated | Yes |
+| `13` | `STREAM` | `stream_id:u32; offset:u64; flags:u8; data` (§11.3) | Both, if negotiated | Yes |
+| `14` | `MAX_STREAM_DATA` | 12 bytes: `stream_id:u32; max:u64` (§11.3) | Both, if negotiated | Yes |
+| `15` | `MAX_DATA` | 8 bytes: `max:u64` (§11.3) | Both, if negotiated | Yes |
+| `16` | `STREAM_RESET` | 14 bytes: `stream_id:u32; code:u16; final:u64` (§11.3) | Both, if negotiated | Yes |
 
 **`AUTH_RESULT`:**
 - `status=0` means success. Any other value is a failure, and all other fields MUST then be zero.
 - `tun_mtu` MUST be at least 1280 on success.
 - `dns_ipv4=0` means the relay supplied no resolver. Full-tunnel mode MUST then get an authenticated resolver setting from trusted, explicit client configuration.
-- `features` bit 0 (`REDUNDANCY`): the relay accepts `IP_DATAGRAM` and `REDUNDANCY` (§11.1). Bit 1 (`FEC`): the relay accepts `IP_DATAGRAM`, `FEC_REPAIR` and `FEC` (§11.2). A relay MUST send other bits as zero, and a client MUST ignore bits it does not know.
+- `features` bit 0 (`REDUNDANCY`): the relay accepts `IP_DATAGRAM` and `REDUNDANCY` (§11.1). Bit 1 (`FEC`): the relay accepts `IP_DATAGRAM`, `FEC_REPAIR` and `FEC` (§11.2). Bit 2 (`STREAMS`): the relay accepts `STREAM_OPEN` and carries streams (§11.3). A relay MUST send other bits as zero, and a client MUST ignore bits it does not know.
 - IPv6 configuration and pushed routes are deferred to an extension frame.
 - The relay controls address assignment by deployment policy. Receiving an address does not by itself authorize inbound Internet exposure.
 
@@ -386,7 +391,7 @@ frame_value:  frame_length bytes
 - `offset + data_len <= total_len`, and `20 <= total_len <= 65535`.
 - Fragments whose byte ranges overlap with conflicting contents cause the whole datagram to be discarded.
 
-**`ERROR` codes:** `1 MALFORMED`, `2 AUTH_FAILED`, `3 UNAUTHORIZED`, `4 PATH_UNAVAILABLE`, `5 CAPACITY`, `6 UNSUPPORTED`, `7 SESSION_EXPIRED`, `8 PROTOCOL_VIOLATION`. Unknown values are informational and MUST NOT crash an implementation. `CLOSE` and `PATH_ABANDON` use the same code space, plus `0 NO_ERROR`.
+**`ERROR` codes:** `1 MALFORMED`, `2 AUTH_FAILED`, `3 UNAUTHORIZED`, `4 PATH_UNAVAILABLE`, `5 CAPACITY`, `6 UNSUPPORTED`, `7 SESSION_EXPIRED`, `8 PROTOCOL_VIOLATION`, `9 CONNECT_FAILED`, `10 ABORTED` (the last two for `STREAM_RESET`, §11.3). Unknown values are informational and MUST NOT crash an implementation. `CLOSE` and `PATH_ABANDON` use the same code space, plus `0 NO_ERROR`.
 
 ### 10.2 `ACK` frame
 
@@ -408,9 +413,10 @@ The ranges follow QUIC (RFC 9000 §19.3.1):
 
 Behavior:
 - An `ACK` MAY travel on any path. For example, the fast path can carry ACKs for the DNS path.
-- Receivers SHOULD acknowledge ack-eliciting packets within `max_ack_delay` (default 25 ms), or after every second ack-eliciting packet, whichever comes first.
+- Receivers SHOULD acknowledge ack-eliciting packets within `max_ack_delay` (default 25 ms), or after every second ack-eliciting packet, whichever comes first. A packet carrying stream data (§11.3) that arrives after a gap in packet numbers SHOULD be acknowledged at once (RFC 9000 §13.2.1), so the sender learns of the loss and retransmits promptly. IP payloads are not retransmitted and keep the usual delay.
+- On a path whose loss estimate (§15.2) is at least 50%, the reference implementation sends each acknowledgement three times, in separate packets: the sender learns of losses only from acknowledgements that arrive.
 - A packet that contains only non-ack-eliciting frames MUST NOT be acknowledged on its own.
-- ACKs are **measurements only**. An ACK of an ARC packet does not guarantee application delivery, and a missing ACK does not trigger retransmission of IP payloads. Control frames with a nonce or ID are safe to resend in a fresh packet.
+- ACKs are **measurements only** for IP payloads. An ACK of an ARC packet does not guarantee application delivery, and a missing ACK does not trigger retransmission of IP payloads. Control frames with a nonce or ID are safe to resend in a fresh packet, and stream data is retransmitted (§11.3).
 - `ack_delay_us` lets the sender subtract the receiver's hold time when computing RTT. On poll-driven carriers this hold time is most of the observed delay.
 
 ## 11. Packet reassembly and deduplication
@@ -456,7 +462,7 @@ Redundancy needs a second path. On a single lossy path, forward error correction
   - The repair count per block is the smallest M for which more than M losses among K+M packets, lost independently at the measured rate, has probability at most 0.1%. It is capped at K/2.
   - The interleaving depth is about the mean loss-burst length, at most 8. Bursts are measured as runs of lost packets ended by a later acknowledged one.
   - A block group stays open about RTT/4, so rebuilt packets arrive before TCP takes the gap for loss, and at least long enough to collect 4 packets per block at the current send rate. The limit is 20 ms, or with interleaving min(RTT, 50 ms).
-  - With long bursts, `auto` stays off when a group at the current rate and window cannot span 4 mean bursts. Interleaving then cannot spread a burst, and the repairs would mostly be lost with it.
+  - With long bursts, the window also stays open long enough to collect 4 mean bursts' worth of packets, within the same limit, and `auto` stays off when even the limit is too short at the current rate, or when the mean burst exceeds 16, twice the deepest interleaving. Interleaving then cannot spread a burst, and the repairs would mostly be lost with it. (netem drops whole GSO batches, so under its "uniform" loss ARC measures bursts of 12–47 at a few hundred Mbit/s; protecting them cost 27% of TCP goodput with redundancy on.)
   - Repairs travel on the primary path.
 - **Limits.** FEC repairs random loss well. Long bursts on one path are hard for any block code at moderate rates: a group deep enough to spread them spans more time than a rebuilt packet can usefully arrive in. Redundancy across independent paths (§11.1) handles that case far better.
 - **Default.** `arc-client` defaults to `auto`, on this evidence (`test/netns/fec.sh`: one link, 40 ms RTT, medians of repeated 10 s TCP runs, Mbit/s up / down):
@@ -473,6 +479,44 @@ Redundancy needs a second path. On a single lossy path, forward error correction
   - Under uniform loss, TCP gains 3–8×.
   - Under bursty loss, `auto` mostly holds back and is neutral: single runs vary several-fold, and the medians do not separate.
   - `always` costs about 40% of clean-path throughput in this setup, in CPU for encoding and in extra packets.
+
+### 11.3 Streams (split TCP)
+
+FEC and redundancy keep a TCP connection moving at a few percent loss. At tens of percent, end-to-end TCP stalls whatever the tunnel does to its packets: it reads loss as congestion, and its retransmissions are lost as often as anything else. Streams carry the connection's bytes instead of its packets. The client completes the application's TCP handshake locally, the client and relay exchange the bytes reliably over the session, and the relay opens the real connection to the destination. The application's TCP then sees a loss-free path to the client, and the session alone deals with the loss, retransmitting and pacing without treating random loss as congestion. Satellite links use the same technique, a performance-enhancing proxy.
+
+The costs:
+- It breaks TCP's end-to-end semantics. The client acknowledges data the destination has not received, and a connection the relay cannot open is reset after the application has sent data.
+- The relay holds per-connection state and buffers.
+- It carries only TCP. QUIC and other UDP traffic stays IP packets.
+
+That makes it an opt-in mode for degraded networks. The client decides per connection which TCP connections become streams.
+
+- **Negotiation.** The relay advertises support with `AUTH_RESULT` features bit 2. Without it, the client sends no stream frames, and a relay that did not advertise it MUST ignore them.
+- **Stream IDs.** The client numbers streams from 1 upward and never reuses an ID in a session. The relay creates a stream on the first frame naming a new ID, since data may arrive before `STREAM_OPEN`. It treats an ID it has seen but no longer holds as closed, and ignores frames for it.
+- **`STREAM_OPEN`.** Asks the relay to connect stream `stream_id` to TCP `addr:port`: 4 address bytes for IPv4, 16 for IPv6. Port 0 and an unspecified address are malformed. It is retransmitted until acknowledged. The relay applies its egress policy (§17.2) and either connects or resets the stream: `CONNECT_FAILED` if the destination refused or did not answer, `UNAUTHORIZED` if policy forbids it, `CAPACITY` beyond its stream limit.
+- **`STREAM`.** Carries bytes of a stream starting at `offset`. Flags bit 0 (`FIN`) marks the end of the sender's data at `offset` + the data length; other flag bits are malformed. Offsets plus lengths stay below 2^62. Both directions of a stream are independent byte sequences, and each ends with its own `FIN`.
+- **Reliability.** A sender retransmits a stream frame's bytes, and its `FIN`, when the packet carrying them is declared lost or on PTO (§10.2), except for bytes already acknowledged in another packet. The receiver delivers bytes in order, once, and discards duplicates.
+- **Flow control.** `MAX_STREAM_DATA` gives the offset below which the peer may send on a stream, and `MAX_DATA` the total of the highest offsets it may send across all streams, past and present. Both only increase. Each end starts by assuming 2 MiB per stream and 16 MiB in total. A receiver advertises more as the application reads, at the latest when half the credit is used. Data beyond either limit, or a final size that changes or is exceeded, ends the session with `CLOSE(PROTOCOL_VIOLATION)`.
+- **Reset.** `STREAM_RESET` abandons a stream in both directions, with an error code and `final`, the size of what its sender sent on the stream. An endpoint receiving a reset for a stream it has not reset answers with its own, so each end learns the other's final size and the connection-wide flow control counts stay in step.
+- **Limits.** Each end holds at most 256 streams per session, including reset ones waiting for the peer's reset.
+- **Scheduling.** Stream data travels on the primary path (§15.2), rotating among streams with data to send, retransmissions first. Redundancy and FEC do not apply to it.
+- **Rate control (reference implementation).** Loss-based congestion control would make streams as fragile as the TCP they replace. Each path paces stream data at a rate driven by two signals that random loss does not produce:
+  - Queueing delay: a round's lowest RTT sample more than max(base/4, 5 ms) above a base RTT. In slow start the latest sample counts, as in HyStart. The base is the lowest sample of the last 10 s, not the path's one-minute minimum, so a path whose RTT rose (a network change) is not mistaken for a queued one. Delay persisting for 8 rounds of backoff becomes the new base: by then the controller would have drained a queue of its own.
+  - A loss spike: a round's stream-packet loss more than max(0.1, 3σ) above the baseline loss. The baseline learns from rounds without queueing delay, so steady random loss of any level stops counting as congestion within a few rounds.
+
+  Without either signal, the rate doubles per round until the first congestion signal. After that it grows by an eighth per round up to the last delivered rate, then by 3%. On a signal it falls to 0.9 times the delivered rate, corrected for the baseline loss. It does not fall again while the queue drains. A cap of 2 × rate × (RTT + the interval between acknowledgements) on bytes in flight stops sending into an outage.
+- **Repeats (reference implementation).** At 90% loss in each direction, about 1 packet in 100 is answered by an acknowledgement that arrives. A lost range is otherwise resent only once an acknowledgement reveals the loss, which leaves the path mostly idle. So while a path's baseline loss is at least 50%, spare sending capacity goes to repeating bytes in flight, oldest first, after new and lost data.
+- **Evidence** (`internal/session` tests, simulated 10 Mbit/s link with 40 ms RTT, uniform loss in each direction; "before" loses packets before the link, as netem does, "after" behind it, so that lost packets cost capacity):
+
+  | Loss | Goodput, before | Goodput, after | Bytes sent per byte delivered |
+  |---|---|---|---|
+  | 0% | 9.1 Mbit/s | — | 1.0 |
+  | 10% | 8.8 Mbit/s | 7.6 Mbit/s | 1.1–1.2 |
+  | 50% | 8.2 Mbit/s | 4.1 Mbit/s | 2.2 |
+  | 90% | 0.42 Mbit/s | 0.23 Mbit/s | 13–15 |
+
+  With a 300 ms buffer the mean queueing delay stays at about 5 ms, where loss-based TCP would fill the buffer. Concurrent streams share the link evenly.
+- **Limits.** Like any delay-based controller, it yields to loss-based flows that keep a standing queue at a shared bottleneck. That suits a mode for degraded links, not a default.
 
 ## 12. Carrier framing and cells
 

@@ -363,6 +363,6 @@ func logPaths(log *slog.Logger, c *session.Client, carriers []*carrierState, now
 		}
 		log.Info("path", "id", p.ID, "carrier", carrier, "primary", p.Primary, "healthy", p.Healthy, "eligible", p.Eligible,
 			"flows", p.Flows, "min_rtt", p.MinRTT.Round(100*time.Microsecond), "srtt", p.SRTT.Round(100*time.Microsecond),
-			"loss", fmt.Sprintf("%.3f", p.Loss), "capacity_mbit", fmt.Sprintf("%.1f", p.Capacity*8/1e6))
+			"loss", fmt.Sprintf("%.3f", p.Loss), "burst", fmt.Sprintf("%.1f", p.Burst), "capacity_mbit", fmt.Sprintf("%.1f", p.Capacity*8/1e6))
 	}
 }

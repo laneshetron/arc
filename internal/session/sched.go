@@ -49,6 +49,15 @@ func (r *rateMax) roll(now time.Time) {
 		r.start = now
 		return
 	}
+	if now.Sub(r.start) >= rateWindow*rateWindows {
+		// Idle longer than the whole ring: every window, including the
+		// one in progress, is too old to count. Closing them one by one
+		// left the last busy window in the ring, so a path back from an
+		// outage reported its old rate, measured and slow next to a busy
+		// path, and new flows avoided it.
+		*r = rateMax{start: now}
+		return
+	}
 	for i := 0; i < rateWindows && now.Sub(r.start) >= rateWindow; i++ {
 		r.ring[r.next] = float64(r.bytes) / rateWindow.Seconds()
 		r.next = (r.next + 1) % rateWindows
