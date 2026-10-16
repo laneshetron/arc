@@ -19,6 +19,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/laneshetron/arc/internal/carrier/sockopt"
 	"github.com/laneshetron/arc/internal/carrier/stream"
@@ -63,6 +64,8 @@ func run(args []string) error {
 	keyFile := fs.String("key-file", "", "client static private key; a new one is generated if empty")
 	tunName := fs.String("tun", "arc0", "TUN interface name")
 	fullTunnel := fs.Bool("full-tunnel", false, "route all traffic through the tunnel")
+	dns := fs.String("dns", "", "trusted IPv4 DNS resolver (overrides the relay's resolver)")
+	dnsMode := fs.String("dns-mode", "systemd-resolved", "full-tunnel DNS setup: systemd-resolved or manual (requires -dns and an externally configured resolver)")
 	var routes prefixList
 	fs.Var(&routes, "route", "route this prefix through the tunnel (repeatable)")
 	var binds []string
@@ -129,6 +132,37 @@ func run(args []string) error {
 	table := fs.Int("table", 5243, "routing table for -full-tunnel")
 	prof := profiling.Register(fs)
 	fs.Parse(args)
+	if !*fullTunnel {
+		var dnsFlag bool
+		fs.Visit(func(f *flag.Flag) {
+			if f.Name == "dns" || f.Name == "dns-mode" {
+				dnsFlag = true
+			}
+		})
+		if dnsFlag {
+			return errors.New("-dns and -dns-mode require -full-tunnel; configure split-tunnel DNS with your resolver manager")
+		}
+	}
+	if *fullTunnel && (*mark == 0 || uint64(*mark) > 1<<32-1 || *table <= 0 || (*table >= 253 && *table <= 255)) {
+		return errors.New("-full-tunnel requires a nonzero 32-bit -mark and a dedicated routing -table (not 253, 254 or 255)")
+	}
+	if *dnsMode != "systemd-resolved" && *dnsMode != "manual" {
+		return errors.New("-dns-mode must be systemd-resolved or manual")
+	}
+	var trustedDNS netip.Addr
+	if *dns != "" {
+		var err error
+		trustedDNS, err = netip.ParseAddr(*dns)
+		if err != nil {
+			return fmt.Errorf("-dns: %w", err)
+		}
+		if err := tun.ValidateDNS(trustedDNS); err != nil {
+			return err
+		}
+	}
+	if *fullTunnel && *dnsMode == "manual" && !trustedDNS.IsValid() {
+		return errors.New("-full-tunnel -dns-mode manual requires an explicit trusted -dns ADDRESS and external resolver configuration")
+	}
 	stopProfiles, err := prof.Start()
 	if err != nil {
 		return err
@@ -211,13 +245,21 @@ func run(args []string) error {
 		if err != nil {
 			return err
 		}
+		bootstrap, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		tlsEndpoints, err := stream.ResolveEndpoints(bootstrap, *tlsAddr)
+		cancel()
+		if err != nil {
+			// The UDP carriers may work regardless; the TLS carrier keeps
+			// resolving the relay until it can.
+			log.Warn("resolving the TLS relay; retrying when the carrier connects", "relay", *tlsAddr, "err", err)
+		}
 		for _, iface := range binds {
 			name := iface
 			if name == "" {
 				name = "default"
 			}
 			conn := stream.Dial(stream.ClientOptions{
-				Addr: *tlsAddr, TLS: tlsConfig, Peer: relayAddr,
+				Addr: *tlsAddr, Endpoints: tlsEndpoints, TLS: tlsConfig, Peer: relayAddr,
 				Camouflage: camo,
 				Sockopt:    sockopt.Options{Mark: sockOpts.Mark, Device: iface},
 				OnState: func(err error) {
@@ -235,13 +277,21 @@ func run(args []string) error {
 		if err != nil {
 			return err
 		}
+		// As for -tls: resolve before full-tunnel DNS can route lookups
+		// into the tunnel the carrier exists to rescue.
+		bootstrap, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		frontEndpoints, err := stream.ResolveEndpoints(bootstrap, *frontAddr)
+		cancel()
+		if err != nil {
+			log.Warn("resolving the relay front; retrying when the carrier connects", "front", *frontAddr, "err", err)
+		}
 		for _, iface := range binds {
 			name := iface
 			if name == "" {
 				name = "default"
 			}
 			conn := stream.Dial(stream.ClientOptions{
-				Addr: *frontAddr, TLS: frontTLS, Peer: relayAddr,
+				Addr: *frontAddr, Endpoints: frontEndpoints, TLS: frontTLS, Peer: relayAddr,
 				Camouflage: camo, Front: &stream.FrontDialOptions{Token: tokens[0]},
 				Sockopt: sockopt.Options{Mark: sockOpts.Mark, Device: iface},
 				OnState: func(err error) {
@@ -256,7 +306,13 @@ func run(args []string) error {
 	}
 
 	var cleanup func() error
+	var cleanupDNS func() error
 	defer func() {
+		if cleanupDNS != nil {
+			if err := cleanupDNS(); err != nil {
+				log.Warn("restoring DNS", "err", err)
+			}
+		}
 		if cleanup != nil {
 			if err := cleanup(); err != nil {
 				log.Warn("removing routing rules", "err", err)
@@ -264,6 +320,15 @@ func run(args []string) error {
 		}
 	}()
 	onEstablished := func(r wire.AuthResult) error {
+		resolver := trustedDNS
+		if !resolver.IsValid() {
+			resolver = netip.AddrFrom4(r.DNSv4)
+		}
+		if *fullTunnel {
+			if err := tun.ValidateDNS(resolver); err != nil {
+				return fmt.Errorf("full tunnel requires -dns ADDRESS or an authenticated relay resolver: %w", err)
+			}
+		}
 		addr := netip.PrefixFrom(netip.AddrFrom4(r.IPv4), int(r.Prefix4))
 		if err := dev.Configure(addr, int(r.TunMTU)); err != nil {
 			return fmt.Errorf("configure %s: %w", dev.Name(), err)
@@ -278,8 +343,16 @@ func run(args []string) error {
 				return err
 			}
 		}
-		if r.DNSv4 != [4]byte{} {
-			log.Info("relay offers a resolver; configure it to avoid DNS leaks", "dns", netip.AddrFrom4(r.DNSv4))
+		if *fullTunnel && *dnsMode == "systemd-resolved" {
+			nextCleanup, err := dev.ConfigureDNS(resolver)
+			if err != nil {
+				return err
+			}
+			cleanupDNS = nextCleanup
+		} else if *fullTunnel {
+			log.Info("using externally configured DNS", "resolver", resolver)
+		} else if !resolver.IsUnspecified() {
+			log.Info("relay offers a resolver; configure split-tunnel DNS with your resolver manager", "dns", resolver)
 		}
 		return nil
 	}

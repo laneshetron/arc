@@ -22,6 +22,9 @@ ARC is a multipath, carrier-agnostic overlay VPN. A TUN interface gives applicat
 
 ## Development
 
+Use Go 1.26.9 or a newer supported patched release. CI checks reachable
+vulnerabilities with govulncheck as well as running the tests.
+
 ```sh
 go test -race ./...
 go test -run='^$' -fuzz='^FuzzPacket$' -fuzztime=1m ./internal/wire   # also FuzzFrames
@@ -47,12 +50,12 @@ sudo bin/arc-relay run -listen 0.0.0.0:4433 -network 10.77.0.1/16
 
 # Client host
 echo "some-token" > token
-sudo bin/arc-client run -relay RELAY_IP:4433 -relay-key RELAY_PUBLIC_KEY -full-tunnel
+sudo bin/arc-client run -relay RELAY_IP:4433 -relay-key RELAY_PUBLIC_KEY -full-tunnel -dns 1.1.1.1
 
 # Several links at once (e.g. Wi-Fi and cellular): one carrier per interface,
 # with flows spread across them, failover, and traffic moved off a link that
 # turns lossy (-status 5s logs each path's state)
-sudo bin/arc-client run -relay RELAY_IP:4433 -relay-key RELAY_PUBLIC_KEY -full-tunnel -bind wlan0 -bind wwan0
+sudo bin/arc-client run -relay RELAY_IP:4433 -relay-key RELAY_PUBLIC_KEY -full-tunnel -dns 1.1.1.1 -bind wlan0 -bind wwan0
 
 # Where UDP may be blocked, also carry the session over TLS/TCP (used only
 # while no UDP path works); the relay runs with -tls-listen 0.0.0.0:443, and
@@ -93,6 +96,61 @@ sudo bin/arc-client run ... -split-tcp auto
 sudo bin/arc-client run ... -bind wlan0 -bind wwan0 -redundancy auto
 ```
 
+Full-tunnel mode requires either an explicit trusted `-dns ADDRESS` or a
+resolver supplied by the authenticated relay (`arc-relay run -dns ADDRESS`).
+By default the client configures systemd-resolved with `resolvectl` and
+restores the interface's DNS settings on exit. It fails if that setup is
+unavailable. On hosts with another resolver manager, configure that manager
+to use the chosen resolver, then pass `-dns-mode manual -dns ADDRESS`.
+The namespace tests use manual mode because they do not run a resolver
+service or make DNS queries.
+
+Full-tunnel policy includes LAN destinations, so a LAN resolver cannot
+bypass the tunnel via a more-specific main-table route. Only marked
+carrier sockets bypass it. Local-network access is available in split
+tunnel mode with explicit `-route` prefixes. Existing custom routing rules
+with higher priority remain the administrator's responsibility.
+
+The relay caps authenticated sessions (`-max-sessions 1024`) independently
+of pending Noise handshakes (`-max-pending 4096`),
+global Noise handshake work (`-handshakes-per-second 256`), per-source UDP-IP
+handshake work (`-handshakes-per-source 8`), and pending plus established
+TLS connections (`-max-tls-conns 4096`). TLS handshakes have a smaller
+separate budget (`-max-tls-handshakes 128`), a ten-second timeout
+(`-tls-handshake-timeout`; lossy networks, where TLS is the fallback, need
+several seconds), and
+at most four pending handshakes per actual TCP peer IP. Total TLS
+connections per peer IP are capped by `-max-tls-conns-per-source 64`.
+Handshake limits use token buckets
+with a burst equal to the rate; tune the per-source rate for clients sharing
+a NAT. TLS carriers use distinct synthetic source addresses and share the
+global work limit. Failed handshakes consume the same budget as successful attempts.
+Refilled source buckets are discarded. At source-table saturation, a new
+source must prove reachability with a cookie before replacing the oldest
+bucket. A cookie-validated, valid Noise handshake may replace the oldest
+unauthenticated session when the pending budget is full; active sessions
+are never displaced. Authentication rechecks active capacity before leasing
+an address.
+FEC decoders cap repair bytes and block metadata independently of source
+storage. Path IDs only increase, so a retired path's nonce space is never
+reused, and no history of retired paths is kept; a session ends only if
+its 32-bit path ID space runs out.
+
+The client resolves a TLS relay hostname once before installing tunnel
+routes, then rotates through the cached IP endpoints on reconnect while
+still verifying the original TLS hostname. This lets fallback recover when
+tunnel DNS is unavailable. If that first lookup fails (DNS not up yet),
+the client starts anyway and the TLS carrier retries the lookup with each
+connection attempt until one succeeds. Restart the client to refresh endpoints after
+the operator changes the relay's DNS records. Managed DNS reconnects with
+the same resolver are no-ops; resolver changes update the link in place
+and restore the previous resolver on failure. `-dns` and `-dns-mode` are
+rejected in split-tunnel mode; configure that mode's DNS externally.
+
+These bounds do not replace operator firewall policy. Static bearer tokens
+still require operator rotation/restart for revocation; this pre-alpha does
+not provide expiring credentials or tenant destination isolation.
+
 The end-to-end test builds this setup in three network namespaces:
 
 ```sh
@@ -110,3 +168,4 @@ loss (`docker run --rm --privileged arc-e2e split [SECONDS] [REPS]`).
 `test/netns/bench.sh` compares ARC's throughput with kernel WireGuard over the same topology
 (`docker run --rm --privileged arc-e2e bench` on macOS). Treat its numbers as relative: both ends
 share one machine.
+

@@ -147,8 +147,19 @@ func run(args []string) error {
 	noFEC := fs.Bool("no-fec", false, "decline forward error correction for clients' traffic")
 	noStreams := fs.Bool("no-split-tcp", false, "decline to connect clients' TCP streams (split TCP)")
 	noRedundancy := fs.Bool("no-redundancy", false, "decline clients' requests to duplicate downlink traffic on two paths")
+	maxSessions := fs.Int("max-sessions", 1024, "maximum authenticated sessions (pending handshakes have a separate budget)")
+	maxPending := fs.Int("max-pending", 4096, "maximum pending Noise handshakes")
+	handshakeRate := fs.Int("handshakes-per-second", 256, "global Noise handshake work rate and burst")
+	sourceRate := fs.Int("handshakes-per-source", 8, "per-source-IP Noise handshake work rate and burst")
+	maxTLS := fs.Int("max-tls-conns", 4096, "maximum pending and established TLS carrier connections combined")
+	maxTLSHandshakes := fs.Int("max-tls-handshakes", 128, "maximum pending TLS handshakes")
+	maxTLSPerSource := fs.Int("max-tls-conns-per-source", 64, "maximum TLS carrier connections per TCP peer IP")
+	tlsHandshakeTimeout := fs.Duration("tls-handshake-timeout", 10*time.Second, "time allowed for a TLS carrier handshake; lossy networks need several seconds")
 	prof := profiling.Register(fs)
 	fs.Parse(args)
+	if *maxSessions <= 0 || *maxPending <= 0 || *handshakeRate <= 0 || *sourceRate <= 0 || *maxTLS <= 0 || *maxTLSHandshakes <= 0 || *maxTLSPerSource <= 0 || *tlsHandshakeTimeout <= 0 {
+		return errors.New("session, handshake and TLS limits must be positive")
+	}
 	stopProfiles, err := prof.Start()
 	if err != nil {
 		return err
@@ -222,6 +233,8 @@ func run(args []string) error {
 		}
 		ln, err := stream.Listen(*tlsListen, stream.ListenerOptions{
 			TLS: &tls.Config{Certificates: []tls.Certificate{cert}}, Camouflage: *tlsCamouflage,
+			MaxConns: *maxTLS, MaxPending: *maxTLSHandshakes, MaxConnsPerSource: *maxTLSPerSource,
+			HandshakeTimeout: *tlsHandshakeTimeout,
 		})
 		if err != nil {
 			return err
@@ -256,6 +269,7 @@ func run(args []string) error {
 		Session: session.RelayConfig{
 			Static: static, ResetSecret: resetSecret, IdleTimeout: gwCfg.Idle + 10*time.Second,
 			NoRedundancy: *noRedundancy, NoFEC: *noFEC, NoStreams: *noStreams,
+			MaxSessions: *maxSessions, MaxPending: *maxPending, HandshakesPerSecond: *handshakeRate, HandshakesPerSource: *sourceRate,
 		},
 		Conn: conn, Streams: streams, TUN: dev, Gateway: gw, Logger: log, StatusInterval: *status,
 	})
