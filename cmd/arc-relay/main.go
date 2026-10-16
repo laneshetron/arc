@@ -135,6 +135,7 @@ func run(args []string) error {
 	tlsCert := fs.String("tls-cert", "relay.crt", "TLS certificate (PEM) for -tls-listen")
 	tlsKey := fs.String("tls-key", "relay.tls.key", "TLS private key (PEM) for -tls-listen")
 	noFEC := fs.Bool("no-fec", false, "decline forward error correction for clients' traffic")
+	noStreams := fs.Bool("no-split-tcp", false, "decline to connect clients' TCP streams (split TCP)")
 	noRedundancy := fs.Bool("no-redundancy", false, "decline clients' requests to duplicate downlink traffic on two paths")
 	maxSessions := fs.Int("max-sessions", 1024, "maximum authenticated sessions (pending handshakes have a separate budget)")
 	maxPending := fs.Int("max-pending", 4096, "maximum pending Noise handshakes")
@@ -233,7 +234,7 @@ func run(args []string) error {
 	err = engine.RunRelay(ctx, engine.RelayConfig{
 		Session: session.RelayConfig{
 			Static: static, ResetSecret: resetSecret, IdleTimeout: gwCfg.Idle + 10*time.Second,
-			NoRedundancy: *noRedundancy, NoFEC: *noFEC,
+			NoRedundancy: *noRedundancy, NoFEC: *noFEC, NoStreams: *noStreams,
 			MaxSessions: *maxSessions, MaxPending: *maxPending, HandshakesPerSecond: *handshakeRate, HandshakesPerSource: *sourceRate,
 		},
 		Conn: conn, Streams: streams, TUN: dev, Gateway: gw, Logger: log, StatusInterval: *status,

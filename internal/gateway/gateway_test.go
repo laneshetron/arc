@@ -87,3 +87,27 @@ func TestNetworkValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestAllowDial(t *testing.T) {
+	g, err := New(Config{Network: netip.MustParsePrefix("10.77.0.1/16"), TunMTU: 1280})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for dst, want := range map[string]bool{
+		"198.51.100.7:443":   true,
+		"192.168.1.10:22":    true,
+		"10.77.0.1:53":       true,  // the relay's tunnel address
+		"10.77.0.5:22":       false, // another client
+		"127.0.0.1:80":       false,
+		"0.0.0.0:80":         false,
+		"224.0.0.1:80":       false,
+		"169.254.169.254:80": false,
+		"255.255.255.255:80": false,
+		"[2001:db8::1]:443":  false,
+		"198.51.100.7:0":     false,
+	} {
+		if got := g.AllowDial(netip.MustParseAddrPort(dst)); got != want {
+			t.Errorf("AllowDial(%s) = %v, want %v", dst, got, want)
+		}
+	}
+}

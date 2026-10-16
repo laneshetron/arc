@@ -26,6 +26,8 @@
 #     goodput
 #   - a session comes up within 15 s with both links at 70% loss
 #   - TCP runs over the TLS/TCP carrier when UDP is blocked (Part 3)
+#   - split TCP carries TCP at 50% loss, and at least doubles ARC's
+#     TCP goodput at 20% loss (Part 4)
 #   - a session survives about 80 s of 90% loss on both links and carries
 #     traffic again within 5 s of the loss clearing
 #
@@ -441,7 +443,8 @@ if [[ -n $MP_CLIENT ]]; then kill "$MP_CLIENT"; wait "$MP_CLIENT" 2>/dev/null ||
 $C "$BIN/arc-client" run -relay 192.168.10.2:4433 -relay-key "$RELAY_PUB" \
   -token-file "$WORK/token" -route 192.168.20.0/24 -bind c0 \
   -tls 192.168.10.2:8443 -tls-ca "$WORK/relay.crt" >"$WORK/client3.log" 2>&1 &
-PIDS+=($!)
+TLS_CLIENT=$!
+PIDS+=("$TLS_CLIENT")
 wait_until 10 grep -q "session established" "$WORK/client3.log" ||
   { cat "$WORK/client3.log"; exit 1; }
 block_udp() { $C iptables -"$1" OUTPUT -p udp -d 192.168.10.2 --dport 4433 -j DROP; }
@@ -470,6 +473,74 @@ carrier_row "clean"
 carrier_row "loss 1%" loss 1%
 carrier_row "rtt 40ms, loss 1%" delay 20ms loss 1%
 
+# --- Part 4: split TCP (spec §11.3) -------------------------------------------
+# One link at 40 ms RTT with heavy loss both ways, where TCP through any
+# tunnel stalls: plain routing, ARC carrying IP packets, and ARC with
+# -split-tcp always, which ends TCP at the client and carries its bytes as
+# streams. Runs are bounded, since iperf3 can wait a long time at 90% loss.
+kill "$TLS_CLIENT"; wait "$TLS_CLIENT" 2>/dev/null || true
+SPLIT_CLIENT=
+start_split_client() { # start_split_client MODE
+  if [[ -n $SPLIT_CLIENT ]]; then kill "$SPLIT_CLIENT"; wait "$SPLIT_CLIENT" 2>/dev/null || true; fi
+  unimpair 0
+  $C "$BIN/arc-client" run -relay 192.168.10.2:4433 -relay-key "$RELAY_PUB" \
+    -token-file "$WORK/token" -route 192.168.20.0/24 -bind c0 -split-tcp "$1" >"$WORK/client4.log" 2>&1 &
+  SPLIT_CLIENT=$!
+  PIDS+=("$SPLIT_CLIENT")
+  wait_until 10 grep -q "session established" "$WORK/client4.log" ||
+    { cat "$WORK/client4.log"; exit 1; }
+}
+tcp_bounded() { # tcp_bounded [IPERF_ARGS...]: like tcp_up, but 0 after DURATION+30 s
+  if $C timeout $((DURATION + 30)) iperf3 -c "$TARGET" -t "$DURATION" -O 2 -f m --connect-timeout 10000 "$@" \
+    >"$WORK/iperf.log" 2>&1; then
+    grep receiver "$WORK/iperf.log" | tail -1 | awk '{print $(NF-2)}'
+  else
+    echo 0
+  fi
+  restart_iperf_server # a stranded run leaves the server busy
+}
+SPLIT_ROWS=()
+declare -A SPLIT
+for mode in plain off always; do
+  if [[ $mode == plain ]]; then
+    $C ip route replace 192.168.20.0/24 via 192.168.10.2 dev c0 onlink
+  else
+    start_split_client "$mode"
+  fi
+  for sc in "rtt 40ms, loss 5%|delay 20ms loss 5%" "rtt 40ms, loss 20%|delay 20ms loss 20%" \
+    "rtt 40ms, loss 50%|delay 20ms loss 50%" "rtt 40ms, loss 90%|delay 20ms loss 90%"; do
+    name=${sc%%|*} args=${sc#*|}
+    # shellcheck disable=SC2086
+    impair 0 $args
+    sleep 2
+    up=$(tcp_bounded)
+    down=$(tcp_bounded -R)
+    unimpair 0
+    tunnel=arc-split-$mode
+    [[ $mode == plain ]] && tunnel=plain
+    SPLIT["$name/$mode"]=$down
+    SPLIT_ROWS+=("$(printf '%-26s %-16s %10s %10s' "$name" "$tunnel" "$up" "$down")")
+    echo "measured: $name, $tunnel" >&2
+  done
+  # The ARC client installs its own route when it connects.
+  [[ $mode == plain ]] && $C ip route del 192.168.20.0/24
+done
+# 90% is recorded, not asserted: one 10 s iperf3 run there carries 0-2
+# Mbit/s, and sometimes cannot finish setting up.
+name="rtt 40ms, loss 50%"
+on=${SPLIT["$name/always"]} off=${SPLIT["$name/off"]}
+if awk -v on="$on" 'BEGIN { exit !(on > 0) }'; then
+  pass "split TCP carried $on Mbit/s down at $name (IP packets: $off)"
+else
+  fail "split TCP carried no TCP at $name"
+fi
+on=${SPLIT["rtt 40ms, loss 20%/always"]} off=${SPLIT["rtt 40ms, loss 20%/off"]}
+if awk -v on="$on" -v off="$off" 'BEGIN { exit !(on >= 2 * off && on > 0) }'; then
+  pass "split TCP raised TCP goodput from $off to $on Mbit/s at 20% loss"
+else
+  fail "split TCP reached $on Mbit/s at 20% loss, against $off without; want at least twice"
+fi
+
 echo
 echo "Part 1: single link, $DURATION s TCP runs; $(nproc) CPUs; kernel $(uname -r)"
 printf '%-26s %-10s %10s %10s %10s\n' "scenario" "tunnel" "TCP Mbit/s" "ping loss%" "ping ms"
@@ -481,6 +552,10 @@ echo
 echo "Part 3: one link, UDP vs the TLS/TCP carrier (UDP blocked); ping during each transfer"
 printf '%-26s %-10s %10s %20s\n' "scenario" "tunnel" "TCP Mbit/s" "ping avg / max ms"
 printf '%s\n' "${TLS_ROWS[@]}"
+echo
+echo "Part 4: one link, split TCP; TCP goodput through the tunnel (or plain routing)"
+printf '%-26s %-16s %10s %10s\n' "scenario" "tunnel" "up Mbit/s" "down Mbit/s"
+printf '%s\n' "${SPLIT_ROWS[@]}"
 echo
 echo "UDP receive-buffer drops over the whole run: relay $(rcvbuf_errors "$R"), client $(rcvbuf_errors "$C")"
 echo

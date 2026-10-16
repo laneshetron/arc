@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/netip"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/laneshetron/arc/internal/carrier/stream"
 	"github.com/laneshetron/arc/internal/gateway"
 	"github.com/laneshetron/arc/internal/session"
+	"github.com/laneshetron/arc/internal/wire"
 )
 
 // RelayConfig configures a relay engine. Session.Authorize is set to
@@ -28,6 +30,29 @@ type RelayConfig struct {
 
 	// StatusInterval, if nonzero, logs each session's paths that often.
 	StatusInterval time.Duration
+
+	// Dial connects a client's stream (spec §11.3) to its destination,
+	// once Gateway.AllowDial permits it; nil uses a net.Dialer with
+	// DialTimeout. Streams are declined with Session.NoStreams.
+	Dial func(ctx context.Context, dst netip.AddrPort) (net.Conn, error)
+	// AllowDial overrides Gateway.AllowDial, for tests.
+	AllowDial func(dst netip.AddrPort) bool
+}
+
+// DialTimeout bounds how long the relay tries to connect a stream.
+const DialTimeout = 15 * time.Second
+
+// streamKey names a stream on the relay.
+type streamKey struct {
+	s  *session.RelaySession
+	id uint32
+}
+
+// dialResult is a finished connection attempt for a stream.
+type dialResult struct {
+	key  streamKey
+	conn net.Conn
+	err  error
 }
 
 // RunRelay runs the relay until ctx is canceled or an I/O error occurs. The
@@ -59,6 +84,25 @@ func RunRelay(ctx context.Context, cfg RelayConfig) error {
 	}
 	var out, sout, toTUN [][]byte
 	var to, sto []netip.AddrPort
+
+	dial := cfg.Dial
+	if dial == nil {
+		d := &net.Dialer{Timeout: DialTimeout}
+		dial = func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
+			return d.DialContext(ctx, "tcp", dst.String())
+		}
+	}
+	allow := cfg.AllowDial
+	if allow == nil {
+		allow = cfg.Gateway.AllowDial
+	}
+	bridges := map[streamKey]*bridge{}
+	bridgeEvents, dials := make(chan bridgeEvent, 64), make(chan dialResult, 64)
+	defer func() {
+		for _, b := range bridges {
+			b.finish(true)
+		}
+	}()
 
 	for {
 		out, to, sout, sto = out[:0], to[:0], sout[:0], sto[:0]
@@ -94,6 +138,32 @@ func RunRelay(ctx context.Context, cfg RelayConfig) error {
 			case session.SessionClosed:
 				cfg.Gateway.Release(e.Session)
 				log.Info("session closed", "address", netip.AddrFrom4(e.Session.Config().IPv4), "reason", e.Err)
+				for k, b := range bridges {
+					if k.s == e.Session {
+						b.finish(true)
+					}
+				}
+			case session.StreamOpened:
+				k := streamKey{e.Session, e.ID}
+				if !allow(e.Dst) {
+					e.Session.StreamReset(time.Now(), e.ID, wire.CodeUnauthorized)
+					continue
+				}
+				go func(dst netip.AddrPort) {
+					conn, err := dial(ctx, dst)
+					select {
+					case dials <- dialResult{k, conn, err}:
+					case <-ctx.Done():
+						if conn != nil {
+							conn.Close()
+						}
+					}
+				}(e.Dst)
+			case session.RelayStreamUpdate:
+				k := streamKey{e.Session, e.ID}
+				if b := bridges[k]; b != nil {
+					b.service(time.Now())
+				}
 			}
 		}
 		for _, p, ok := r.PollIP(); ok; _, p, ok = r.PollIP() {
@@ -128,13 +198,40 @@ func RunRelay(ctx context.Context, cfg RelayConfig) error {
 				}
 				bufpool.Put(p) // SendIP copied what it needed
 			}
+		case d := <-dials:
+			now := time.Now()
+			switch {
+			case d.err != nil:
+				d.key.s.StreamReset(now, d.key.id, wire.CodeConnectFailed)
+			case d.key.s.State() != session.StateActive:
+				d.conn.Close()
+			default:
+				conn, ok := d.conn.(halfCloser)
+				if !ok {
+					d.conn.Close()
+					d.key.s.StreamReset(now, d.key.id, wire.CodeConnectFailed)
+					break
+				}
+				abort := conn.Close
+				if tc, ok := d.conn.(*net.TCPConn); ok {
+					abort = func() error { abortTCP(tc)(); return nil }
+				}
+				b := newBridge(d.key.id, d.key.s, conn, func() { abort() })
+				bridges[d.key] = b
+				b.forget = func() { delete(bridges, d.key) }
+				b.start(ctx, bridgeEvents)
+				b.service(now)
+			}
+		case e := <-bridgeEvents:
+			e.b.handle(time.Now(), e)
 		case <-status:
 			now := time.Now()
 			for _, s := range r.LiveSessions() {
 				lease := netip.AddrFrom4(s.Config().IPv4)
 				for _, p := range s.Paths(now) {
 					log.Info("path", "session", lease, "id", p.ID, "downlink", p.Primary, "healthy", p.Healthy,
-						"flows", p.Flows, "srtt", p.SRTT.Round(100*time.Microsecond), "loss", fmt.Sprintf("%.3f", p.Loss))
+						"flows", p.Flows, "srtt", p.SRTT.Round(100*time.Microsecond), "loss", fmt.Sprintf("%.3f", p.Loss),
+						"stream_mbit", fmt.Sprintf("%.2f", p.StreamRate*8/1e6), "stream_inflight", p.StreamInflight)
 				}
 			}
 		case <-timer.C:

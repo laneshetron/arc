@@ -138,3 +138,22 @@ func (g *Gateway) Lookup(pkt []byte) *session.RelaySession {
 	defer g.mu.Unlock()
 	return g.leased[dst]
 }
+
+// AllowDial reports whether the relay may connect a client's stream to dst
+// (spec §11.3), applying the limits IP forwarding has: IPv4 only, no
+// loopback, unspecified, multicast, broadcast, or link-local
+// destinations, and nothing in the tunnel network except the relay's own
+// address, which clients reach as IP traffic too.
+func (g *Gateway) AllowDial(dst netip.AddrPort) bool {
+	a := dst.Addr()
+	switch {
+	case !a.Is4() || dst.Port() == 0:
+		return false
+	case a.IsLoopback(), a.IsUnspecified(), a.IsMulticast(), a.IsLinkLocalUnicast(),
+		a == netip.AddrFrom4([4]byte{255, 255, 255, 255}):
+		return false
+	case g.cfg.Network.Contains(a):
+		return a == g.cfg.Network.Addr()
+	}
+	return true
+}
