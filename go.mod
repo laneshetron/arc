@@ -1,6 +1,6 @@
 module github.com/laneshetron/arc
 
-go 1.26.0
+go 1.26.9
 
 require (
 	github.com/flynn/noise v1.1.0
@@ -20,3 +20,4 @@ require (
 	golang.org/x/time v0.7.0 // indirect
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
 )
+

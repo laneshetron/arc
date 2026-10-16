@@ -49,11 +49,12 @@ func (d *Device) AddRoute(prefix netip.Prefix) error {
 }
 
 // FullTunnel sends all traffic through the interface except packets
-// carrying mark, which the carrier sockets set (§17.1). It follows the
-// wg-quick layout:
+// carrying mark, which the carrier sockets set (§17.1). More-specific
+// LAN routes must not bypass this rule: a LAN DNS resolver would leak
+// queries outside the tunnel. Custom higher-priority policy rules remain
+// the administrator's responsibility.
 //
 //	ip rule add not fwmark MARK table TABLE
-//	ip rule add table main suppress_prefixlength 0
 //	ip route add default dev IFACE table TABLE
 //
 // IPv6 is blackholed in the same table so it cannot leak around an
@@ -71,9 +72,7 @@ func (d *Device) FullTunnel(mark uint32, table int) (cleanup func() error, err e
 	for _, family := range []int{unix.AF_INET, unix.AF_INET6} {
 		viaTunnel := netlink.NewRule()
 		viaTunnel.Family, viaTunnel.Mark, viaTunnel.Invert, viaTunnel.Table = family, mark, true, table
-		mainUnlessDefault := netlink.NewRule()
-		mainUnlessDefault.Family, mainUnlessDefault.Table, mainUnlessDefault.SuppressPrefixlen = family, unix.RT_TABLE_MAIN, 0
-		rules = append(rules, viaTunnel, mainUnlessDefault)
+		rules = append(rules, viaTunnel)
 	}
 
 	cleanup = func() error {
