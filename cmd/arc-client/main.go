@@ -208,7 +208,8 @@ func run(args []string) error {
 		return fmt.Errorf("create TUN: %w", err)
 	}
 	defer dev.Close()
-	sockOpts := udp.Options{NoOffload: *noOffload}
+	// Each carrier talks only to the relay, so its socket is connected.
+	sockOpts := udp.Options{NoOffload: *noOffload, Peer: relayAddr}
 	if len(binds) == 0 {
 		binds = []string{""}
 	}

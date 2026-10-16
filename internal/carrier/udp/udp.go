@@ -5,6 +5,8 @@ package udp
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"syscall"
@@ -38,6 +40,11 @@ type Options struct {
 	// NoOffload disables UDP GSO and GRO, for comparing against plain
 	// per-datagram I/O.
 	NoOffload bool
+	// Peer, if valid, connects the socket to that address: it then sends
+	// only there and receives only from there. The kernel resolves the
+	// route and policy once instead of for every datagram (on macOS, a send
+	// through a bound interface then takes about 9 µs of CPU instead of 24).
+	Peer netip.AddrPort
 }
 
 // Conn is a UDP carrier socket. Reads and writes may run on different
@@ -52,7 +59,8 @@ type Conn struct {
 	// gso_linux.go. gsoBufs are reused coalescing buffers.
 	gso     bool
 	gsoBufs [][]byte
-	gro     *groReader // non-nil when UDP_GRO is enabled; see gro_linux.go
+	gro     *groReader     // non-nil when UDP_GRO is enabled; see gro_linux.go
+	peer    netip.AddrPort // the connected peer; zero if unconnected
 
 	// Caches for the send path: the last destination's *net.UDPAddr and
 	// the last segment size's control message, which would otherwise be
@@ -64,15 +72,21 @@ type Conn struct {
 }
 
 // udpAddr returns a *net.UDPAddr for to, reusing the previous one when the
-// destination repeats, as it does for every packet a client sends.
-func (c *Conn) udpAddr(to netip.AddrPort) *net.UDPAddr {
+// destination repeats, as it does for every packet a client sends. A
+// connected socket sends without an address (a nil interface, not a nil
+// *net.UDPAddr).
+func (c *Conn) udpAddr(to netip.AddrPort) net.Addr {
+	if c.peer.IsValid() {
+		return nil
+	}
 	if c.lastAddr == nil || to != c.lastTo {
 		c.lastTo, c.lastAddr = to, net.UDPAddrFromAddrPort(to)
 	}
 	return c.lastAddr
 }
 
-// Listen opens an IPv4 UDP socket on addr (use port 0 for a client).
+// Listen opens an IPv4 UDP socket on addr (use port 0 for a client),
+// connected to opts.Peer if that is set.
 func Listen(addr netip.AddrPort, opts Options) (*Conn, error) {
 	if opts.BufferSize == 0 {
 		opts.BufferSize = DefaultBufferSize
@@ -90,17 +104,27 @@ func Listen(addr netip.AddrPort, opts Options) (*Conn, error) {
 		}
 		return sockErr
 	}}
-	pc, err := lc.ListenPacket(context.Background(), "udp4", addr.String())
-	if err != nil {
-		return nil, err
+	var uc *net.UDPConn
+	if opts.Peer.IsValid() {
+		d := net.Dialer{LocalAddr: net.UDPAddrFromAddrPort(addr), Control: lc.Control}
+		nc, err := d.DialContext(context.Background(), "udp4", opts.Peer.String())
+		if err != nil {
+			return nil, err
+		}
+		uc = nc.(*net.UDPConn)
+	} else {
+		pc, err := lc.ListenPacket(context.Background(), "udp4", addr.String())
+		if err != nil {
+			return nil, err
+		}
+		uc = pc.(*net.UDPConn)
 	}
-	uc := pc.(*net.UDPConn)
 	if !forced {
 		// Best effort: the kernel caps these at its configured maximums.
 		uc.SetReadBuffer(opts.BufferSize)
 		uc.SetWriteBuffer(opts.BufferSize)
 	}
-	c := &Conn{uc: uc, pc: ipv4.NewPacketConn(uc)}
+	c := &Conn{uc: uc, pc: ipv4.NewPacketConn(uc), peer: opts.Peer}
 	if !opts.NoOffload {
 		c.gso = gsoSupported(uc)
 		c.gro = enableGRO(uc)
@@ -114,6 +138,19 @@ func (c *Conn) LocalAddr() netip.AddrPort { return c.uc.LocalAddr().(*net.UDPAdd
 // ReadBatch reads up to len(bufs) datagrams. Datagram i is bufs[i][:sizes[i]]
 // from addrs[i].
 func (c *Conn) ReadBatch(bufs [][]byte, sizes []int, addrs []netip.AddrPort) (int, error) {
+	for {
+		n, err := c.readBatch(bufs, sizes, addrs)
+		// A connected socket reports an ICMP error from an earlier send on
+		// the next read. The peer may come back (a relay restarting), so
+		// read on, as an unconnected socket would never have noticed.
+		if n == 0 && c.peer.IsValid() && refused(err) {
+			continue
+		}
+		return n, err
+	}
+}
+
+func (c *Conn) readBatch(bufs [][]byte, sizes []int, addrs []netip.AddrPort) (int, error) {
 	if c.gro != nil {
 		return c.gro.read(bufs, sizes, addrs)
 	}
@@ -132,13 +169,24 @@ func (c *Conn) ReadBatch(bufs [][]byte, sizes []int, addrs []netip.AddrPort) (in
 		sizes[i] = msgs[i].N
 		if ua, ok := msgs[i].Addr.(*net.UDPAddr); ok {
 			addrs[i] = ua.AddrPort()
+		} else {
+			addrs[i] = c.peer // a connected socket need not report it
 		}
 	}
 	return n, err
 }
 
-// WriteBatch sends each packet to the matching address.
+// WriteBatch sends each packet to the matching address. A datagram the
+// kernel refuses is dropped, as the network might drop it, and the rest are
+// still sent; the first such error is returned.
 func (c *Conn) WriteBatch(pkts [][]byte, addrs []netip.AddrPort) error {
+	if c.peer.IsValid() {
+		for _, to := range addrs {
+			if to != c.peer {
+				return fmt.Errorf("udp: send to %v on a socket connected to %v", to, c.peer)
+			}
+		}
+	}
 	if c.gso {
 		err := c.writeGSO(pkts, addrs)
 		if err == nil || !gsoUnsupported(err) {
@@ -161,14 +209,34 @@ func (c *Conn) writePlain(pkts [][]byte, addrs []netip.AddrPort) error {
 		msgs[i].Buffers[0] = pkts[i]
 		msgs[i].Addr = c.udpAddr(addrs[i])
 	}
+	return c.sendAll(msgs)
+}
+
+// sendAll sends msgs, skipping any the kernel refuses (ENOBUFS when an
+// interface queue is full, say), and returns the first error.
+func (c *Conn) sendAll(msgs []ipv4.Message) error {
+	var first error
 	for len(msgs) > 0 {
 		n, err := c.pc.WriteBatch(msgs, 0)
-		if err != nil {
-			return err
+		msgs = msgs[max(n, 0):] // sendmmsg's -1 on Linux
+		if err == nil {
+			continue
 		}
-		msgs = msgs[n:]
+		if c.gso && gsoUnsupported(err) {
+			return err // the caller resends without GSO
+		}
+		if first == nil && !refused(err) {
+			first = err
+		}
+		if len(msgs) > 0 {
+			msgs = msgs[1:] // the one that failed
+		}
 	}
-	return nil
+	return first
 }
+
+// refused reports whether err is an ICMP error from an earlier datagram,
+// which only a connected socket reports. It says nothing about this one.
+func refused(err error) bool { return errors.Is(err, syscall.ECONNREFUSED) }
 
 func (c *Conn) Close() error { return c.uc.Close() }
