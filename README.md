@@ -14,7 +14,7 @@ ARC is a multipath, carrier-agnostic overlay VPN. A TUN interface gives applicat
 | `internal/reassembly` | Bounded IP datagram reassembly |
 | `internal/session` | Client and relay session state machines (sans-IO) |
 | `internal/carrier/udp` | UDP carrier with batched I/O |
-| `internal/tun` | TUN device and Linux address/route setup |
+| `internal/tun` | TUN device, and address, route and DNS setup on Linux and macOS |
 | `internal/gateway` | Relay address pool, token authorization, routing to sessions |
 | `internal/engine` | Event loops that run sessions on real sockets and TUN devices |
 | `cmd/arc-client`, `cmd/arc-relay` | The client and relay commands |
@@ -169,3 +169,33 @@ loss (`docker run --rm --privileged arc-e2e split [SECONDS] [REPS]`).
 (`docker run --rm --privileged arc-e2e bench` on macOS). Treat its numbers as relative: both ends
 share one machine.
 
+## The client on macOS
+
+The relay runs on Linux; the client also runs on macOS, with the same flags:
+
+```sh
+go build -o bin/ ./cmd/arc-client
+sudo bin/arc-client run -relay RELAY_IP:4433 -relay-key RELAY_PUBLIC_KEY -full-tunnel -dns 1.1.1.1
+```
+
+The interface is the next free `utunN` (`-tun utunN` picks one). macOS has
+no socket marks or policy routing, so a full tunnel works differently:
+
+- **Carriers are bound to their interface** (`IP_BOUND_IF`), which routes
+  them by that interface's own routes rather than the tunnel's. With no
+  `-bind`, the client binds to the default route's interface at startup and
+  stays there: if the Mac moves from Wi-Fi to Ethernet, restart it, or pass
+  `-bind en0 -bind en7` to use both.
+- **Routes** `0.0.0.0/1` and `128.0.0.0/1` go through the tunnel, and IPv6
+  is rejected. Directly connected networks keep their more specific
+  routes, so unlike on Linux the local network stays reachable outside the
+  tunnel. DNS still goes through the tunnel's resolver.
+- **DNS** is published to configd's dynamic store as a service that
+  overrides the primary one (`-dns-mode scutil`, the default), as VPN
+  clients do, and removed on exit. Nothing persistent changes. If the
+  client is killed before it can clean up, the next run replaces the
+  entry, or remove it with
+  `printf 'remove State:/Network/Service/arc/IPv4\nremove State:/Network/Service/arc/DNS\n' | sudo scutil`.
+
+`test/macos/e2e.sh` checks split and full tunnels against a relay in
+Docker Desktop.

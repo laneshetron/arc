@@ -26,8 +26,9 @@ type Options struct {
 	// Mark sets SO_MARK (Linux), so policy routing can keep the carrier's
 	// own packets out of the tunnel (§17.1). Zero leaves it unset.
 	Mark uint32
-	// Device binds the socket to one interface (SO_BINDTODEVICE on Linux),
-	// for running one path per underlay. Empty leaves it unbound.
+	// Device binds the socket to one interface (SO_BINDTODEVICE on Linux,
+	// IP_BOUND_IF on macOS), for running one path per underlay. Empty
+	// leaves it unbound.
 	Device string
 	// BufferSize sets SO_RCVBUF and SO_SNDBUF. Zero means
 	// DefaultBufferSize. On Linux, privileged processes exceed

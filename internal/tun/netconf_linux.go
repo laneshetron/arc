@@ -105,3 +105,17 @@ func (d *Device) FullTunnel(mark uint32, table int) (cleanup func() error, err e
 func prefixNet(p netip.Prefix) *net.IPNet {
 	return &net.IPNet{IP: p.Addr().AsSlice(), Mask: net.CIDRMask(p.Bits(), p.Addr().BitLen())}
 }
+
+// DefaultName is the default TUN interface name.
+const DefaultName = "arc0"
+
+// DNSManager is the resolver manager ConfigureDNS uses.
+const DNSManager = "systemd-resolved"
+
+// PolicyRouting reports whether FullTunnel keeps carrier sockets out of the
+// tunnel by their mark. Otherwise each carrier must be bound to its
+// underlay interface (see Underlay).
+const PolicyRouting = true
+
+// Underlay is not needed with policy routing.
+func Underlay() (string, error) { return "", nil }
