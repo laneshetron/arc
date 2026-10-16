@@ -479,15 +479,17 @@ func (s *RelaySession) onJoin(now time.Time, p *path, f wire.PathJoin) bool {
 	if _, err := io.ReadFull(s.relay.cfg.Rand, p.challenge[:]); err != nil {
 		return true
 	}
-	p.remoteCID, p.joined = f.CID, true
+	p.remoteCID, p.joined, p.skippedAt = f.CID, true, time.Time{}
 	p.control = append(p.control, wire.PathChallenge{Data: p.challenge})
-	// The client opens slots lowest first, so unjoined slots below this
-	// one are lost to it (their NEW_PATH arrived too late, or never):
-	// retire them, so issueSlots replaces them rather than counting them
-	// as spares forever.
-	for _, q := range slices.Clone(s.conn.paths) {
-		if !q.joined && q.id < p.id {
-			s.removePath(q)
+	// The client opens slots lowest first, so an unjoined slot below this
+	// one was probably lost to it (its NEW_PATH arrived too late, or
+	// never). But JOINs travel over independent carriers and may arrive
+	// out of order, so a lower slot's JOIN may still be in flight: stop
+	// counting such slots as spares, so issueSlots replaces them, and
+	// retire them in Tick only if no JOIN arrives within the path timeout.
+	for _, q := range s.conn.paths {
+		if !q.joined && q.id < p.id && q.skippedAt.IsZero() {
+			q.skippedAt = now
 		}
 	}
 	s.issueSlots(now)
@@ -511,7 +513,7 @@ func (s *RelaySession) issueSlots(now time.Time) {
 	r := s.relay
 	spare := 0
 	for _, p := range s.conn.paths {
-		if !p.joined {
+		if !p.joined && p.skippedAt.IsZero() {
 			spare++
 		}
 	}
@@ -742,10 +744,22 @@ func (r *Relay) Tick(now time.Time) {
 		case !now.Before(s.conn.lastRecv().Add(r.cfg.IdleTimeout)):
 			r.closeSession(now, s, ErrIdleTimeout, false)
 		default:
+			removed := false
 			for _, p := range slices.Clone(s.conn.paths) {
 				if at := s.conn.abandonAt(p, DefaultPathTimeout); p.joined && !at.IsZero() && !now.Before(at) {
 					s.conn.queue(wire.PathAbandon{PathID: p.id, Code: wire.CodePathUnavailable})
 					s.removePath(p)
+					removed = true
+				} else if !p.joined && !p.skippedAt.IsZero() && !now.Before(p.skippedAt.Add(DefaultPathTimeout)) {
+					s.removePath(p)
+					removed = true
+				}
+			}
+			// Freed capacity may be needed for spares: a client whose slots
+			// ran out cannot send the JOIN that would otherwise refill them.
+			if removed {
+				if s.issueSlots(now); s.state == StateClosed {
+					continue
 				}
 			}
 			s.conn.onTimers(now)
@@ -776,6 +790,8 @@ func (r *Relay) NextDeadline() time.Time {
 		for _, p := range s.conn.paths {
 			if p.joined {
 				d = earliest(d, s.conn.abandonAt(p, DefaultPathTimeout))
+			} else if !p.skippedAt.IsZero() {
+				d = earliest(d, p.skippedAt.Add(DefaultPathTimeout))
 			}
 		}
 	}

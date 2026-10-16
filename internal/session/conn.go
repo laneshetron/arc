@@ -137,6 +137,9 @@ type path struct {
 	candRecv      int
 	candSent      int
 	candSentAt    time.Time
+	// skippedAt is when the client joined a higher slot while this one
+	// was unjoined; the slot is retired if no JOIN follows (see onJoin).
+	skippedAt time.Time
 }
 
 func newPath(id uint32, local, remote wire.CID, now time.Time) *path {
