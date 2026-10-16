@@ -1,4 +1,5 @@
-# Shared by e2e.sh and bench.sh: the three-namespace topology.
+# Shared by the netns scripts (e2e.sh, front.sh, bench.sh, ...): the
+# three-namespace topology.
 #
 #   arc-c (client)        arc-r (relay)                arc-i ("internet")
 #   c0 192.168.10.1/32 -- r0 192.168.10.2/24
