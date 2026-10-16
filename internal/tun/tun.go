@@ -21,6 +21,7 @@ const bufCap = Offset + 65535
 type Device struct {
 	dev  wgtun.Device
 	name string
+	dns  dnsState
 
 	rbufs  [][]byte
 	rsizes []int

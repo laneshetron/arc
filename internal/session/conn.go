@@ -66,6 +66,8 @@ var (
 	ErrPathTimeout      = errors.New("session: path timed out")
 	ErrPathAbandoned    = errors.New("session: path abandoned by peer")
 	ErrIntegrityLimit   = errors.New("session: too many authentication failures")
+	ErrPathLimit        = errors.New("session: path IDs exhausted; establish a new session")
+	ErrCapacity         = errors.New("session: authenticated session limit reached")
 	// ErrProtocolViolation ends a session whose peer broke the protocol,
 	// such as by sending beyond a stream's flow control limit.
 	ErrProtocolViolation = errors.New("session: peer violated the protocol")
@@ -144,6 +146,9 @@ type path struct {
 	candRecv      int
 	candSent      int
 	candSentAt    time.Time
+	// skippedAt is when the client joined a higher slot while this one
+	// was unjoined; the slot is retired if no JOIN follows (see onJoin).
+	skippedAt time.Time
 }
 
 func newPath(id uint32, local, remote wire.CID, now time.Time) *path {
@@ -212,6 +217,11 @@ type conn struct {
 	recv  *crypto.RecvKeys
 	paths []*path // ordered by ID for deterministic iteration
 	byCID map[wire.CID]*path
+	// highestPathID is the highest path ID ever added. Path IDs only
+	// increase, so a path's nonce space (path ID and packet number under
+	// the session's keys) is never recreated, without remembering every
+	// retired path: a session's paths can come and go indefinitely.
+	highestPathID uint32
 
 	// primary chooses the path for unbound control frames, and pathFor
 	// the path for each IP packet (the primary when nil); see sched.go.
@@ -278,10 +288,15 @@ func newConn(keys crypto.TrafficKeys, now time.Time) *conn {
 	}
 }
 
-func (c *conn) addPath(p *path) {
+func (c *conn) addPath(p *path) bool {
+	if (len(c.paths) > 0 || c.highestPathID > 0) && p.id <= c.highestPathID || c.byCID[p.localCID] != nil {
+		return false
+	}
+	c.highestPathID = p.id
 	i, _ := slices.BinarySearchFunc(c.paths, p.id, func(q *path, id uint32) int { return int(q.id) - int(id) })
 	c.paths = slices.Insert(c.paths, i, p)
 	c.byCID[p.localCID] = p
+	return true
 }
 
 func (c *conn) removePath(p *path) {

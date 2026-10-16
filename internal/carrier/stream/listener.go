@@ -23,8 +23,22 @@ type ListenerOptions struct {
 	// framing. A relay so configured should hold a certificate covering
 	// the cover names its clients present.
 	Camouflage bool
-	// MaxConns bounds concurrent connections (default 4096).
+	// MaxConns bounds pending handshakes and established connections together (default 4096).
 	MaxConns int
+	// MaxPending bounds TLS work independently of established carriers (default 128).
+	MaxPending int
+	// MaxConnsPerSource and MaxPendingPerSource apply to the actual TCP peer
+	// IP before any synthetic ARC address is assigned (defaults 64 and 4).
+	MaxConnsPerSource   int
+	MaxPendingPerSource int
+	// HandshakeTimeout bounds a pending handshake (default 10 seconds,
+	// as the client allows). TLS is the carrier for networks that block
+	// UDP, which are often lossy as well: a lost ClientHello waits out
+	// TCP's retransmission timeout, doubling with each loss, and a shorter
+	// limit would fail the fallback exactly where it is needed. The
+	// pending budgets, not this timeout, bound the work an attacker can
+	// hold.
+	HandshakeTimeout time.Duration
 	// Idle closes a connection that receives nothing for this long
 	// (default 5 minutes: well past keepalives and the session idle
 	// timeout).
@@ -46,9 +60,18 @@ type Listener struct {
 	ctx  context.Context
 	stop context.CancelFunc
 
-	mu    sync.Mutex
-	links map[netip.AddrPort]*link
-	next  uint64
+	mu             sync.Mutex
+	links          map[netip.AddrPort]*link
+	connections    map[*tls.Conn]*acceptedConn // includes pending TLS work
+	pending        int
+	sources        map[netip.Addr]int
+	pendingSources map[netip.Addr]int
+	next           uint64
+}
+
+type acceptedConn struct {
+	source  netip.Addr
+	pending bool
 }
 
 // streamPrefix is the first 8 bytes of synthetic addresses: a unique
@@ -66,6 +89,21 @@ func IsStreamAddr(a netip.AddrPort) bool {
 func Listen(addr string, opts ListenerOptions) (*Listener, error) {
 	if opts.MaxConns == 0 {
 		opts.MaxConns = 4096
+	}
+	if opts.MaxPending == 0 {
+		opts.MaxPending = 128
+	}
+	if opts.MaxConnsPerSource == 0 {
+		opts.MaxConnsPerSource = 64
+	}
+	if opts.MaxPendingPerSource == 0 {
+		opts.MaxPendingPerSource = 4
+	}
+	if opts.HandshakeTimeout == 0 {
+		opts.HandshakeTimeout = 10 * time.Second
+	}
+	if opts.MaxConns < 0 || opts.MaxPending < 0 || opts.MaxConnsPerSource < 0 || opts.MaxPendingPerSource < 0 || opts.HandshakeTimeout < 0 || opts.Queue < 0 || opts.Idle < 0 {
+		return nil, errors.New("stream: connection, queue and idle limits must not be negative")
 	}
 	if opts.Idle == 0 {
 		opts.Idle = 5 * time.Minute
@@ -87,6 +125,7 @@ func Listen(addr string, opts ListenerOptions) (*Listener, error) {
 	l := &Listener{
 		ln: tls.NewListener(tcp, cfg), opts: opts, in: make(chan inbound, opts.Queue),
 		ctx: ctx, stop: stop, links: make(map[netip.AddrPort]*link),
+		connections: make(map[*tls.Conn]*acceptedConn), sources: make(map[netip.Addr]int), pendingSources: make(map[netip.Addr]int),
 	}
 	go l.accept()
 	return l, nil
@@ -105,12 +144,45 @@ func (l *Listener) accept() {
 			time.Sleep(10 * time.Millisecond) // e.g. out of file descriptors
 			continue
 		}
-		go l.serve(conn.(*tls.Conn))
+		tc := conn.(*tls.Conn)
+		peer, err := netip.ParseAddrPort(tc.RemoteAddr().String())
+		if err != nil {
+			tc.Close()
+			continue
+		}
+		source := peer.Addr().Unmap()
+		l.mu.Lock()
+		if len(l.connections) >= l.opts.MaxConns || l.pending >= l.opts.MaxPending ||
+			l.sources[source] >= l.opts.MaxConnsPerSource || l.pendingSources[source] >= l.opts.MaxPendingPerSource || l.ctx.Err() != nil {
+			l.mu.Unlock()
+			tc.Close()
+			continue
+		}
+		l.connections[tc] = &acceptedConn{source: source, pending: true}
+		l.sources[source]++
+		l.pendingSources[source]++
+		l.pending++
+		l.mu.Unlock()
+		go l.serve(tc)
 	}
 }
 
 func (l *Listener) serve(conn *tls.Conn) {
-	ctx, cancel := context.WithTimeout(l.ctx, 10*time.Second)
+	defer func() {
+		conn.Close()
+		l.mu.Lock()
+		entry := l.connections[conn]
+		if entry.pending {
+			l.finishPending(entry)
+		}
+		l.sources[entry.source]--
+		if l.sources[entry.source] == 0 {
+			delete(l.sources, entry.source)
+		}
+		delete(l.connections, conn)
+		l.mu.Unlock()
+	}()
+	ctx, cancel := context.WithTimeout(l.ctx, l.opts.HandshakeTimeout)
 	err := conn.HandshakeContext(ctx)
 	cancel()
 	if err != nil {
@@ -130,11 +202,12 @@ func (l *Listener) serve(conn *tls.Conn) {
 		tcp.SetNoDelay(true)
 	}
 	l.mu.Lock()
-	if len(l.links) >= l.opts.MaxConns || l.ctx.Err() != nil {
+	if l.ctx.Err() != nil {
 		l.mu.Unlock()
 		conn.Close()
 		return
 	}
+	l.finishPending(l.connections[conn])
 	l.next++
 	var a [16]byte
 	copy(a[:8], streamPrefix[:])
@@ -149,6 +222,17 @@ func (l *Listener) serve(conn *tls.Conn) {
 	l.mu.Lock()
 	delete(l.links, addr)
 	l.mu.Unlock()
+}
+
+// finishPending runs under mu. The total and per-source connection
+// permits remain held until the established carrier closes.
+func (l *Listener) finishPending(entry *acceptedConn) {
+	entry.pending = false
+	l.pending--
+	l.pendingSources[entry.source]--
+	if l.pendingSources[entry.source] == 0 {
+		delete(l.pendingSources, entry.source)
+	}
 }
 
 // WriteBatch queues each packet for the connection its address names.
@@ -181,6 +265,9 @@ func (l *Listener) Close() error {
 	l.stop()
 	err := l.ln.Close()
 	l.mu.Lock()
+	for conn := range l.connections {
+		conn.Close()
+	}
 	for _, k := range l.links {
 		k.close()
 	}
