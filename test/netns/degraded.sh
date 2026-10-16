@@ -241,29 +241,46 @@ measure_failover() { # measure_failover NAME BASE_NETEM_ARGS
 measure_failover "blackholed busy link, clean links" ""
 measure_failover "blackholed busy link, rtt 100ms" "delay 50ms"
 
+tcp_link() { # prints 0 or 1: the link that sent more packets over the next second
+  local a b
+  a=$(tx c0) b=$(tx c1)
+  sleep 1
+  if (($(tx c0) - a >= $(tx c1) - b)); then echo 0; else echo 1; fi
+}
+
 # A lossy but live busy link: loss-aware path selection (spec §15.2) should
-# move traffic to the clean link within a couple of seconds, so TCP runs at
-# clean-link speed rather than at the loss-limited speed of Part 1. The TCP
-# run itself supplies the traffic the client measures loss on.
+# move a running TCP flow to the clean link within a few seconds (the loss
+# estimate, then evictGrace). The link is judged by the TCP flow itself:
+# flows are pinned per path, so a ping run beside it, as busy_link sends,
+# can be on the other link and says nothing about where the TCP flow is.
+# The flow also supplies the traffic the client measures loss on.
 lossy_link() { # lossy_link LOSS
-  local link after mbps
+  local link after mbps iperf secs=$((DURATION < 8 ? 8 : DURATION))
   # A fresh session: loss estimates only refresh from traffic and are
   # otherwise kept for 30 s, so a link that an earlier scenario made lossy
   # would still look lossy, and staying put would then be right.
   start_multipath_client off "client-lossy-$1.log"
   sleep 1
-  link=$(busy_link)
+  $C iperf3 -c "$TARGET" -t $((secs + 4)) -f m >"$WORK/iperf.log" 2>&1 &
+  iperf=$!
+  sleep 2
+  link=$(tcp_link)
   local from
   from=$(wc -l <"$WORK/client-lossy-$1.log")
   impair "$link" loss "$1"
-  mbps=$(tcp_up)
-  after=$(busy_link)
-  MP_ROWS+=("$(printf '%-34s c%s at %s loss: traffic moved to c%s, TCP %s Mbit/s' "lossy busy link, other clean" "$link" "$1" "$after" "$mbps")")
+  sleep "$secs"
+  after=$(tcp_link)
+  wait "$iperf" || true
+  mbps=$(grep receiver "$WORK/iperf.log" | tail -1 | awk '{print $(NF-2)}')
+  if [[ -z $mbps ]]; then
+    fail "TCP run failed at $1 loss"
+    sed 's/^/  iperf3: /' "$WORK/iperf.log"
+  fi
+  MP_ROWS+=("$(printf '%-34s c%s at %s loss: TCP moved to c%s, %s Mbit/s overall' "lossy busy link, other clean" "$link" "$1" "$after" "${mbps:-0}")")
   if [[ $after != "$link" ]]; then
-    pass "traffic left c$link at $1 loss"
+    pass "TCP left c$link at $1 loss"
   else
-    fail "traffic stayed on c$link at $1 loss"
-    echo "  path state (client, then relay), from -status:"
+    fail "TCP stayed on c$link at $1 loss"
     echo "  client path state since the loss began, from -status:"
     tail -n +"$from" "$WORK/client-lossy-$1.log" | grep 'msg=path ' | sed 's/^/    /'
   fi
