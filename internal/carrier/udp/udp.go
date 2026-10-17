@@ -140,9 +140,10 @@ func (c *Conn) LocalAddr() netip.AddrPort { return c.uc.LocalAddr().(*net.UDPAdd
 func (c *Conn) ReadBatch(bufs [][]byte, sizes []int, addrs []netip.AddrPort) (int, error) {
 	for {
 		n, err := c.readBatch(bufs, sizes, addrs)
-		// A connected socket reports an ICMP error from an earlier send on
-		// the next read. The peer may come back (a relay restarting), so
-		// read on, as an unconnected socket would never have noticed.
+		// A connected socket reports an ICMP or route error from an
+		// earlier send on the next read. The peer may come back (a relay
+		// restarting, a Wi-Fi link reassociating), so read on, as an
+		// unconnected socket would never have noticed.
 		if n == 0 && c.peer.IsValid() && refused(err) {
 			continue
 		}
@@ -236,7 +237,23 @@ func (c *Conn) sendAll(msgs []ipv4.Message) error {
 }
 
 // refused reports whether err is an ICMP error from an earlier datagram,
-// which only a connected socket reports. It says nothing about this one.
-func refused(err error) bool { return errors.Is(err, syscall.ECONNREFUSED) }
+// which only a connected socket reports, or a route error a send reports
+// while the network is briefly unreachable (macOS during a Wi-Fi roam,
+// say). Either way a datagram is lost, as the network might lose it; the
+// socket is fine.
+func refused(err error) bool {
+	for _, e := range []syscall.Errno{
+		syscall.ECONNREFUSED, // port unreachable
+		syscall.ENETUNREACH,  // net unreachable, or no route
+		syscall.EHOSTUNREACH, // host unreachable
+		syscall.EHOSTDOWN,    // macOS: the next hop doesn't answer ARP
+		syscall.ENETDOWN,     // the interface went down
+	} {
+		if errors.Is(err, e) {
+			return true
+		}
+	}
+	return false
+}
 
 func (c *Conn) Close() error { return c.uc.Close() }

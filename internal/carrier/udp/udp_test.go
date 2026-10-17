@@ -3,7 +3,10 @@ package udp
 import (
 	"bytes"
 	"fmt"
+	"net"
 	"net/netip"
+	"os"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -155,6 +158,26 @@ func TestConnectedPeerRestart(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Error("no datagram from the restarted peer")
+	}
+}
+
+// ICMP and route errors a connected socket reports must not end its reader
+// or count as send failures. macOS reported "recvmsg: network is
+// unreachable" on Wi-Fi, and the client exited.
+func TestRefused(t *testing.T) {
+	for _, errno := range []syscall.Errno{
+		syscall.ECONNREFUSED, syscall.ENETUNREACH, syscall.EHOSTUNREACH,
+		syscall.EHOSTDOWN, syscall.ENETDOWN,
+	} {
+		err := &net.OpError{Op: "read", Net: "udp", Err: os.NewSyscallError("recvmsg", errno)}
+		if !refused(err) {
+			t.Errorf("%v is fatal; want it read past", err)
+		}
+	}
+	for _, err := range []error{net.ErrClosed, os.ErrDeadlineExceeded, syscall.EBADF, syscall.EMSGSIZE} {
+		if refused(err) {
+			t.Errorf("%v is read past; want it returned", err)
+		}
 	}
 }
 
