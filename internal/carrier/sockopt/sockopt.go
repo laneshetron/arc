@@ -8,7 +8,7 @@ import "syscall"
 // Options are the carrier socket options; zero values leave them unset.
 type Options struct {
 	Mark   uint32 // SO_MARK (Linux)
-	Device string // SO_BINDTODEVICE (Linux)
+	Device string // SO_BINDTODEVICE (Linux), IP_BOUND_IF (macOS)
 }
 
 // Control returns a net.Dialer or net.ListenConfig Control function that

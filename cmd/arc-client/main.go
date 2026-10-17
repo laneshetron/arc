@@ -62,14 +62,14 @@ func run(args []string) error {
 	relayKey := fs.String("relay-key", "", "relay static public key (base64), pinned")
 	tokenFile := fs.String("token-file", "token", "file containing the access token")
 	keyFile := fs.String("key-file", "", "client static private key; a new one is generated if empty")
-	tunName := fs.String("tun", "arc0", "TUN interface name")
+	tunName := fs.String("tun", tun.DefaultName, "TUN interface name")
 	fullTunnel := fs.Bool("full-tunnel", false, "route all traffic through the tunnel")
 	dns := fs.String("dns", "", "trusted IPv4 DNS resolver (overrides the relay's resolver)")
-	dnsMode := fs.String("dns-mode", "systemd-resolved", "full-tunnel DNS setup: systemd-resolved or manual (requires -dns and an externally configured resolver)")
+	dnsMode := fs.String("dns-mode", tun.DNSManager, "full-tunnel DNS setup: "+tun.DNSManager+" or manual (requires -dns and an externally configured resolver)")
 	var routes prefixList
 	fs.Var(&routes, "route", "route this prefix through the tunnel (repeatable)")
 	var binds []string
-	fs.Func("bind", "bind a carrier socket to this interface (repeatable)", func(iface string) error {
+	fs.Func("bind", "bind a carrier socket to this interface (repeatable; on macOS, a full tunnel binds to the default route's interface if none is given)", func(iface string) error {
 		if iface == "" {
 			return errors.New("interface name must not be empty")
 		}
@@ -128,8 +128,8 @@ func run(args []string) error {
 		}
 		return nil
 	})
-	mark := fs.Uint("mark", 0x5243, "fwmark for carrier sockets, used by -full-tunnel")
-	table := fs.Int("table", 5243, "routing table for -full-tunnel")
+	mark := fs.Uint("mark", 0x5243, "fwmark for carrier sockets, used by -full-tunnel (Linux)")
+	table := fs.Int("table", 5243, "routing table for -full-tunnel (Linux)")
 	prof := profiling.Register(fs)
 	fs.Parse(args)
 	if !*fullTunnel {
@@ -143,11 +143,11 @@ func run(args []string) error {
 			return errors.New("-dns and -dns-mode require -full-tunnel; configure split-tunnel DNS with your resolver manager")
 		}
 	}
-	if *fullTunnel && (*mark == 0 || uint64(*mark) > 1<<32-1 || *table <= 0 || (*table >= 253 && *table <= 255)) {
+	if *fullTunnel && tun.PolicyRouting && (*mark == 0 || uint64(*mark) > 1<<32-1 || *table <= 0 || (*table >= 253 && *table <= 255)) {
 		return errors.New("-full-tunnel requires a nonzero 32-bit -mark and a dedicated routing -table (not 253, 254 or 255)")
 	}
-	if *dnsMode != "systemd-resolved" && *dnsMode != "manual" {
-		return errors.New("-dns-mode must be systemd-resolved or manual")
+	if *dnsMode != tun.DNSManager && *dnsMode != "manual" {
+		return errors.New("-dns-mode must be " + tun.DNSManager + " or manual")
 	}
 	var trustedDNS netip.Addr
 	if *dns != "" {
@@ -209,11 +209,23 @@ func run(args []string) error {
 	}
 	defer dev.Close()
 	sockOpts := udp.Options{NoOffload: *noOffload}
-	if *fullTunnel {
-		sockOpts.Mark = uint32(*mark)
-	}
 	if len(binds) == 0 {
 		binds = []string{""}
+	}
+	if *fullTunnel && tun.PolicyRouting {
+		sockOpts.Mark = uint32(*mark)
+	} else if *fullTunnel {
+		// Without marks, an unbound carrier would route into the tunnel
+		// it carries. This binding doesn't follow later changes of the
+		// default route; pass -bind for each interface to use them all.
+		for i, iface := range binds {
+			if iface == "" {
+				if binds[i], err = tun.Underlay(); err != nil {
+					return err
+				}
+				log.Info("binding carrier to the default route's interface", "interface", binds[i])
+			}
+		}
 	}
 	carriers := make([]engine.Carrier, 0, len(binds))
 	for _, iface := range binds {
@@ -343,7 +355,7 @@ func run(args []string) error {
 				return err
 			}
 		}
-		if *fullTunnel && *dnsMode == "systemd-resolved" {
+		if *fullTunnel && *dnsMode == tun.DNSManager {
 			nextCleanup, err := dev.ConfigureDNS(resolver)
 			if err != nil {
 				return err
