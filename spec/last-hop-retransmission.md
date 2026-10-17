@@ -212,21 +212,25 @@ with retransmission** on the same runs.
 ### 5.1 `stall.sh` extensions (first PR, before any protocol change)
 
 - `LAST_HOP_RTT`: delay between the relay and the AP, taken out of the ISP
-  leg so the end-to-end RTT stays 40 ms. Values 1, 10, 20 ms, to cross the
-  `min_rtt / 4` line of §4.
-- An `arc-rtx` mode, once the feature exists.
-- Per run, from the sender's namespace (`SHOW_LOGS`, already partly
-  there): `TcpRetransSegs`, `TcpExtTCPSackRecovery`, `TcpExtTCPTimeouts`,
-  `TcpExtTCPDSACKRecv`, `TcpExtTCPDSACKUndo`, `TcpExtTCPLossUndo`, and the relay's
+  leg so the end-to-end RTT stays 40 ms. Values 1 and 20 ms, either side
+  of the `min_rtt / 4` line of §4. (A netem above each Wi-Fi bucket adds
+  the delay before the bucket, which is exact for the downlink. On the
+  uplink, sends queued during a stall skip it when the stall ends.)
+- Per run, from the sender's namespace: `TcpRetransSegs`,
+  `TcpExtTCPSackRecovery`, `TcpExtTCPTimeouts`, `TcpExtTCPDSACKRecv`, and
+  `TcpExtTCPDSACKUndo` + `TcpExtTCPLossUndo`. Medians of retransmissions
+  and undos go in the table.
+- Requesting a congestion control the kernel lacks (`CCS=bbr` on Docker
+  Desktop) fails instead of skipping it.
+- Later, with the feature: an `arc-rtx` mode and the relay's
   retransmission counters (sent, wasted as duplicates, refused by budget,
   expired).
-- A congestion-control check that fails loudly when `bbr` is requested but
-  unavailable, instead of the current "skipping".
 
 ### 5.2 Tier 1: CI with BBR (GitHub Actions `ubuntu-latest`)
 
-Ubuntu's kernel ships `tcp_bbr`. A `workflow_dispatch` job (not on every
-push; CI runners are noisy, see the netns notes) runs:
+Ubuntu's kernel ships `tcp_bbr`. `.github/workflows/stall.yml` runs on
+demand (`workflow_dispatch`) and on pull requests that change the script,
+not on every push (CI runners are noisy, see the netns notes):
 
 ```sh
 sudo modprobe sch_netem tcp_bbr

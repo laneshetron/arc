@@ -13,11 +13,14 @@
 #
 # Usage: stall.sh BIN_DIR [SECONDS] [REPS]   (defaults 10 and 3)
 # Environment: STALL (90ms), PERIOD (455ms), HOLD (frames the access point
-# holds during a stall, 64), CCS (congestion controls to try, default
+# holds during a stall, 64), LAST_HOP_RTT (round trip between the relay
+# and the AP, taken out of the ISP's 40 ms, default 0ms), CCS (congestion
+# controls to try, default
 # "cubic bbr"), MODES (default "plain arc arc-fecoff"), UDP (a rate, such
 # as 20M: report the loss % of a constant-rate UDP download instead of TCP
-# goodput), SHOW_LOGS (print the sender's TCP retransmission counters per
-# run, and the last relay and client status lines).
+# goodput), SHOW_LOGS (print the last relay and client status lines).
+# Each run also prints the sender's TCP counters: retransmitted segments,
+# SACK recoveries, timeouts, DSACKs, and undos of window reductions.
 set -euo pipefail
 
 BIN=$(cd "${1:?usage: stall.sh BIN_DIR [SECONDS] [REPS]}" && pwd)
@@ -26,6 +29,7 @@ REPS=${3:-3}
 STALL=${STALL:-90ms}
 PERIOD=${PERIOD:-455ms}
 HOLD=${HOLD:-64}
+LAST_HOP_RTT=${LAST_HOP_RTT:-0ms}
 source "$(dirname "$0")/lib.sh"
 WORK=$(mktemp -d)
 TARGET=192.168.20.2
@@ -77,29 +81,46 @@ stop_client() {
 }
 use_plain() { $C ip route replace 192.168.20.0/24 via 192.168.10.2 dev c0 onlink; }
 
-# The "Internet" side (r1/i0) is the ISP: 20 ms each way, and a 400 Mbit/s
-# downstream shaper with a deep queue. The client link (c0/r0) is the
+# The "Internet" side (r1/i0) is the ISP: 20 ms each way less half of
+# LAST_HOP_RTT, and a 400 Mbit/s downstream shaper with a deep queue. The client link (c0/r0) is the
 # Wi-Fi: a token bucket at 800 Mbit/s that the staller switches between
 # running and stopped. The bucket keeps its queue across changes (its
 # limit never changes), so frames held during a stall go out when it ends.
 # During a stall, the downlink (r0) bucket's queue shrinks to HOLD frames,
 # so it keeps those and drops the rest; the uplink (c0) holds everything,
 # as the station queues its own sends.
-$I tc qdisc replace dev i0 root netem delay 20ms rate 400mbit limit 100000
-$R tc qdisc replace dev r1 root netem delay 20ms limit 100000
+#
+# With LAST_HOP_RTT, a netem at the root of each client-link queue delays
+# packets before they reach the bucket: the relay is that far from the AP.
+# (On the uplink the delay then comes before the station's queue instead
+# of after it, so sends queued during a stall skip it when the stall ends.)
+last_hop=$(awk -v r="${LAST_HOP_RTT%ms}" 'BEGIN { printf "%g", r / 2 }')
+isp=$(awk -v h="$last_hop" 'BEGIN { printf "%g", 20 - h }')
+if awk -v h="$last_hop" 'BEGIN { exit !(h < 0 || h > 20) }'; then
+  echo "LAST_HOP_RTT must be between 0 and 40 ms" >&2
+  exit 2
+fi
+$I tc qdisc replace dev i0 root netem delay "${isp}ms" rate 400mbit limit 100000
+$R tc qdisc replace dev r1 root netem delay "${isp}ms" limit 100000
 RUN="rate 800mbit burst 200kb"
 STOP="rate 8bit burst 1600" # 1 byte/s: nothing more gets through
+WIFI="root"
+if [[ $last_hop != 0 ]]; then
+  $R tc qdisc replace dev r0 root handle 1: netem delay "${last_hop}ms" limit 100000
+  $C tc qdisc replace dev c0 root handle 1: netem delay "${last_hop}ms" limit 100000
+  WIFI="parent 1:1"
+fi
 # A tbf change resets its fifo's limit to the tbf's own (here, in packets),
 # so the stall shrinks the fifo after stopping the bucket.
-$R tc qdisc replace dev r0 root handle 10: tbf $RUN limit 10000
+$R tc qdisc replace dev r0 $WIFI handle 10: tbf $RUN limit 10000
 $R tc qdisc replace dev r0 parent 10:1 handle 20: pfifo limit 10000
-$C tc qdisc replace dev c0 root handle 10: tbf $RUN limit 10000000
+$C tc qdisc replace dev c0 $WIFI handle 10: tbf $RUN limit 10000000
 wifi() { # wifi RUN|STOP
-  ip netns exec arc-r tc qdisc change dev r0 root handle 10: tbf $1 limit 10000
+  ip netns exec arc-r tc qdisc change dev r0 $WIFI handle 10: tbf $1 limit 10000
   if [[ $1 == "$STOP" ]]; then
     ip netns exec arc-r tc qdisc change dev r0 parent 10:1 handle 20: pfifo limit "$HOLD"
   fi
-  ip netns exec arc-c tc qdisc change dev c0 root handle 10: tbf $1 limit 10000000
+  ip netns exec arc-c tc qdisc change dev c0 $WIFI handle 10: tbf $1 limit 10000000
 }
 start_stalls() {
   local stall=${STALL%ms} period=${PERIOD%ms}
@@ -133,19 +154,28 @@ udp_loss() { # udp_loss RATE: prints the loss % of a constant-rate UDP download
   $C timeout $((DURATION + 30)) iperf3 -c "$TARGET" -u -b "$1" -l 1200 -t "$DURATION" -R -f m >"$WORK/iperf.log" 2>&1 || { echo 100; return; }
   grep receiver "$WORK/iperf.log" | tail -1 | grep -oE '\(([0-9.e+-]+)%\)' | tr -d '(%)'
 }
-r0_drops() { $R tc -s qdisc show dev r0 | awk '/dropped/ { for (i = 1; i <= NF; i++) if ($i == "(dropped") { gsub(",", "", $(i + 1)); print $(i + 1); exit } }'; }
+r0_drops() { $R tc -s qdisc show dev r0 | awk '/^qdisc tbf/ { tbf = 1 } tbf && /dropped/ { for (i = 1; i <= NF; i++) if ($i == "(dropped") { gsub(",", "", $(i + 1)); print $(i + 1); exit } }'; }
+# The sender's TCP counters (the download's sender is iperf3 in arc-i), as
+# absolute values: nstat's history file is shared across namespaces.
+TCP_COUNTERS="TcpRetransSegs TcpExtTCPSackRecovery TcpExtTCPTimeouts TcpExtTCPDSACKRecv TcpExtTCPDSACKUndo TcpExtTCPLossUndo"
+tcp_counters() { $I nstat -asz $TCP_COUNTERS | awk 'NR > 1 { v[$1] = $2 } END { n = split(ENVIRON["TCP_COUNTERS"], k, " "); for (i = 1; i <= n; i++) printf "%d ", v[k[i]]; print "" }'; }
+export TCP_COUNTERS
 median() { sort -g | awk '{v[NR] = $1} END {print (NR ? v[int((NR + 1) / 2)] : "-")}'; }
 
 available=$($I sysctl -n net.ipv4.tcp_available_congestion_control)
 ROWS=()
 for cc in ${CCS:-cubic bbr}; do
   if [[ " $available " != *" $cc "* ]]; then
+    if [[ -n ${CCS:-} ]]; then
+      echo "FAIL: $cc requested but not available (have: $available; try modprobe tcp_$cc)" >&2
+      exit 1
+    fi
     echo "skipping $cc: not available (have: $available)"
     continue
   fi
   for mode in ${MODES:-plain arc arc-fecoff}; do
     for stalls in off on; do
-      downs=() drops=()
+      downs=() drops=() retx=() undo=()
       for rep in $(seq "$REPS"); do
         case $mode in
           plain) stop_client; use_plain ;;
@@ -154,20 +184,24 @@ for cc in ${CCS:-cubic bbr}; do
         esac
         [[ $stalls == on ]] && start_stalls
         d0=$(r0_drops)
-        [[ -n ${SHOW_LOGS:-} ]] && $I nstat -n
+        read -ra t0 <<<"$(tcp_counters)"
         if [[ -n ${UDP:-} ]]; then
           downs+=("$(udp_loss "$UDP")")
         else
           downs+=("$(tcp -R -C "$cc")")
         fi
         drops+=("$(($(r0_drops) - d0))")
-        if [[ -n ${SHOW_LOGS:-} ]]; then
-          echo "sender TCP, $mode stalls $stalls: $($I nstat -z TcpRetransSegs TcpExtTCPTimeouts TcpExtTCPLossProbes TcpExtTCPSpuriousRTOs TcpExtTCPSackRecovery 2>/dev/null | awk 'NR > 1 { printf "%s=%s ", $1, $2 }')"
-        fi
+        read -ra t1 <<<"$(tcp_counters)"
+        d=() # retransmitted segments, SACK recoveries, timeouts, DSACKs received, DSACK and loss undos
+        for i in "${!t1[@]}"; do d+=("$((t1[i] - t0[i]))"); done
+        retx+=("${d[0]}")
+        undo+=("$((d[4] + d[5]))")
+        echo "  run $rep: retransmits ${d[0]}, recoveries ${d[1]}, timeouts ${d[2]}, DSACKs ${d[3]}, undos $((d[4] + d[5]))"
         stop_stalls
       done
-      ROWS+=("$(printf '%-6s %-11s %-7s %12s %10s' "$cc" "$mode" "$stalls" \
-        "$(printf '%s\n' "${downs[@]}" | median)" "$(printf '%s\n' "${drops[@]}" | median)")")
+      ROWS+=("$(printf '%-6s %-11s %-7s %12s %10s %10s %8s' "$cc" "$mode" "$stalls" \
+        "$(printf '%s\n' "${downs[@]}" | median)" "$(printf '%s\n' "${drops[@]}" | median)" \
+        "$(printf '%s\n' "${retx[@]}" | median)" "$(printf '%s\n' "${undo[@]}" | median)")")
       echo "measured: $cc $mode stalls $stalls: down ${downs[*]} (AP drops ${drops[*]})"
     done
   done
@@ -179,7 +213,8 @@ if [[ -n ${SHOW_LOGS:-} ]]; then
 fi
 
 echo
-echo "Download at 40 ms RTT through a 400 Mbit/s ISP and 800 Mbit/s Wi-Fi, stalls of $STALL every $PERIOD with $HOLD frames held at the AP;"
-echo "medians of $REPS runs of $DURATION s; $(nproc) CPUs; kernel $(uname -r)"
-printf '%-6s %-11s %-7s %12s %10s\n' "cc" "path" "stalls" "down Mbit/s" "AP drops"
+echo "Download at 40 ms RTT (last hop $LAST_HOP_RTT) through a 400 Mbit/s ISP and 800 Mbit/s Wi-Fi,"
+echo "stalls of $STALL every $PERIOD with $HOLD frames held at the AP; medians of $REPS runs of $DURATION s;"
+echo "$(nproc) CPUs; kernel $(uname -r). retx: the sender's retransmitted segments; undo: its DSACK and loss undos."
+printf '%-6s %-11s %-7s %12s %10s %10s %8s\n' "cc" "path" "stalls" "down Mbit/s" "AP drops" "retx" "undo"
 printf '%s\n' "${ROWS[@]}"
