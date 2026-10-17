@@ -31,8 +31,44 @@ up to 95 ms of delay. The access point kept a fixed number of frames
 
 Without stalls all three reach 320–380 Mbit/s. The stall's *delay* costs
 TCP little (202 Mbit/s with unlimited holding); its *loss* costs it almost
-everything. ARC does slightly worse than plain routing because it sends
-more frames into the same few slots (FEC repairs, acknowledgements).
+everything. In emulation ARC does slightly worse than plain routing,
+because it sends more frames into the same few slots (FEC repairs,
+acknowledgements).
+
+### Same sender, direct vs ARC, on real Wi-Fi
+
+The real-world comparisons above set ARC through us-east-1 against
+direct downloads from Cloudflare's nearby PoP, a different server at a
+much lower RTT. On a second network (2026-10-17; the stalls follow the Mac,
+not the network), a test server on the relay instance itself served both
+routes during the same stalls. It set CUBIC or BBR per connection and
+recorded each connection's `TCP_INFO`. The direct route used a temporary
+security-group rule for the Mac's address. Three runs of 10 s per cell,
+Mbit/s; the direct runs came before and after the ARC runs:
+
+| Download from the relay instance | CUBIC ×1 | CUBIC ×4 | BBR ×1 | BBR ×4 |
+|---|---|---|---|---|
+| Direct, before | 6–10 | 17–20 | 102–113 | 97–124 |
+| Through ARC | 98–168 | 96–146 | 88–135 | 93–120 |
+| Direct, after | 9–12 | 13–17 | 21–102 | 79–136 |
+
+| Sender's TCP, per cell | Retransmitted segments | Min RTT | D-SACKs |
+|---|---|---|---|
+| Direct | 2.1–7.4% | 10.5–13.5 ms | 11–2,480 |
+| Through ARC | 0.14–0.56% | 14.9–18.6 ms | 0–46 |
+
+- **Over the same AWS path, ARC already beats direct**: about 10× for
+  CUBIC, and level for BBR. The tunneled flows saw a tenth of the
+  retransmissions. The client measured 0.1–2% downlink loss before FEC
+  repair (`-status`), and FEC (auto) likely repaired much of the rest.
+  FEC's counters weren't captured, so how much each accounts for is open
+  (§8).
+- **The earlier ARC-vs-plain gaps were mostly the server**, not the
+  tunnel: Cloudflare's PoP against a relay 11–13 ms away.
+- **The first network was worse**: there ARC measured 10–17% downlink
+  loss, beyond what FEC repairs. Retransmission matters most for links
+  like that. On the second network the case is weaker: ARC is already at
+  or above direct.
 
 ARC can do better than plain routing here, because the relay sits close to
 the lossy hop and learns of each loss one last-hop round trip after it
@@ -53,7 +89,10 @@ the tunneled flow delay instead of loss.
   relay held ~1 packet per stall while the sender retransmitted 60–75
   segments per loss recovery.
 - **FEC (§11.2)**: a block code can't rebuild 55 ms of consecutive loss
-  in time to matter. `auto` correctly stays off for bursts that long.
+  in time to matter, and `auto` correctly stays off for bursts that long.
+  It doesn't help in emulation, where the AP drops whole blocks. On the
+  second real network, where loss was lighter, it likely repaired most of
+  it (§1).
 - **Redundancy (§11.1)**: needs a second path whose stalls don't line up,
   and doubles traffic.
 - **Split TCP (§11.3)**: does recover these losses (ARC retransmits
@@ -188,17 +227,18 @@ client's ACKs.
   the repair's arrival shows that retransmission was spurious:
   - A receiver that reports D-SACK lets Linux undo the reduction
     (`TCPDSACKUndo`) and widen RACK's reordering window for later losses.
-    **Whether macOS sends D-SACK is unknown, and decides how much CUBIC
-    gains here.**
+    **macOS does send D-SACKs**: direct downloads from the relay to the Mac
+    drew 11–2,480 per cell (`TCP_INFO` `dsack_dups`, §1), so these undos
+    are available to Linux senders.
   - Even without undo, the sender's retransmission is no longer the only
     copy. If the far sender's retransmission itself falls into the next
     stall, the flow still has the relay's copy, which avoids the slow
     recovery episodes measured in §2.
 - **BBR** mostly ignores loss: v1 entirely, v3 once loss in a round exceeds
-  2%. Retransmission keeps v3 under that threshold. Most of the
-  real-world gap was measured with Cloudflare, which runs BBR (~110 Mbit/s
-  through ARC vs ~410 direct, while stalling). Whether ARC's extra loss is
-  what costs BBR that much is not established; §5 measures it.
+  2%. Retransmission keeps v3 under that threshold. Against the same
+  sender, BBR through ARC already matches direct (§1). The gap measured
+  earlier against Cloudflare (~110 Mbit/s through ARC vs ~410 direct)
+  was mostly Cloudflare's nearby PoP.
 - **UDP applications** (QUIC, VoIP, games) receive a late copy instead of
   nothing. QUIC treats it like any reordered packet. Real-time media
   usually drops it as late. `retain_age` bounds the lateness.
@@ -247,15 +287,18 @@ runs the same day as the change (a draft PR carrying main) for a baseline.
   Confirm with a 100 Hz ping to the gateway right before and after each
   run: stalls show as ~90 ms spikes every ~455 ms. AWDL comes back on by
   itself, and stalls stop when the phone leaves.
-- Sender: the relay itself (`iperf3 -s` bound to its tunnel address) with
-  `-C bbr` and `-C cubic`. Amazon Linux 2023 ships `tcp_bbr`.
+- Sender: the relay itself, with a small server that sets
+  `TCP_CONGESTION` per connection (`?cc=bbr`) and reports each
+  connection's `TCP_INFO` (retransmissions, min RTT, D-SACKs), as used for
+  §1. Amazon Linux 2023 ships `tcp_bbr`.
 - Alternate the relay between retransmission off and on (a temporary
   systemd drop-in, as in the earlier `-no-offload` A/B), 5 runs each,
   interleaved so that drift in the stall pattern affects both alike.
 - Measure goodput, the client's `-status` loss and burst, the relay's
-  counters, and the relay-side TCP counters for the iperf3 flow.
-- Direct-path control (no ARC, same sender): needs a temporary security
-  group rule for one TCP port on the relay. Ask before changing the
+  retransmission and FEC counters, and the sender's `TCP_INFO`.
+- Direct-path control (no ARC, same sender), before and after the ARC
+  runs, as in §1: a temporary security-group rule for one TCP port from
+  the Mac's address only, removed afterwards. Ask before changing the
   infrastructure.
 - Optional: Cloudflare's speed test through ARC as a real BBR server. It
   returns 429 to the relay's IP after a few hundred MB, so keep runs few.
@@ -278,8 +321,8 @@ runs the same day as the change (a draft PR carrying main) for a baseline.
   doesn't happen there, record that, since it decides whether `auto` is
   needed.
 - Real Wi-Fi, stalling: ARC with retransmission beats today's ARC for
-  both BBR and CUBIC, and the client's measured downlink loss falls well
-  below 1%.
+  both BBR and CUBIC, stays at or above direct (§1), and the client's
+  measured downlink loss falls well below 1%.
 - No regression beyond noise in §5.4.
 
 ## 6. Spec changes
@@ -309,8 +352,13 @@ runs the same day as the change (a draft PR carrying main) for a baseline.
 
 ## 8. Open questions
 
-- Does macOS send D-SACK? It decides how much CUBIC gains when the
-  relay is far from the client (§4).
+- Why did ARC's packets fare so much better than direct TCP's on the
+  second network (§1), when emulation shows no such effect? Candidates:
+  loss less bursty than the emulation's tail drops (failed Wi-Fi retries,
+  say), which FEC repairs; or the AP treating the tunnel's flow
+  differently. FEC counters (repairs sent, packets rebuilt) in the next
+  A/B runs would tell. If FEC accounts for it, the emulation's AP model
+  needs a random-loss component too.
 - Is 64 frames typical of access points in power-save buffering, and does
   it vary with frame size? This affects how much the AP keeps, not the
   design.
