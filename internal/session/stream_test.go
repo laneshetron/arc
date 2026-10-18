@@ -585,3 +585,28 @@ func TestStreamStalls(t *testing.T) {
 		t.Errorf("goodput %.1f Mbit/s through stalls; want at least a quarter of the 50 Mbit/s link", goodput*8/1e6)
 	}
 }
+
+func TestStreamLongRTTNotStalls(t *testing.T) {
+	// Acknowledgements arriving regularly 30 ms or more apart, as on a
+	// long path with few packets in flight early on, are its normal
+	// cadence, not stalls. Taking them for stalls held the rate: 1 MiB
+	// over a clean 50 Mbit/s link with 200 ms delay each way took 17 s,
+	// against 3 s before stall detection.
+	n := newNetwork(t, 99, defaultRelayConfig(), ClientConfig{})
+	for _, l := range []*link{n.up, n.down} {
+		l.rate, l.delay = 6_250_000, 200*time.Millisecond
+	}
+	s := n.establish()
+	n.runFor(2 * time.Second)
+	data := randomBytes(16, 1<<20)
+	start := n.now
+	sp := openPair(t, n, s, nil, data)
+	if !sp.run(60*time.Second) || !bytes.Equal(sp.client.got, data) {
+		t.Fatalf("transfer incomplete: %d/%d", len(sp.client.got), len(data))
+	}
+	took := sp.client.eofAt.Sub(start)
+	t.Logf("1 MiB at 400 ms RTT in %v (%d stalls seen)", took.Round(10*time.Millisecond), s.conn.paths[0].cc.stalls)
+	if took > 5*time.Second {
+		t.Errorf("1 MiB at 400 ms RTT took %v; want at most 5 s", took)
+	}
+}

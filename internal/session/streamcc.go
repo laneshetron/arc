@@ -81,8 +81,10 @@ const (
 	// ccRecent is how many of the latest RTT samples slow start takes the
 	// lowest of, so that one delayed sample doesn't end it.
 	ccRecent = 4
-	// A stall is acknowledgements stopping for at least ccMinStall and
-	// ccStallGaps usual gaps between them while data is outstanding.
+	// A stall is acknowledgements stopping, while data is outstanding, for
+	// at least ccMinStall, ccStallGaps usual gaps between them, and the
+	// path's base RTT: on a long path with little in flight, a regular
+	// cadence of acknowledgements tens of milliseconds apart is normal.
 	ccMinStall  = 30 * time.Millisecond
 	ccStallGaps = 8
 )
@@ -229,7 +231,7 @@ func (cc *streamCC) onAck(now time.Time, acked, lost, ackedBytes int, rtt time.D
 	if acked > 0 {
 		if !cc.lastAck.IsZero() {
 			gap := min(now.Sub(cc.lastAck), ccMaxAckGap)
-			if gap >= max(ccMinStall, ccStallGaps*cc.ackGap) && cc.lastSend.After(cc.lastAck) {
+			if gap >= max(ccMinStall, ccStallGaps*cc.ackGap, cc.baseRTT(0)) && cc.lastSend.After(cc.lastAck) {
 				// A stall's gap stays out of the usual gap, which would
 				// otherwise delay pausing for the next one.
 				cc.stallEnd = now
