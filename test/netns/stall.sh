@@ -14,11 +14,16 @@
 # Usage: stall.sh BIN_DIR [SECONDS] [REPS]   (defaults 10 and 3)
 # Environment: STALL (90ms), PERIOD (455ms), HOLD (frames the access point
 # holds during a stall, 64), LAST_HOP_RTT (round trip between the relay
-# and the AP, taken out of the ISP's 40 ms, default 0ms), CCS (congestion
+# and the AP, taken out of the ISP's 40 ms, default 0ms), LAST_HOP_SLOT
+# (netem slot arguments for each direction of the last hop, such as "0ms
+# 20ms": packets go out in bursts at random intervals, delay varying as on
+# Wi-Fi but without reordering; needs LAST_HOP_RTT), CCS (congestion
 # controls to try, default
-# "cubic bbr"), MODES (default "plain arc arc-fecoff"), UDP (a rate, such
+# "cubic bbr"), MODES (default "plain arc arc-fecoff"; arc-split runs the
+# client with -split-tcp always), UDP (a rate, such
 # as 20M: report the loss % of a constant-rate UDP download instead of TCP
-# goodput), SHOW_LOGS (print the last relay and client status lines).
+# goodput), STALLS (which rows to run, default "off on"), SHOW_LOGS (print
+# the last relay and client status lines).
 # Each run also prints the sender's TCP counters: retransmitted segments,
 # SACK recoveries, timeouts, DSACKs, and undos of window reductions.
 set -euo pipefail
@@ -30,6 +35,7 @@ STALL=${STALL:-90ms}
 PERIOD=${PERIOD:-455ms}
 HOLD=${HOLD:-64}
 LAST_HOP_RTT=${LAST_HOP_RTT:-0ms}
+LAST_HOP_SLOT=${LAST_HOP_SLOT:-}
 source "$(dirname "$0")/lib.sh"
 WORK=$(mktemp -d)
 TARGET=192.168.20.2
@@ -66,10 +72,11 @@ start_relay() { # start_relay [ARC_RELAY_FLAGS...]: (re)starts the relay unless 
 }
 
 CLIENT=
-start_client() { # start_client FEC_MODE
+start_client() { # start_client FEC_MODE [ARC_CLIENT_FLAGS...]
   stop_client
+  local fec=$1; shift
   $C "$BIN/arc-client" run -relay 192.168.10.2:4433 -relay-key "$RELAY_PUB" \
-    -token-file "$WORK/token" -route 192.168.20.0/24 -bind c0 -fec "$1" -status 1s >"$WORK/client.log" 2>&1 &
+    -token-file "$WORK/token" -route 192.168.20.0/24 -bind c0 -fec "$fec" -status 1s "$@" >"$WORK/client.log" 2>&1 &
   CLIENT=$!
   PIDS+=("$CLIENT")
   wait_until 10 grep -q "session established" "$WORK/client.log" || { cat "$WORK/client.log"; exit 1; }
@@ -106,8 +113,10 @@ RUN="rate 800mbit burst 200kb"
 STOP="rate 8bit burst 1600" # 1 byte/s: nothing more gets through
 WIFI="root"
 if [[ $last_hop != 0 ]]; then
-  $R tc qdisc replace dev r0 root handle 1: netem delay "${last_hop}ms" limit 100000
-  $C tc qdisc replace dev c0 root handle 1: netem delay "${last_hop}ms" limit 100000
+  slot=()
+  [[ -n $LAST_HOP_SLOT ]] && read -ra slot <<<"slot $LAST_HOP_SLOT"
+  $R tc qdisc replace dev r0 root handle 1: netem delay "${last_hop}ms" "${slot[@]}" limit 100000
+  $C tc qdisc replace dev c0 root handle 1: netem delay "${last_hop}ms" "${slot[@]}" limit 100000
   WIFI="parent 1:1"
 fi
 # A tbf change resets its fifo's limit to the tbf's own (here, in packets),
@@ -122,10 +131,14 @@ wifi() { # wifi RUN|STOP
   fi
   ip netns exec arc-c tc qdisc change dev c0 $WIFI handle 10: tbf $1 limit 10000000
 }
+# The staller stops at the end of a cycle, when asked through a file, so
+# that no tc command of its own lands after stop_stalls restores the link
+# (one did, leaving the AP's queue at HOLD frames for the next run).
 start_stalls() {
   local stall=${STALL%ms} period=${PERIOD%ms}
+  rm -f "$WORK/stop-stalls"
   (
-    while :; do
+    until [[ -e $WORK/stop-stalls ]]; do
       wifi "$STOP"
       sleep "$(awk -v s="$stall" 'BEGIN { print s / 1000 }')"
       wifi "$RUN"
@@ -135,7 +148,11 @@ start_stalls() {
   STALLER=$!
 }
 stop_stalls() {
-  if [[ -n $STALLER ]]; then kill "$STALLER"; wait "$STALLER" 2>/dev/null || true; STALLER=; fi
+  if [[ -n $STALLER ]]; then
+    touch "$WORK/stop-stalls"
+    wait "$STALLER" 2>/dev/null || true
+    STALLER=
+  fi
   wifi "$RUN"
 }
 
@@ -174,13 +191,14 @@ for cc in ${CCS:-cubic bbr}; do
     continue
   fi
   for mode in ${MODES:-plain arc arc-fecoff}; do
-    for stalls in off on; do
+    for stalls in ${STALLS:-off on}; do
       downs=() drops=() retx=() undo=()
       for rep in $(seq "$REPS"); do
         case $mode in
           plain) stop_client; use_plain ;;
           arc) start_relay; start_client auto ;;
           arc-fecoff) start_relay; start_client off ;;
+          arc-split) start_relay; start_client auto -split-tcp always ;;
         esac
         [[ $stalls == on ]] && start_stalls
         d0=$(r0_drops)
@@ -197,6 +215,9 @@ for cc in ${CCS:-cubic bbr}; do
         retx+=("${d[0]}")
         undo+=("$((d[4] + d[5]))")
         echo "  run $rep: retransmits ${d[0]}, recoveries ${d[1]}, timeouts ${d[2]}, DSACKs ${d[3]}, undos $((d[4] + d[5]))"
+        if [[ -n ${SHOW_LOGS:-} && $mode != plain ]]; then
+          grep "msg=path" "$WORK/client.log" | tail -1 | sed 's/^/    client: /'
+        fi
         stop_stalls
       done
       ROWS+=("$(printf '%-6s %-11s %-7s %12s %10s %10s %8s' "$cc" "$mode" "$stalls" \
@@ -208,7 +229,7 @@ for cc in ${CCS:-cubic bbr}; do
 done
 stop_client
 if [[ -n ${SHOW_LOGS:-} ]]; then
-  grep -E "path" "$WORK/relay.log" | tail -20
+  grep -E "resends|path" "$WORK/relay.log" | tail -20
   tail -20 "$WORK/client.log"
 fi
 

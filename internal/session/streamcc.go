@@ -11,9 +11,14 @@ import (
 // stalls. Each path instead paces stream data at a rate driven by two
 // congestion signals that random loss does not produce:
 //
-//   - queueing delay: the lowest RTT sample in a round rising more than
-//     queueTarget above the path's minimum RTT, as a filling bottleneck
-//     queue causes;
+//   - queueing delay: the lowest RTT sample in two rounds running rising
+//     more than queueTarget above the path's minimum RTT, as a filling
+//     bottleneck queue causes. On links whose delay varies by itself (Wi-Fi
+//     aggregation and contention, by tens of milliseconds), the target
+//     widens to three times the spread of a round's samples above its lowest: a
+//     standing queue delays every sample alike, while jitter scatters
+//     them, and a round of a few scattered samples rarely includes the
+//     path's luckiest;
 //   - a loss spike: the loss rate of a round's stream packets rising well
 //     above the path's baseline loss, as overrunning a policer or a
 //     shallow buffer causes. Steady loss, however heavy, becomes the
@@ -60,6 +65,15 @@ const (
 	// ccLossy is the baseline loss at which spare sending capacity goes to
 	// repeating stream data in flight (see conn.nextRepeatFrame).
 	ccLossy = 0.5
+	// ccJitterGain weighs each round's sample spread (mean less lowest) in
+	// the jitter estimate, from rounds of at least ccJitterSamples samples,
+	// and ccJitterTargets is how many jitters of delay count as a queue.
+	ccJitterGain    = 1.0 / 8
+	ccJitterSamples = 4
+	ccJitterTargets = 3
+	// ccRecent is how many of the latest RTT samples slow start takes the
+	// lowest of, so that one delayed sample doesn't end it.
+	ccRecent = 4
 )
 
 // queueTarget is the queueing delay a path's minimum RTT tolerates before
@@ -75,8 +89,12 @@ type streamCC struct {
 	tokensAt  time.Time
 
 	roundStart, roundEnd time.Time
-	roundMin             time.Duration // lowest RTT sample this round, 0 if none
-	roundLast            time.Duration // latest RTT sample this round
+	roundMin             time.Duration           // lowest RTT sample this round, 0 if none
+	recent               [ccRecent]time.Duration // latest RTT samples, newest at recentN-1 mod ccRecent
+	recentN              int
+	roundSum             time.Duration // sum of this round's RTT samples
+	roundN               int           // and their number
+	jitter               time.Duration // smoothed spread of a round's RTT samples above its lowest
 	roundSent            int           // stream bytes sent this round
 	roundAcked           int           // stream bytes acknowledged this round
 	// The previous round's delay signal and lowest RTT sample, and
@@ -183,7 +201,10 @@ func (cc *streamCC) onAck(now time.Time, acked, lost, ackedBytes int, rtt time.D
 	cc.lost += lost
 	cc.roundAcked += ackedBytes
 	if rtt > 0 {
-		cc.roundLast = rtt
+		cc.recent[cc.recentN%ccRecent] = rtt
+		cc.recentN++
+		cc.roundSum += rtt
+		cc.roundN++
 		if cc.roundMin == 0 || rtt < cc.roundMin {
 			cc.roundMin = rtt
 		}
@@ -203,12 +224,22 @@ func (cc *streamCC) update(now time.Time, minRTT, srtt time.Duration, mss int) {
 		return
 	}
 	// The round's lowest RTT sample shows a standing queue without
-	// mistaking jitter for one. Slow start, which doubles the rate each
-	// round, cannot wait for a whole round to show it and goes by the
-	// latest sample (as HyStart does).
-	target := queueTarget(minRTT)
+	// mistaking jitter for one, and a queue persists: steady state backs
+	// off only when two rounds running show it. Slow start, which doubles
+	// the rate each round, cannot wait for a whole round to show it and
+	// goes by the lowest of the latest few samples (as HyStart does).
+	// The jitter estimate starts at zero and takes rounds to form; the
+	// round's own spread stands in until it has.
+	var spread time.Duration
+	if cc.roundN >= ccJitterSamples {
+		spread = cc.roundSum/time.Duration(cc.roundN) - cc.roundMin
+		cc.jitter += time.Duration(ccJitterGain * float64(spread-cc.jitter))
+	}
+	target := max(queueTarget(minRTT), ccJitterTargets*max(cc.jitter, spread))
+	recent := cc.recentMin()
 	delay := cc.roundMin > 0 && cc.roundMin-minRTT > target ||
-		cc.slowStart && cc.roundLast > 0 && cc.roundLast-minRTT > target
+		cc.slowStart && recent > 0 && recent-minRTT > target
+	prevDelay := cc.lastDelay
 	spike, judged := cc.judgeLoss(delay)
 	feedback := cc.roundMin > 0 || judged
 	appLimited := float64(cc.roundSent) < cc.rate*now.Sub(cc.roundStart).Seconds()/2
@@ -235,9 +266,11 @@ func (cc *streamCC) update(now time.Time, minRTT, srtt time.Duration, mss int) {
 	} else {
 		cc.delayRounds, cc.delayMin = 0, 0
 	}
+	// A queue must persist; slow start can't wait to see it twice.
+	queued := delay && (prevDelay || cc.slowStart)
 	switch {
-	case (delay || spike) && settling:
-	case delay || spike:
+	case (queued || spike) && settling:
+	case queued || spike:
 		next, floor := cc.rate*ccBackoff, cc.rate/2
 		if cc.slowStart {
 			// Doubling overshot by up to the RTT the signal took to come
@@ -265,7 +298,20 @@ func (cc *streamCC) update(now time.Time, minRTT, srtt time.Duration, mss int) {
 	}
 	cc.rate = max(cc.rate, ccMinRate, 4*float64(mss)/srtt.Seconds())
 	cc.roundStart, cc.roundEnd = now, now.Add(max(srtt, ccMinRound))
-	cc.roundMin, cc.roundLast, cc.roundSent, cc.roundAcked = 0, 0, 0, 0
+	cc.roundMin, cc.roundSent, cc.roundAcked = 0, 0, 0
+	cc.roundSum, cc.roundN = 0, 0
+}
+
+// recentMin is the lowest of the latest ccRecent RTT samples, or 0 if
+// there are none.
+func (cc *streamCC) recentMin() time.Duration {
+	var m time.Duration
+	for i := range min(cc.recentN, ccRecent) {
+		if r := cc.recent[i]; m == 0 || r < m {
+			m = r
+		}
+	}
+	return m
 }
 
 // delivered estimates the rate the path carried this round: stream bytes

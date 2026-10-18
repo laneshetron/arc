@@ -19,8 +19,12 @@ type link struct {
 	dup    float64
 	delay  time.Duration
 	jitter time.Duration // uniform extra delay; reorders packets
-	mtu    int           // drop larger datagrams; 0 means unlimited
-	down   bool          // drop everything
+	// wobble is uniform extra delay that keeps packets in order, as on
+	// Wi-Fi, where aggregation and contention vary the delay of a FIFO.
+	wobble  time.Duration
+	lastDue time.Time // when the previous packet arrives, for wobble
+	mtu     int       // drop larger datagrams; 0 means unlimited
+	down    bool      // drop everything
 
 	// rate limits the link to this many bytes per second, with a FIFO
 	// queue holding at most queue's worth of transmission time (default
@@ -212,6 +216,13 @@ func (n *network) send(toRelay bool, pathID uint32, data []byte) {
 		at = at.Add(l.delay)
 		if l.jitter > 0 {
 			at = at.Add(time.Duration(n.rng.Int64N(int64(l.jitter))))
+		}
+		if l.wobble > 0 {
+			at = at.Add(time.Duration(n.rng.Int64N(int64(l.wobble))))
+			if at.Before(l.lastDue) {
+				at = l.lastDue
+			}
+			l.lastDue = at
 		}
 		n.seq++
 		n.inflight = append(n.inflight, delivery{at: at, seq: n.seq, toRelay: toRelay, pathID: pathID, from: c.addr, data: data})

@@ -520,3 +520,34 @@ func TestStreamBurstyLoss(t *testing.T) {
 		t.Errorf("goodput %.1f Mbit/s; want at least half the 50 Mbit/s link", goodput*8/1e6)
 	}
 }
+
+func TestStreamDelayVariance(t *testing.T) {
+	// Wi-Fi varies the delay of packets it keeps in order by several to
+	// tens of milliseconds. Rate control must not take that for a queue:
+	// over a 50 Mbit/s link at 40 ms RTT whose delay also varies by up to
+	// 20 ms each way, a transfer reached 9.3 Mbit/s when every round whose
+	// lowest sample beat the target counted as a queue (and 44 without the
+	// variance).
+	transfer := func(wobble time.Duration) float64 {
+		// The link is set before the session starts, so that its minimum
+		// RTT is the link's (TestStreamRTTRise covers a change).
+		n := newNetwork(t, 93, defaultRelayConfig(), ClientConfig{})
+		for _, l := range []*link{n.up, n.down} {
+			l.rate, l.delay, l.wobble = 6_250_000, 20*time.Millisecond, wobble
+		}
+		s := n.establish()
+		n.runFor(time.Second)
+		data := randomBytes(12, 16<<20)
+		start := n.now
+		sp := openPair(t, n, s, nil, data)
+		if !sp.run(60*time.Second) || !bytes.Equal(sp.client.got, data) {
+			t.Fatalf("wobble %v: transfer incomplete: %d/%d", wobble, len(sp.client.got), len(data))
+		}
+		return float64(len(data)) / sp.client.eofAt.Sub(start).Seconds()
+	}
+	steady, varied := transfer(0), transfer(20*time.Millisecond)
+	t.Logf("16 MiB at 40 ms RTT: %.1f Mbit/s steady, %.1f Mbit/s with delay varying by up to 20 ms", steady*8/1e6, varied*8/1e6)
+	if varied < 0.4*6_250_000 {
+		t.Errorf("goodput %.1f Mbit/s with delay variance; want at least 40%% of the 50 Mbit/s link", varied*8/1e6)
+	}
+}
