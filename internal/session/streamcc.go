@@ -31,6 +31,13 @@ import (
 // a full queue is about the bottleneck's rate (by at most half, or three
 // quarters ending slow start, if too little was acknowledged to tell), and
 // it holds while the queue drains.
+//
+// Neither signal counts around a stall: acknowledgements stopping for far
+// longer than usual while data is outstanding, then resuming, as when Wi-Fi
+// leaves the channel for tens of milliseconds (a Mac's AWDL). The access
+// point drops what it can't hold meanwhile and every RTT sample jumps, but
+// the link's capacity hasn't changed: lost data is retransmitted and the
+// rate holds.
 // A cap on bytes
 // in flight stops sending into an outage, which produces no
 // acknowledgements to clock it.
@@ -74,6 +81,10 @@ const (
 	// ccRecent is how many of the latest RTT samples slow start takes the
 	// lowest of, so that one delayed sample doesn't end it.
 	ccRecent = 4
+	// A stall is acknowledgements stopping for at least ccMinStall and
+	// ccStallGaps usual gaps between them while data is outstanding.
+	ccMinStall  = 30 * time.Millisecond
+	ccStallGaps = 8
 )
 
 // queueTarget is the queueing delay a path's minimum RTT tolerates before
@@ -112,6 +123,11 @@ type streamCC struct {
 
 	lastAck time.Time
 	ackGap  time.Duration // smoothed interval between acknowledgements
+	// lastSend is when stream data was last sent, and stallEnd when the
+	// last stall ended (its acknowledgements resumed).
+	lastSend time.Time
+	stallEnd time.Time
+	stalls   int
 
 	// The lowest RTT sample in the current and previous half of
 	// ccBaseWindow.
@@ -186,9 +202,10 @@ func (cc *streamCC) canSend(now time.Time, inflight int, srtt time.Duration, mss
 	return true, time.Time{}
 }
 
-func (cc *streamCC) onSent(size int) {
+func (cc *streamCC) onSent(now time.Time, size int) {
 	cc.tokens -= float64(size)
 	cc.roundSent += size
+	cc.lastSend = now
 }
 
 // onAck records an acknowledgement's outcome for stream packets: how many
@@ -212,7 +229,14 @@ func (cc *streamCC) onAck(now time.Time, acked, lost, ackedBytes int, rtt time.D
 	if acked > 0 {
 		if !cc.lastAck.IsZero() {
 			gap := min(now.Sub(cc.lastAck), ccMaxAckGap)
-			cc.ackGap += (gap - cc.ackGap) / 8
+			if gap >= max(ccMinStall, ccStallGaps*cc.ackGap) && cc.lastSend.After(cc.lastAck) {
+				// A stall's gap stays out of the usual gap, which would
+				// otherwise delay pausing for the next one.
+				cc.stallEnd = now
+				cc.stalls++
+			} else {
+				cc.ackGap += (gap - cc.ackGap) / 8
+			}
 		}
 		cc.lastAck = now
 	}
@@ -240,7 +264,13 @@ func (cc *streamCC) update(now time.Time, minRTT, srtt time.Duration, mss int) {
 	delay := cc.roundMin > 0 && cc.roundMin-minRTT > target ||
 		cc.slowStart && recent > 0 && recent-minRTT > target
 	prevDelay := cc.lastDelay
-	spike, judged := cc.judgeLoss(delay)
+	// Around a stall (rounds within an RTT of its end, when its losses are
+	// declared), neither delay nor loss says anything about congestion.
+	stalled := !cc.stallEnd.IsZero() && !cc.stallEnd.Add(srtt).Before(cc.roundStart)
+	if stalled {
+		delay = false
+	}
+	spike, judged := cc.judgeLoss(delay || stalled)
 	feedback := cc.roundMin > 0 || judged
 	appLimited := float64(cc.roundSent) < cc.rate*now.Sub(cc.roundStart).Seconds()/2
 	// For a round after a backoff the queue still holds what was sent
@@ -287,7 +317,7 @@ func (cc *streamCC) update(now time.Time, minRTT, srtt time.Duration, mss int) {
 		}
 		cc.rate = max(next, floor)
 		cc.backedOff = true
-	case !feedback || appLimited:
+	case stalled, !feedback || appLimited:
 	case cc.slowStart:
 		cc.rate *= ccSlowStartGain
 	case cc.rate < cc.capacity:

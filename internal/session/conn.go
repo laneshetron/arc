@@ -763,7 +763,7 @@ func (c *conn) sealPacket(now time.Time, p *path, pt []byte, retx []wire.Frame, 
 		p.sent.add(sentPacket{pn: pn, sentAt: now, epoch: epoch, frames: retx, probe: probe, size: len(pkt), ping: ping, stream: stream})
 	}
 	if stream {
-		p.cc.onSent(len(pkt))
+		p.cc.onSent(now, len(pkt))
 	}
 	p.lastSend = now
 	c.stats.PacketsSent++

@@ -551,3 +551,37 @@ func TestStreamDelayVariance(t *testing.T) {
 		t.Errorf("goodput %.1f Mbit/s with delay variance; want at least 40%% of the 50 Mbit/s link", varied*8/1e6)
 	}
 }
+
+func TestStreamStalls(t *testing.T) {
+	// Wi-Fi that leaves the channel (a Mac's AWDL) stops the link for 90
+	// ms every 455 ms; what is sent meanwhile is lost. Rate control must
+	// retransmit without backing off for each stall: the link's capacity
+	// is unchanged, and ~80% of the time it carries data. 50 Mbit/s at
+	// 40 ms RTT. Backing off at every stall, rate control managed 5.0
+	// Mbit/s. (A whole window is lost to each stall here, unlike behind an
+	// access point that holds some frames, so the bar is modest.)
+	n := newNetwork(t, 95, defaultRelayConfig(), ClientConfig{})
+	for _, l := range []*link{n.up, n.down} {
+		l.rate, l.delay = 6_250_000, 20*time.Millisecond
+	}
+	s := n.establish()
+	n.runFor(time.Second)
+	data := randomBytes(13, 16<<20)
+	start := n.now
+	sp := openPair(t, n, s, nil, data)
+	ok := n.runUntil(60*time.Second, func() bool {
+		sp.pump()
+		down := n.now.Sub(start)%(455*time.Millisecond) < 90*time.Millisecond
+		n.up.down, n.down.down = down, down
+		return sp.client.eof
+	})
+	n.up.down, n.down.down = false, false
+	if !ok || !bytes.Equal(sp.client.got, data) {
+		t.Fatalf("transfer incomplete: %d/%d", len(sp.client.got), len(data))
+	}
+	goodput := float64(len(data)) / sp.client.eofAt.Sub(start).Seconds()
+	t.Logf("16 MiB through stalls at %.1f Mbit/s (%d stalls seen)", goodput*8/1e6, s.conn.paths[0].cc.stalls)
+	if goodput < 0.25*6_250_000 {
+		t.Errorf("goodput %.1f Mbit/s through stalls; want at least a quarter of the 50 Mbit/s link", goodput*8/1e6)
+	}
+}
