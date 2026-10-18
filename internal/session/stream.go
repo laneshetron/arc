@@ -708,6 +708,9 @@ func (c *conn) streamFrame(s *stream, maxData int) (wire.Stream, bool) {
 	credit := min(ts.limit, ts.next+(ss.sendLimit-ss.sendUsed))
 	hi := min(ts.end(), ts.next+uint64(maxData), credit)
 	if hi == ts.next && !(ts.fin && !ts.finSent && ts.next == ts.end()) {
+		if ts.end() > ts.next {
+			c.streamsBlocked = true // data waiting for flow-control credit
+		}
 		return wire.Stream{}, false
 	}
 	f := wire.Stream{ID: s.id, Offset: ts.next, Data: ts.buf[ts.next-ts.base : hi-ts.base]}

@@ -252,6 +252,9 @@ type conn struct {
 	streams   streamSet // see stream.go
 	// streamWake is when pacing next lets stream data go, if it is waiting.
 	streamWake time.Time
+	// streamsBlocked records that stream data waited for flow-control
+	// credit in the current sendStreams, for rate control (streamcc.go).
+	streamsBlocked bool
 
 	plaintext    []byte
 	ptScratch    []byte // reused to build each outgoing packet's plaintext
@@ -579,6 +582,7 @@ func (c *conn) sendStreams(now time.Time) {
 	srtt := p.rtt.srtt()
 	p.cc.update(now, p.cc.baseRTT(p.rtt.minRTT()), srtt, p.maxPacket)
 	budget := p.maxPacket - wire.DataHeaderLen - wire.AEADTagLen
+	c.streamsBlocked = false
 	for {
 		ok, wake := p.cc.canSend(now, p.sent.streamBytes, srtt, p.maxPacket)
 		if !ok {
@@ -601,6 +605,9 @@ func (c *conn) sendStreams(now time.Time) {
 		}
 		c.streamFrames = frames[:0]
 		if len(frames) == 0 {
+			if c.streamsBlocked {
+				p.cc.roundBlocked = true // not idle: waiting on the receiver
+			}
 			return
 		}
 		// The sent packet keeps the frames for retransmission.

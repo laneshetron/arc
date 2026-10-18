@@ -107,6 +107,7 @@ type streamCC struct {
 	roundN               int           // and their number
 	jitter               time.Duration // smoothed spread of a round's RTT samples above its lowest
 	roundSent            int           // stream bytes sent this round
+	roundBlocked         bool          // sending this round waited on the window or pacing
 	roundAcked           int           // stream bytes acknowledged this round
 	// The previous round's delay signal and lowest RTT sample, and
 	// whether it backed off.
@@ -197,9 +198,11 @@ func (cc *streamCC) canSend(now time.Time, inflight int, srtt time.Duration, mss
 	}
 	cc.refill(now, mss)
 	if inflight >= cc.window(srtt, mss) {
+		cc.roundBlocked = true
 		return false, time.Time{} // an acknowledgement or PTO comes first
 	}
 	if cc.tokens < 0 {
+		cc.roundBlocked = true
 		wait := time.Duration(math.Ceil(-cc.tokens / cc.rate * float64(time.Second)))
 		return false, now.Add(max(wait, time.Microsecond))
 	}
@@ -277,6 +280,9 @@ func (cc *streamCC) update(now time.Time, minRTT, srtt time.Duration, mss int) {
 	spike, judged := cc.judgeLoss(delay || stalled)
 	feedback := cc.roundMin > 0 || judged
 	appLimited := float64(cc.roundSent) < cc.rate*now.Sub(cc.roundStart).Seconds()/2
+	// Idle: app-limited without ever waiting on the window or pacing, so
+	// the sender had nothing more to send.
+	idle := appLimited && !cc.roundBlocked
 	// For a round after a backoff the queue still holds what was sent
 	// before it, and after that it may be draining: neither calls for
 	// another backoff.
@@ -303,7 +309,9 @@ func (cc *streamCC) update(now time.Time, minRTT, srtt time.Duration, mss int) {
 	// A queue must persist; slow start can't wait to see it twice.
 	queued := delay && (prevDelay || cc.slowStart)
 	switch {
-	case (queued || spike) && settling:
+	// An idle round didn't build a queue or overrun a buffer: background
+	// traffic's few samples can look like either.
+	case (queued || spike) && (settling || idle):
 	case queued || spike:
 		if queued {
 			cc.backoffsDelay++
@@ -311,7 +319,7 @@ func (cc *streamCC) update(now time.Time, minRTT, srtt time.Duration, mss int) {
 			cc.backoffsLoss++
 		}
 		if appLimited {
-			cc.backoffsIdle++
+			cc.backoffsIdle++ // app-limited, though waiting on window or pacing
 		}
 		next, floor := cc.rate*ccBackoff, cc.rate/2
 		if cc.slowStart {
@@ -341,7 +349,7 @@ func (cc *streamCC) update(now time.Time, minRTT, srtt time.Duration, mss int) {
 	cc.rate = max(cc.rate, ccMinRate, 4*float64(mss)/srtt.Seconds())
 	cc.roundStart, cc.roundEnd = now, now.Add(max(srtt, ccMinRound))
 	cc.roundMin, cc.roundSent, cc.roundAcked = 0, 0, 0
-	cc.roundSum, cc.roundN = 0, 0
+	cc.roundSum, cc.roundN, cc.roundBlocked = 0, 0, false
 }
 
 // recentMin is the lowest of the latest ccRecent RTT samples, or 0 if
