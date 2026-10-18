@@ -128,6 +128,10 @@ type streamCC struct {
 	lastSend time.Time
 	stallEnd time.Time
 	stalls   int
+	// Backoffs so far, for status: for queueing delay and for a loss
+	// spike, and how many of them came in rounds that didn't use the rate
+	// (app-limited).
+	backoffsDelay, backoffsLoss, backoffsIdle int
 
 	// The lowest RTT sample in the current and previous half of
 	// ccBaseWindow.
@@ -301,6 +305,14 @@ func (cc *streamCC) update(now time.Time, minRTT, srtt time.Duration, mss int) {
 	switch {
 	case (queued || spike) && settling:
 	case queued || spike:
+		if queued {
+			cc.backoffsDelay++
+		} else {
+			cc.backoffsLoss++
+		}
+		if appLimited {
+			cc.backoffsIdle++
+		}
 		next, floor := cc.rate*ccBackoff, cc.rate/2
 		if cc.slowStart {
 			// Doubling overshot by up to the RTT the signal took to come

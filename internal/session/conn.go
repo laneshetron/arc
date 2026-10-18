@@ -93,11 +93,14 @@ type PathInfo struct {
 	// second, and StreamInflight its bytes in flight; 0 if unused.
 	StreamRate     float64
 	StreamInflight int
-	MaxPacket      int
-	LastRecv       time.Time
-	Flows          int     // flows pinned to the path (§15.2)
-	Capacity       float64 // estimated, in bytes per second; 0 if unmeasured
-	Eligible       bool    // may take new flows
+	// Stream rate backoffs so far: for queueing delay, for a loss spike,
+	// and of those, in rounds that didn't use the rate; and stalls seen.
+	StreamBackoffsDelay, StreamBackoffsLoss, StreamBackoffsIdle, StreamStalls int
+	MaxPacket                                                                 int
+	LastRecv                                                                  time.Time
+	Flows                                                                     int     // flows pinned to the path (§15.2)
+	Capacity                                                                  float64 // estimated, in bytes per second; 0 if unmeasured
+	Eligible                                                                  bool    // may take new flows
 }
 
 type path struct {
@@ -381,6 +384,8 @@ func (c *conn) pathInfo(now time.Time) []PathInfo {
 			SRTT: p.rtt.srtt(), MinRTT: p.rtt.minRTT(), Loss: loss, MaxPacket: p.maxPacket, LastRecv: p.lastRecv,
 			Flows: p.flows, Capacity: p.capacity(now), Burst: p.burst,
 			StreamRate: p.cc.rate, StreamInflight: p.sent.streamBytes,
+			StreamBackoffsDelay: p.cc.backoffsDelay, StreamBackoffsLoss: p.cc.backoffsLoss,
+			StreamBackoffsIdle: p.cc.backoffsIdle, StreamStalls: p.cc.stalls,
 		}
 		if prim != nil {
 			info.Eligible = c.eligible(now, p, prim)
