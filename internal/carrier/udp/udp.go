@@ -12,6 +12,7 @@ import (
 	"syscall"
 
 	"golang.org/x/net/ipv4"
+	"golang.org/x/sys/unix"
 )
 
 // MaxDatagram is the largest datagram the carrier reads.
@@ -45,6 +46,10 @@ type Options struct {
 	// route and policy once instead of for every datagram (on macOS, a send
 	// through a bound interface then takes about 9 µs of CPU instead of 24).
 	Peer netip.AddrPort
+	// OnReconnect, if set, is called with the socket's new local address
+	// after a connected socket whose source address went away connects
+	// again (see WriteBatch). It runs on the writing goroutine.
+	OnReconnect func(local netip.AddrPort)
 }
 
 // Conn is a UDP carrier socket. Reads and writes may run on different
@@ -61,6 +66,9 @@ type Conn struct {
 	gsoBufs [][]byte
 	gro     *groReader     // non-nil when UDP_GRO is enabled; see gro_linux.go
 	peer    netip.AddrPort // the connected peer; zero if unconnected
+
+	raw         syscall.RawConn
+	onReconnect func(netip.AddrPort)
 
 	// Caches for the send path: the last destination's *net.UDPAddr and
 	// the last segment size's control message, which would otherwise be
@@ -124,7 +132,12 @@ func Listen(addr netip.AddrPort, opts Options) (*Conn, error) {
 		uc.SetReadBuffer(opts.BufferSize)
 		uc.SetWriteBuffer(opts.BufferSize)
 	}
-	c := &Conn{uc: uc, pc: ipv4.NewPacketConn(uc), peer: opts.Peer}
+	raw, err := uc.SyscallConn()
+	if err != nil {
+		uc.Close()
+		return nil, err
+	}
+	c := &Conn{uc: uc, pc: ipv4.NewPacketConn(uc), peer: opts.Peer, raw: raw, onReconnect: opts.OnReconnect}
 	if !opts.NoOffload {
 		c.gso = gsoSupported(uc)
 		c.gro = enableGRO(uc)
@@ -132,8 +145,18 @@ func Listen(addr netip.AddrPort, opts Options) (*Conn, error) {
 	return c, nil
 }
 
-// LocalAddr returns the socket's bound address.
-func (c *Conn) LocalAddr() netip.AddrPort { return c.uc.LocalAddr().(*net.UDPAddr).AddrPort() }
+// LocalAddr returns the socket's local address, which for a connected
+// socket changes when it connects again.
+func (c *Conn) LocalAddr() netip.AddrPort {
+	var sa unix.Sockaddr
+	var err error
+	if cerr := c.raw.Control(func(fd uintptr) { sa, err = unix.Getsockname(int(fd)) }); cerr == nil && err == nil {
+		if sa4, ok := sa.(*unix.SockaddrInet4); ok {
+			return netip.AddrPortFrom(netip.AddrFrom4(sa4.Addr), uint16(sa4.Port))
+		}
+	}
+	return c.uc.LocalAddr().(*net.UDPAddr).AddrPort()
+}
 
 // ReadBatch reads up to len(bufs) datagrams. Datagram i is bufs[i][:sizes[i]]
 // from addrs[i].
@@ -180,6 +203,13 @@ func (c *Conn) readBatch(bufs [][]byte, sizes []int, addrs []netip.AddrPort) (in
 // WriteBatch sends each packet to the matching address. A datagram the
 // kernel refuses is dropped, as the network might drop it, and the rest are
 // still sent; the first such error is returned.
+//
+// A connected socket keeps the source address it had when it connected.
+// If that address goes away, as when a Mac wakes from sleep on a new DHCP
+// lease, every send fails (EADDRNOTAVAIL on macOS, ENETUNREACH on Linux)
+// until the socket connects again, which picks the interface's current
+// address. So a send failing that way reconnects the socket, at most once
+// per call, and retries the datagram.
 func (c *Conn) WriteBatch(pkts [][]byte, addrs []netip.AddrPort) error {
 	if c.peer.IsValid() {
 		for _, to := range addrs {
@@ -217,6 +247,7 @@ func (c *Conn) writePlain(pkts [][]byte, addrs []netip.AddrPort) error {
 // interface queue is full, say), and returns the first error.
 func (c *Conn) sendAll(msgs []ipv4.Message) error {
 	var first error
+	reconnected := false
 	for len(msgs) > 0 {
 		n, err := c.pc.WriteBatch(msgs, 0)
 		msgs = msgs[max(n, 0):] // sendmmsg's -1 on Linux
@@ -225,6 +256,12 @@ func (c *Conn) sendAll(msgs []ipv4.Message) error {
 		}
 		if c.gso && gsoUnsupported(err) {
 			return err // the caller resends without GSO
+		}
+		if !reconnected && c.peer.IsValid() && sourceLost(err) {
+			reconnected = true
+			if c.reconnect() == nil {
+				continue // resend the one that failed
+			}
 		}
 		if first == nil && !refused(err) {
 			first = err
@@ -254,6 +291,45 @@ func refused(err error) bool {
 		}
 	}
 	return false
+}
+
+// sourceLost reports whether a send on a connected socket failed in a way
+// that connecting again might cure: the source address is gone, or a
+// failed reconnect left the socket unconnected.
+func sourceLost(err error) bool {
+	for _, e := range []syscall.Errno{
+		syscall.EADDRNOTAVAIL, // macOS: the source address is gone
+		syscall.ENETUNREACH,   // Linux: likewise; or no route yet
+		syscall.EHOSTUNREACH,
+		syscall.ENETDOWN,
+		syscall.EDESTADDRREQ, // unconnected after a failed reconnect
+		syscall.ENOTCONN,
+	} {
+		if errors.Is(err, e) {
+			return true
+		}
+	}
+	return false
+}
+
+// reconnect connects the socket to its peer again, which picks a source
+// address from the interface's current ones. If it fails, as while the
+// interface has no address, the socket may be left unconnected, and the
+// next send tries again. Reads carry on throughout; the engine discards
+// anything that arrives from elsewhere while the socket is unconnected.
+func (c *Conn) reconnect() error {
+	sa := &unix.SockaddrInet4{Port: int(c.peer.Port()), Addr: c.peer.Addr().As4()}
+	var err error
+	if cerr := c.raw.Control(func(fd uintptr) { err = connectFD(int(fd), sa) }); cerr != nil {
+		return cerr
+	}
+	if err != nil {
+		return err
+	}
+	if c.onReconnect != nil {
+		c.onReconnect(c.LocalAddr())
+	}
+	return nil
 }
 
 func (c *Conn) Close() error { return c.uc.Close() }

@@ -230,16 +230,20 @@ func run(args []string) error {
 	}
 	carriers := make([]engine.Carrier, 0, len(binds))
 	for _, iface := range binds {
+		name := iface
+		if name == "" {
+			name = "default"
+		}
 		sockOpts.Device = iface
+		sockOpts.OnReconnect = func(local netip.AddrPort) {
+			log.Info("carrier reconnected to the relay", "carrier", name, "local", local)
+		}
 		conn, err := udp.Listen(netip.MustParseAddrPort("0.0.0.0:0"), sockOpts)
 		if err != nil {
 			return fmt.Errorf("open carrier %q: %w", iface, err)
 		}
 		defer conn.Close()
-		name := iface
-		if name == "" {
-			name = "default"
-		}
+		log.Info("carrier", "carrier", name, "local", conn.LocalAddr())
 		carriers = append(carriers, engine.Carrier{Name: name, Conn: conn})
 	}
 	var camo *stream.Camouflage

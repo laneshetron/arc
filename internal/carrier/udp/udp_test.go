@@ -208,3 +208,51 @@ func TestWriteBatchSkipsRefused(t *testing.T) {
 		}
 	}
 }
+
+// TestReconnect checks that a connected socket still exchanges datagrams
+// with its peer after connecting again, which is how it recovers from
+// losing its source address (see TestConnectedSourceAddressChange).
+func TestReconnect(t *testing.T) {
+	peer, err := Listen(netip.MustParseAddrPort("127.0.0.1:0"), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	var reconnected []netip.AddrPort
+	c, err := Listen(netip.MustParseAddrPort("0.0.0.0:0"), Options{
+		Peer: peer.LocalAddr(), OnReconnect: func(a netip.AddrPort) { reconnected = append(reconnected, a) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if err := c.reconnect(); err != nil {
+		t.Fatal(err)
+	}
+	if len(reconnected) != 1 || reconnected[0] != c.LocalAddr() || !c.LocalAddr().Addr().IsLoopback() {
+		t.Errorf("OnReconnect calls %v; want one with %v", reconnected, c.LocalAddr())
+	}
+	if err := c.WriteBatch([][]byte{[]byte("out")}, []netip.AddrPort{peer.LocalAddr()}); err != nil {
+		t.Fatal(err)
+	}
+	if p, from := readOne(t, peer); string(p) != "out" || from != c.LocalAddr() {
+		t.Errorf("peer got %q from %v; want it from %v", p, from, c.LocalAddr())
+	}
+	peer.WriteBatch([][]byte{[]byte("in")}, []netip.AddrPort{c.LocalAddr()})
+	if p, from := readOne(t, c); string(p) != "in" || from != peer.LocalAddr() {
+		t.Errorf("got %q from %v", p, from)
+	}
+}
+
+func TestSourceLost(t *testing.T) {
+	for _, e := range []syscall.Errno{syscall.EADDRNOTAVAIL, syscall.ENETUNREACH, syscall.EDESTADDRREQ} {
+		if err := (&net.OpError{Op: "write", Err: os.NewSyscallError("sendmsg", e)}); !sourceLost(err) {
+			t.Errorf("%v: want a reconnect", err)
+		}
+	}
+	for _, e := range []syscall.Errno{syscall.ECONNREFUSED, syscall.ENOBUFS, syscall.EMSGSIZE, syscall.EHOSTDOWN} {
+		if err := (&net.OpError{Op: "write", Err: os.NewSyscallError("sendmsg", e)}); sourceLost(err) {
+			t.Errorf("%v: want no reconnect", err)
+		}
+	}
+}
