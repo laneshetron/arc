@@ -11,8 +11,9 @@ import (
 
 // TestConnectedSourceAddressChange moves a connected carrier's interface to
 // a new address, as DHCP may on waking from sleep, and checks that the
-// carrier then sends from the new one. It needs root and ip(8) to create a
-// dummy interface, so it runs only in privileged environments such as
+// carrier, bound to that interface as on macOS, then sends from the new
+// one. It needs root and ip(8) to create a dummy interface, so it runs
+// only in privileged environments such as
 //
 //	docker run --rm --privileged -v $PWD:/src -w /src golang:1.26 \
 //	  sh -c 'apt-get update && apt-get install -y iproute2 && go test -race ./internal/carrier/udp'
@@ -53,7 +54,7 @@ func TestConnectedSourceAddressChange(t *testing.T) {
 	relay := netip.MustParseAddrPort("10.99.0.9:4433")
 	var reconnected []netip.AddrPort
 	c, err := Listen(netip.MustParseAddrPort("0.0.0.0:0"), Options{
-		Peer: relay, OnReconnect: func(local netip.AddrPort) { reconnected = append(reconnected, local) },
+		Peer: relay, Device: dev, OnReconnect: func(local netip.AddrPort) { reconnected = append(reconnected, local) },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -83,4 +84,5 @@ func TestConnectedSourceAddressChange(t *testing.T) {
 	if len(reconnected) != 1 || reconnected[0].Addr() != netip.MustParseAddr("10.99.0.2") {
 		t.Errorf("OnReconnect calls %v; want one with 10.99.0.2", reconnected)
 	}
+
 }

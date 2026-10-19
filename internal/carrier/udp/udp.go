@@ -209,7 +209,9 @@ func (c *Conn) readBatch(bufs [][]byte, sizes []int, addrs []netip.AddrPort) (in
 // lease, every send fails (EADDRNOTAVAIL on macOS, ENETUNREACH on Linux)
 // until the socket connects again, which picks the interface's current
 // address. So a send failing that way reconnects the socket, at most once
-// per call, and retries the datagram.
+// per call, and retries the datagram. If reconnecting fails, as while the
+// interface has no address, the rest of the batch is dropped and the
+// reconnect's error returned; the next call tries again.
 func (c *Conn) WriteBatch(pkts [][]byte, addrs []netip.AddrPort) error {
 	if c.peer.IsValid() {
 		for _, to := range addrs {
@@ -259,9 +261,16 @@ func (c *Conn) sendAll(msgs []ipv4.Message) error {
 		}
 		if !reconnected && c.peer.IsValid() && sourceLost(err) {
 			reconnected = true
-			if c.reconnect() == nil {
+			rerr := c.reconnect()
+			if rerr == nil {
 				continue // resend the one that failed
 			}
+			// The socket may now be unconnected, and every send would
+			// fail with EDESTADDRREQ; drop the rest, and report why.
+			if first == nil && !refused(rerr) {
+				first = fmt.Errorf("udp: reconnecting to %v: %w", c.peer, rerr)
+			}
+			return first
 		}
 		if first == nil && !refused(err) {
 			first = err

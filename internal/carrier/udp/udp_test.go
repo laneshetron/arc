@@ -256,3 +256,29 @@ func TestSourceLost(t *testing.T) {
 		}
 	}
 }
+
+// TestSendWhileUnconnected checks that a socket a failed reconnect left
+// unconnected (on macOS, while the interface has no address) connects
+// again on the next send.
+func TestSendWhileUnconnected(t *testing.T) {
+	peer, err := Listen(netip.MustParseAddrPort("127.0.0.1:0"), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	c, err := Listen(netip.MustParseAddrPort("0.0.0.0:0"), Options{Peer: peer.LocalAddr()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	var derr error
+	if err := c.raw.Control(func(fd uintptr) { derr = disconnectFD(int(fd)) }); err != nil || derr != nil {
+		t.Fatal(err, derr)
+	}
+	if err := c.WriteBatch([][]byte{[]byte("out")}, []netip.AddrPort{peer.LocalAddr()}); err != nil {
+		t.Fatal(err)
+	}
+	if p, from := readOne(t, peer); string(p) != "out" || from != c.LocalAddr() {
+		t.Errorf("peer got %q from %v; want it from %v", p, from, c.LocalAddr())
+	}
+}
