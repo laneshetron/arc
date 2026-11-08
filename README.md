@@ -43,7 +43,7 @@ go build -o bin/ ./cmd/...
 # Relay host
 bin/arc-relay genkey > relay.key
 bin/arc-relay pubkey < relay.key          # give this to clients
-echo "some-token" > tokens
+echo "lane some-token relay" > tokens      # NAME TOKEN [relay]: see Accounts below
 sudo sysctl -w net.ipv4.ip_forward=1
 sudo iptables -t nat -A POSTROUTING -s 10.77.0.0/16 -o eth0 -j MASQUERADE
 sudo bin/arc-relay run -listen 0.0.0.0:4433 -network 10.77.0.1/16
@@ -150,6 +150,32 @@ rejected in split-tunnel mode; configure that mode's DNS externally.
 These bounds do not replace operator firewall policy. Static bearer tokens
 still require operator rotation/restart for revocation; this pre-alpha does
 not provide expiring credentials or tenant destination isolation.
+
+### Accounts
+
+Each line of the relay's `-tokens-file` is a credential of an account:
+
+```
+lane    3f9c…   relay
+lane    81d2…   relay
+friend  c47a…
+```
+
+A name may repeat, giving its account several tokens (to rotate one
+without disconnecting the account's other clients).
+
+Clients of one account can reach each other's tunnel addresses; clients of
+different accounts never can. (Split TCP never connects a stream to another
+client, even within an account.) Only accounts marked `relay` reach the
+relay's own tunnel address, where the operator may run services on the
+relay host. A bare `TOKEN` line is an account of its own, named by its line
+number, without relay access. The relay logs each session's account. All
+accounts share the relay's exit address.
+
+This covers the tunnel network. Other addresses of the relay host (its LAN
+or VPC address, for instance) are delivered locally by the kernel, so the
+host firewall must keep tunnel clients from them, e.g.
+`iptables -A INPUT -i arc0 ! -d 10.77.0.1 -j DROP`.
 
 The end-to-end test builds this setup in three network namespaces:
 

@@ -5,6 +5,12 @@
 //	arc-relay pubkey < relay.key
 //	arc-relay run -key-file relay.key -tokens-file tokens -network 10.77.0.1/16
 //
+// The tokens file lists the accounts allowed in, one credential per line,
+// as NAME TOKEN [relay]. Clients of one account reach each other's tunnel
+// addresses; clients of different accounts never do. "relay" lets an
+// account's clients reach the relay's own tunnel address. A bare TOKEN
+// line is an account of its own, without relay access.
+//
 // For networks that block UDP, also accept TLS/TCP carriers (clients use
 // -tls and, for a self-signed certificate, -tls-ca relay.crt):
 //
@@ -131,7 +137,7 @@ func run(args []string) error {
 	listen := fs.String("listen", "0.0.0.0:4433", "UDP address to listen on")
 	keyFile := fs.String("key-file", "relay.key", "relay static private key (from genkey)")
 	resetFile := fs.String("reset-secret-file", "reset.secret", "stateless reset secret; created if missing, keep it across restarts")
-	tokensFile := fs.String("tokens-file", "tokens", "accepted client tokens, one per line")
+	tokensFile := fs.String("tokens-file", "tokens", "client accounts, one credential per line: NAME TOKEN [relay], or a bare TOKEN for an account of its own; accounts cannot reach each other's clients, and only \"relay\" accounts reach the relay's tunnel address")
 	tunName := fs.String("tun", "arc0", "TUN interface name")
 	network := fs.String("network", "10.77.0.1/16", "relay tunnel address and client network")
 	mtu := fs.Int("mtu", 1280, "tunnel MTU")
@@ -190,12 +196,14 @@ func run(args []string) error {
 	if len(lines) == 0 {
 		return fmt.Errorf("%s: no tokens", *tokensFile)
 	}
+	accounts, err := gateway.ParseAccounts(lines)
+	if err != nil {
+		return fmt.Errorf("%s: %w", *tokensFile, err)
+	}
 	gwCfg := gateway.Config{
 		Network: netPrefix, TunMTU: uint16(*mtu),
 		Keepalive: session.DefaultKeepalive, Idle: session.DefaultIdleTimeout,
-	}
-	for _, l := range lines {
-		gwCfg.Tokens = append(gwCfg.Tokens, []byte(l))
+		Accounts: accounts,
 	}
 	if *dns != "" {
 		if gwCfg.DNS, err = netip.ParseAddr(*dns); err != nil {
@@ -252,7 +260,7 @@ func run(args []string) error {
 		}
 		front, err := stream.ListenFront(*frontListen, stream.FrontOptions{
 			TLS:    &tls.Config{Certificates: []tls.Certificate{cert}},
-			Tokens: gwCfg.Tokens, Site: site,
+			Tokens: gw.Tokens(), Site: site,
 			MaxConns: *maxTLS, MaxPending: *maxTLSHandshakes, MaxConnsPerSource: *maxTLSPerSource,
 			HandshakeTimeout: *tlsHandshakeTimeout,
 		})
@@ -263,7 +271,7 @@ func run(args []string) error {
 		streams, tlsAddr = front, front.Addr().String()
 	}
 
-	log.Info("relay listening", "addr", conn.LocalAddr(), "tls", tlsAddr, "tun", dev.Name(), "network", netPrefix,
+	log.Info("relay listening", "addr", conn.LocalAddr(), "tls", tlsAddr, "tun", dev.Name(), "network", netPrefix, "accounts", len(accounts),
 		"public_key", keyfile.Encode(static.Public))
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
