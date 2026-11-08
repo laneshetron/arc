@@ -199,3 +199,15 @@ no socket marks or policy routing, so a full tunnel works differently:
 
 `test/macos/e2e.sh` checks split and full tunnels against a relay in
 Docker Desktop.
+
+## License
+
+Copyright (C) 2026 Lane Shetron.
+
+ARC is free software: you can redistribute it and/or modify it under the
+terms of the GNU Affero General Public License, version 3, as published by
+the Free Software Foundation. See [LICENSE](LICENSE) for the full text.
+
+If you run a modified version as a network service, the AGPL requires you to
+offer its users the corresponding source code. For other licensing terms,
+contact the copyright holder.
