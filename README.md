@@ -194,6 +194,33 @@ account needs the host's other addresses, a host firewall rule such as
 defense for IP forwarding (not for split TCP, which only the relay's own
 checks cover).
 
+### Diagnostics
+
+When someone else runs a client on a network that interferes with ARC,
+the relay's operator can receive that client's diagnostics without asking
+for them. The relay accepts uploads with `-diagnostics-dir DIR`; the
+client opts in with `-share-diagnostics`:
+
+```sh
+sudo bin/arc-relay run ... -diagnostics-dir /var/lib/arc/diagnostics
+sudo bin/arc-client run ... -share-diagnostics
+```
+
+The client keeps a journal, `journal.jsonl` by default (`-journal FILE`):
+its log at debug level, including each carrier's failures (a TLS
+handshake reset, a timeout), path quality every ten minutes, and the
+version, platform and carriers it runs with. The journal persists across
+runs, up to 4 MiB, so a run that never connected is uploaded by the next
+one that does. Uploads go over the session 5 s after it comes up and every
+ten minutes after; what the relay confirms it stored leaves the journal.
+The journal holds addresses (the relay's, and those of the client's own
+links as the relay sees them) but no traffic and no credentials.
+
+The relay stores each upload as `DIR/ACCOUNT/TIME-ADDRESS.jsonl`, at most
+8 MiB per upload and 64 MiB per account (clear an account's directory to
+accept more), and logs `diagnostics received` with the account.
+`-journal` without `-share-diagnostics` keeps the journal locally only.
+
 The end-to-end test builds this setup in three network namespaces:
 
 ```sh

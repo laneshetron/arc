@@ -17,6 +17,8 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	"runtime"
+	"runtime/debug"
 	"strings"
 	"syscall"
 	"time"
@@ -25,6 +27,7 @@ import (
 	"github.com/laneshetron/arc/internal/carrier/stream"
 	"github.com/laneshetron/arc/internal/carrier/udp"
 	"github.com/laneshetron/arc/internal/crypto"
+	"github.com/laneshetron/arc/internal/diag"
 	"github.com/laneshetron/arc/internal/engine"
 	"github.com/laneshetron/arc/internal/keyfile"
 	"github.com/laneshetron/arc/internal/profiling"
@@ -63,6 +66,8 @@ func run(args []string) error {
 	tokenFile := fs.String("token-file", "token", "file containing the access token")
 	keyFile := fs.String("key-file", "", "client static private key; a new one is generated if empty")
 	tunName := fs.String("tun", tun.DefaultName, "TUN interface name")
+	journalFile := fs.String("journal", "", "keep a diagnostics journal in this file: the client's log at debug level, as JSON lines, kept across runs (default journal.jsonl with -share-diagnostics)")
+	shareDiagnostics := fs.Bool("share-diagnostics", false, "upload the journal to the relay's operator whenever a session is up, if the relay accepts diagnostics; it holds this client's log (carrier outcomes, path quality, addresses of the relay and of this host's links), never its traffic or token")
 	fullTunnel := fs.Bool("full-tunnel", false, "route all traffic through the tunnel")
 	dns := fs.String("dns", "", "trusted IPv4 DNS resolver (overrides the relay's resolver)")
 	dnsMode := fs.String("dns-mode", tun.DNSManager, "full-tunnel DNS setup: "+tun.DNSManager+" or manual (requires -dns and an externally configured resolver)")
@@ -170,6 +175,17 @@ func run(args []string) error {
 	defer stopProfiles()
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	if *shareDiagnostics && *journalFile == "" {
+		*journalFile = "journal.jsonl"
+	}
+	var journal *diag.Journal
+	if *journalFile != "" {
+		if journal, err = diag.OpenJournal(*journalFile, 0); err != nil {
+			return err
+		}
+		defer journal.Close()
+		log = diag.Tee(log.Handler(), journal.Handler())
+	}
 	relayAddr, err := netip.ParseAddrPort(*relay)
 	if err != nil {
 		return fmt.Errorf("-relay: %w", err)
@@ -372,14 +388,19 @@ func run(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	log.Info("starting", "relay", relayAddr, "tun", dev.Name(), "full_tunnel", *fullTunnel,
-		"routes", strings.Trim(routes.String(), "[]"))
-	err = engine.RunClient(ctx, engine.ClientConfig{
+		"routes", strings.Trim(routes.String(), "[]"), "version", version(), "os", runtime.GOOS, "arch", runtime.GOARCH,
+		"carriers", carrierNames(carriers), "split_tcp", splitMode, "share_diagnostics", *shareDiagnostics)
+	cfg := engine.ClientConfig{
 		Session: session.ClientConfig{
 			Static: static, RelayPublic: pin[:], Credential: []byte(tokens[0]), Redundancy: redundancy, FEC: fecMode,
 		},
 		Relay: relayAddr, Carriers: carriers, TUN: dev, OnEstablished: onEstablished, Logger: log,
 		StatusInterval: *status, SplitTCP: splitMode,
-	})
+	}
+	if *shareDiagnostics {
+		cfg.Diagnostics = journal
+	}
+	err = engine.RunClient(ctx, cfg)
 	if errors.Is(err, context.Canceled) {
 		return nil
 	}
@@ -408,4 +429,33 @@ func clientTLS(addr, caFile, serverName string) (*tls.Config, error) {
 		}
 	}
 	return cfg, nil
+}
+
+// version is the module version and VCS revision the binary was built
+// from, as far as the build recorded them.
+func version() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "unknown"
+	}
+	v := info.Main.Version
+	for _, s := range info.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			v += " " + s.Value
+		case "vcs.modified":
+			if s.Value == "true" {
+				v += "+dirty"
+			}
+		}
+	}
+	return v
+}
+
+func carrierNames(carriers []engine.Carrier) string {
+	names := make([]string, len(carriers))
+	for i, c := range carriers {
+		names[i] = c.Name
+	}
+	return strings.Join(names, ",")
 }

@@ -78,7 +78,7 @@ func ParseAccounts(lines []string) ([]Account, error) {
 }
 
 func validName(s string) bool {
-	if s == "" || len(s) > 64 {
+	if s == "" || s == "." || s == ".." || len(s) > 64 {
 		return false
 	}
 	for _, c := range []byte(s) {

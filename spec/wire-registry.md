@@ -42,10 +42,11 @@ All other type values are reserved: drop them silently.
 | `0x14` | `MAX_STREAM_DATA` | 12 (`stream_id:u32; max:u64`) | yes |
 | `0x15` | `MAX_DATA` | 8 (`max:u64`) | yes |
 | `0x16` | `STREAM_RESET` | 14 (`stream_id:u32; code:u16; final:u64`) | yes |
-| `0x17`–`0x7F` | reserved, required | — | reject the packet |
+| `0x17` | `DIAGNOSTICS_OPEN` | 4 (`stream_id:u32`) | yes |
+| `0x18`–`0x7F` | reserved, required | — | reject the packet |
 | `0x80`–`0xFF` | extensions, ignorable | — | ignore |
 
-`IP_DATAGRAM` and `REDUNDANCY` are sent only when `AUTH_RESULT` advertises features bit 0 (§11.1), and `FEC_REPAIR` and `FEC` only with bit 1 (§11.2), which also allows `IP_DATAGRAM`. The stream frames (`0x12`–`0x16`) are sent only with bit 2 (§11.3). Stream IDs are never 0, and stream offsets and limits stay below 2^62.
+`IP_DATAGRAM` and `REDUNDANCY` are sent only when `AUTH_RESULT` advertises features bit 0 (§11.1), and `FEC_REPAIR` and `FEC` only with bit 1 (§11.2), which also allows `IP_DATAGRAM`. The stream frames (`0x12`–`0x16`) are sent only with bit 2 (§11.3), and `DIAGNOSTICS_OPEN` only with bit 3, which also allows `0x13`–`0x16` for the upload (§11.4). Stream IDs are never 0, and stream offsets and limits stay below 2^62.
 
 ## AUTH_RESULT features (§10.1)
 
@@ -54,6 +55,7 @@ All other type values are reserved: drop them silently.
 | 0 | `REDUNDANCY` | relay accepts `IP_DATAGRAM` and `REDUNDANCY` (§11.1) |
 | 1 | `FEC` | relay accepts `IP_DATAGRAM`, `FEC_REPAIR` and `FEC` (§11.2) |
 | 2 | `STREAMS` | relay accepts `STREAM_OPEN` and carries streams to TCP destinations (§11.3) |
+| 3 | `DIAGNOSTICS` | relay accepts `DIAGNOSTICS_OPEN`, keeping clients' diagnostics uploads (§11.4) |
 
 Other bits are sent as zero and ignored on receipt.
 
