@@ -8,8 +8,12 @@
 // The tokens file lists the accounts allowed in, one credential per line,
 // as NAME TOKEN [relay]. Clients of one account reach each other's tunnel
 // addresses; clients of different accounts never do. "relay" lets an
-// account's clients reach the relay's own tunnel address. A bare TOKEN
-// line is an account of its own, without relay access.
+// account's clients reach the relay host: its tunnel address, and the
+// addresses of its interfaces, by IP forwarding or split TCP. A bare TOKEN
+// line is an account of its own, without relay access. -deny keeps every
+// account from networks private to the operator:
+//
+//	arc-relay run ... -deny 172.31.0.0/16
 //
 // For networks that block UDP, also accept TLS/TCP carriers (clients use
 // -tls and, for a self-signed certificate, -tls-ca relay.crt):
@@ -37,6 +41,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/netip"
 	"os"
@@ -138,6 +143,15 @@ func run(args []string) error {
 	keyFile := fs.String("key-file", "relay.key", "relay static private key (from genkey)")
 	resetFile := fs.String("reset-secret-file", "reset.secret", "stateless reset secret; created if missing, keep it across restarts")
 	tokensFile := fs.String("tokens-file", "tokens", "client accounts, one credential per line: NAME TOKEN [relay], or a bare TOKEN for an account of its own; accounts cannot reach each other's clients, and only \"relay\" accounts reach the relay's tunnel address")
+	var deny []netip.Prefix
+	fs.Func("deny", "IPv4 prefix no client may reach, by IP forwarding or split TCP, e.g. the relay's VPC (repeatable); the relay host's own addresses stay reachable for \"relay\" accounts", func(v string) error {
+		p, err := netip.ParsePrefix(v)
+		if err != nil || !p.Addr().Is4() {
+			return fmt.Errorf("want an IPv4 prefix, e.g. 172.31.0.0/16")
+		}
+		deny = append(deny, p.Masked())
+		return nil
+	})
 	tunName := fs.String("tun", "arc0", "TUN interface name")
 	network := fs.String("network", "10.77.0.1/16", "relay tunnel address and client network")
 	mtu := fs.Int("mtu", 1280, "tunnel MTU")
@@ -203,7 +217,10 @@ func run(args []string) error {
 	gwCfg := gateway.Config{
 		Network: netPrefix, TunMTU: uint16(*mtu),
 		Keepalive: session.DefaultKeepalive, Idle: session.DefaultIdleTimeout,
-		Accounts: accounts,
+		Accounts: accounts, Deny: deny,
+	}
+	if gwCfg.HostAddrs, err = hostAddrs(); err != nil {
+		return err
 	}
 	if *dns != "" {
 		if gwCfg.DNS, err = netip.ParseAddr(*dns); err != nil {
@@ -272,6 +289,7 @@ func run(args []string) error {
 	}
 
 	log.Info("relay listening", "addr", conn.LocalAddr(), "tls", tlsAddr, "tun", dev.Name(), "network", netPrefix, "accounts", len(accounts),
+		"host_addrs", gwCfg.HostAddrs, "deny", deny,
 		"public_key", keyfile.Encode(static.Public))
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -287,4 +305,23 @@ func run(args []string) error {
 		return nil
 	}
 	return err
+}
+
+// hostAddrs returns the IPv4 addresses of the host's interfaces, which
+// only accounts with relay access may reach. They are read once, at
+// startup: restart the relay after an interface's address changes.
+func hostAddrs() ([]netip.Addr, error) {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return nil, fmt.Errorf("list host addresses: %w", err)
+	}
+	var out []netip.Addr
+	for _, a := range addrs {
+		if n, ok := a.(*net.IPNet); ok {
+			if ip, ok := netip.AddrFromSlice(n.IP); ok && ip.Unmap().Is4() {
+				out = append(out, ip.Unmap())
+			}
+		}
+	}
+	return out, nil
 }

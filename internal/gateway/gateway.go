@@ -20,6 +20,7 @@ import (
 var (
 	ErrPoolExhausted = errors.New("gateway: address pool exhausted")
 	ErrBadCredential = errors.New("gateway: unknown credential")
+	ErrWrongAccount  = errors.New("gateway: credential of another account")
 )
 
 // Config describes the tunnel network.
@@ -38,6 +39,18 @@ type Config struct {
 	// Tokens is shorthand for accounts of one token each, with no relay
 	// access, named token1, token2, ...
 	Tokens [][]byte
+
+	// HostAddrs are the relay host's own addresses outside the tunnel
+	// network (its LAN or VPC address, say). Like the relay's tunnel
+	// address, they are reachable only with RelayAccess, by IP forwarding
+	// and by split TCP alike: the kernel would deliver either to the host
+	// itself.
+	HostAddrs []netip.Addr
+	// Deny lists destinations no client may reach, by IP forwarding or by
+	// split TCP: networks private to the operator, such as the relay's
+	// VPC. HostAddrs take precedence, so an account with RelayAccess still
+	// reaches the host's own address within a denied network.
+	Deny []netip.Prefix
 }
 
 // A lease is a tunnel address and the account it was leased to. The
@@ -70,6 +83,15 @@ func New(cfg Config) (*Gateway, error) {
 	if err := validate(accounts); err != nil {
 		return nil, err
 	}
+	cfg.HostAddrs = slices.Clone(cfg.HostAddrs)
+	for i, a := range cfg.HostAddrs {
+		cfg.HostAddrs[i] = a.Unmap()
+	}
+	for _, p := range cfg.Deny {
+		if !p.IsValid() || !p.Addr().Is4() {
+			return nil, fmt.Errorf("gateway: deny prefix %v is not IPv4", p)
+		}
+	}
 	return &Gateway{cfg: cfg, accounts: accounts, next: cfg.Network.Masked().Addr().Next(), leased: map[netip.Addr]lease{}}, nil
 }
 
@@ -85,14 +107,20 @@ func (g *Gateway) Tokens() [][]byte {
 
 // Authorize implements session.Authorizer: it checks the credential and,
 // on first authentication, leases an address to the credential's
-// account. A lease keeps the account it was leased to: a refresh with
-// another account's credential does not move it.
-func (g *Gateway) Authorize(credential, _ []byte, refresh bool) (wire.AuthResult, error) {
+// account. A lease keeps the account it was leased to, so a refresh must
+// present a credential of that same account.
+func (g *Gateway) Authorize(credential, _ []byte, prior *wire.AuthResult) (wire.AuthResult, error) {
 	a := g.account(credential)
 	if a == nil {
 		return wire.AuthResult{}, ErrBadCredential
 	}
-	if refresh {
+	if prior != nil {
+		g.mu.Lock()
+		l, ok := g.leased[netip.AddrFrom4(prior.IPv4)]
+		g.mu.Unlock()
+		if !ok || l.account != a {
+			return wire.AuthResult{}, ErrWrongAccount
+		}
 		return wire.AuthResult{}, nil
 	}
 	addr, err := g.lease(a)
@@ -209,21 +237,70 @@ func (g *Gateway) Lookup(pkt []byte) *session.RelaySession {
 	return l.session
 }
 
-// AllowForward reports whether the relay may write a client's packet to
-// the TUN. The session already checked that the source is its lease
-// (§11); this checks the destination against the lease's account: other
-// accounts' addresses and the tunnel network's reserved addresses are
-// refused, and the relay's own address needs RelayAccess. Packets leaving
-// the tunnel network are always allowed.
-func (g *Gateway) AllowForward(pkt []byte) bool {
+// AllowForward reports whether the relay may write a packet from session s
+// to the TUN. The session already checked that the packet's source is its
+// lease (§11), so the policy follows the session's lease, not the packet:
+// see allowForward.
+func (g *Gateway) AllowForward(s *session.RelaySession, pkt []byte) bool {
+	return g.allowForward(netip.AddrFrom4(s.Config().IPv4), pkt)
+}
+
+// allowForward applies AllowForward's policy to a packet from the client
+// leasing from. In the tunnel network, other accounts' addresses and the
+// reserved addresses are refused, and the relay's own address needs
+// RelayAccess; elsewhere, allowDst decides.
+func (g *Gateway) allowForward(from netip.Addr, pkt []byte) bool {
 	if len(pkt) < 20 || pkt[0]>>4 != 4 {
 		return false
 	}
 	dst := netip.AddrFrom4([4]byte(pkt[16:20]))
-	if !g.cfg.Network.Contains(dst) {
-		return true
+	if g.cfg.Network.Contains(dst) {
+		return g.allowTunnel(from, dst)
 	}
-	return g.allowTunnel(netip.AddrFrom4([4]byte(pkt[12:16])), dst)
+	return g.allowDst(from, dst)
+}
+
+// AllowDial reports whether the relay may connect a stream from session s
+// to dst (spec §11.3), under the policy IP forwarding has. Split TCP
+// terminates streams at the relay, so a stream to another client is
+// refused even within an account.
+func (g *Gateway) AllowDial(s *session.RelaySession, dst netip.AddrPort) bool {
+	return g.allowDial(netip.AddrFrom4(s.Config().IPv4), dst)
+}
+
+func (g *Gateway) allowDial(from netip.Addr, dst netip.AddrPort) bool {
+	a := dst.Addr()
+	switch {
+	case !a.Is4() || dst.Port() == 0:
+		return false
+	case g.cfg.Network.Contains(a):
+		return a == g.cfg.Network.Addr() && g.allowTunnel(from, a)
+	}
+	return g.allowDst(from, a)
+}
+
+// allowDst reports whether the client leasing from may reach dst, an IPv4
+// address outside the tunnel network: never loopback, unspecified,
+// multicast, broadcast, or link-local addresses (cloud metadata services
+// among them), the relay host's own addresses only with RelayAccess, and
+// nothing in Deny.
+func (g *Gateway) allowDst(from, dst netip.Addr) bool {
+	switch {
+	case dst.IsLoopback(), dst.IsUnspecified(), dst.IsMulticast(), dst.IsLinkLocalUnicast(),
+		dst == netip.AddrFrom4([4]byte{255, 255, 255, 255}):
+		return false
+	case slices.Contains(g.cfg.HostAddrs, dst):
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		l, ok := g.leased[from]
+		return ok && l.account.RelayAccess
+	}
+	for _, p := range g.cfg.Deny {
+		if p.Contains(dst) {
+			return false
+		}
+	}
+	return true
 }
 
 // allowTunnel reports whether the client leasing src may reach dst, an
@@ -240,24 +317,4 @@ func (g *Gateway) allowTunnel(src, dst netip.Addr) bool {
 	}
 	to, ok := g.leased[dst]
 	return ok && to.account == from.account
-}
-
-// AllowDial reports whether the relay may connect a stream from the
-// client leasing src to dst (spec §11.3), applying the limits IP
-// forwarding has: IPv4 only, no loopback, unspecified, multicast,
-// broadcast, or link-local destinations, and in the tunnel network only
-// what AllowForward allows. Split TCP terminates streams at the relay, so
-// a stream to another client is refused even within an account.
-func (g *Gateway) AllowDial(src netip.Addr, dst netip.AddrPort) bool {
-	a := dst.Addr()
-	switch {
-	case !a.Is4() || dst.Port() == 0:
-		return false
-	case a.IsLoopback(), a.IsUnspecified(), a.IsMulticast(), a.IsLinkLocalUnicast(),
-		a == netip.AddrFrom4([4]byte{255, 255, 255, 255}):
-		return false
-	case g.cfg.Network.Contains(a):
-		return a == g.cfg.Network.Addr() && g.allowTunnel(src, a)
-	}
-	return true
 }

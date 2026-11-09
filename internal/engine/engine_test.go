@@ -166,7 +166,7 @@ func TestTunnelOverLoopback(t *testing.T) {
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if r, err := gw.Authorize([]byte("secret"), nil, false); err == nil && netip.AddrFrom4(r.IPv4) == lease {
+		if r, err := gw.Authorize([]byte("secret"), nil, nil); err == nil && netip.AddrFrom4(r.IPv4) == lease {
 			return
 		}
 		time.Sleep(50 * time.Millisecond)

@@ -16,7 +16,8 @@ import (
 
 // TestAccountIsolation runs a relay with two accounts and three clients
 // over loopback: a1 and a2 belong to account a (relay access), b to
-// account b. Packets the relay writes to its TUN stand for what the
+// account b. The relay host also has the address 172.31.5.9 in its denied
+// VPC, 172.31.0.0/16. Packets the relay writes to its TUN stand for what the
 // kernel would route back into the TUN, so the test plays the kernel by
 // feeding them back.
 func TestAccountIsolation(t *testing.T) {
@@ -29,6 +30,8 @@ func TestAccountIsolation(t *testing.T) {
 			{Name: "a", Tokens: [][]byte{[]byte("a1"), []byte("a2")}, RelayAccess: true},
 			{Name: "b", Tokens: [][]byte{[]byte("b1")}},
 		},
+		HostAddrs: []netip.Addr{netip.MustParseAddr("172.31.5.9")},
+		Deny:      []netip.Prefix{netip.MustParsePrefix("172.31.0.0/16")},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -128,6 +131,18 @@ func TestAccountIsolation(t *testing.T) {
 	if got := recv(t, b.tun.out); !bytes.Equal(got, p) {
 		t.Fatal("relay's packet did not reach a client without relay access")
 	}
+
+	// The relay host's other addresses follow relay access too, and denied
+	// networks are closed to everyone.
+	host := netip.MustParseAddr("172.31.5.9")
+	p = ipv4(a1.lease, host, 100, 10)
+	a1.tun.in <- [][]byte{p}
+	if got := recv(t, relayTUN.out); !bytes.Equal(got, p) {
+		t.Fatal("relay-access client could not reach the relay host")
+	}
+	b.tun.in <- [][]byte{ipv4(b.lease, host, 100, 11)}
+	a1.tun.in <- [][]byte{ipv4(a1.lease, netip.MustParseAddr("172.31.7.1"), 100, 12)}
+	nothing("relay host without relay access, or a denied network")
 
 	// The internet works for both accounts.
 	internet := netip.MustParseAddr("198.51.100.7")

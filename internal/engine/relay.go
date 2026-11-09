@@ -94,7 +94,7 @@ func RunRelay(ctx context.Context, cfg RelayConfig) error {
 		}
 	}
 	allow := func(s *session.RelaySession, dst netip.AddrPort) bool {
-		return cfg.Gateway.AllowDial(netip.AddrFrom4(s.Config().IPv4), dst)
+		return cfg.Gateway.AllowDial(s, dst)
 	}
 	if cfg.AllowDial != nil {
 		allow = func(_ *session.RelaySession, dst netip.AddrPort) bool { return cfg.AllowDial(dst) }
@@ -171,9 +171,9 @@ func RunRelay(ctx context.Context, cfg RelayConfig) error {
 				}
 			}
 		}
-		for _, p, ok := r.PollIP(); ok; _, p, ok = r.PollIP() {
-			if !cfg.Gateway.AllowForward(p) {
-				bufpool.Put(p) // for another account, or the relay without RelayAccess
+		for s, p, ok := r.PollIP(); ok; s, p, ok = r.PollIP() {
+			if !cfg.Gateway.AllowForward(s, p) {
+				bufpool.Put(p) // for another account, the relay host without RelayAccess, or denied
 				continue
 			}
 			toTUN = append(toTUN, p)

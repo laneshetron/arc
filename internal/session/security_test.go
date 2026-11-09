@@ -212,9 +212,9 @@ func TestAuthChecksActiveCapacityBeforeLeasing(t *testing.T) {
 	calls := 0
 	cfg := defaultRelayConfig()
 	cfg.MaxSessions = 1
-	cfg.Authorize = func(c, k []byte, refresh bool) (wire.AuthResult, error) {
+	cfg.Authorize = func(c, k []byte, prior *wire.AuthResult) (wire.AuthResult, error) {
 		calls++
-		return testAuthorizer(c, k, refresh)
+		return testAuthorizer(c, k, prior)
 	}
 	n := newNetwork(t, 308, cfg, ClientConfig{})
 	first, _ := n.client.PollTransmit()
@@ -344,5 +344,31 @@ func TestSkippedSlotsRefillAfterExpiry(t *testing.T) {
 	n.runFor(DefaultPathTimeout + time.Second)
 	if s.State() != StateActive || len(n.client.slots) != spareSlots {
 		t.Fatalf("session %v with %d client slots after expiry, want active with %d", s.State(), len(n.client.slots), spareSlots)
+	}
+}
+
+// A refresh hands the Authorizer the session's configuration, so it can
+// hold the credential to the principal the session was leased to, and its
+// rejection ends the session.
+func TestRefreshSeesTheSessionsLease(t *testing.T) {
+	cfg := defaultRelayConfig()
+	var priors []*wire.AuthResult
+	cfg.Authorize = func(c, k []byte, prior *wire.AuthResult) (wire.AuthResult, error) {
+		priors = append(priors, prior)
+		if prior != nil && string(c) != "good" {
+			return wire.AuthResult{Status: uint8(wire.CodeAuthFailed)}, nil // another principal's
+		}
+		return testAuthorizer(c, k, prior)
+	}
+	n := newNetwork(t, 310, cfg, ClientConfig{})
+	s := n.establish()
+	if len(priors) != 1 || priors[0] != nil {
+		t.Fatalf("first authentication saw prior %v", priors)
+	}
+	if s.onAuth(n.now, []byte("other")) || s.State() != StateClosed {
+		t.Fatal("refresh with another principal's credential kept the session")
+	}
+	if len(priors) != 2 || priors[1] == nil || priors[1].IPv4 != lease {
+		t.Fatalf("refresh saw prior %+v, want the session's lease", priors[1:])
 	}
 }
