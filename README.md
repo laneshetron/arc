@@ -22,7 +22,7 @@ ARC is a multipath, carrier-agnostic overlay VPN. A TUN interface gives applicat
 
 ## Development
 
-Use Go 1.26.9 or a newer supported patched release. CI checks reachable
+Use Go 1.26.10 or a newer supported patched release. CI checks reachable
 vulnerabilities with govulncheck as well as running the tests.
 
 ```sh
@@ -43,7 +43,7 @@ go build -o bin/ ./cmd/...
 # Relay host
 bin/arc-relay genkey > relay.key
 bin/arc-relay pubkey < relay.key          # give this to clients
-echo "some-token" > tokens
+echo "lane some-token relay" > tokens      # NAME TOKEN [relay]: see Accounts below
 sudo sysctl -w net.ipv4.ip_forward=1
 sudo iptables -t nat -A POSTROUTING -s 10.77.0.0/16 -o eth0 -j MASQUERADE
 sudo bin/arc-relay run -listen 0.0.0.0:4433 -network 10.77.0.1/16
@@ -149,7 +149,50 @@ rejected in split-tunnel mode; configure that mode's DNS externally.
 
 These bounds do not replace operator firewall policy. Static bearer tokens
 still require operator rotation/restart for revocation; this pre-alpha does
-not provide expiring credentials or tenant destination isolation.
+not provide expiring credentials.
+
+### Accounts
+
+Each line of the relay's `-tokens-file` is a credential of an account:
+
+```
+lane    3f9c…   relay
+lane    81d2…   relay
+friend  c47a…
+```
+
+A name may repeat, giving its account several tokens. The relay reads
+the file only at startup, so changing it means restarting the relay, which
+interrupts every session. Several tokens allow a staged migration (add the
+new token, move clients to it, then remove the old one, a restart each
+time) but not yet an uninterrupted rotation, which needs credentials the
+relay can reload.
+
+Clients of one account can reach each other's tunnel addresses; clients of
+different accounts never can. (Split TCP never connects a stream to another
+client, even within an account.) Only accounts marked `relay` reach the
+relay host, where the operator may run services: its tunnel address, and
+the addresses of its interfaces (read at startup), whether by IP
+forwarding or by split TCP. A bare `TOKEN` line is an account of its own,
+named by its line number (`line3`), without relay access; since inserting
+a line above it renames it, prefer named accounts. The relay logs each
+session's account. All accounts share the relay's exit address.
+
+No account reaches loopback, link-local (cloud metadata services among
+them), multicast or broadcast destinations. `-deny PREFIX` (repeatable)
+closes networks private to the operator, such as the relay's VPC, to every
+account, by IP forwarding and split TCP alike. Split TCP connects from the
+relay host itself, so host firewall rules on forwarded traffic do not
+cover it; `-deny` does. The relay host's own addresses stay reachable for
+`relay` accounts even inside a denied network.
+
+An address that reaches the host without being on one of its interfaces,
+such as a cloud provider's public IP mapped by NAT, is not a host address;
+if the host serves anything private on it, list it with `-deny`. Where no
+account needs the host's other addresses, a host firewall rule such as
+`iptables -A INPUT -i arc0 ! -d 10.77.0.1 -j DROP` adds a second line of
+defense for IP forwarding (not for split TCP, which only the relay's own
+checks cover).
 
 The end-to-end test builds this setup in three network namespaces:
 
@@ -158,6 +201,8 @@ sudo test/netns/e2e.sh bin                                   # Linux
 docker build -f test/netns/Dockerfile -t arc-e2e . && docker run --rm --privileged arc-e2e   # macOS
 ```
 
+`test/netns/accounts.sh` checks account isolation, the relay host's addresses and `-deny` with
+two clients and split TCP (`docker run --rm --privileged arc-e2e accounts`).
 `test/netns/degraded.sh` runs plain routing, ARC, and WireGuard under netem loss, delay, jitter, and
 bandwidth limits, and measures ARC's failover across two links, whether it moves traffic off a lossy
 link, and what redundancy does when both links are lossy (`docker run --rm --privileged arc-e2e degraded`).
