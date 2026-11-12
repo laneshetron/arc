@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"sync/atomic"
 	"syscall"
+	"time"
 
 	"golang.org/x/net/ipv4"
 	"golang.org/x/sys/unix"
@@ -45,12 +47,22 @@ type Options struct {
 	// only there and receives only from there. The kernel resolves the
 	// route and policy once instead of for every datagram (on macOS, a send
 	// through a bound interface then takes about 9 µs of CPU instead of 24).
+	//
+	// If the peer is unreachable when the socket opens (its interface is
+	// down, or has no address or route yet), Listen still succeeds: the
+	// socket stays unconnected, sends fail, and each WriteBatch at most
+	// once per connectRetry tries to connect again, so the carrier joins
+	// once its interface can reach the peer (see Connected).
 	Peer netip.AddrPort
 	// OnReconnect, if set, is called with the socket's new local address
 	// after a connected socket whose source address went away connects
 	// again (see WriteBatch). It runs on the writing goroutine.
 	OnReconnect func(local netip.AddrPort)
 }
+
+// connectRetry is how often a socket that could not connect to its peer
+// tries again, on sends.
+const connectRetry = time.Second
 
 // Conn is a UDP carrier socket. Reads and writes may run on different
 // goroutines, but each must be used by only one goroutine at a time.
@@ -67,7 +79,12 @@ type Conn struct {
 	gro     *groReader     // non-nil when UDP_GRO is enabled; see gro_linux.go
 	peer    netip.AddrPort // the connected peer; zero if unconnected
 
+	// For a socket whose peer was unreachable when it opened: raw
+	// connects it later, on the writing goroutine, which alone uses
+	// nextConnect.
 	raw         syscall.RawConn
+	pending     atomic.Bool // not yet connected to peer
+	nextConnect time.Time
 	onReconnect func(netip.AddrPort)
 
 	// Caches for the send path: the last destination's *net.UDPAddr and
@@ -113,14 +130,19 @@ func Listen(addr netip.AddrPort, opts Options) (*Conn, error) {
 		return sockErr
 	}}
 	var uc *net.UDPConn
+	pending := false
 	if opts.Peer.IsValid() {
 		d := net.Dialer{LocalAddr: net.UDPAddrFromAddrPort(addr), Control: lc.Control}
 		nc, err := d.DialContext(context.Background(), "udp4", opts.Peer.String())
-		if err != nil {
+		if err == nil {
+			uc = nc.(*net.UDPConn)
+		} else if unreachable(err) {
+			pending = true // connect on a later send
+		} else {
 			return nil, err
 		}
-		uc = nc.(*net.UDPConn)
-	} else {
+	}
+	if uc == nil {
 		pc, err := lc.ListenPacket(context.Background(), "udp4", addr.String())
 		if err != nil {
 			return nil, err
@@ -138,6 +160,7 @@ func Listen(addr netip.AddrPort, opts Options) (*Conn, error) {
 		return nil, err
 	}
 	c := &Conn{uc: uc, pc: ipv4.NewPacketConn(uc), peer: opts.Peer, raw: raw, onReconnect: opts.OnReconnect}
+	c.pending.Store(pending)
 	if !opts.NoOffload {
 		c.gso = gsoSupported(uc)
 		c.gro = enableGRO(uc)
@@ -211,12 +234,19 @@ func (c *Conn) readBatch(bufs [][]byte, sizes []int, addrs []netip.AddrPort) (in
 // address. So a send failing that way reconnects the socket, at most once
 // per call, and retries the datagram. If reconnecting fails, as while the
 // interface has no address, the rest of the batch is dropped and the
-// reconnect's error returned; the next call tries again.
+// reconnect's error returned; later calls drop their batches and try
+// again at most once per connectRetry, as for a socket whose peer was
+// unreachable when it opened.
 func (c *Conn) WriteBatch(pkts [][]byte, addrs []netip.AddrPort) error {
 	if c.peer.IsValid() {
 		for _, to := range addrs {
 			if to != c.peer {
 				return fmt.Errorf("udp: send to %v on a socket connected to %v", to, c.peer)
+			}
+		}
+		if c.pending.Load() {
+			if err := c.connectPending(); err != nil {
+				return err // the batch is dropped
 			}
 		}
 	}
@@ -282,6 +312,37 @@ func (c *Conn) sendAll(msgs []ipv4.Message) error {
 	return first
 }
 
+// connectPending connects a socket that is not connected to its peer (it
+// was unreachable when the socket opened, or when a reconnect last
+// failed), at most once per connectRetry.
+func (c *Conn) connectPending() error {
+	now := time.Now()
+	if now.Before(c.nextConnect) {
+		return fmt.Errorf("udp: not yet connected to %v", c.peer)
+	}
+	if err := c.reconnect(); err != nil {
+		return fmt.Errorf("udp: connecting to %v: %w", c.peer, err)
+	}
+	return nil
+}
+
+// Connected reports whether a socket with a peer is connected to it. It
+// is false while the peer has been unreachable since the socket opened,
+// or since a reconnect failed.
+func (c *Conn) Connected() bool { return !c.pending.Load() }
+
+// unreachable reports whether connecting failed because the peer cannot
+// be reached from here now: the interface is down, or has no address or
+// route. Those may change; other errors will not.
+func unreachable(err error) bool {
+	for _, e := range []syscall.Errno{syscall.ENETUNREACH, syscall.EHOSTUNREACH, syscall.ENETDOWN, syscall.EADDRNOTAVAIL} {
+		if errors.Is(err, e) {
+			return true
+		}
+	}
+	return false
+}
+
 // refused reports whether err is an ICMP error from an earlier datagram,
 // which only a connected socket reports, or a route error a send reports
 // while the network is briefly unreachable (macOS during a Wi-Fi roam,
@@ -323,18 +384,23 @@ func sourceLost(err error) bool {
 
 // reconnect connects the socket to its peer again, which picks a source
 // address from the interface's current ones. If it fails, as while the
-// interface has no address, the socket may be left unconnected, and the
-// next send tries again. Reads carry on throughout; the engine discards
+// interface has no address, the socket may be left unconnected, and
+// WriteBatch tries again at most once per connectRetry. Reads carry on throughout; the engine discards
 // anything that arrives from elsewhere while the socket is unconnected.
 func (c *Conn) reconnect() error {
 	sa := &unix.SockaddrInet4{Port: int(c.peer.Port()), Addr: c.peer.Addr().As4()}
 	var err error
 	if cerr := c.raw.Control(func(fd uintptr) { err = connectFD(int(fd), sa) }); cerr != nil {
-		return cerr
+		err = cerr
 	}
 	if err != nil {
+		// Possibly unconnected now: WriteBatch retries, at most once
+		// per connectRetry.
+		c.pending.Store(true)
+		c.nextConnect = time.Now().Add(connectRetry)
 		return err
 	}
+	c.pending.Store(false)
 	if c.onReconnect != nil {
 		c.onReconnect(c.LocalAddr())
 	}
