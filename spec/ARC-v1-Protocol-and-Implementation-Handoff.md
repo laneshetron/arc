@@ -375,12 +375,13 @@ frame_value:  frame_length bytes
 | `14` | `MAX_STREAM_DATA` | 12 bytes: `stream_id:u32; max:u64` (§11.3) | Both, if negotiated | Yes |
 | `15` | `MAX_DATA` | 8 bytes: `max:u64` (§11.3) | Both, if negotiated | Yes |
 | `16` | `STREAM_RESET` | 14 bytes: `stream_id:u32; code:u16; final:u64` (§11.3) | Both, if negotiated | Yes |
+| `17` | `DIAGNOSTICS_OPEN` | 4 bytes: `stream_id:u32` (§11.4) | Client → relay, if negotiated | Yes |
 
 **`AUTH_RESULT`:**
 - `status=0` means success. Any other value is a failure, and all other fields MUST then be zero.
 - `tun_mtu` MUST be at least 1280 on success.
 - `dns_ipv4=0` means the relay supplied no resolver. Full-tunnel mode MUST then get an authenticated resolver setting from trusted, explicit client configuration.
-- `features` bit 0 (`REDUNDANCY`): the relay accepts `IP_DATAGRAM` and `REDUNDANCY` (§11.1). Bit 1 (`FEC`): the relay accepts `IP_DATAGRAM`, `FEC_REPAIR` and `FEC` (§11.2). Bit 2 (`STREAMS`): the relay accepts `STREAM_OPEN` and carries streams (§11.3). A relay MUST send other bits as zero, and a client MUST ignore bits it does not know.
+- `features` bit 0 (`REDUNDANCY`): the relay accepts `IP_DATAGRAM` and `REDUNDANCY` (§11.1). Bit 1 (`FEC`): the relay accepts `IP_DATAGRAM`, `FEC_REPAIR` and `FEC` (§11.2). Bit 2 (`STREAMS`): the relay accepts `STREAM_OPEN` and carries streams (§11.3). Bit 3 (`DIAGNOSTICS`): the relay accepts `DIAGNOSTICS_OPEN` (§11.4). A relay MUST send other bits as zero, and a client MUST ignore bits it does not know.
 - IPv6 configuration and pushed routes are deferred to an extension frame.
 - The relay controls address assignment by deployment policy. Receiving an address does not by itself authorize inbound Internet exposure.
 
@@ -519,6 +520,16 @@ That makes it an opt-in mode for degraded networks. The client decides per conne
 
   With a 300 ms buffer the mean queueing delay stays at about 5 ms, where loss-based TCP would fill the buffer. Concurrent streams share the link evenly.
 - **Limits.** Like any delay-based controller, it yields to loss-based flows that keep a standing queue at a shared bottleneck. That suits a mode for degraded links, not a default.
+
+### 11.4 Diagnostics uploads
+
+A client on a network that interferes with ARC is often run by someone other than the relay's operator, who then has only that person's account of what went wrong. A diagnostics upload carries the client's own record (which carriers it tried, how each failed, path quality) to the operator over the session, once one comes up, including the record of earlier runs that never connected.
+
+- **Negotiation.** The relay advertises acceptance with `AUTH_RESULT` features bit 3, independently of bit 2: a relay that connects no streams may still accept uploads. With bit 3 alone, the stream frames (`0x13`–`0x16`) are used for uploads only, and the relay ignores `STREAM_OPEN`. Without bit 3, the client sends no `DIAGNOSTICS_OPEN`, and a relay ignores one.
+- **`DIAGNOSTICS_OPEN`.** Opens stream `stream_id` (numbered as in §11.3) as an upload instead of a connection. It is retransmitted until acknowledged. The stream otherwise follows §11.3: reliability, flow control, reset and limits.
+- **Exchange.** The client sends the upload and `FIN`. Once the relay has stored all of it durably (the file and its directory entry synced), it sends the three bytes `ok\n` and `FIN`. Only then may the client discard what it uploaded. The relay resets the stream (`CAPACITY`) when it will not store the upload, for instance past a size limit, and the client keeps its record for a later attempt.
+- **Bounds.** An upload is data the client chose, kept on the relay's disk, so the relay bounds it: each upload's size, an account's stored total and file count, the uploads in progress (one per session, a few per account), and how long an upload may stall or run. Each upload's bytes are charged to its account as they arrive, so concurrent uploads never share an account's free space. Older uploads are deleted to make room only once a new one is stored, so an upload that fails costs the operator nothing. A stalled or overlong upload is reset and discarded, and an empty one is refused.
+- **Content (reference implementation).** The client's log at debug level, as JSON lines, from a journal file that persists across runs and holds at most 4 MiB. Uploads start 5 s after each session is established and repeat every 10 minutes. The relay keeps each upload as a file under its operator's directory, named by account, time and tunnel address, at most 8 MiB per upload and 64 MiB and 256 uploads per account (the account's oldest stored uploads are deleted to make room), one upload in progress per session and four per account, abandoned after 2 minutes without data or 30 minutes in all. Uploading is opt-in on the client (`-share-diagnostics`). A journal is bound to the relay public key the client pins, and records kept for another relay are discarded, never uploaded. The client logs no traffic and no credentials, but the journal is its whole debug log.
 
 ## 12. Carrier framing and cells
 
