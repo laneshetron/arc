@@ -472,7 +472,25 @@ func (c *Client) streamEvents() {
 // StreamsSupported reports whether the active session's relay carries
 // streams (§11.3).
 func (c *Client) StreamsSupported() bool {
-	return c.state == StateActive && c.conn.streams.enabled
+	return c.state == StateActive && c.conn.streams.connect
+}
+
+// DiagnosticsSupported reports whether the active session's relay accepts
+// diagnostics uploads (§11.4).
+func (c *Client) DiagnosticsSupported() bool {
+	return c.state == StateActive && c.conn.streams.diagnostics
+}
+
+// OpenDiagnostics opens a stream uploading diagnostics to the relay's
+// operator (§11.4) and returns its ID. The client writes the upload and
+// finishes its side; the relay answers "ok\n" and FIN once it kept it, or
+// resets the stream.
+func (c *Client) OpenDiagnostics(now time.Time) (uint32, error) {
+	c.observe(now)
+	if c.state != StateActive {
+		return 0, ErrNotActive
+	}
+	return c.conn.openDiagnostics(now)
 }
 
 // OpenStream asks the relay to connect a new stream to a TCP destination
@@ -570,8 +588,10 @@ func (c *Client) onAuthResult(now time.Time, r wire.AuthResult) {
 		c.conn.fec.mode = c.cfg.FEC
 		c.conn.queue(wire.FEC{Seq: 1, Mode: c.cfg.FEC}) // the relay protects the downlink likewise
 	}
-	if r.Features&wire.FeatureStreams != 0 {
+	if r.Features&(wire.FeatureStreams|wire.FeatureDiagnostics) != 0 {
 		c.conn.streams.init(true)
+		c.conn.streams.connect = r.Features&wire.FeatureStreams != 0
+		c.conn.streams.diagnostics = r.Features&wire.FeatureDiagnostics != 0
 	}
 	c.conn.keepalive = c.keepalive()
 	c.conn.probe(now, p0)

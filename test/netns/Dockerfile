@@ -5,7 +5,7 @@
 #   docker run --rm --privileged arc-e2e            # end-to-end checks
 #   docker run --rm --privileged arc-e2e bench      # ARC vs WireGuard throughput
 #   docker run --rm --privileged arc-e2e degraded   # loss, delay, jitter, failover
-FROM golang:1.26.10-bookworm AS build
+FROM golang:1.26.11-bookworm AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download

@@ -30,7 +30,8 @@ F = dict(PADDING=0x00, AUTH=0x01, AUTH_RESULT=0x02, IP_PACKET=0x03, IP_FRAGMENT=
          NEW_PATH=0x05, PATH_JOIN=0x06, PATH_CHALLENGE=0x07, PATH_RESPONSE=0x08,
          PATH_ABANDON=0x09, PING=0x0A, ACK=0x0B, CLOSE=0x0C, ERROR=0x0D,
          IP_DATAGRAM=0x0E, REDUNDANCY=0x0F, FEC_REPAIR=0x10, FEC=0x11, STREAM_OPEN=0x12,
-         STREAM=0x13, MAX_STREAM_DATA=0x14, MAX_DATA=0x15, STREAM_RESET=0x16)
+         STREAM=0x13, MAX_STREAM_DATA=0x14, MAX_DATA=0x15, STREAM_RESET=0x16,
+         DIAGNOSTICS_OPEN=0x17)
 
 CLIENT_CID = bytes.fromhex("c1c2c3c4c5c6c7c8")
 RELAY_CID = bytes.fromhex("a1a2a3a4a5a6a7a8")
@@ -233,6 +234,7 @@ def build():
         ("MAX_STREAM_DATA", F["MAX_STREAM_DATA"], struct.pack("!IQ", 3, 3 << 20), {"stream_id": 3, "max": 3 << 20}),
         ("MAX_DATA", F["MAX_DATA"], struct.pack("!Q", 24 << 20), {"max": 24 << 20}),
         ("STREAM_RESET", F["STREAM_RESET"], struct.pack("!IHQ", 3, 9, 1234), {"stream_id": 3, "code": 9, "final": 1234}),
+        ("DIAGNOSTICS_OPEN", F["DIAGNOSTICS_OPEN"], struct.pack("!I", 5), {"stream_id": 5}),
         ("UNKNOWN_EXTENSION", 0x9F, b"\xAA\xBB", {"ignorable": True}),
     ]
     fixtures["frames"] = [
@@ -349,6 +351,8 @@ def build():
         {"name": "max_stream_data past max offset", "hex": frame(0x14, struct.pack("!IQ", 1, 2**62)).hex()},
         {"name": "max_data wrong size", "hex": frame(0x15, struct.pack("!I", 1)).hex()},
         {"name": "stream_reset wrong size", "hex": frame(0x16, struct.pack("!IH", 1, 9)).hex()},
+        {"name": "diagnostics_open stream zero", "hex": frame(0x17, struct.pack("!I", 0)).hex()},
+        {"name": "diagnostics_open wrong size", "hex": frame(0x17, struct.pack("!IH", 1, 0)).hex()},
         {"name": "redundancy unknown mode", "hex": frame(0x0F, struct.pack("!IB", 1, 2)).hex()},
         {"name": "path_join wrong size", "hex": "06000700000000000000"},
         {"name": "ping with value", "hex": "0a000100"},

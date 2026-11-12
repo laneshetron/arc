@@ -242,6 +242,7 @@ func TestParseAccounts(t *testing.T) {
 		{"a tok relays"},           // unknown option
 		{"a tok relay extra"},      // too many fields
 		{"a/b tok"},                // invalid name
+		{".. tok"},                 // a path element
 		{"a tok1 relay", "a tok2"}, // relay access differs
 		{"a tok1", "b tok1"},       // token repeated
 		{"tok", "line1 other"},     // name of a bare line taken

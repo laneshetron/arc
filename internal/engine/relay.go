@@ -10,6 +10,7 @@ import (
 
 	"github.com/laneshetron/arc/internal/bufpool"
 	"github.com/laneshetron/arc/internal/carrier/stream"
+	"github.com/laneshetron/arc/internal/diag"
 	"github.com/laneshetron/arc/internal/gateway"
 	"github.com/laneshetron/arc/internal/session"
 	"github.com/laneshetron/arc/internal/wire"
@@ -38,6 +39,10 @@ type RelayConfig struct {
 	// AllowDial overrides Gateway.AllowDial, for tests: it sees only the
 	// destination, not the client's account.
 	AllowDial func(dst netip.AddrPort) bool
+
+	// Diagnostics, if set, keeps clients' diagnostics uploads (spec
+	// §11.4), and the relay advertises that it accepts them.
+	Diagnostics *diag.Store
 }
 
 // DialTimeout bounds how long the relay tries to connect a stream.
@@ -74,6 +79,7 @@ func RunRelay(ctx context.Context, cfg RelayConfig) error {
 	go readPackets(ctx, cfg.TUN, tunCh, errc)
 
 	cfg.Session.Authorize = cfg.Gateway.Authorize
+	cfg.Session.Diagnostics = cfg.Diagnostics != nil
 	r := session.NewRelay(cfg.Session, time.Now())
 	timer := time.NewTimer(time.Hour)
 	defer timer.Stop()
@@ -150,7 +156,11 @@ func RunRelay(ctx context.Context, cfg RelayConfig) error {
 				}
 			case session.StreamOpened:
 				k := streamKey{e.Session, e.ID}
-				if !allow(e.Session, e.Dst) {
+				if e.Diagnostics {
+					startDiagnostics(ctx, cfg, e, bridges, bridgeEvents, log)
+					continue
+				}
+				if cfg.Session.NoStreams || !allow(e.Session, e.Dst) {
 					e.Session.StreamReset(time.Now(), e.ID, wire.CodeUnauthorized)
 					continue
 				}
@@ -248,4 +258,37 @@ func RunRelay(ctx context.Context, cfg RelayConfig) error {
 			r.Tick(time.Now())
 		}
 	}
+}
+
+// startDiagnostics stores a client's diagnostics upload, or refuses it.
+func startDiagnostics(ctx context.Context, cfg RelayConfig, e session.StreamOpened, bridges map[streamKey]*bridge,
+	events chan bridgeEvent, log *slog.Logger) {
+	now := time.Now()
+	lease := netip.AddrFrom4(e.Session.Config().IPv4)
+	account := cfg.Gateway.AccountName(lease)
+	if cfg.Diagnostics == nil {
+		e.Session.StreamReset(now, e.ID, wire.CodeUnsupported)
+		return
+	}
+	conn, err := cfg.Diagnostics.Create(account, lease.String(), now)
+	if err != nil {
+		log.Warn("diagnostics refused", "account", account, "address", lease, "err", err)
+		e.Session.StreamReset(now, e.ID, wire.CodeCapacity)
+		return
+	}
+	k := streamKey{e.Session, e.ID}
+	b := newBridge(e.ID, e.Session, conn, func() { conn.Close() })
+	bridges[k] = b
+	b.forget = func() {
+		delete(bridges, k)
+		switch {
+		case conn.Kept():
+			log.Info("diagnostics received", "account", account, "address", lease, "bytes", conn.Size(), "file", conn.Name())
+		case conn.Expired():
+			log.Warn("diagnostics abandoned: the upload stalled or ran too long", "account", account, "address", lease,
+				"bytes", conn.Size())
+		}
+	}
+	b.start(ctx, events)
+	b.service(now)
 }

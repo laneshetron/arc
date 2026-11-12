@@ -22,7 +22,7 @@ ARC is a multipath, carrier-agnostic overlay VPN. A TUN interface gives applicat
 
 ## Development
 
-Use Go 1.26.10 or a newer supported patched release. CI checks reachable
+Use Go 1.26.11 or a newer supported patched release. CI checks reachable
 vulnerabilities with govulncheck as well as running the tests.
 
 ```sh
@@ -193,6 +193,43 @@ account needs the host's other addresses, a host firewall rule such as
 `iptables -A INPUT -i arc0 ! -d 10.77.0.1 -j DROP` adds a second line of
 defense for IP forwarding (not for split TCP, which only the relay's own
 checks cover).
+
+### Diagnostics
+
+When someone else runs a client on a network that interferes with ARC,
+the relay's operator can receive that client's diagnostics without asking
+for them. The relay accepts uploads with `-diagnostics-dir DIR`; the
+client opts in with `-share-diagnostics`:
+
+```sh
+sudo bin/arc-relay run ... -diagnostics-dir /var/lib/arc/diagnostics
+sudo bin/arc-client run ... -share-diagnostics
+```
+
+The client keeps a journal, `journal.jsonl` by default (`-journal FILE`):
+its log at debug level, including each carrier's failures (a TLS
+handshake reset, a timeout), path quality every ten minutes, and the
+version, platform and carriers it runs with. The journal persists across
+runs, up to 4 MiB, so a run that never connected is uploaded by the next
+one that does. It belongs to the relay whose key the client pins: a client
+pointed at a different relay discards what the journal held rather than
+send it to another operator. Uploads go over the session 5 s after it
+comes up and every ten minutes after; what the relay confirms it stored
+leaves the journal. The journal holds addresses (the relay's, and those of
+the client's own links as the relay sees them). ARC does not log traffic
+or credentials, but the journal is the client's whole debug log: read it
+before sharing it anywhere else.
+
+The relay stores each upload as `DIR/ACCOUNT/TIME-ADDRESS.jsonl` and logs
+`diagnostics received` with the account. Uploads are client-chosen data
+on the relay's disk, so they are bounded: at most 8 MiB per upload, and
+64 MiB and 256 uploads per account: each new upload, once stored, deletes
+the account's oldest as needed to stay within them (an upload that fails
+deletes nothing). One upload runs at a time per client and four per
+account, an upload that stalls for two minutes or runs past thirty is
+abandoned, and empty uploads are refused. Other files you put in an
+account's directory count toward its 64 MiB but are never deleted.
+`-journal` without `-share-diagnostics` keeps the journal locally only.
 
 The end-to-end test builds this setup in three network namespaces:
 

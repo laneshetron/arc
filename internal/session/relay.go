@@ -54,6 +54,11 @@ type RelayConfig struct {
 	// streams for clients. The caller must otherwise answer each
 	// StreamOpened, connecting or resetting the stream.
 	NoStreams bool
+
+	// Diagnostics accepts clients' diagnostics uploads (§11.4): each
+	// arrives as a StreamOpened with Diagnostics set, which the caller
+	// answers by storing the stream's bytes or resetting it.
+	Diagnostics bool
 }
 
 // RelayDatagram is an outgoing packet for a client address.
@@ -80,6 +85,9 @@ type StreamOpened struct {
 	Session *RelaySession
 	ID      uint32
 	Dst     netip.AddrPort
+	// Diagnostics marks an upload of the client's diagnostics (§11.4),
+	// which has no Dst.
+	Diagnostics bool
 }
 
 // RelayStreamUpdate reports news on a stream, as StreamUpdate does for
@@ -364,6 +372,9 @@ func (r *Relay) handleData(now time.Time, from netip.AddrPort, b []byte) {
 		case wire.StreamOpen:
 			s.onUplink(p)
 			s.conn.onStreamOpen(f)
+		case wire.DiagOpen:
+			s.onUplink(p)
+			s.conn.onDiagOpen(f)
 		case wire.Stream:
 			s.onUplink(p)
 			if !s.conn.onStream(f) {
@@ -659,7 +670,13 @@ func (s *RelaySession) onAuth(now time.Time, credential []byte) bool {
 	}
 	if !r.cfg.NoStreams {
 		result.Features |= wire.FeatureStreams
+	}
+	if r.cfg.Diagnostics {
+		result.Features |= wire.FeatureDiagnostics
+	}
+	if !r.cfg.NoStreams || r.cfg.Diagnostics {
 		s.conn.streams.init(false)
+		s.conn.streams.connect, s.conn.streams.diagnostics = !r.cfg.NoStreams, r.cfg.Diagnostics
 	}
 	s.result = result
 	s.state = StateActive
@@ -920,7 +937,7 @@ func (r *Relay) PollEvent() (RelayEvent, bool) {
 	for _, s := range r.live {
 		ss := &s.conn.streams
 		for _, f := range ss.opened {
-			r.events = append(r.events, StreamOpened{Session: s, ID: f.ID, Dst: f.Dst})
+			r.events = append(r.events, StreamOpened{Session: s, ID: f.ID, Dst: f.Dst, Diagnostics: !f.Dst.IsValid()})
 		}
 		for _, id := range ss.updates {
 			r.events = append(r.events, RelayStreamUpdate{Session: s, ID: id})

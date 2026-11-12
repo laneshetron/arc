@@ -296,6 +296,14 @@
       }
     },
     {
+      "name": "DIAGNOSTICS_OPEN",
+      "type": 23,
+      "frame_hex": "17000400000005",
+      "fields": {
+        "stream_id": 5
+      }
+    },
+    {
       "name": "UNKNOWN_EXTENSION",
       "type": 159,
       "frame_hex": "9f0002aabb",
@@ -528,6 +536,14 @@
     {
       "name": "stream_reset wrong size",
       "hex": "160006000000010009"
+    },
+    {
+      "name": "diagnostics_open stream zero",
+      "hex": "17000400000000"
+    },
+    {
+      "name": "diagnostics_open wrong size",
+      "hex": "170006000000010000"
     },
     {
       "name": "redundancy unknown mode",

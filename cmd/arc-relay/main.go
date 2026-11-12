@@ -53,6 +53,7 @@ import (
 	"github.com/laneshetron/arc/internal/carrier/stream"
 	"github.com/laneshetron/arc/internal/carrier/udp"
 	"github.com/laneshetron/arc/internal/crypto"
+	"github.com/laneshetron/arc/internal/diag"
 	"github.com/laneshetron/arc/internal/engine"
 	"github.com/laneshetron/arc/internal/gateway"
 	"github.com/laneshetron/arc/internal/keyfile"
@@ -153,6 +154,7 @@ func run(args []string) error {
 		return nil
 	})
 	tunName := fs.String("tun", "arc0", "TUN interface name")
+	diagDir := fs.String("diagnostics-dir", "", "accept clients' diagnostics uploads (arc-client -share-diagnostics) and keep each in this directory, under its account's name (default: off)")
 	network := fs.String("network", "10.77.0.1/16", "relay tunnel address and client network")
 	mtu := fs.Int("mtu", 1280, "tunnel MTU")
 	dns := fs.String("dns", "", "IPv4 resolver to offer clients")
@@ -289,18 +291,25 @@ func run(args []string) error {
 	}
 
 	log.Info("relay listening", "addr", conn.LocalAddr(), "tls", tlsAddr, "tun", dev.Name(), "network", netPrefix, "accounts", len(accounts),
-		"host_addrs", gwCfg.HostAddrs, "deny", deny,
+		"host_addrs", gwCfg.HostAddrs, "deny", deny, "diagnostics_dir", *diagDir,
 		"public_key", keyfile.Encode(static.Public))
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	err = engine.RunRelay(ctx, engine.RelayConfig{
+	rcfg := engine.RelayConfig{
 		Session: session.RelayConfig{
 			Static: static, ResetSecret: resetSecret, IdleTimeout: gwCfg.Idle + 10*time.Second,
 			NoRedundancy: *noRedundancy, NoFEC: *noFEC, NoStreams: *noStreams,
 			MaxSessions: *maxSessions, MaxPending: *maxPending, HandshakesPerSecond: *handshakeRate, HandshakesPerSource: *sourceRate,
 		},
 		Conn: conn, Streams: streams, TUN: dev, Gateway: gw, Logger: log, StatusInterval: *status,
-	})
+	}
+	if *diagDir != "" {
+		if err := os.MkdirAll(*diagDir, 0o700); err != nil {
+			return fmt.Errorf("-diagnostics-dir: %w", err)
+		}
+		rcfg.Diagnostics = &diag.Store{Dir: *diagDir}
+	}
+	err = engine.RunRelay(ctx, rcfg)
 	if ctx.Err() != nil {
 		return nil
 	}

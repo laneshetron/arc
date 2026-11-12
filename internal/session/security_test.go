@@ -372,3 +372,31 @@ func TestRefreshSeesTheSessionsLease(t *testing.T) {
 		t.Fatalf("refresh saw prior %+v, want the session's lease", priors[1:])
 	}
 }
+
+// Diagnostics uploads are negotiated apart from connecting streams: a
+// relay may accept one without the other, and the client opens only what
+// the relay advertised (§11.4).
+func TestDiagnosticsNegotiation(t *testing.T) {
+	cfg := defaultRelayConfig()
+	cfg.NoStreams, cfg.Diagnostics = true, true
+	n := newNetwork(t, 311, cfg, ClientConfig{})
+	n.establish()
+	if n.client.StreamsSupported() || !n.client.DiagnosticsSupported() {
+		t.Fatal("negotiated streams without diagnostics")
+	}
+	if _, err := n.client.OpenStream(n.now, netip.MustParseAddrPort("198.51.100.7:443")); err != ErrStreamsUnsupported {
+		t.Fatalf("OpenStream: %v", err)
+	}
+	if _, err := n.client.OpenDiagnostics(n.now); err != nil {
+		t.Fatalf("OpenDiagnostics: %v", err)
+	}
+
+	n = newNetwork(t, 312, defaultRelayConfig(), ClientConfig{})
+	n.establish()
+	if !n.client.StreamsSupported() || n.client.DiagnosticsSupported() {
+		t.Fatal("a relay without diagnostics advertised them")
+	}
+	if _, err := n.client.OpenDiagnostics(n.now); err != ErrDiagnosticsUnsupported {
+		t.Fatalf("OpenDiagnostics: %v", err)
+	}
+}
