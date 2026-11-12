@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/laneshetron/arc/internal/bufpool"
+	"github.com/laneshetron/arc/internal/diag"
 	"github.com/laneshetron/arc/internal/session"
 	"github.com/laneshetron/arc/internal/splittcp"
 	"github.com/laneshetron/arc/internal/wire"
@@ -55,6 +56,15 @@ type ClientConfig struct {
 	// locally and carries as streams (spec §11.3), if the relay supports
 	// them.
 	SplitTCP SplitMode
+
+	// Diagnostics, if set, is uploaded to the relay's operator (spec
+	// §11.4) when the relay accepts diagnostics: DiagnosticsDelay after
+	// each session is established (default 5 s), then every
+	// DiagnosticsInterval (default 10 min). Every DiagnosticsInterval the
+	// paths' state is also logged at debug level, for the journal.
+	Diagnostics         *diag.Journal
+	DiagnosticsDelay    time.Duration
+	DiagnosticsInterval time.Duration
 }
 
 // SplitMode selects which TCP connections become streams.
@@ -67,6 +77,18 @@ const (
 	SplitAuto
 	SplitAlways
 )
+
+func (m SplitMode) String() string {
+	switch m {
+	case SplitOff:
+		return "off"
+	case SplitAuto:
+		return "auto"
+	case SplitAlways:
+		return "always"
+	}
+	return fmt.Sprintf("SplitMode(%d)", uint8(m))
+}
 
 // SplitAutoLoss is the loss rate at which SplitAuto splits new
 // connections.
@@ -139,6 +161,12 @@ func RunClient(ctx context.Context, cfg ClientConfig) error {
 	if cfg.RejoinDelay == 0 {
 		cfg.RejoinDelay = 5 * time.Second
 	}
+	if cfg.DiagnosticsDelay == 0 {
+		cfg.DiagnosticsDelay = 5 * time.Second
+	}
+	if cfg.DiagnosticsInterval == 0 {
+		cfg.DiagnosticsInterval = 10 * time.Minute
+	}
 	log := cfg.Logger
 	if log == nil {
 		log = slog.Default()
@@ -182,6 +210,16 @@ func RunClient(ctx context.Context, cfg ClientConfig) error {
 	var reconnectAt time.Time
 	var toTUN [][]byte
 
+	// Diagnostics: the next upload, and the one in flight.
+	var uploadAt time.Time
+	var upload *bridge
+	var snapshots <-chan time.Time
+	if cfg.Diagnostics != nil {
+		t := time.NewTicker(cfg.DiagnosticsInterval)
+		defer t.Stop()
+		snapshots = t.C
+	}
+
 	// Split TCP: the userspace stack, created with the first session.
 	var split *splittcp.Stack
 	var accepts <-chan *splittcp.Conn
@@ -222,7 +260,11 @@ func RunClient(ctx context.Context, cfg ClientConfig) error {
 			switch e := e.(type) {
 			case session.Established:
 				addr := netip.AddrFrom4(e.Config.IPv4)
-				log.Info("session established", "address", netip.PrefixFrom(addr, int(e.Config.Prefix4)), "mtu", e.Config.TunMTU)
+				log.Info("session established", "address", netip.PrefixFrom(addr, int(e.Config.Prefix4)), "mtu", e.Config.TunMTU,
+					"carrier", pathCarrier(carriers, 0), "features", e.Config.Features)
+				if cfg.Diagnostics != nil && c.DiagnosticsSupported() {
+					uploadAt = time.Now().Add(cfg.DiagnosticsDelay)
+				}
 				if cfg.OnEstablished != nil {
 					if err := cfg.OnEstablished(e.Config); err != nil {
 						c.Close(time.Now())
@@ -269,6 +311,7 @@ func RunClient(ctx context.Context, cfg ClientConfig) error {
 				for _, b := range bridges {
 					b.finish(true) // the session's streams are gone
 				}
+				uploadAt, upload = time.Time{}, nil
 				if errors.Is(e.Err, session.ErrAuthFailed) {
 					return e.Err
 				}
@@ -302,6 +345,9 @@ func RunClient(ctx context.Context, cfg ClientConfig) error {
 					deadline = due
 				}
 			}
+		}
+		if !uploadAt.IsZero() && (deadline.IsZero() || uploadAt.Before(deadline)) {
+			deadline = uploadAt
 		}
 		if !reconnectAt.IsZero() {
 			deadline = reconnectAt
@@ -368,9 +414,17 @@ func RunClient(ctx context.Context, cfg ClientConfig) error {
 		case e := <-bridgeEvents:
 			e.b.handle(time.Now(), e)
 		case <-status:
-			logPaths(log, c, carriers, time.Now())
+			logPaths(log, slog.LevelInfo, c, carriers, time.Now())
+		case <-snapshots:
+			logPaths(log, slog.LevelDebug, c, carriers, time.Now())
 		case <-timer.C:
 			now := time.Now()
+			if !uploadAt.IsZero() && !now.Before(uploadAt) {
+				uploadAt = now.Add(cfg.DiagnosticsInterval)
+				if upload == nil || upload.finished {
+					upload = startUpload(ctx, c, cfg.Diagnostics, bridges, bridgeEvents, log, now)
+				}
+			}
 			if !reconnectAt.IsZero() && !now.Before(reconnectAt) {
 				reconnectAt = time.Time{}
 				if c, err = newSession(now); err != nil {
@@ -490,19 +544,49 @@ func flushTransmits(c *session.Client, carriers []*carrierState, pinned int, log
 	}
 }
 
-// logPaths logs each path's state, for -status.
-func logPaths(log *slog.Logger, c *session.Client, carriers []*carrierState, now time.Time) {
+// startUpload uploads what the journal holds on a diagnostics stream, if
+// anything, and returns its bridge.
+func startUpload(ctx context.Context, c *session.Client, j *diag.Journal, bridges map[uint32]*bridge,
+	events chan bridgeEvent, log *slog.Logger, now time.Time) *bridge {
+	data, commit := j.Pending()
+	if len(data) == 0 {
+		return nil
+	}
+	id, err := c.OpenDiagnostics(now)
+	if err != nil {
+		log.Debug("diagnostics upload", "err", err)
+		return nil
+	}
+	conn := diag.NewUploadConn(data, func() error {
+		log.Debug("diagnostics uploaded", "bytes", len(data))
+		return commit()
+	})
+	b := newBridge(id, c, conn, conn.Abort)
+	bridges[id] = b
+	b.forget = func() { delete(bridges, id) }
+	b.start(ctx, events)
+	b.service(now)
+	return b
+}
+
+// pathCarrier names the carrier bound to path id, or "".
+func pathCarrier(carriers []*carrierState, id uint32) string {
+	for _, cs := range carriers {
+		if cs.bound && cs.path == id {
+			return cs.Name
+		}
+	}
+	return ""
+}
+
+// logPaths logs each path's state, for -status and the journal.
+func logPaths(log *slog.Logger, level slog.Level, c *session.Client, carriers []*carrierState, now time.Time) {
 	if c.State() != session.StateActive {
 		return
 	}
 	for _, p := range c.Paths(now) {
-		carrier := ""
-		for _, cs := range carriers {
-			if cs.bound && cs.path == p.ID {
-				carrier = cs.Name
-			}
-		}
-		log.Info("path", "id", p.ID, "carrier", carrier, "primary", p.Primary, "healthy", p.Healthy, "eligible", p.Eligible,
+		carrier := pathCarrier(carriers, p.ID)
+		log.Log(context.Background(), level, "path", "id", p.ID, "carrier", carrier, "primary", p.Primary, "healthy", p.Healthy, "eligible", p.Eligible,
 			"flows", p.Flows, "min_rtt", p.MinRTT.Round(100*time.Microsecond), "srtt", p.SRTT.Round(100*time.Microsecond),
 			"loss", fmt.Sprintf("%.3f", p.Loss), "burst", fmt.Sprintf("%.1f", p.Burst),
 			"stream_mbit", fmt.Sprintf("%.2f", p.StreamRate*8/1e6), "stream_inflight", p.StreamInflight, "capacity_mbit", fmt.Sprintf("%.1f", p.Capacity*8/1e6))

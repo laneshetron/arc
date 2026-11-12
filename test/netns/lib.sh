@@ -52,7 +52,7 @@ setup_topology() {
 }
 
 teardown_topology() {
-  for pid in "${PIDS[@]}"; do kill "$pid" 2>/dev/null || true; done
+  for pid in "${PIDS[@]}" "${TICKERS[@]}"; do kill "$pid" 2>/dev/null || true; done
   wait 2>/dev/null || true
   for ns in arc-c arc-r arc-i; do ip netns del "$ns" 2>/dev/null || true; done
 }
@@ -61,18 +61,44 @@ teardown_topology() {
 # netem, e.g. `impair 0 delay 50ms loss 1%`. LINK 0 is c0/r0, 1 is c1/r2.
 # Each direction gets the arguments independently, so `delay 50ms` makes a
 # 100 ms round trip.
+#
+# Bursty loss (gemodel) gets a ticker: 100 small pings a second across the
+# link. netem's Gilbert-Elliott chain advances per packet, not per unit of
+# time, so a burst of "10 packets" otherwise lasts until 10 more packets
+# cross the link. A TCP sender backed off to one retransmission per timeout
+# then stays in the burst for many seconds, stalling for the rest of the
+# run, and whatever runs next starts inside the burst the last run left.
+# Tunnels that send keepalives escape such bursts sooner, which skews
+# comparisons between them. The ticker bounds a burst to about its nominal
+# length in time (10 packets: ~100 ms), as on a real lossy link. It adds
+# ~34 kbit/s each way to the link's counters.
+declare -A TICKERS
 impair() {
   local link=$1; shift
   local cdev=c$link rdev=r0
   [[ $link == 1 ]] && rdev=r2
+  stop_ticker "$link"
   ip netns exec arc-c tc qdisc replace dev "$cdev" root netem limit 100000 "$@"
   ip netns exec arc-r tc qdisc replace dev "$rdev" root netem limit 100000 "$@"
+  if [[ " $* " == *" gemodel "* ]]; then
+    ip netns exec arc-c ping -q -s 0 -i 0.01 -I "$cdev" 192.168.10.2 >/dev/null 2>&1 &
+    TICKERS[$link]=$!
+  fi
+}
+
+stop_ticker() { # stop_ticker LINK
+  if [[ -n ${TICKERS[$1]:-} ]]; then
+    kill "${TICKERS[$1]}" 2>/dev/null || true
+    wait "${TICKERS[$1]}" 2>/dev/null || true
+    unset "TICKERS[$1]"
+  fi
 }
 
 # unimpair LINK: remove impairment from a link.
 unimpair() {
   local link=$1 rdev=r0
   [[ $link == 1 ]] && rdev=r2
+  stop_ticker "$link"
   ip netns exec arc-c tc qdisc del dev "c$link" root 2>/dev/null || true
   ip netns exec arc-r tc qdisc del dev "$rdev" root 2>/dev/null || true
 }
