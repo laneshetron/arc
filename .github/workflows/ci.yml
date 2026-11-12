@@ -65,8 +65,13 @@ jobs:
             { sudo apt-get install -y "linux-modules-extra-$(uname -r)" && sudo modprobe sch_netem; } ||
             echo "netem unavailable; degraded.sh will skip"
       - run: go build -o bin/ ./cmd/arc-client ./cmd/arc-relay
-      - name: degraded networks in network namespaces
-        run: sudo ./test/netns/degraded.sh bin
+      - name: debug
+        run: |
+          cat /etc/os-release | head -2; uname -r
+          sudo aa-status 2>&1 | grep -iE 'iperf|tc|ip |profiles' || true
+          ls -l /etc/apparmor.d | grep -iE 'iperf|tc' || true
+          d=$(mktemp -d); echo $d; sudo iperf3 -s -D --logfile $d/x.log; echo rc=$?
+          sudo bash -x ./test/netns/degraded.sh bin 2>&1 | head -60
 
   fixtures:
     runs-on: ubuntu-latest
