@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/netip"
 	"testing"
+	"time"
 )
 
 func TestBatchRoundTrip(t *testing.T) {
@@ -47,6 +48,140 @@ func TestBatchRoundTrip(t *testing.T) {
 	for i := range n {
 		if !bytes.Equal(bufs[i][:sizes[i]], pkts[i]) || from[i] != a.LocalAddr() {
 			t.Errorf("datagram %d: %q from %v", i, bufs[i][:sizes[i]], from[i])
+		}
+	}
+}
+
+// readOne reads one datagram from c, failing the test after a second.
+func readOne(t *testing.T, c *Conn) ([]byte, netip.AddrPort) {
+	t.Helper()
+	c.uc.SetReadDeadline(time.Now().Add(time.Second))
+	defer c.uc.SetReadDeadline(time.Time{})
+	bufs, sizes, from := [][]byte{make([]byte, MaxDatagram)}, make([]int, 1), make([]netip.AddrPort, 1)
+	for {
+		n, err := c.ReadBatch(bufs, sizes, from)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n > 0 {
+			return bufs[0][:sizes[0]], from[0]
+		}
+	}
+}
+
+func TestConnectedPeer(t *testing.T) {
+	loop := netip.MustParseAddrPort("127.0.0.1:0")
+	peer, err := Listen(loop, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	stranger, err := Listen(loop, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stranger.Close()
+	c, err := Listen(loop, Options{Peer: peer.LocalAddr()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	if err := c.WriteBatch([][]byte{[]byte("out")}, []netip.AddrPort{peer.LocalAddr()}); err != nil {
+		t.Fatal(err)
+	}
+	if p, from := readOne(t, peer); string(p) != "out" || from != c.LocalAddr() {
+		t.Errorf("peer got %q from %v", p, from)
+	}
+	if err := c.WriteBatch([][]byte{[]byte("astray")}, []netip.AddrPort{stranger.LocalAddr()}); err == nil {
+		t.Error("sent to an address other than the peer")
+	}
+
+	// The kernel drops the stranger's datagram; the peer's arrives.
+	stranger.WriteBatch([][]byte{[]byte("stranger")}, []netip.AddrPort{c.LocalAddr()})
+	peer.WriteBatch([][]byte{[]byte("in")}, []netip.AddrPort{c.LocalAddr()})
+	if p, from := readOne(t, c); string(p) != "in" || from != peer.LocalAddr() {
+		t.Errorf("got %q from %v, want the peer's datagram", p, from)
+	}
+}
+
+// A connected socket learns of ICMP port unreachable errors; they must not
+// end reading or sending, since the peer may only be restarting. As in the
+// engine, a read is pending while the peer is away.
+func TestConnectedPeerRestart(t *testing.T) {
+	loop := netip.MustParseAddrPort("127.0.0.1:0")
+	peer, err := Listen(loop, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := peer.LocalAddr()
+	c, err := Listen(loop, Options{Peer: addr})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	peer.Close()
+
+	type result struct {
+		p   []byte
+		err error
+	}
+	got := make(chan result, 1)
+	go func() {
+		bufs, sizes, from := [][]byte{make([]byte, MaxDatagram)}, make([]int, 1), make([]netip.AddrPort, 1)
+		n, err := c.ReadBatch(bufs, sizes, from)
+		for n == 0 && err == nil {
+			n, err = c.ReadBatch(bufs, sizes, from)
+		}
+		got <- result{bufs[0][:sizes[0]], err}
+	}()
+	time.Sleep(10 * time.Millisecond) // let the read block
+	// Unanswered: the peer's port is closed.
+	for range 3 {
+		if err := c.WriteBatch([][]byte{[]byte("anyone?")}, []netip.AddrPort{addr}); err != nil {
+			t.Fatalf("send while the peer is down: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if peer, err = Listen(addr, Options{}); err != nil {
+		t.Skipf("cannot reopen the peer's port: %v", err)
+	}
+	defer peer.Close()
+	peer.WriteBatch([][]byte{[]byte("back")}, []netip.AddrPort{c.LocalAddr()})
+	select {
+	case r := <-got:
+		if r.err != nil || string(r.p) != "back" {
+			t.Errorf("read %q, %v; want the restarted peer's datagram", r.p, r.err)
+		}
+	case <-time.After(time.Second):
+		t.Error("no datagram from the restarted peer")
+	}
+}
+
+// A datagram the kernel refuses is dropped alone; the rest of the batch is
+// still sent.
+func TestWriteBatchSkipsRefused(t *testing.T) {
+	loop := netip.MustParseAddrPort("127.0.0.1:0")
+	for _, opts := range []Options{{}, {NoOffload: true}} {
+		a, err := Listen(loop, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer a.Close()
+		b, err := Listen(loop, Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer b.Close()
+		pkts := [][]byte{[]byte("first"), make([]byte, MaxDatagram), []byte("last")} // too big for UDP
+		to := []netip.AddrPort{b.LocalAddr(), b.LocalAddr(), b.LocalAddr()}
+		if err := a.WriteBatch(pkts, to); err == nil {
+			t.Errorf("%+v: oversized datagram sent without error", opts)
+		}
+		for _, want := range []string{"first", "last"} {
+			if p, _ := readOne(t, b); string(p) != want {
+				t.Errorf("%+v: got %q, want %q", opts, p, want)
+			}
 		}
 	}
 }

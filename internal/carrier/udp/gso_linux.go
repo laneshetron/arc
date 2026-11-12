@@ -101,13 +101,5 @@ func (c *Conn) writeGSO(pkts [][]byte, addrs []netip.AddrPort) error {
 		i = j
 	}
 	c.tx = msgs[:max(len(msgs), len(c.tx))]
-
-	for len(msgs) > 0 {
-		n, err := c.pc.WriteBatch(msgs, 0)
-		if err != nil {
-			return err
-		}
-		msgs = msgs[n:]
-	}
-	return nil
+	return c.sendAll(msgs)
 }
