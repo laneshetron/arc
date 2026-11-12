@@ -223,6 +223,25 @@ else
 fi
 block_udp D
 
+# Starting with one link down (a modem unplugged, Wi-Fi off): the client
+# comes up on the other, and the link joins once it can reach the relay.
+kill "$CLIENT_PID"; wait "$CLIENT_PID" 2>/dev/null || true
+$C ip link set c1 down
+$C "$BIN/arc-client" run "${CLIENT_ARGS[@]}" >"$WORK/client-down.log" 2>&1 &
+CLIENT_PID=$!
+PIDS+=("$CLIENT_PID")
+if wait_for 10 "session with c1 down" grep -q "session established" "$WORK/client-down.log" &&
+  $C timeout 30 ping -c3 -i0.2 -W2 192.168.20.2 >/dev/null 2>&1; then
+  pass "started with one link down"
+else
+  fail "could not start with one link down"
+fi
+$C ip link set c1 up
+$C ip route replace 192.168.10.2 dev c1 metric 100
+$C ip neigh replace 192.168.10.2 lladdr "$($R ip -br link show r2 | awk '{print $3}')" dev c1 nud permanent
+wait_for 20 "late link joined" grep -q "path validated" "$WORK/client-down.log" &&
+  pass "the link that was down joined once it came up"
+
 # Shutdown removes the routing rules.
 kill "$CLIENT_PID"; wait "$CLIENT_PID" 2>/dev/null || true
 if $C ip rule | grep -q 5243; then
