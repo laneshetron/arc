@@ -67,11 +67,21 @@ jobs:
       - run: go build -o bin/ ./cmd/arc-client ./cmd/arc-relay
       - name: debug
         run: |
-          cat /etc/os-release | head -2; uname -r
-          sudo aa-status 2>&1 | grep -iE 'iperf|tc|ip |profiles' || true
-          ls -l /etc/apparmor.d | grep -iE 'iperf|tc' || true
-          d=$(mktemp -d); echo $d; sudo iperf3 -s -D --logfile $d/x.log; echo rc=$?
-          sudo timeout 60 bash -x ./test/netns/degraded.sh bin 2>&1 | sed -n 60,110p
+          dpkg -l wireguard-tools | tail -1
+          ls /etc/apparmor.d | grep -i wg || true
+          sudo aa-status | grep -iw wg || true
+          for f in $(grep -lr 'bin/wg' /etc/apparmor.d 2>/dev/null); do echo "== $f"; cat $f; done
+          sudo ip link add wgt type wireguard
+          d=$(mktemp -d); wg genkey > $d/k
+          try() { echo "-- $1"; shift; if sudo bash -c "$*"; then echo ok; else echo failed; fi; }
+          try "file in mktemp" "wg set wgt private-key $d/k"
+          try "pipe to /dev/stdin" "cat $d/k | wg set wgt private-key /dev/stdin"
+          try "process substitution" "wg set wgt private-key <(cat $d/k)"
+          try "/etc/wireguard file" "mkdir -p /etc/wireguard && cp $d/k /etc/wireguard/t.key && wg set wgt private-key /etc/wireguard/t.key"
+          try "wg setconf" "printf '[Interface]\nPrivateKey = %s\n' \$(cat $d/k) > $d/c.conf && wg setconf wgt $d/c.conf"
+          try "setconf /dev/stdin" "printf '[Interface]\nPrivateKey = %s\n' \$(cat $d/k) | wg setconf wgt /dev/stdin"
+          sudo dmesg | grep -i apparmor | tail -5
+
 
   fixtures:
     runs-on: ubuntu-latest
