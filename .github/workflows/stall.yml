@@ -1,0 +1,63 @@
+name: stall
+
+# Periodic Wi-Fi stalls (test/netns/stall.sh) with CUBIC and BBR. Docker
+# Desktop's kernel has no BBR; Ubuntu's does. Each cell takes minutes and
+# shared runners are noisy, so this runs on demand and on pull requests
+# that change the script, not on every push. Compare cells within one
+# run, and against main's code run the same day.
+on:
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: seconds per TCP run
+        default: "10"
+      reps:
+        description: runs per cell (medians are reported)
+        default: "5"
+      modes:
+        description: paths to compare
+        default: plain arc arc-fecoff
+  pull_request:
+    paths:
+      - test/netns/stall.sh
+      - test/netns/lib.sh
+      - .github/workflows/stall.yml
+
+jobs:
+  stall:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        hold: [64, 256]
+        last_hop_rtt: [1ms, 20ms]
+    name: stall (hold ${{ matrix.hold }}, last hop ${{ matrix.last_hop_rtt }})
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: sudo apt-get update && sudo apt-get install -y iperf3
+      - name: load netem and BBR
+        run: |
+          sudo modprobe sch_netem ||
+            { sudo apt-get install -y "linux-modules-extra-$(uname -r)" && sudo modprobe sch_netem; }
+          sudo modprobe tcp_bbr
+          sysctl net.ipv4.tcp_available_congestion_control
+      - run: go build -o bin/ ./cmd/arc-client ./cmd/arc-relay
+      - name: stalls
+        env:
+          MODES: ${{ inputs.modes || 'plain arc arc-fecoff' }}
+          SECONDS_PER_RUN: ${{ inputs.seconds || '10' }}
+          REPS: ${{ inputs.reps || '5' }}
+          HOLD: ${{ matrix.hold }}
+          LAST_HOP_RTT: ${{ matrix.last_hop_rtt }}
+        run: |
+          sudo env CCS="cubic bbr" MODES="$MODES" HOLD="$HOLD" LAST_HOP_RTT="$LAST_HOP_RTT" \
+            ./test/netns/stall.sh bin "$SECONDS_PER_RUN" "$REPS" | tee stall.txt
+          {
+            echo '```'
+            sed -n '/^Download at/,$p' stall.txt
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
