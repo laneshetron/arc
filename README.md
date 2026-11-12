@@ -211,14 +211,21 @@ its log at debug level, including each carrier's failures (a TLS
 handshake reset, a timeout), path quality every ten minutes, and the
 version, platform and carriers it runs with. The journal persists across
 runs, up to 4 MiB, so a run that never connected is uploaded by the next
-one that does. Uploads go over the session 5 s after it comes up and every
-ten minutes after; what the relay confirms it stored leaves the journal.
-The journal holds addresses (the relay's, and those of the client's own
-links as the relay sees them) but no traffic and no credentials.
+one that does. It belongs to the relay whose key the client pins: a client
+pointed at a different relay discards what the journal held rather than
+send it to another operator. Uploads go over the session 5 s after it
+comes up and every ten minutes after; what the relay confirms it stored
+leaves the journal. The journal holds addresses (the relay's, and those of
+the client's own links as the relay sees them). ARC does not log traffic
+or credentials, but the journal is the client's whole debug log: read it
+before sharing it anywhere else.
 
-The relay stores each upload as `DIR/ACCOUNT/TIME-ADDRESS.jsonl`, at most
-8 MiB per upload and 64 MiB per account (clear an account's directory to
-accept more), and logs `diagnostics received` with the account.
+The relay stores each upload as `DIR/ACCOUNT/TIME-ADDRESS.jsonl` and logs
+`diagnostics received` with the account. Uploads are client-chosen data
+on the relay's disk, so they are bounded: at most 8 MiB per upload and
+64 MiB per account (clear an account's directory to accept more), one
+upload at a time per client and four per account, and an upload that
+stalls for two minutes or runs past thirty is abandoned.
 `-journal` without `-share-diagnostics` keeps the journal locally only.
 
 The end-to-end test builds this setup in three network namespaces:

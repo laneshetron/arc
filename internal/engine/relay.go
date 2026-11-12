@@ -281,8 +281,12 @@ func startDiagnostics(ctx context.Context, cfg RelayConfig, e session.StreamOpen
 	bridges[k] = b
 	b.forget = func() {
 		delete(bridges, k)
-		if conn.Kept() {
+		switch {
+		case conn.Kept():
 			log.Info("diagnostics received", "account", account, "address", lease, "bytes", conn.Size(), "file", conn.Name())
+		case conn.Expired():
+			log.Warn("diagnostics abandoned: the upload stalled or ran too long", "account", account, "address", lease,
+				"bytes", conn.Size())
 		}
 	}
 	b.start(ctx, events)

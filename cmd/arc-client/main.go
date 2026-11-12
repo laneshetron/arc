@@ -9,6 +9,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"errors"
 	"flag"
 	"fmt"
@@ -67,7 +68,7 @@ func run(args []string) error {
 	keyFile := fs.String("key-file", "", "client static private key; a new one is generated if empty")
 	tunName := fs.String("tun", tun.DefaultName, "TUN interface name")
 	journalFile := fs.String("journal", "", "keep a diagnostics journal in this file: the client's log at debug level, as JSON lines, kept across runs (default journal.jsonl with -share-diagnostics)")
-	shareDiagnostics := fs.Bool("share-diagnostics", false, "upload the journal to the relay's operator whenever a session is up, if the relay accepts diagnostics; it holds this client's log (carrier outcomes, path quality, addresses of the relay and of this host's links), never its traffic or token")
+	shareDiagnostics := fs.Bool("share-diagnostics", false, "upload the journal to the relay's operator whenever a session is up, if the relay accepts diagnostics; it holds this client's log (carrier outcomes, path quality, addresses of the relay and of this host's links), not its traffic or token, which ARC does not log")
 	fullTunnel := fs.Bool("full-tunnel", false, "route all traffic through the tunnel")
 	dns := fs.String("dns", "", "trusted IPv4 DNS resolver (overrides the relay's resolver)")
 	dnsMode := fs.String("dns-mode", tun.DNSManager, "full-tunnel DNS setup: "+tun.DNSManager+" or manual (requires -dns and an externally configured resolver)")
@@ -178,14 +179,6 @@ func run(args []string) error {
 	if *shareDiagnostics && *journalFile == "" {
 		*journalFile = "journal.jsonl"
 	}
-	var journal *diag.Journal
-	if *journalFile != "" {
-		if journal, err = diag.OpenJournal(*journalFile, 0); err != nil {
-			return err
-		}
-		defer journal.Close()
-		log = diag.Tee(log.Handler(), journal.Handler())
-	}
 	relayAddr, err := netip.ParseAddrPort(*relay)
 	if err != nil {
 		return fmt.Errorf("-relay: %w", err)
@@ -193,6 +186,19 @@ func run(args []string) error {
 	pin, err := keyfile.Decode32(*relayKey)
 	if err != nil {
 		return fmt.Errorf("-relay-key: %w", err)
+	}
+	var journal *diag.Journal
+	if *journalFile != "" {
+		// The journal is bound to this relay: its operator never receives
+		// what a run against another relay recorded.
+		if journal, err = diag.OpenJournal(*journalFile, base64.StdEncoding.EncodeToString(pin[:]), 0); err != nil {
+			return err
+		}
+		defer journal.Close()
+		log = diag.Tee(log.Handler(), journal.Handler())
+		if n := journal.Discarded(); n > 0 {
+			log.Warn("journal held another relay's diagnostics; discarded them", "journal", *journalFile, "bytes", n)
+		}
 	}
 	tokens, err := keyfile.ReadLines(*tokenFile)
 	if err != nil {
