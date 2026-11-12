@@ -7,6 +7,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 )
@@ -109,16 +111,16 @@ func (c *UploadConn) Acknowledged() bool {
 // size limits. It is safe for concurrent use.
 //
 // The limits bound what clients can make the relay keep: every upload is
-// data a client chose, stored on the relay's disk. An upload reserves its
-// whole allowance when it starts and releases it when it is kept (then its
-// file counts instead) or abandoned, so concurrent uploads cannot share
-// the same free space.
+// data a client chose, stored on the relay's disk. Each write of an upload
+// is charged to its account as it arrives; when the account is full, its
+// oldest stored uploads are deleted to make room, so the operator keeps
+// the newest diagnostics without clearing anything by hand. Uploads in
+// progress are never deleted, and two cannot be charged for the same free
+// space.
 type Store struct {
 	Dir string
 	// MaxUpload and MaxAccount bound one upload and an account's
-	// directory (defaults 8 MiB and 64 MiB). Older files are not pruned:
-	// once an account's directory is full, its uploads are refused until
-	// the operator clears it.
+	// directory (defaults 8 MiB and 64 MiB).
 	MaxUpload, MaxAccount int64
 	// MaxActive bounds an account's uploads in progress (default 4); a
 	// client (a lease) has at most one.
@@ -129,21 +131,80 @@ type Store struct {
 	Idle, Deadline time.Duration
 
 	mu       sync.Mutex
-	accounts map[string]*accountUploads
+	accounts map[string]*account
 }
 
-// accountUploads is an account's uploads in progress.
-type accountUploads struct {
-	reserved int64
+// account is what an account's directory holds: stored uploads, oldest
+// first (their names start with the time), which may be pruned; other
+// files, which count but are not the Store's to delete; and the bytes
+// written so far by uploads in progress.
+type account struct {
+	dir      string
+	uploads  []storedUpload
+	other    int64
+	inflight int64
 	leases   map[string]bool
 	swept    bool // stale .part files removed
 }
 
+type storedUpload struct {
+	name string
+	size int64
+}
+
+func (a *account) used() int64 {
+	n := a.other + a.inflight
+	for _, u := range a.uploads {
+		n += u.size
+	}
+	return n
+}
+
+// scan rereads the directory, which the operator may have changed.
+func (a *account) scan() error {
+	entries, err := os.ReadDir(a.dir)
+	if err != nil {
+		return err
+	}
+	a.uploads, a.other = a.uploads[:0], 0
+	for _, e := range entries {
+		info, err := e.Info()
+		if err != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		switch filepath.Ext(e.Name()) {
+		case ".part": // in progress: counted as it is written
+		case ".jsonl":
+			a.uploads = append(a.uploads, storedUpload{filepath.Join(a.dir, e.Name()), info.Size()})
+		default:
+			a.other += info.Size()
+		}
+	}
+	slices.SortFunc(a.uploads, func(x, y storedUpload) int { return strings.Compare(x.name, y.name) })
+	return nil
+}
+
+// charge accounts for n more bytes of an upload in progress, deleting the
+// oldest stored uploads if that is what makes room.
+func (a *account) charge(n, max int64) error {
+	for a.used()+n > max && len(a.uploads) > 0 {
+		if err := os.Remove(a.uploads[0].name); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		a.uploads = a.uploads[1:]
+	}
+	if a.used()+n > max {
+		return fmt.Errorf("diag: account holds %d bytes of uploads in progress and other files, its limit", a.used())
+	}
+	a.inflight += n
+	return nil
+}
+
 // Create starts an upload for account from the client at lease. The name
 // must be a safe path element (gateway account names are).
-func (s *Store) Create(account, lease string, now time.Time) (*SinkConn, error) {
-	if account == "" || account == "." || account == ".." || filepath.Base(account) != account {
-		return nil, fmt.Errorf("diag: unusable account name %q", account)
+func (s *Store) Create(name, lease string, now time.Time) (*SinkConn, error) {
+	if name == "" || name == "." || name == ".." || filepath.Base(name) != name {
+		return nil, fmt.Errorf("diag: unusable account name %q", name)
 	}
 	maxUpload, maxAccount, maxActive := s.MaxUpload, s.MaxAccount, s.MaxActive
 	if maxUpload <= 0 {
@@ -162,54 +223,57 @@ func (s *Store) Create(account, lease string, now time.Time) (*SinkConn, error) 
 	if deadline <= 0 {
 		deadline = 30 * time.Minute
 	}
-	dir := filepath.Join(s.Dir, account)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.accounts == nil {
-		s.accounts = map[string]*accountUploads{}
+		s.accounts = map[string]*account{}
 	}
-	a := s.accounts[account]
+	a := s.accounts[name]
 	if a == nil {
-		a = &accountUploads{leases: map[string]bool{}}
-		s.accounts[account] = a
+		a = &account{dir: filepath.Join(s.Dir, name), leases: map[string]bool{}}
+		s.accounts[name] = a
 	}
 	if a.leases[lease] {
 		return nil, fmt.Errorf("diag: an upload from %s is in progress", lease)
 	}
 	if len(a.leases) >= maxActive {
-		return nil, fmt.Errorf("diag: account %s has %d uploads in progress, its limit", account, len(a.leases))
+		return nil, fmt.Errorf("diag: account %s has %d uploads in progress, its limit", name, len(a.leases))
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := os.MkdirAll(a.dir, 0o700); err != nil {
 		return nil, err
 	}
 	if !a.swept { // left by a relay that stopped mid-upload
-		parts, _ := filepath.Glob(filepath.Join(dir, "*.part"))
+		parts, _ := filepath.Glob(filepath.Join(a.dir, "*.part"))
 		for _, p := range parts {
 			os.Remove(p)
 		}
 		a.swept = true
 	}
-	stored, err := dirSize(dir)
+	if err := a.scan(); err != nil {
+		return nil, err
+	}
+	if a.other+a.inflight >= maxAccount {
+		return nil, fmt.Errorf("diag: account %s is full of uploads in progress and other files", name)
+	}
+	file := filepath.Join(a.dir, fmt.Sprintf("%s-%s.jsonl", now.UTC().Format("20060102T150405.000Z"), lease))
+	f, err := os.OpenFile(file+".part", os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return nil, err
 	}
-	used := stored + a.reserved
-	if used >= maxAccount {
-		return nil, fmt.Errorf("diag: account %s holds %d bytes of diagnostics (%d in progress), its limit",
-			account, stored, a.reserved)
-	}
-	name := filepath.Join(dir, fmt.Sprintf("%s-%s.jsonl", now.UTC().Format("20060102T150405.000Z"), lease))
-	f, err := os.OpenFile(name+".part", os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
-		return nil, err
-	}
-	c := &SinkConn{f: f, name: name, max: min(maxUpload, maxAccount-used), kept: make(chan struct{}), idle: idle}
-	a.reserved += c.max
+	c := &SinkConn{f: f, name: file, max: maxUpload, kept: make(chan struct{}), idle: idle}
 	a.leases[lease] = true
-	c.release = func() {
+	c.charge = func(n int64) error {
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		a.reserved -= c.max
+		return a.charge(n, maxAccount)
+	}
+	c.release = func(kept bool, size int64) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		a.inflight -= size
+		if kept {
+			a.uploads = append(a.uploads, storedUpload{file, size})
+		}
 		delete(a.leases, lease)
 	}
 	c.mu.Lock() // the timers' callbacks lock it too
@@ -217,25 +281,6 @@ func (s *Store) Create(account, lease string, now time.Time) (*SinkConn, error) 
 	c.deadlineTimer = time.AfterFunc(deadline, c.expire)
 	c.mu.Unlock()
 	return c, nil
-}
-
-// dirSize sums the sizes of the files kept in dir; uploads in progress
-// (.part files) count by their reservations instead.
-func dirSize(dir string) (int64, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return 0, err
-	}
-	var n int64
-	for _, e := range entries {
-		if filepath.Ext(e.Name()) == ".part" {
-			continue
-		}
-		if info, err := e.Info(); err == nil {
-			n += info.Size()
-		}
-	}
-	return n, nil
 }
 
 // SinkConn is the relay's end of a diagnostics stream: writing it fills
@@ -246,8 +291,9 @@ type SinkConn struct {
 	connBase
 	f       *os.File
 	name    string
-	max     int64 // the upload's reserved allowance
-	release func()
+	max     int64
+	charge  func(n int64) error         // to the account, before writing n bytes
+	release func(kept bool, size int64) // once kept or abandoned
 	idle    time.Duration
 
 	mu            sync.Mutex
@@ -280,10 +326,12 @@ func (c *SinkConn) Write(p []byte) (int, error) {
 	if c.size+int64(len(p)) > c.max {
 		return 0, fmt.Errorf("diag: upload exceeds %d bytes", c.max)
 	}
+	if err := c.charge(int64(len(p))); err != nil {
+		return 0, err
+	}
 	c.idleTimer.Reset(c.idle)
-	n, err := c.f.Write(p)
-	c.size += int64(n)
-	return n, err
+	c.size += int64(len(p)) // charged, whatever the write does
+	return c.f.Write(p)
 }
 
 // CloseWrite is the client's FIN: the upload is complete. The file and its
@@ -369,12 +417,12 @@ func (c *SinkConn) close() {
 	}
 }
 
-// stop releases the upload's reservation and timers, once it was kept or
+// stop releases the upload's charge and timers, once it was kept or
 // abandoned; c.mu is held.
 func (c *SinkConn) stop() {
 	c.idleTimer.Stop()
 	c.deadlineTimer.Stop()
-	c.release()
+	c.release(c.isKept, c.size)
 }
 
 // Kept reports whether the upload was stored.

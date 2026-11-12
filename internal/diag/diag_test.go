@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -133,8 +134,9 @@ func TestUploadAndStore(t *testing.T) {
 		t.Fatalf("abandoned upload left %d files", len(entries))
 	}
 
-	// A full account is refused.
-	os.WriteFile(filepath.Join(dir, "friend", "big"), make([]byte, 3<<10), 0o600)
+	// An account full of files that are not uploads is refused: only
+	// uploads are pruned.
+	os.WriteFile(filepath.Join(dir, "friend", "notes.txt"), make([]byte, 3<<10), 0o600)
 	if _, err := s.Create("friend", "10.77.0.2", now.Add(2*time.Second)); err == nil {
 		t.Fatal("upload to a full account accepted")
 	}
@@ -207,64 +209,120 @@ func TestJournalTrimmedAtStartup(t *testing.T) {
 	}
 }
 
-// TestStoreQuotaConcurrent fills an account's remaining space with
-// concurrent uploads: each reserves its allowance when it starts, so
-// together they stay within MaxAccount.
-func TestStoreQuotaConcurrent(t *testing.T) {
+func dirSize(t *testing.T, dir string) (n int64) {
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if info, err := e.Info(); err == nil { // else pruned meanwhile
+			n += info.Size()
+		}
+	}
+	return n
+}
+
+func upload(t *testing.T, s *Store, lease string, now time.Time, size int) {
+	t.Helper()
+	c, err := s.Create("friend", lease, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Write(make([]byte, size)); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	c.Close()
+}
+
+// TestStorePrunesOldest fills an account: the oldest uploads make room
+// for the newest, and nothing else is deleted.
+func TestStorePrunesOldest(t *testing.T) {
 	dir := t.TempDir()
-	const maxAccount = 6 << 10 // 1 KiB stored, then 2, 2 and the last 1 reserved
-	s := &Store{Dir: dir, MaxUpload: 2 << 10, MaxAccount: maxAccount, MaxActive: 8}
+	s := &Store{Dir: dir, MaxUpload: 2 << 10, MaxAccount: 4 << 10}
 	now := time.Date(2026, 11, 9, 12, 0, 0, 0, time.UTC)
 	os.MkdirAll(filepath.Join(dir, "friend"), 0o700)
-	os.WriteFile(filepath.Join(dir, "friend", "old.jsonl"), make([]byte, 1<<10), 0o600)
+	os.WriteFile(filepath.Join(dir, "friend", "notes.txt"), make([]byte, 512), 0o600)
+	for i := range 6 {
+		upload(t, s, "10.77.0.2", now.Add(time.Duration(i)*time.Second), 1<<10)
+	}
+	entries, _ := os.ReadDir(filepath.Join(dir, "friend"))
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	want := []string{"20261109T120003.000Z-10.77.0.2.jsonl", "20261109T120004.000Z-10.77.0.2.jsonl",
+		"20261109T120005.000Z-10.77.0.2.jsonl", "notes.txt"}
+	if !slices.Equal(names, want) {
+		t.Fatalf("account holds %v, want %v", names, want)
+	}
+	if used := dirSize(t, filepath.Join(dir, "friend")); used > 4<<10 {
+		t.Fatalf("account holds %d bytes", used)
+	}
+	// The operator clearing files is noticed at the next upload.
+	os.Remove(filepath.Join(dir, "friend", want[0]))
+	upload(t, s, "10.77.0.2", now.Add(10*time.Second), 1<<10)
+	if entries, _ := os.ReadDir(filepath.Join(dir, "friend")); len(entries) != 4 {
+		t.Fatalf("an upload pruned what the operator had already freed: %v", entries)
+	}
+}
+
+// TestStoreQuotaConcurrent runs uploads that together exceed an account:
+// stored uploads are pruned for them, uploads in progress never are, the
+// account stays within MaxAccount throughout, and a refused upload's
+// bytes are released.
+func TestStoreQuotaConcurrent(t *testing.T) {
+	dir := t.TempDir()
+	const maxAccount = 5 << 10
+	s := &Store{Dir: dir, MaxUpload: 2 << 10, MaxAccount: maxAccount, MaxActive: 8}
+	now := time.Date(2026, 11, 9, 12, 0, 0, 0, time.UTC)
+	upload(t, s, "10.77.0.9", now, 1<<10)
 
 	var sinks []*SinkConn
-	for i := range 4 {
-		c, err := s.Create("friend", fmt.Sprintf("10.77.0.%d", i+2), now)
-		if i < 3 && err != nil {
+	for i := range 3 {
+		c, err := s.Create("friend", fmt.Sprintf("10.77.0.%d", i+2), now.Add(time.Second))
+		if err != nil {
 			t.Fatalf("upload %d refused: %v", i, err)
-		}
-		if i == 3 {
-			if err == nil {
-				t.Fatal("an upload beyond the reserved space was accepted")
-			}
-			break
 		}
 		sinks = append(sinks, c)
 	}
 	var wg sync.WaitGroup
+	var mu sync.Mutex
+	kept := 0
 	for _, c := range sinks {
 		wg.Go(func() {
 			buf := make([]byte, 256)
-			for {
+			for c.Size() < 2<<10 {
 				if _, err := c.Write(buf); err != nil {
-					break
+					c.Close() // refused: the engine resets the stream
+					return
+				}
+				s.mu.Lock() // pruning and charges happen under it; writes follow charges
+				used := dirSize(t, filepath.Join(dir, "friend"))
+				s.mu.Unlock()
+				if used > maxAccount {
+					t.Errorf("account holds %d bytes, past its %d limit", used, maxAccount)
 				}
 			}
 			if err := c.CloseWrite(); err != nil {
 				t.Error(err)
 			}
+			mu.Lock()
+			kept++
+			mu.Unlock()
 		})
 	}
 	wg.Wait()
-	if used, _ := dirSize(filepath.Join(dir, "friend")); used > maxAccount {
-		t.Fatalf("account holds %d bytes, past its %d limit", used, maxAccount)
-	} else if used < maxAccount {
-		t.Fatalf("account holds %d bytes; the uploads should have filled %d", used, maxAccount)
+	// Together they need 6 KiB of 5: at least one is refused, whichever
+	// ran out of room first, and what is kept is complete.
+	used := dirSize(t, filepath.Join(dir, "friend"))
+	if used > maxAccount || kept > 2 || used != int64(kept)*(2<<10) {
+		t.Fatalf("account holds %d bytes after %d of 3 uploads were kept", used, kept)
 	}
-	if _, err := s.Create("friend", "10.77.0.2", now.Add(time.Second)); err == nil {
-		t.Fatal("upload to a full account accepted")
+	if _, err := os.Stat(filepath.Join(dir, "friend", "20261109T120000.000Z-10.77.0.9.jsonl")); err == nil {
+		t.Fatal("the oldest upload was not pruned")
 	}
-	// An abandoned upload gives its reservation back.
-	os.Remove(filepath.Join(dir, "friend", "old.jsonl"))
-	c, err := s.Create("friend", "10.77.0.2", now.Add(2*time.Second))
-	if err != nil {
-		t.Fatal(err)
-	}
-	c.Close()
-	if _, err := s.Create("friend", "10.77.0.3", now.Add(3*time.Second)); err != nil {
-		t.Fatalf("an abandoned upload kept its reservation: %v", err)
-	}
+	// The refused upload's charge was released.
+	upload(t, s, "10.77.0.2", now.Add(2*time.Second), 2<<10)
 }
 
 func TestStoreActiveLimits(t *testing.T) {

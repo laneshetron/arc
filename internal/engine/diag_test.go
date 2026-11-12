@@ -126,7 +126,7 @@ func (s *stalledStream) StreamInfo(uint32) session.StreamInfo { return session.S
 
 // TestDiagnosticsStalledUpload holds a diagnostics stream open without
 // finishing it: the relay abandons the upload, resets the stream, and
-// frees the client's upload slot and its reservation.
+// frees the client's upload slot and the bytes charged to its account.
 func TestDiagnosticsStalledUpload(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
