@@ -1,4 +1,4 @@
-//go:build !linux
+//go:build !linux && !darwin
 
 package tun
 
@@ -13,3 +13,11 @@ func (d *Device) Configure(netip.Prefix, int) error             { return errUnsu
 func (d *Device) AddRoute(netip.Prefix) error                   { return errUnsupported }
 func (d *Device) FullTunnel(uint32, int) (func() error, error)  { return nil, errUnsupported }
 func (d *Device) ConfigureDNS(netip.Addr) (func() error, error) { return nil, errUnsupported }
+
+const (
+	DefaultName   = "arc0"
+	DNSManager    = "none"
+	PolicyRouting = false
+)
+
+func Underlay() (string, error) { return "", errUnsupported }

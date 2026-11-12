@@ -9,6 +9,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"errors"
 	"flag"
 	"fmt"
@@ -17,6 +18,8 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	"runtime"
+	"runtime/debug"
 	"strings"
 	"syscall"
 	"time"
@@ -25,6 +28,7 @@ import (
 	"github.com/laneshetron/arc/internal/carrier/stream"
 	"github.com/laneshetron/arc/internal/carrier/udp"
 	"github.com/laneshetron/arc/internal/crypto"
+	"github.com/laneshetron/arc/internal/diag"
 	"github.com/laneshetron/arc/internal/engine"
 	"github.com/laneshetron/arc/internal/keyfile"
 	"github.com/laneshetron/arc/internal/profiling"
@@ -62,14 +66,16 @@ func run(args []string) error {
 	relayKey := fs.String("relay-key", "", "relay static public key (base64), pinned")
 	tokenFile := fs.String("token-file", "token", "file containing the access token")
 	keyFile := fs.String("key-file", "", "client static private key; a new one is generated if empty")
-	tunName := fs.String("tun", "arc0", "TUN interface name")
+	tunName := fs.String("tun", tun.DefaultName, "TUN interface name")
+	journalFile := fs.String("journal", "", "keep a diagnostics journal in this file: the client's log at debug level, as JSON lines, kept across runs (default journal.jsonl with -share-diagnostics)")
+	shareDiagnostics := fs.Bool("share-diagnostics", false, "upload the journal to the relay's operator whenever a session is up, if the relay accepts diagnostics; it holds this client's log (carrier outcomes, path quality, addresses of the relay and of this host's links), not its traffic or token, which ARC does not log")
 	fullTunnel := fs.Bool("full-tunnel", false, "route all traffic through the tunnel")
 	dns := fs.String("dns", "", "trusted IPv4 DNS resolver (overrides the relay's resolver)")
-	dnsMode := fs.String("dns-mode", "systemd-resolved", "full-tunnel DNS setup: systemd-resolved or manual (requires -dns and an externally configured resolver)")
+	dnsMode := fs.String("dns-mode", tun.DNSManager, "full-tunnel DNS setup: "+tun.DNSManager+" or manual (requires -dns and an externally configured resolver)")
 	var routes prefixList
 	fs.Var(&routes, "route", "route this prefix through the tunnel (repeatable)")
 	var binds []string
-	fs.Func("bind", "bind a carrier socket to this interface (repeatable)", func(iface string) error {
+	fs.Func("bind", "bind a carrier socket to this interface (repeatable; on macOS, a full tunnel binds to the default route's interface if none is given)", func(iface string) error {
 		if iface == "" {
 			return errors.New("interface name must not be empty")
 		}
@@ -128,8 +134,8 @@ func run(args []string) error {
 		}
 		return nil
 	})
-	mark := fs.Uint("mark", 0x5243, "fwmark for carrier sockets, used by -full-tunnel")
-	table := fs.Int("table", 5243, "routing table for -full-tunnel")
+	mark := fs.Uint("mark", 0x5243, "fwmark for carrier sockets, used by -full-tunnel (Linux)")
+	table := fs.Int("table", 5243, "routing table for -full-tunnel (Linux)")
 	prof := profiling.Register(fs)
 	fs.Parse(args)
 	if !*fullTunnel {
@@ -143,11 +149,11 @@ func run(args []string) error {
 			return errors.New("-dns and -dns-mode require -full-tunnel; configure split-tunnel DNS with your resolver manager")
 		}
 	}
-	if *fullTunnel && (*mark == 0 || uint64(*mark) > 1<<32-1 || *table <= 0 || (*table >= 253 && *table <= 255)) {
+	if *fullTunnel && tun.PolicyRouting && (*mark == 0 || uint64(*mark) > 1<<32-1 || *table <= 0 || (*table >= 253 && *table <= 255)) {
 		return errors.New("-full-tunnel requires a nonzero 32-bit -mark and a dedicated routing -table (not 253, 254 or 255)")
 	}
-	if *dnsMode != "systemd-resolved" && *dnsMode != "manual" {
-		return errors.New("-dns-mode must be systemd-resolved or manual")
+	if *dnsMode != tun.DNSManager && *dnsMode != "manual" {
+		return errors.New("-dns-mode must be " + tun.DNSManager + " or manual")
 	}
 	var trustedDNS netip.Addr
 	if *dns != "" {
@@ -170,6 +176,9 @@ func run(args []string) error {
 	defer stopProfiles()
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	if *shareDiagnostics && *journalFile == "" {
+		*journalFile = "journal.jsonl"
+	}
 	relayAddr, err := netip.ParseAddrPort(*relay)
 	if err != nil {
 		return fmt.Errorf("-relay: %w", err)
@@ -177,6 +186,24 @@ func run(args []string) error {
 	pin, err := keyfile.Decode32(*relayKey)
 	if err != nil {
 		return fmt.Errorf("-relay-key: %w", err)
+	}
+	var journal *diag.Journal
+	if *journalFile != "" {
+		// The journal is bound to this relay: its operator never receives
+		// what a run against another relay recorded.
+		// Diagnostics never keep the tunnel from coming up: without a
+		// usable journal, the client runs without one.
+		journal, err = diag.OpenJournal(*journalFile, base64.StdEncoding.EncodeToString(pin[:]), 0)
+		if err != nil {
+			log.Warn("running without a diagnostics journal", "journal", *journalFile, "err", err)
+			journal = nil
+		} else {
+			defer journal.Close()
+			log = diag.Tee(log.Handler(), journal.Handler())
+			if n := journal.Discarded(); n > 0 {
+				log.Warn("journal held another relay's diagnostics; discarded them", "journal", *journalFile, "bytes", n)
+			}
+		}
 	}
 	tokens, err := keyfile.ReadLines(*tokenFile)
 	if err != nil {
@@ -209,11 +236,23 @@ func run(args []string) error {
 	}
 	defer dev.Close()
 	sockOpts := udp.Options{NoOffload: *noOffload}
-	if *fullTunnel {
-		sockOpts.Mark = uint32(*mark)
-	}
 	if len(binds) == 0 {
 		binds = []string{""}
+	}
+	if *fullTunnel && tun.PolicyRouting {
+		sockOpts.Mark = uint32(*mark)
+	} else if *fullTunnel {
+		// Without marks, an unbound carrier would route into the tunnel
+		// it carries. This binding doesn't follow later changes of the
+		// default route; pass -bind for each interface to use them all.
+		for i, iface := range binds {
+			if iface == "" {
+				if binds[i], err = tun.Underlay(); err != nil {
+					return err
+				}
+				log.Info("binding carrier to the default route's interface", "interface", binds[i])
+			}
+		}
 	}
 	carriers := make([]engine.Carrier, 0, len(binds))
 	for _, iface := range binds {
@@ -343,7 +382,7 @@ func run(args []string) error {
 				return err
 			}
 		}
-		if *fullTunnel && *dnsMode == "systemd-resolved" {
+		if *fullTunnel && *dnsMode == tun.DNSManager {
 			nextCleanup, err := dev.ConfigureDNS(resolver)
 			if err != nil {
 				return err
@@ -360,14 +399,19 @@ func run(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	log.Info("starting", "relay", relayAddr, "tun", dev.Name(), "full_tunnel", *fullTunnel,
-		"routes", strings.Trim(routes.String(), "[]"))
-	err = engine.RunClient(ctx, engine.ClientConfig{
+		"routes", strings.Trim(routes.String(), "[]"), "version", version(), "os", runtime.GOOS, "arch", runtime.GOARCH,
+		"carriers", carrierNames(carriers), "split_tcp", splitMode, "share_diagnostics", *shareDiagnostics)
+	cfg := engine.ClientConfig{
 		Session: session.ClientConfig{
 			Static: static, RelayPublic: pin[:], Credential: []byte(tokens[0]), Redundancy: redundancy, FEC: fecMode,
 		},
 		Relay: relayAddr, Carriers: carriers, TUN: dev, OnEstablished: onEstablished, Logger: log,
 		StatusInterval: *status, SplitTCP: splitMode,
-	})
+	}
+	if *shareDiagnostics {
+		cfg.Diagnostics = journal
+	}
+	err = engine.RunClient(ctx, cfg)
 	if errors.Is(err, context.Canceled) {
 		return nil
 	}
@@ -396,4 +440,33 @@ func clientTLS(addr, caFile, serverName string) (*tls.Config, error) {
 		}
 	}
 	return cfg, nil
+}
+
+// version is the module version and VCS revision the binary was built
+// from, as far as the build recorded them.
+func version() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "unknown"
+	}
+	v := info.Main.Version
+	for _, s := range info.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			v += " " + s.Value
+		case "vcs.modified":
+			if s.Value == "true" {
+				v += "+dirty"
+			}
+		}
+	}
+	return v
+}
+
+func carrierNames(carriers []engine.Carrier) string {
+	names := make([]string, len(carriers))
+	for i, c := range carriers {
+		names[i] = c.Name
+	}
+	return strings.Join(names, ",")
 }
