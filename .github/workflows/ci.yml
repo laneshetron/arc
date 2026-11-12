@@ -71,7 +71,7 @@ jobs:
           sudo aa-status 2>&1 | grep -iE 'iperf|tc|ip |profiles' || true
           ls -l /etc/apparmor.d | grep -iE 'iperf|tc' || true
           d=$(mktemp -d); echo $d; sudo iperf3 -s -D --logfile $d/x.log; echo rc=$?
-          sudo bash -x ./test/netns/degraded.sh bin 2>&1 | head -60
+          sudo timeout 60 bash -x ./test/netns/degraded.sh bin 2>&1 | sed -n 60,110p
 
   fixtures:
     runs-on: ubuntu-latest
