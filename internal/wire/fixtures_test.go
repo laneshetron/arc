@@ -265,6 +265,10 @@ func checkFrameFields(t *testing.T, fr Frame, fields map[string]any) {
 		if v.ID != uint32(num("stream_id")) || v.Code != ErrorCode(num("code")) || v.Final != num("final") {
 			t.Errorf("STREAM_RESET = %+v", v)
 		}
+	case DiagOpen:
+		if v.ID != uint32(num("stream_id")) {
+			t.Errorf("DIAGNOSTICS_OPEN = %+v", v)
+		}
 	case NewPath:
 		if v.PathID != uint32(num("path_id")) || hex.EncodeToString(v.CID[:]) != fields["cid_hex"] ||
 			hex.EncodeToString(v.ResetToken[:]) != fields["reset_token_hex"] {

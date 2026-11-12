@@ -57,7 +57,7 @@ start_relay() {
   $R "$BIN/arc-relay" run -listen 192.168.10.2:4433 -key-file "$WORK/relay.key" \
     -reset-secret-file "$WORK/reset.secret" -tokens-file "$WORK/tokens" \
     -tls-listen 192.168.10.2:8443 -tls-cert "$WORK/relay.crt" -tls-key "$WORK/relay.tls.key" \
-    -network 10.77.0.1/16 >>"$WORK/relay.log" 2>&1 &
+    -network 10.77.0.1/16 -diagnostics-dir "$WORK/diagnostics" >>"$WORK/relay.log" 2>&1 &
   RELAY_PID=$!
   PIDS+=("$RELAY_PID")
 }
@@ -67,7 +67,8 @@ wait_for 10 "relay up" $R ip addr show arc0
 # --- client --------------------------------------------------------------
 # Each link also gets a TLS/TCP carrier, used only while UDP does not work.
 CLIENT_ARGS=(-relay 192.168.10.2:4433 -relay-key "$RELAY_PUB" -token-file "$WORK/token"
-  -full-tunnel -dns-mode manual -dns 10.77.0.1 -bind c0 -bind c1 -tls 192.168.10.2:8443 -tls-ca "$WORK/relay.crt")
+  -full-tunnel -dns-mode manual -dns 10.77.0.1 -bind c0 -bind c1 -tls 192.168.10.2:8443 -tls-ca "$WORK/relay.crt"
+  -share-diagnostics -journal "$WORK/journal.jsonl")
 $C "$BIN/arc-client" run "${CLIENT_ARGS[@]}" >"$WORK/client.log" 2>&1 &
 CLIENT_PID=$!
 PIDS+=("$CLIENT_PID")
@@ -75,6 +76,14 @@ wait_for 10 "client established" grep -q "session established" "$WORK/client.log
   pass "session established"
 
 # --- checks --------------------------------------------------------------
+# The client's journal reaches the relay's operator once the session is up.
+if wait_for 15 "diagnostics uploaded" grep -q "diagnostics received" "$WORK/relay.log" &&
+  grep -qh '"msg":"session established"' "$WORK"/diagnostics/line1/*.jsonl; then
+  pass "client diagnostics reached the relay ($(grep -o 'bytes=[0-9]*' "$WORK/relay.log" | head -1))"
+else
+  fail "client diagnostics did not reach the relay"
+fi
+
 # A LAN resolver (or any other LAN unicast destination) must not bypass
 # the full tunnel's policy rule. Marked carrier packets still use c0.
 if $C ip -4 route get 192.168.10.2 | grep -q 'dev arc0' &&
