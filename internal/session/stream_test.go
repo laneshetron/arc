@@ -610,3 +610,85 @@ func TestStreamLongRTTNotStalls(t *testing.T) {
 		t.Errorf("1 MiB at 400 ms RTT took %v; want at most 5 s", took)
 	}
 }
+
+// TestStreamCongestionWithAckBlackouts checks that stall detection does
+// not hide congestion. A link whose acknowledgements stop for 60 ms every
+// 400 ms (longer than the base RTT, so each blackout counts as a stall)
+// while the data direction keeps flowing, through a congested 10 Mbit/s
+// bottleneck: the rate must still converge, keeping the bottleneck's
+// queue short when it is deep and its drops few when it is shallow,
+// rather than suppressing every backoff near a stall.
+func TestStreamCongestionWithAckBlackouts(t *testing.T) {
+	const rate = 1_250_000
+	type result struct {
+		goodput float64       // fraction of the link
+		queued  time.Duration // mean queueing delay at the bottleneck
+		dropped float64       // fraction of datagrams the bottleneck dropped
+		stalls  int
+	}
+	run := func(queue time.Duration, blackouts bool) result {
+		n := newNetwork(t, 97, defaultRelayConfig(), ClientConfig{})
+		for _, l := range []*link{n.up, n.down} {
+			l.rate, l.delay = rate, 20*time.Millisecond
+		}
+		n.down.queue = queue
+		s := n.establish()
+		n.runFor(time.Second)
+		data := randomBytes(17, 8<<20)
+		start := n.now
+		sp := openPair(t, n, s, nil, data)
+		sent0, drops0 := n.down.sent, n.down.drops
+		var queued time.Duration
+		samples := 0
+		next := n.now
+		ok := n.runUntil(60*time.Second, func() bool {
+			sp.pump()
+			if blackouts {
+				n.up.down = n.now.Sub(start)%(400*time.Millisecond) < 60*time.Millisecond
+			}
+			if n.now.Sub(start) > 2*time.Second && !n.now.Before(next) {
+				queued += max(n.down.busyUntil.Sub(n.now), 0)
+				samples++
+				next = n.now.Add(10 * time.Millisecond)
+			}
+			return sp.client.eof
+		})
+		n.up.down = false
+		if !ok || !bytes.Equal(sp.client.got, data) {
+			t.Fatalf("queue %v, blackouts %v: transfer incomplete: %d/%d", queue, blackouts, len(sp.client.got), len(data))
+		}
+		return result{
+			goodput: float64(len(data)) / sp.client.eofAt.Sub(start).Seconds() / rate,
+			queued:  queued / time.Duration(max(samples, 1)),
+			dropped: float64(n.down.drops-drops0) / float64(max(n.down.sent-sent0, 1)),
+			stalls:  s.conn.paths[0].cc.stalls,
+		}
+	}
+	for _, queue := range []time.Duration{300 * time.Millisecond, 30 * time.Millisecond} {
+		base, got := run(queue, false), run(queue, true)
+		for _, r := range []struct {
+			name string
+			r    result
+		}{{"steady", base}, {"ack blackouts", got}} {
+			t.Logf("%v queue, %s: %.0f%% of the link, mean queueing delay %v, %.2f%% dropped, %d stalls",
+				queue, r.name, 100*r.r.goodput, r.r.queued.Round(100*time.Microsecond), 100*r.r.dropped, r.r.stalls)
+		}
+		if got.stalls == 0 {
+			t.Errorf("%v queue: no blackout counted as a stall; the test exercises nothing", queue)
+		}
+		if got.goodput < 0.7 {
+			t.Errorf("%v queue: %.0f%% of the link with ack blackouts; want at least 70%%", queue, 100*got.goodput)
+		}
+		// A stall excuses delay up to its own length (60 ms here) beyond
+		// the target, so a deep queue settles near 100 ms; ignoring delay
+		// around stalls altogether left the 300 ms queue full (245 ms
+		// mean, 17% dropped).
+		if got.queued > queue/2 {
+			t.Errorf("%v queue: mean queueing delay %v with ack blackouts; want at most half the queue", queue, got.queued)
+		}
+		if got.dropped > base.dropped+0.03 {
+			t.Errorf("%v queue: %.1f%% dropped with ack blackouts, %.1f%% without; want at most 3 points more",
+				queue, 100*got.dropped, 100*base.dropped)
+		}
+	}
+}
