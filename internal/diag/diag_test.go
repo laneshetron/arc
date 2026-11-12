@@ -219,6 +219,17 @@ func dirSize(t *testing.T, dir string) (n int64) {
 	return n
 }
 
+// storedSize is what dir holds besides uploads in progress.
+func storedSize(t *testing.T, dir string) (n int64) {
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if info, err := e.Info(); err == nil && filepath.Ext(e.Name()) != ".part" {
+			n += info.Size()
+		}
+	}
+	return n
+}
+
 func upload(t *testing.T, s *Store, lease string, now time.Time, size int) {
 	t.Helper()
 	c, err := s.Create("friend", lease, now)
@@ -297,7 +308,7 @@ func TestStoreQuotaConcurrent(t *testing.T) {
 					return
 				}
 				s.mu.Lock() // pruning and charges happen under it; writes follow charges
-				used := dirSize(t, filepath.Join(dir, "friend"))
+				used := storedSize(t, filepath.Join(dir, "friend"))
 				s.mu.Unlock()
 				if used > maxAccount {
 					t.Errorf("account holds %d bytes, past its %d limit", used, maxAccount)
@@ -312,16 +323,21 @@ func TestStoreQuotaConcurrent(t *testing.T) {
 		})
 	}
 	wg.Wait()
-	// Together they need 6 KiB of 5: either one ran out of room while the
-	// others were in progress, or one finished first and was then pruned
-	// for the last. Either way what remains is whole uploads, within the
-	// limit.
+	// Together they need 6 KiB in progress of 5: some ran out of room
+	// while others were in progress (all of them, possibly, with limits
+	// this small), or one finished first. What
+	// remains is whole uploads, within the limit, and the oldest went
+	// first.
 	used := dirSize(t, filepath.Join(dir, "friend"))
-	if used > maxAccount || used%(2<<10) != 0 || used > int64(kept)*(2<<10) {
-		t.Fatalf("account holds %d bytes after %d of 3 uploads were kept", used, kept)
+	_, err := os.Stat(filepath.Join(dir, "friend", "20261109T120000.000Z-10.77.0.9.jsonl"))
+	if old := err == nil; old {
+		used -= 1 << 10
+		if used > 4<<10 {
+			t.Fatal("a newer upload was pruned before the oldest")
+		}
 	}
-	if _, err := os.Stat(filepath.Join(dir, "friend", "20261109T120000.000Z-10.77.0.9.jsonl")); err == nil {
-		t.Fatal("the oldest upload was not pruned")
+	if used > maxAccount || used%(2<<10) != 0 || used > int64(kept)*(2<<10) {
+		t.Fatalf("account holds %d bytes of new uploads after %d of 3 were kept", used, kept)
 	}
 	// The refused upload's charge was released.
 	upload(t, s, "10.77.0.2", now.Add(2*time.Second), 2<<10)
@@ -411,5 +427,116 @@ func TestStoreStalledUploads(t *testing.T) {
 				t.Fatalf("an abandoned upload kept its slot: %v", err)
 			}
 		})
+	}
+}
+
+// TestStoreFailedUploadPrunesNothing: an upload that needs older uploads'
+// room but never finishes leaves them all in place.
+func TestStoreFailedUploadPrunesNothing(t *testing.T) {
+	dir := t.TempDir()
+	s := &Store{Dir: dir, MaxUpload: 2 << 10, MaxAccount: 4 << 10, Idle: 50 * time.Millisecond}
+	now := time.Date(2026, 11, 9, 12, 0, 0, 0, time.UTC)
+	for i := range 3 {
+		upload(t, s, "10.77.0.2", now.Add(time.Duration(i)*time.Second), 1<<10)
+	}
+	names := func() (n []string) {
+		entries, _ := os.ReadDir(filepath.Join(dir, "friend"))
+		for _, e := range entries {
+			n = append(n, e.Name())
+		}
+		return n
+	}
+	before := names()
+
+	aborted, err := s.Create("friend", "10.77.0.2", now.Add(10*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := aborted.Write(make([]byte, 2<<10)); err != nil {
+		t.Fatal(err)
+	}
+	aborted.Close()
+	stalled, _ := s.Create("friend", "10.77.0.3", now.Add(11*time.Second))
+	stalled.Write(make([]byte, 2<<10))
+	if _, err := stalled.Read(make([]byte, 8)); err == nil || !stalled.Expired() {
+		t.Fatal("the stalled upload was not abandoned")
+	}
+	if after := names(); !slices.Equal(before, after) {
+		t.Fatalf("failed uploads changed the account from %v to %v", before, after)
+	}
+
+	// Kept, the same upload displaces the oldest, and only as much as
+	// it needs.
+	upload(t, s, "10.77.0.2", now.Add(20*time.Second), 2<<10)
+	if after := names(); len(after) != 3 || slices.Contains(after, before[0]) || !slices.Contains(after, before[1]) {
+		t.Fatalf("account holds %v", after)
+	}
+}
+
+// TestStoreBoundsFileCount: tiny uploads cannot pile up files, and empty
+// ones are refused.
+func TestStoreBoundsFileCount(t *testing.T) {
+	dir := t.TempDir()
+	s := &Store{Dir: dir, MaxFiles: 5}
+	now := time.Date(2026, 11, 9, 12, 0, 0, 0, time.UTC)
+	for i := range 50 {
+		c, err := s.Create("friend", "10.77.0.2", now.Add(time.Duration(i)*time.Second))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i%2 == 0 {
+			if err := c.CloseWrite(); err == nil {
+				t.Fatal("an empty upload was kept")
+			}
+		} else {
+			c.Write([]byte("{}\n"))
+			if err := c.CloseWrite(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		c.Close()
+	}
+	entries, _ := os.ReadDir(filepath.Join(dir, "friend"))
+	if len(entries) != 5 || entries[4].Name() != "20261109T120049.000Z-10.77.0.2.jsonl" {
+		t.Fatalf("account holds %d files, newest %s", len(entries), entries[len(entries)-1].Name())
+	}
+}
+
+// TestJournalSurvivesFailedRewrite: when the spool cannot be rewritten (a
+// full disk, a read-only directory), logging goes on without a panic and
+// the journal stays bounded; once it can, the file is whole again.
+func TestJournalSurvivesFailedRewrite(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes to read-only directories")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "journal.jsonl")
+	j, err := OpenJournal(path, "relay-a", 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer j.Close()
+	log := slog.New(j.Handler())
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(dir, 0o700)
+	for i := range 500 { // forces several rewrites, which fail
+		log.Info("record", "i", i)
+	}
+	if _, err := os.Stat(path + ".tmp"); err == nil {
+		t.Fatal("a failed rewrite left its temporary file")
+	}
+	if data, _ := j.Pending(); len(data) > 4096 || !strings.Contains(string(data), `"i":499`) {
+		t.Fatalf("journal holds %d bytes", len(data))
+	}
+	os.Chmod(dir, 0o700)
+	for i := range 200 {
+		log.Info("record", "j", i)
+	}
+	data, _ := j.Pending()
+	onDisk, _ := os.ReadFile(path)
+	if !strings.Contains(string(data), `"j":199`) || !bytes.Equal(append(bytes.Clone(j.header), data...), onDisk) {
+		t.Fatalf("after recovery the file holds %d bytes, the journal %d", len(onDisk), len(data))
 	}
 }

@@ -112,16 +112,21 @@ func (c *UploadConn) Acknowledged() bool {
 //
 // The limits bound what clients can make the relay keep: every upload is
 // data a client chose, stored on the relay's disk. Each write of an upload
-// is charged to its account as it arrives; when the account is full, its
-// oldest stored uploads are deleted to make room, so the operator keeps
-// the newest diagnostics without clearing anything by hand. Uploads in
-// progress are never deleted, and two cannot be charged for the same free
-// space.
+// is charged to its account as it arrives, so two uploads in progress
+// cannot be charged for the same space. Once an upload is kept, the
+// account's oldest stored uploads are deleted until it is back within
+// MaxAccount and MaxFiles, so the operator keeps the newest diagnostics
+// without clearing anything by hand; an upload that fails deletes
+// nothing. While uploads are in progress, the directory may exceed
+// MaxAccount by what they hold (at most MaxActive × MaxUpload). Empty
+// uploads are refused.
 type Store struct {
 	Dir string
 	// MaxUpload and MaxAccount bound one upload and an account's
 	// directory (defaults 8 MiB and 64 MiB).
 	MaxUpload, MaxAccount int64
+	// MaxFiles bounds how many uploads an account keeps (default 256).
+	MaxFiles int
 	// MaxActive bounds an account's uploads in progress (default 4); a
 	// client (a lease) has at most one.
 	MaxActive int
@@ -152,14 +157,6 @@ type storedUpload struct {
 	size int64
 }
 
-func (a *account) used() int64 {
-	n := a.other + a.inflight
-	for _, u := range a.uploads {
-		n += u.size
-	}
-	return n
-}
-
 // scan rereads the directory, which the operator may have changed.
 func (a *account) scan() error {
 	entries, err := os.ReadDir(a.dir)
@@ -184,20 +181,32 @@ func (a *account) scan() error {
 	return nil
 }
 
-// charge accounts for n more bytes of an upload in progress, deleting the
-// oldest stored uploads if that is what makes room.
+// charge accounts for n more bytes of an upload in progress. Stored
+// uploads do not count against it, since the upload displaces them once
+// kept; files that are not uploads, and other uploads in progress, do.
 func (a *account) charge(n, max int64) error {
-	for a.used()+n > max && len(a.uploads) > 0 {
-		if err := os.Remove(a.uploads[0].name); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
-		a.uploads = a.uploads[1:]
-	}
-	if a.used()+n > max {
-		return fmt.Errorf("diag: account holds %d bytes of uploads in progress and other files, its limit", a.used())
+	if a.other+a.inflight+n > max {
+		return fmt.Errorf("diag: account holds %d bytes of uploads in progress and other files, its limit",
+			a.other+a.inflight)
 	}
 	a.inflight += n
 	return nil
+}
+
+// keep adds a kept upload and deletes the oldest others until the stored
+// uploads are within the limits. The newest upload is never deleted: it
+// fits, since its bytes were charged.
+func (a *account) keep(u storedUpload, maxBytes int64, maxFiles int) {
+	a.uploads = append(a.uploads, u)
+	stored := a.other
+	for _, u := range a.uploads {
+		stored += u.size
+	}
+	for len(a.uploads) > 1 && (stored > maxBytes || len(a.uploads) > maxFiles) {
+		os.Remove(a.uploads[0].name) // gone already, or the next scan counts it again
+		stored -= a.uploads[0].size
+		a.uploads = a.uploads[1:]
+	}
 }
 
 // Create starts an upload for account from the client at lease. The name
@@ -206,7 +215,7 @@ func (s *Store) Create(name, lease string, now time.Time) (*SinkConn, error) {
 	if name == "" || name == "." || name == ".." || filepath.Base(name) != name {
 		return nil, fmt.Errorf("diag: unusable account name %q", name)
 	}
-	maxUpload, maxAccount, maxActive := s.MaxUpload, s.MaxAccount, s.MaxActive
+	maxUpload, maxAccount, maxActive, maxFiles := s.MaxUpload, s.MaxAccount, s.MaxActive, s.MaxFiles
 	if maxUpload <= 0 {
 		maxUpload = 8 << 20
 	}
@@ -215,6 +224,9 @@ func (s *Store) Create(name, lease string, now time.Time) (*SinkConn, error) {
 	}
 	if maxActive <= 0 {
 		maxActive = 4
+	}
+	if maxFiles <= 0 {
+		maxFiles = 256
 	}
 	idle, deadline := s.Idle, s.Deadline
 	if idle <= 0 {
@@ -272,7 +284,7 @@ func (s *Store) Create(name, lease string, now time.Time) (*SinkConn, error) {
 		defer s.mu.Unlock()
 		a.inflight -= size
 		if kept {
-			a.uploads = append(a.uploads, storedUpload{file, size})
+			a.keep(storedUpload{file, size}, maxAccount, maxFiles)
 		}
 		delete(a.leases, lease)
 	}
@@ -342,6 +354,9 @@ func (c *SinkConn) CloseWrite() error {
 	defer c.mu.Unlock()
 	if c.closed || c.isKept {
 		return net.ErrClosed
+	}
+	if c.size == 0 {
+		return errors.New("diag: empty upload")
 	}
 	if err := c.f.Sync(); err != nil {
 		return err

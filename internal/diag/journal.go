@@ -139,20 +139,28 @@ func (j *Journal) Discarded() int { return j.discarded }
 func (j *Journal) Handler() slog.Handler { return j.handler }
 
 // Write appends one record; slog's JSON handler writes each in one call.
+// The journal stays bounded in memory even when its file cannot be
+// written (a full disk, say): the record is then kept in memory only, and
+// the error returned, which slog drops. Logging never fails the client.
 func (j *Journal) Write(p []byte) (int, error) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	if len(p) > j.max/2 {
 		return len(p), nil // never displaces the whole journal
 	}
+	var err error
 	if len(j.data)+len(p) > j.max {
 		j.dropHead(len(j.data) - j.max/2)
-		if err := j.rewrite(); err != nil {
-			return 0, err
-		}
+		err = j.rewrite()
 	}
 	j.data = append(j.data, p...)
-	return j.f.Write(p)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := j.f.Write(p); err != nil {
+		return 0, fmt.Errorf("journal: %w", err)
+	}
+	return len(p), nil
 }
 
 // Pending returns what the journal holds, and a commit function that drops
@@ -198,24 +206,29 @@ func (j *Journal) dropHead(n int) {
 }
 
 // rewrite replaces the file with data, atomically, and reopens it for
-// appending.
+// appending. If it fails, the journal keeps appending to the file it had
+// (which then holds records the data no longer does, until a later
+// rewrite succeeds); j.f is never left unusable.
 func (j *Journal) rewrite() error {
-	if j.f != nil {
-		j.f.Close()
-		j.f = nil
-	}
 	tmp := j.path + ".tmp"
 	if err := os.WriteFile(tmp, append(bytes.Clone(j.header), j.data...), 0o600); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("journal: %w", err)
+	}
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		os.Remove(tmp)
 		return fmt.Errorf("journal: %w", err)
 	}
 	if err := os.Rename(tmp, j.path); err != nil {
+		f.Close()
+		os.Remove(tmp)
 		return fmt.Errorf("journal: %w", err)
 	}
-	f, err := os.OpenFile(j.path, os.O_WRONLY|os.O_APPEND, 0)
-	if err != nil {
-		return fmt.Errorf("journal: %w", err)
+	if j.f != nil {
+		j.f.Close()
 	}
-	j.f = f
+	j.f = f // the open file follows the rename
 	return nil
 }
 

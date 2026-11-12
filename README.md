@@ -222,12 +222,13 @@ before sharing it anywhere else.
 
 The relay stores each upload as `DIR/ACCOUNT/TIME-ADDRESS.jsonl` and logs
 `diagnostics received` with the account. Uploads are client-chosen data
-on the relay's disk, so they are bounded: at most 8 MiB per upload and
-64 MiB per account, where the account's oldest uploads are deleted to
-make room for new ones; one upload at a time per client and four per
-account; and an upload that stalls for two minutes or runs past thirty is
-abandoned. Other files you put in an account's directory count toward its
-64 MiB but are never deleted.
+on the relay's disk, so they are bounded: at most 8 MiB per upload, and
+64 MiB and 256 uploads per account: each new upload, once stored, deletes
+the account's oldest as needed to stay within them (an upload that fails
+deletes nothing). One upload runs at a time per client and four per
+account, an upload that stalls for two minutes or runs past thirty is
+abandoned, and empty uploads are refused. Other files you put in an
+account's directory count toward its 64 MiB but are never deleted.
 `-journal` without `-share-diagnostics` keeps the journal locally only.
 
 The end-to-end test builds this setup in three network namespaces:

@@ -191,13 +191,18 @@ func run(args []string) error {
 	if *journalFile != "" {
 		// The journal is bound to this relay: its operator never receives
 		// what a run against another relay recorded.
-		if journal, err = diag.OpenJournal(*journalFile, base64.StdEncoding.EncodeToString(pin[:]), 0); err != nil {
-			return err
-		}
-		defer journal.Close()
-		log = diag.Tee(log.Handler(), journal.Handler())
-		if n := journal.Discarded(); n > 0 {
-			log.Warn("journal held another relay's diagnostics; discarded them", "journal", *journalFile, "bytes", n)
+		// Diagnostics never keep the tunnel from coming up: without a
+		// usable journal, the client runs without one.
+		journal, err = diag.OpenJournal(*journalFile, base64.StdEncoding.EncodeToString(pin[:]), 0)
+		if err != nil {
+			log.Warn("running without a diagnostics journal", "journal", *journalFile, "err", err)
+			journal = nil
+		} else {
+			defer journal.Close()
+			log = diag.Tee(log.Handler(), journal.Handler())
+			if n := journal.Discarded(); n > 0 {
+				log.Warn("journal held another relay's diagnostics; discarded them", "journal", *journalFile, "bytes", n)
+			}
 		}
 	}
 	tokens, err := keyfile.ReadLines(*tokenFile)
