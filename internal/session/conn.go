@@ -506,7 +506,7 @@ func (c *conn) onAck(now time.Time, ack *wire.Ack) {
 		if res.hasRTT {
 			rtt = res.rttSample
 		}
-		p.cc.onAck(now, res.streamAcked, res.streamLost, res.streamAckedBytes, rtt)
+		p.cc.onAck(now, res.streamAcked, res.streamLost, res.streamAckedBytes, rtt, p.sent.streamBytes)
 		for _, f := range res.streamFrames {
 			if sf, ok := f.(wire.Stream); ok {
 				c.onStreamAcked(sf)
