@@ -37,7 +37,11 @@ import (
 // leaves the channel for tens of milliseconds (a Mac's AWDL). The access
 // point drops what it can't hold meanwhile and every RTT sample jumps, but
 // the link's capacity hasn't changed: lost data is retransmitted and the
-// rate holds.
+// rate holds. A stall delays the samples around it by no more than its own
+// length, though, so queueing delay beyond that still counts: a congested
+// bottleneck whose acknowledgements also stop now and then (or stall
+// detection mistaking a congested path's ACK gaps for stalls) must still
+// back off, or its queue would fill and stay full.
 // A cap on bytes
 // in flight stops sending into an outage, which produces no
 // acknowledgements to clock it.
@@ -129,6 +133,7 @@ type streamCC struct {
 	// last stall ended (its acknowledgements resumed).
 	lastSend time.Time
 	stallEnd time.Time
+	stallGap time.Duration // the last stall's length
 	stalls   int
 
 	// The lowest RTT sample in the current and previous half of
@@ -234,7 +239,7 @@ func (cc *streamCC) onAck(now time.Time, acked, lost, ackedBytes int, rtt time.D
 			if gap >= max(ccMinStall, ccStallGaps*cc.ackGap, cc.baseRTT(0)) && cc.lastSend.After(cc.lastAck) {
 				// A stall's gap stays out of the usual gap, which would
 				// otherwise delay pausing for the next one.
-				cc.stallEnd = now
+				cc.stallEnd, cc.stallGap = now, gap
 				cc.stalls++
 			} else {
 				cc.ackGap += (gap - cc.ackGap) / 8
@@ -255,9 +260,13 @@ func (cc *streamCC) update(now time.Time, minRTT, srtt time.Duration, mss int) {
 	// the rate each round, cannot wait for a whole round to show it and
 	// goes by the lowest of the latest few samples (as HyStart does).
 	// The jitter estimate starts at zero and takes rounds to form; the
-	// round's own spread stands in until it has.
+	// round's own spread stands in until it has. Rounds around a stall
+	// (see below) stay out of it: the stall scatters their samples, and
+	// on a congested path whose rounds are all near stalls the target
+	// would grow with the queue.
+	stalled := !cc.stallEnd.IsZero() && !cc.stallEnd.Add(srtt).Before(cc.roundStart)
 	var spread time.Duration
-	if cc.roundN >= ccJitterSamples {
+	if cc.roundN >= ccJitterSamples && !stalled {
 		spread = cc.roundSum/time.Duration(cc.roundN) - cc.roundMin
 		cc.jitter += time.Duration(ccJitterGain * float64(spread-cc.jitter))
 	}
@@ -267,10 +276,13 @@ func (cc *streamCC) update(now time.Time, minRTT, srtt time.Duration, mss int) {
 		cc.slowStart && recent > 0 && recent-minRTT > target
 	prevDelay := cc.lastDelay
 	// Around a stall (rounds within an RTT of its end, when its losses are
-	// declared), neither delay nor loss says anything about congestion.
-	stalled := !cc.stallEnd.IsZero() && !cc.stallEnd.Add(srtt).Before(cc.roundStart)
+	// declared), loss says nothing about congestion, and delay only beyond
+	// what the stall itself explains: samples held up by it by at most its
+	// length. On a congested path the RTT, and so this window, grows with
+	// the queue until every round is near a stall; without the allowance a
+	// full queue went unnoticed for good.
 	if stalled {
-		delay = false
+		delay = cc.roundMin > 0 && cc.roundMin-minRTT > target+cc.stallGap
 	}
 	spike, judged := cc.judgeLoss(delay || stalled)
 	feedback := cc.roundMin > 0 || judged

@@ -43,6 +43,8 @@ type link struct {
 	// burstP/(burstP+burstR) and the mean burst 1/burstR datagrams.
 	burstP, burstR float64
 	bad            bool
+
+	sent, drops int // datagrams offered, and lost at the full queue
 }
 
 // lost reports whether the link loses its next datagram.
@@ -191,6 +193,7 @@ func (n *network) send(toRelay bool, pathID uint32, data []byte) {
 		copies = 2
 	}
 	for range copies {
+		l.sent++
 		if !l.lossAfterQueue && l.lost(n.rng) || (l.mtu > 0 && len(data) > l.mtu) {
 			continue
 		}
@@ -205,6 +208,7 @@ func (n *network) send(toRelay bool, pathID uint32, data []byte) {
 				start = n.now
 			}
 			if start.Sub(n.now) > queue {
+				l.drops++
 				continue // tail drop
 			}
 			l.busyUntil = start.Add(time.Duration(len(data)) * time.Second / time.Duration(l.rate))
