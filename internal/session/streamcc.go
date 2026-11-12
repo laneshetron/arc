@@ -131,11 +131,16 @@ type streamCC struct {
 	lastAck time.Time
 	ackGap  time.Duration // smoothed interval between acknowledgements
 	// lastSend is when stream data was last sent, and stallEnd when the
-	// last stall ended (its acknowledgements resumed).
-	lastSend time.Time
-	stallEnd time.Time
-	stallGap time.Duration // the last stall's length
-	stalls   int
+	// last stall ended (its acknowledgements resumed). drained is set when
+	// the last acknowledgement left no stream data in flight, and
+	// firstSend is when data was next sent: the wait for the next
+	// acknowledgement starts there, not at the last one.
+	lastSend  time.Time
+	drained   bool
+	firstSend time.Time
+	stallEnd  time.Time
+	stallGap  time.Duration // the last stall's length
+	stalls    int
 	// Backoffs so far, for status: for queueing delay and for a loss
 	// spike, and how many of them came in rounds that didn't use the rate
 	// (app-limited).
@@ -217,12 +222,16 @@ func (cc *streamCC) canSend(now time.Time, inflight int, srtt time.Duration, mss
 func (cc *streamCC) onSent(now time.Time, size int) {
 	cc.tokens -= float64(size)
 	cc.roundSent += size
+	if !cc.lastSend.After(cc.lastAck) {
+		cc.firstSend = now // the first since the last acknowledgement
+	}
 	cc.lastSend = now
 }
 
 // onAck records an acknowledgement's outcome for stream packets: how many
-// were acknowledged and declared lost, and an RTT sample if it has one.
-func (cc *streamCC) onAck(now time.Time, acked, lost, ackedBytes int, rtt time.Duration) {
+// were acknowledged and declared lost, an RTT sample if it has one, and the
+// stream bytes still in flight after it.
+func (cc *streamCC) onAck(now time.Time, acked, lost, ackedBytes int, rtt time.Duration, inflight int) {
 	if cc.rate == 0 {
 		return
 	}
@@ -239,7 +248,22 @@ func (cc *streamCC) onAck(now time.Time, acked, lost, ackedBytes int, rtt time.D
 		}
 	}
 	if acked > 0 {
-		if !cc.lastAck.IsZero() {
+		switch {
+		case cc.lastAck.IsZero():
+		case cc.drained:
+			// Nothing was in flight after the last acknowledgement, so
+			// none was overdue until data went out again, and the first
+			// acknowledgement of that takes a round trip anyway: a stall
+			// is one that comes later still. (Otherwise every pause
+			// between bursts was a stall.) The pause says nothing about
+			// the usual gap between acknowledgements.
+			wait := min(now.Sub(cc.firstSend), ccMaxAckGap)
+			if late := wait - cc.baseRTT(wait); cc.firstSend.After(cc.lastAck) &&
+				late >= max(ccMinStall, ccStallGaps*cc.ackGap) {
+				cc.stallEnd, cc.stallGap = now, late
+				cc.stalls++
+			}
+		default:
 			gap := min(now.Sub(cc.lastAck), ccMaxAckGap)
 			if gap >= max(ccMinStall, ccStallGaps*cc.ackGap, cc.baseRTT(0)) && cc.lastSend.After(cc.lastAck) {
 				// A stall's gap stays out of the usual gap, which would
@@ -250,7 +274,7 @@ func (cc *streamCC) onAck(now time.Time, acked, lost, ackedBytes int, rtt time.D
 				cc.ackGap += (gap - cc.ackGap) / 8
 			}
 		}
-		cc.lastAck = now
+		cc.lastAck, cc.drained = now, inflight == 0
 	}
 }
 

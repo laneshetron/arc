@@ -745,3 +745,61 @@ func TestStreamBurstPacingDebtIsIdle(t *testing.T) {
 		t.Error("a burst that left data waiting on pacing did not make the round busy")
 	}
 }
+
+// TestStreamIdleGapsNotStalls sends bursts with quiet gaps between them, as
+// a browser does, over a clean path. A stall is acknowledgements stopping
+// while data is outstanding; between bursts nothing is, and the first
+// acknowledgement of the next burst takes a round trip like any other.
+// Taking each gap for a stall held the rate and excused queueing delay in
+// the round after every pause.
+func TestStreamIdleGapsNotStalls(t *testing.T) {
+	for _, gap := range []time.Duration{50 * time.Millisecond, 100 * time.Millisecond, 400 * time.Millisecond} {
+		n := newNetwork(t, 107, defaultRelayConfig(), ClientConfig{})
+		for _, l := range []*link{n.up, n.down} {
+			l.rate, l.delay = 6_250_000, 20*time.Millisecond
+		}
+		s := n.establish()
+		n.runFor(time.Second)
+		id, err := n.client.OpenStream(n.now, tcpDst)
+		if err != nil {
+			t.Fatal(err)
+		}
+		opened := func() bool {
+			for _, e := range n.relayEvents {
+				if e, ok := e.(StreamOpened); ok && e.ID == id {
+					return true
+				}
+			}
+			return false
+		}
+		if !n.runUntil(10*time.Second, func() bool { n.pump(); return opened() }) {
+			t.Fatal("relay never reported the stream")
+		}
+		var buf [64 << 10]byte
+		got, want := 0, 0
+		for i := range 40 {
+			k, err := s.StreamWrite(n.now, id, randomBytes(uint64(200+i), 16<<10))
+			if err != nil || k != 16<<10 {
+				t.Fatalf("StreamWrite: %d, %v", k, err)
+			}
+			want += k
+			deadline := n.now.Add(gap)
+			n.runUntil(10*time.Second, func() bool {
+				for {
+					k, _ := n.client.StreamRead(n.now, id, buf[:])
+					got += k
+					if k == 0 {
+						break
+					}
+				}
+				return !n.now.Before(deadline)
+			})
+		}
+		if got != want {
+			t.Fatalf("gap %v: received %d of %d bytes", gap, got, want)
+		}
+		if st := s.conn.paths[0].cc.stalls; st != 0 {
+			t.Errorf("%d stalls in 40 bursts %v apart on a clean path", st, gap)
+		}
+	}
+}

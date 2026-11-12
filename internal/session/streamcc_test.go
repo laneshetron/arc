@@ -17,7 +17,7 @@ func TestStreamCCRegularSlowAcksNotStalls(t *testing.T) {
 		now = now.Add(20 * time.Millisecond)
 		cc.onSent(now, mss)
 		now = now.Add(20 * time.Millisecond)
-		cc.onAck(now, 1, 0, mss, 400*time.Millisecond)
+		cc.onAck(now, 1, 0, mss, 400*time.Millisecond, mss)
 	}
 	if cc.stalls > 2 {
 		t.Errorf("%d stalls in 100 regular acknowledgements 40 ms apart (ackGap %v)", cc.stalls, cc.ackGap)
@@ -45,7 +45,7 @@ func TestStreamCCIdleRoundsDontBackOff(t *testing.T) {
 		// above the queue target.
 		cc.onSent(now, mss)
 		now = now.Add(srtt)
-		cc.onAck(now, 1, 0, mss, minRTT+40*time.Millisecond)
+		cc.onAck(now, 1, 0, mss, minRTT+40*time.Millisecond, 0)
 		cc.update(now, minRTT, srtt, mss)
 	}
 	if cc.rate < before {
