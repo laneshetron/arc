@@ -85,6 +85,8 @@ type Conn struct {
 	raw         syscall.RawConn
 	pending     atomic.Bool // not yet connected to peer
 	nextConnect time.Time
+	connectErr  error  // why the last connect failed
+	device      string // Options.Device, bound again on reconnecting
 	onReconnect func(netip.AddrPort)
 
 	// Caches for the send path: the last destination's *net.UDPAddr and
@@ -131,13 +133,14 @@ func Listen(addr netip.AddrPort, opts Options) (*Conn, error) {
 	}}
 	var uc *net.UDPConn
 	pending := false
+	var connectErr error
 	if opts.Peer.IsValid() {
 		d := net.Dialer{LocalAddr: net.UDPAddrFromAddrPort(addr), Control: lc.Control}
 		nc, err := d.DialContext(context.Background(), "udp4", opts.Peer.String())
 		if err == nil {
 			uc = nc.(*net.UDPConn)
 		} else if unreachable(err) {
-			pending = true // connect on a later send
+			pending, connectErr = true, err // connect on a later send
 		} else {
 			return nil, err
 		}
@@ -159,8 +162,9 @@ func Listen(addr netip.AddrPort, opts Options) (*Conn, error) {
 		uc.Close()
 		return nil, err
 	}
-	c := &Conn{uc: uc, pc: ipv4.NewPacketConn(uc), peer: opts.Peer, raw: raw, onReconnect: opts.OnReconnect}
+	c := &Conn{uc: uc, pc: ipv4.NewPacketConn(uc), peer: opts.Peer, raw: raw, device: opts.Device, onReconnect: opts.OnReconnect}
 	c.pending.Store(pending)
+	c.connectErr = connectErr
 	if !opts.NoOffload {
 		c.gso = gsoSupported(uc)
 		c.gro = enableGRO(uc)
@@ -318,7 +322,7 @@ func (c *Conn) sendAll(msgs []ipv4.Message) error {
 func (c *Conn) connectPending() error {
 	now := time.Now()
 	if now.Before(c.nextConnect) {
-		return fmt.Errorf("udp: not yet connected to %v", c.peer)
+		return fmt.Errorf("udp: not connected to %v: %w", c.peer, c.connectErr)
 	}
 	if err := c.reconnect(); err != nil {
 		return fmt.Errorf("udp: connecting to %v: %w", c.peer, err)
@@ -390,14 +394,14 @@ func sourceLost(err error) bool {
 func (c *Conn) reconnect() error {
 	sa := &unix.SockaddrInet4{Port: int(c.peer.Port()), Addr: c.peer.Addr().As4()}
 	var err error
-	if cerr := c.raw.Control(func(fd uintptr) { err = connectFD(int(fd), sa) }); cerr != nil {
+	if cerr := c.raw.Control(func(fd uintptr) { err = connectFD(int(fd), sa, c.device) }); cerr != nil {
 		err = cerr
 	}
 	if err != nil {
 		// Possibly unconnected now: WriteBatch retries, at most once
 		// per connectRetry.
 		c.pending.Store(true)
-		c.nextConnect = time.Now().Add(connectRetry)
+		c.nextConnect, c.connectErr = time.Now().Add(connectRetry), err
 		return err
 	}
 	c.pending.Store(false)
