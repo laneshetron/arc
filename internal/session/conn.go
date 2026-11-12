@@ -587,6 +587,13 @@ func (c *conn) sendStreams(now time.Time) {
 		ok, wake := p.cc.canSend(now, p.sent.streamBytes, srtt, p.maxPacket)
 		if !ok {
 			c.streamWake = wake
+			// The round waited on the window or pacing only if data was
+			// waiting: a burst's last packet leaves pacing debt, and the
+			// loop asks again though nothing is left to send. Counting that
+			// made a burst's round busy, not idle, and it backed off.
+			if c.streamsWaiting() {
+				p.cc.roundBlocked = true
+			}
 			return
 		}
 		frames, used := c.streamFrames[:0], 0

@@ -113,7 +113,7 @@ type streamCC struct {
 	roundN               int           // and their number
 	jitter               time.Duration // smoothed spread of a round's RTT samples above its lowest
 	roundSent            int           // stream bytes sent this round
-	roundBlocked         bool          // sending this round waited on the window or pacing
+	roundBlocked         bool          // stream data waited this round, on the window, pacing or the receiver
 	roundAcked           int           // stream bytes acknowledged this round
 	// The previous round's delay signal and lowest RTT sample, and
 	// whether it backed off.
@@ -205,11 +205,9 @@ func (cc *streamCC) canSend(now time.Time, inflight int, srtt time.Duration, mss
 	}
 	cc.refill(now, mss)
 	if inflight >= cc.window(srtt, mss) {
-		cc.roundBlocked = true
 		return false, time.Time{} // an acknowledgement or PTO comes first
 	}
 	if cc.tokens < 0 {
-		cc.roundBlocked = true
 		wait := time.Duration(math.Ceil(-cc.tokens / cc.rate * float64(time.Second)))
 		return false, now.Add(max(wait, time.Microsecond))
 	}
