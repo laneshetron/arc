@@ -33,6 +33,7 @@ const (
 	FrameMaxStreamData FrameType = 0x14
 	FrameMaxData       FrameType = 0x15
 	FrameStreamReset   FrameType = 0x16
+	FrameDiagOpen      FrameType = 0x17
 
 	// Frame types at or above FirstExtensionFrame are optional extensions
 	// that receivers may ignore; unknown types below it are required.
@@ -43,7 +44,7 @@ var frameNames = [...]string{
 	"PADDING", "AUTH", "AUTH_RESULT", "IP_PACKET", "IP_FRAGMENT", "NEW_PATH", "PATH_JOIN",
 	"PATH_CHALLENGE", "PATH_RESPONSE", "PATH_ABANDON", "PING", "ACK", "CLOSE", "ERROR",
 	"IP_DATAGRAM", "REDUNDANCY", "FEC_REPAIR", "FEC", "STREAM_OPEN", "STREAM", "MAX_STREAM_DATA",
-	"MAX_DATA", "STREAM_RESET",
+	"MAX_DATA", "STREAM_RESET", "DIAGNOSTICS_OPEN",
 }
 
 func (t FrameType) String() string {
@@ -140,6 +141,9 @@ const (
 	// FeatureStreams: the relay accepts STREAM_OPEN and carries streams to
 	// TCP destinations (§11.3).
 	FeatureStreams uint64 = 1 << 2
+	// FeatureDiagnostics: the relay accepts DIAGNOSTICS_OPEN and keeps what
+	// the client uploads on the stream for its operator (§11.4).
+	FeatureDiagnostics uint64 = 1 << 3
 )
 
 // MaxStreamOffset bounds stream offsets and flow control limits, so that
@@ -151,6 +155,13 @@ const MaxStreamOffset = 1<<62 - 1
 type StreamOpen struct {
 	ID  uint32
 	Dst netip.AddrPort
+}
+
+// DiagOpen opens stream ID as an upload of the client's diagnostics to
+// the relay's operator, instead of a connection (§11.4). Client to relay
+// only.
+type DiagOpen struct {
+	ID uint32
 }
 
 // Stream carries bytes of a stream starting at Offset. Fin marks the end of
@@ -299,6 +310,7 @@ func (Stream) Type() FrameType        { return FrameStream }
 func (MaxStreamData) Type() FrameType { return FrameMaxStreamData }
 func (MaxData) Type() FrameType       { return FrameMaxData }
 func (StreamReset) Type() FrameType   { return FrameStreamReset }
+func (DiagOpen) Type() FrameType      { return FrameDiagOpen }
 func (u Unknown) Type() FrameType     { return u.FrameType }
 
 // AppendFrame appends the TLV encoding of f to b. It panics if the encoded
@@ -384,6 +396,10 @@ func (o StreamOpen) appendValue(b []byte) []byte {
 	b = binary.BigEndian.AppendUint32(b, o.ID)
 	b = binary.BigEndian.AppendUint16(b, o.Dst.Port())
 	return append(b, o.Dst.Addr().AsSlice()...)
+}
+
+func (o DiagOpen) appendValue(b []byte) []byte {
+	return binary.BigEndian.AppendUint32(b, o.ID)
 }
 
 func (f Stream) appendValue(b []byte) []byte {
@@ -630,6 +646,16 @@ func parseValue(t FrameType, v []byte) (Frame, error) {
 		}
 		if o.Dst.Port() == 0 || addr.IsUnspecified() {
 			return nil, errStreamOpen
+		}
+		return o, nil
+
+	case FrameDiagOpen:
+		if len(v) != 4 {
+			return nil, errFrameSize
+		}
+		o := DiagOpen{ID: binary.BigEndian.Uint32(v)}
+		if o.ID == 0 {
+			return nil, errStreamID
 		}
 		return o, nil
 

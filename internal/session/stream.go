@@ -33,9 +33,11 @@ const (
 
 var (
 	ErrStreamsUnsupported = errors.New("session: relay does not support streams")
-	ErrTooManyStreams     = errors.New("session: too many streams")
-	ErrStreamClosed       = errors.New("session: stream closed")
-	ErrStreamWriteClosed  = errors.New("session: stream closed for writing")
+	// ErrDiagnosticsUnsupported: the relay does not accept diagnostics.
+	ErrDiagnosticsUnsupported = errors.New("session: relay does not accept diagnostics")
+	ErrTooManyStreams         = errors.New("session: too many streams")
+	ErrStreamClosed           = errors.New("session: stream closed")
+	ErrStreamWriteClosed      = errors.New("session: stream closed for writing")
 )
 
 // StreamResetError reports a stream reset by the peer.
@@ -170,6 +172,7 @@ func (r *recvStream) done() bool {
 type stream struct {
 	id   uint32
 	dst  netip.AddrPort
+	diag bool // a diagnostics upload (§11.4)
 	send sendStream
 	recv recvStream
 	// resetSent marks a stream this end reset: the application is done
@@ -185,12 +188,15 @@ type stream struct {
 type streamSet struct {
 	enabled bool
 	client  bool
-	streams map[uint32]*stream
-	list    []*stream // the streams in creation order, for repeats
-	repeatI int       // index in list where repeats resume
-	nextID  uint32    // client: the next stream ID
-	seen    rangeSet  // relay: stream IDs seen; those no longer in streams are closed
-	ready   []*stream
+	// What the relay advertised: STREAM_OPEN (connect) and
+	// DIAGNOSTICS_OPEN (diagnostics) streams; either enables streams.
+	connect, diagnostics bool
+	streams              map[uint32]*stream
+	list                 []*stream // the streams in creation order, for repeats
+	repeatI              int       // index in list where repeats resume
+	nextID               uint32    // client: the next stream ID
+	seen                 rangeSet  // relay: stream IDs seen; those no longer in streams are closed
+	ready                []*stream
 
 	// Connection flow control: what this end may send in total (the
 	// peer's MAX_DATA) and has used (the highest offset sent on every
@@ -199,7 +205,7 @@ type streamSet struct {
 	recvLimit, recvHigh, recvTaken uint64
 
 	updates []uint32          // streams with news for the application
-	opened  []wire.StreamOpen // relay: streams to connect
+	opened  []wire.StreamOpen // relay: streams to connect; no Dst for a diagnostics upload
 }
 
 func (ss *streamSet) init(client bool) {
@@ -233,20 +239,42 @@ func (ss *streamSet) schedule(s *stream) {
 	}
 }
 
-// openStream starts a client stream to dst.
-func (c *conn) openStream(now time.Time, dst netip.AddrPort) (uint32, error) {
+// openDiagnostics starts a client stream uploading diagnostics (§11.4).
+func (c *conn) openDiagnostics(now time.Time) (uint32, error) {
 	ss := &c.streams
-	if !ss.enabled {
-		return 0, ErrStreamsUnsupported
+	if !ss.diagnostics {
+		return 0, ErrDiagnosticsUnsupported
 	}
-	if len(ss.streams) >= maxStreams {
+	id, err := ss.nextStream()
+	if err != nil {
+		return 0, err
+	}
+	ss.newStream(id, netip.AddrPort{}).diag = true
+	c.queue(wire.DiagOpen{ID: id})
+	c.flush(now)
+	return id, nil
+}
+
+// nextStream allocates a client stream ID.
+func (ss *streamSet) nextStream() (uint32, error) {
+	if len(ss.streams) >= maxStreams || ss.nextID == 0 { // nextID 0: all 2^32-1 IDs used
 		return 0, ErrTooManyStreams
-	}
-	if ss.nextID == 0 {
-		return 0, ErrTooManyStreams // all 2^32-1 IDs used
 	}
 	id := ss.nextID
 	ss.nextID++
+	return id, nil
+}
+
+// openStream starts a client stream to dst.
+func (c *conn) openStream(now time.Time, dst netip.AddrPort) (uint32, error) {
+	ss := &c.streams
+	if !ss.connect {
+		return 0, ErrStreamsUnsupported
+	}
+	id, err := ss.nextStream()
+	if err != nil {
+		return 0, err
+	}
 	ss.newStream(id, dst)
 	c.queue(wire.StreamOpen{ID: id, Dst: dst})
 	c.flush(now)
@@ -418,15 +446,30 @@ func (c *conn) maybeFinish(s *stream) {
 // onStreamOpen handles STREAM_OPEN on the relay.
 func (c *conn) onStreamOpen(f wire.StreamOpen) {
 	ss := &c.streams
-	if !ss.enabled || ss.client {
+	if !ss.connect || ss.client {
 		return
 	}
 	s := c.relayStream(f.ID)
-	if s == nil || s.dst.IsValid() || s.resetSent || s.err != nil {
+	if s == nil || s.dst.IsValid() || s.diag || s.resetSent || s.err != nil {
 		return // closed, reset before it opened, or a retransmission
 	}
 	s.dst = f.Dst
 	ss.opened = append(ss.opened, f)
+}
+
+// onDiagOpen handles DIAGNOSTICS_OPEN on the relay (§11.4): the stream is
+// an upload, reported to the application as a StreamOpen without Dst.
+func (c *conn) onDiagOpen(f wire.DiagOpen) {
+	ss := &c.streams
+	if !ss.diagnostics || ss.client {
+		return
+	}
+	s := c.relayStream(f.ID)
+	if s == nil || s.dst.IsValid() || s.diag || s.resetSent || s.err != nil {
+		return
+	}
+	s.diag = true
+	ss.opened = append(ss.opened, wire.StreamOpen{ID: f.ID})
 }
 
 // relayStream returns the relay's stream for a client-chosen ID, creating

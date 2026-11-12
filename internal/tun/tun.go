@@ -4,6 +4,8 @@
 package tun
 
 import (
+	"net/netip"
+
 	wgtun "golang.zx2c4.com/wireguard/tun"
 )
 
@@ -21,6 +23,7 @@ const bufCap = Offset + 65535
 type Device struct {
 	dev  wgtun.Device
 	name string
+	addr netip.Prefix // as last configured
 	dns  dnsState
 
 	rbufs  [][]byte

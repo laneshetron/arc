@@ -14,7 +14,7 @@ ARC is a multipath, carrier-agnostic overlay VPN. A TUN interface gives applicat
 | `internal/reassembly` | Bounded IP datagram reassembly |
 | `internal/session` | Client and relay session state machines (sans-IO) |
 | `internal/carrier/udp` | UDP carrier with batched I/O |
-| `internal/tun` | TUN device and Linux address/route setup |
+| `internal/tun` | TUN device, and address, route and DNS setup on Linux and macOS |
 | `internal/gateway` | Relay address pool, token authorization, routing to sessions |
 | `internal/engine` | Event loops that run sessions on real sockets and TUN devices |
 | `cmd/arc-client`, `cmd/arc-relay` | The client and relay commands |
@@ -22,7 +22,7 @@ ARC is a multipath, carrier-agnostic overlay VPN. A TUN interface gives applicat
 
 ## Development
 
-Use Go 1.26.9 or a newer supported patched release. CI checks reachable
+Use Go 1.26.11 or a newer supported patched release. CI checks reachable
 vulnerabilities with govulncheck as well as running the tests.
 
 ```sh
@@ -43,7 +43,7 @@ go build -o bin/ ./cmd/...
 # Relay host
 bin/arc-relay genkey > relay.key
 bin/arc-relay pubkey < relay.key          # give this to clients
-echo "some-token" > tokens
+echo "lane some-token relay" > tokens      # NAME TOKEN [relay]: see Accounts below
 sudo sysctl -w net.ipv4.ip_forward=1
 sudo iptables -t nat -A POSTROUTING -s 10.77.0.0/16 -o eth0 -j MASQUERADE
 sudo bin/arc-relay run -listen 0.0.0.0:4433 -network 10.77.0.1/16
@@ -149,7 +149,87 @@ rejected in split-tunnel mode; configure that mode's DNS externally.
 
 These bounds do not replace operator firewall policy. Static bearer tokens
 still require operator rotation/restart for revocation; this pre-alpha does
-not provide expiring credentials or tenant destination isolation.
+not provide expiring credentials.
+
+### Accounts
+
+Each line of the relay's `-tokens-file` is a credential of an account:
+
+```
+lane    3f9c…   relay
+lane    81d2…   relay
+friend  c47a…
+```
+
+A name may repeat, giving its account several tokens. The relay reads
+the file only at startup, so changing it means restarting the relay, which
+interrupts every session. Several tokens allow a staged migration (add the
+new token, move clients to it, then remove the old one, a restart each
+time) but not yet an uninterrupted rotation, which needs credentials the
+relay can reload.
+
+Clients of one account can reach each other's tunnel addresses; clients of
+different accounts never can. (Split TCP never connects a stream to another
+client, even within an account.) Only accounts marked `relay` reach the
+relay host, where the operator may run services: its tunnel address, and
+the addresses of its interfaces (read at startup), whether by IP
+forwarding or by split TCP. A bare `TOKEN` line is an account of its own,
+named by its line number (`line3`), without relay access; since inserting
+a line above it renames it, prefer named accounts. The relay logs each
+session's account. All accounts share the relay's exit address.
+
+No account reaches loopback, link-local (cloud metadata services among
+them), multicast or broadcast destinations. `-deny PREFIX` (repeatable)
+closes networks private to the operator, such as the relay's VPC, to every
+account, by IP forwarding and split TCP alike. Split TCP connects from the
+relay host itself, so host firewall rules on forwarded traffic do not
+cover it; `-deny` does. The relay host's own addresses stay reachable for
+`relay` accounts even inside a denied network.
+
+An address that reaches the host without being on one of its interfaces,
+such as a cloud provider's public IP mapped by NAT, is not a host address;
+if the host serves anything private on it, list it with `-deny`. Where no
+account needs the host's other addresses, a host firewall rule such as
+`iptables -A INPUT -i arc0 ! -d 10.77.0.1 -j DROP` adds a second line of
+defense for IP forwarding (not for split TCP, which only the relay's own
+checks cover).
+
+### Diagnostics
+
+When someone else runs a client on a network that interferes with ARC,
+the relay's operator can receive that client's diagnostics without asking
+for them. The relay accepts uploads with `-diagnostics-dir DIR`; the
+client opts in with `-share-diagnostics`:
+
+```sh
+sudo bin/arc-relay run ... -diagnostics-dir /var/lib/arc/diagnostics
+sudo bin/arc-client run ... -share-diagnostics
+```
+
+The client keeps a journal, `journal.jsonl` by default (`-journal FILE`):
+its log at debug level, including each carrier's failures (a TLS
+handshake reset, a timeout), path quality every ten minutes, and the
+version, platform and carriers it runs with. The journal persists across
+runs, up to 4 MiB, so a run that never connected is uploaded by the next
+one that does. It belongs to the relay whose key the client pins: a client
+pointed at a different relay discards what the journal held rather than
+send it to another operator. Uploads go over the session 5 s after it
+comes up and every ten minutes after; what the relay confirms it stored
+leaves the journal. The journal holds addresses (the relay's, and those of
+the client's own links as the relay sees them). ARC does not log traffic
+or credentials, but the journal is the client's whole debug log: read it
+before sharing it anywhere else.
+
+The relay stores each upload as `DIR/ACCOUNT/TIME-ADDRESS.jsonl` and logs
+`diagnostics received` with the account. Uploads are client-chosen data
+on the relay's disk, so they are bounded: at most 8 MiB per upload, and
+64 MiB and 256 uploads per account: each new upload, once stored, deletes
+the account's oldest as needed to stay within them (an upload that fails
+deletes nothing). One upload runs at a time per client and four per
+account, an upload that stalls for two minutes or runs past thirty is
+abandoned, and empty uploads are refused. Other files you put in an
+account's directory count toward its 64 MiB but are never deleted.
+`-journal` without `-share-diagnostics` keeps the journal locally only.
 
 The end-to-end test builds this setup in three network namespaces:
 
@@ -158,6 +238,8 @@ sudo test/netns/e2e.sh bin                                   # Linux
 docker build -f test/netns/Dockerfile -t arc-e2e . && docker run --rm --privileged arc-e2e   # macOS
 ```
 
+`test/netns/accounts.sh` checks account isolation, the relay host's addresses and `-deny` with
+two clients and split TCP (`docker run --rm --privileged arc-e2e accounts`).
 `test/netns/degraded.sh` runs plain routing, ARC, and WireGuard under netem loss, delay, jitter, and
 bandwidth limits, and measures ARC's failover across two links, whether it moves traffic off a lossy
 link, and what redundancy does when both links are lossy (`docker run --rm --privileged arc-e2e degraded`).
@@ -172,3 +254,45 @@ holding only a few frames meanwhile (`docker run --rm --privileged arc-e2e stall
 (`docker run --rm --privileged arc-e2e bench` on macOS). Treat its numbers as relative: both ends
 share one machine.
 
+## The client on macOS
+
+The relay runs on Linux; the client also runs on macOS, with the same flags:
+
+```sh
+go build -o bin/ ./cmd/arc-client
+sudo bin/arc-client run -relay RELAY_IP:4433 -relay-key RELAY_PUBLIC_KEY -full-tunnel -dns 1.1.1.1
+```
+
+The interface is the next free `utunN` (`-tun utunN` picks one). macOS has
+no socket marks or policy routing, so a full tunnel works differently:
+
+- **Carriers are bound to their interface** (`IP_BOUND_IF`), which routes
+  them by that interface's own routes rather than the tunnel's. With no
+  `-bind`, the client binds to the default route's interface at startup and
+  stays there: if the Mac moves from Wi-Fi to Ethernet, restart it, or pass
+  `-bind en0 -bind en7` to use both.
+- **Routes** `0.0.0.0/1` and `128.0.0.0/1` go through the tunnel, and IPv6
+  is rejected. Directly connected networks keep their more specific
+  routes, so unlike on Linux the local network stays reachable outside the
+  tunnel. DNS still goes through the tunnel's resolver.
+- **DNS** is published to configd's dynamic store as a service that
+  overrides the primary one (`-dns-mode scutil`, the default), as VPN
+  clients do, and removed on exit. Nothing persistent changes. If the
+  client is killed before it can clean up, the next run replaces the
+  entry, or remove it with
+  `printf 'remove State:/Network/Service/arc/IPv4\nremove State:/Network/Service/arc/DNS\n' | sudo scutil`.
+
+`test/macos/e2e.sh` checks split and full tunnels against a relay in
+Docker Desktop.
+
+## License
+
+Copyright (C) 2026 Lane Shetron.
+
+ARC is free software: you can redistribute it and/or modify it under the
+terms of the GNU Affero General Public License, version 3, as published by
+the Free Software Foundation. See [LICENSE](LICENSE) for the full text.
+
+If you run a modified version as a network service, the AGPL requires you to
+offer its users the corresponding source code. For other licensing terms,
+contact the copyright holder.

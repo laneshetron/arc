@@ -46,6 +46,9 @@ jobs:
       - name: HTTPS front end to end in network namespaces
         if: success() || failure() # independent of e2e.sh's result
         run: sudo ./test/netns/front.sh bin
+      - name: account isolation end to end in network namespaces
+        if: success() || failure()
+        run: sudo ./test/netns/accounts.sh bin
 
   degraded:
     runs-on: ubuntu-latest
