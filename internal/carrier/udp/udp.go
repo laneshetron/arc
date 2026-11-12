@@ -9,9 +9,12 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"sync/atomic"
 	"syscall"
+	"time"
 
 	"golang.org/x/net/ipv4"
+	"golang.org/x/sys/unix"
 )
 
 // MaxDatagram is the largest datagram the carrier reads.
@@ -44,8 +47,18 @@ type Options struct {
 	// only there and receives only from there. The kernel resolves the
 	// route and policy once instead of for every datagram (on macOS, a send
 	// through a bound interface then takes about 9 µs of CPU instead of 24).
+	//
+	// If the peer is unreachable when the socket opens (its interface is
+	// down, or has no address or route yet), Listen still succeeds: the
+	// socket stays unconnected, sends fail, and each WriteBatch at most
+	// once per connectRetry tries to connect again, so the carrier joins
+	// once its interface can reach the peer (see Connected).
 	Peer netip.AddrPort
 }
+
+// connectRetry is how often a socket that could not connect to its peer
+// tries again, on sends.
+const connectRetry = time.Second
 
 // Conn is a UDP carrier socket. Reads and writes may run on different
 // goroutines, but each must be used by only one goroutine at a time.
@@ -61,6 +74,13 @@ type Conn struct {
 	gsoBufs [][]byte
 	gro     *groReader     // non-nil when UDP_GRO is enabled; see gro_linux.go
 	peer    netip.AddrPort // the connected peer; zero if unconnected
+
+	// For a socket whose peer was unreachable when it opened: raw
+	// connects it later, on the writing goroutine, which alone uses
+	// nextConnect.
+	raw         syscall.RawConn
+	pending     atomic.Bool // not yet connected to peer
+	nextConnect time.Time
 
 	// Caches for the send path: the last destination's *net.UDPAddr and
 	// the last segment size's control message, which would otherwise be
@@ -105,14 +125,19 @@ func Listen(addr netip.AddrPort, opts Options) (*Conn, error) {
 		return sockErr
 	}}
 	var uc *net.UDPConn
+	pending := false
 	if opts.Peer.IsValid() {
 		d := net.Dialer{LocalAddr: net.UDPAddrFromAddrPort(addr), Control: lc.Control}
 		nc, err := d.DialContext(context.Background(), "udp4", opts.Peer.String())
-		if err != nil {
+		if err == nil {
+			uc = nc.(*net.UDPConn)
+		} else if unreachable(err) {
+			pending = true // connect on a later send
+		} else {
 			return nil, err
 		}
-		uc = nc.(*net.UDPConn)
-	} else {
+	}
+	if uc == nil {
 		pc, err := lc.ListenPacket(context.Background(), "udp4", addr.String())
 		if err != nil {
 			return nil, err
@@ -124,7 +149,13 @@ func Listen(addr netip.AddrPort, opts Options) (*Conn, error) {
 		uc.SetReadBuffer(opts.BufferSize)
 		uc.SetWriteBuffer(opts.BufferSize)
 	}
-	c := &Conn{uc: uc, pc: ipv4.NewPacketConn(uc), peer: opts.Peer}
+	raw, err := uc.SyscallConn()
+	if err != nil {
+		uc.Close()
+		return nil, err
+	}
+	c := &Conn{uc: uc, pc: ipv4.NewPacketConn(uc), peer: opts.Peer, raw: raw}
+	c.pending.Store(pending)
 	if !opts.NoOffload {
 		c.gso = gsoSupported(uc)
 		c.gro = enableGRO(uc)
@@ -187,6 +218,11 @@ func (c *Conn) WriteBatch(pkts [][]byte, addrs []netip.AddrPort) error {
 				return fmt.Errorf("udp: send to %v on a socket connected to %v", to, c.peer)
 			}
 		}
+		if c.pending.Load() {
+			if err := c.connectPending(); err != nil {
+				return err // the batch is dropped
+			}
+		}
 	}
 	if c.gso {
 		err := c.writeGSO(pkts, addrs)
@@ -234,6 +270,43 @@ func (c *Conn) sendAll(msgs []ipv4.Message) error {
 		}
 	}
 	return first
+}
+
+// connectPending connects a socket whose peer was unreachable when it
+// opened, at most once per connectRetry.
+func (c *Conn) connectPending() error {
+	now := time.Now()
+	if now.Before(c.nextConnect) {
+		return fmt.Errorf("udp: not yet connected to %v", c.peer)
+	}
+	sa := &unix.SockaddrInet4{Port: int(c.peer.Port()), Addr: c.peer.Addr().As4()}
+	var err error
+	if cerr := c.raw.Control(func(fd uintptr) { err = unix.Connect(int(fd), sa) }); cerr != nil {
+		err = cerr
+	}
+	if err != nil {
+		c.nextConnect = now.Add(connectRetry)
+		return fmt.Errorf("udp: connecting to %v: %w", c.peer, err)
+	}
+	c.pending.Store(false)
+	return nil
+}
+
+// Connected reports whether a socket with a peer is connected to it. It
+// is false only while the peer has been unreachable since the socket
+// opened.
+func (c *Conn) Connected() bool { return !c.pending.Load() }
+
+// unreachable reports whether connecting failed because the peer cannot
+// be reached from here now: the interface is down, or has no address or
+// route. Those may change; other errors will not.
+func unreachable(err error) bool {
+	for _, e := range []syscall.Errno{syscall.ENETUNREACH, syscall.EHOSTUNREACH, syscall.ENETDOWN, syscall.EADDRNOTAVAIL} {
+		if errors.Is(err, e) {
+			return true
+		}
+	}
+	return false
 }
 
 // refused reports whether err is an ICMP error from an earlier datagram,
