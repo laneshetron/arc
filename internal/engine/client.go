@@ -114,6 +114,25 @@ type carrierState struct {
 
 	out [][]byte         // reused per flush: datagrams for this carrier
 	to  []netip.AddrPort // and their destinations
+
+	warnAt    time.Time // when the next send failure may be logged
+	sendFails int       // send failures since the last one logged
+}
+
+// sendWarnInterval is the least time between a carrier's "send failed"
+// warnings. A carrier whose sends keep failing (the network down, or its
+// address gone) fails on every flush, many times a millisecond under load.
+const sendWarnInterval = 2 * time.Second
+
+// sendFailed logs a failed send, unless one was logged in the last
+// sendWarnInterval; the next warning counts the failures in between.
+func (cs *carrierState) sendFailed(log *slog.Logger, now time.Time, err error) {
+	cs.sendFails++
+	if now.Before(cs.warnAt) {
+		return
+	}
+	log.Warn("send failed", "carrier", cs.Name, "err", err, "failures", cs.sendFails)
+	cs.warnAt, cs.sendFails = now.Add(sendWarnInterval), 0
 }
 
 // slotRetry is how soon to retry joining when the relay has not issued a
@@ -514,7 +533,7 @@ func flushTransmits(c *session.Client, carriers []*carrierState, pinned int, log
 			continue
 		}
 		if err := cs.Conn.WriteBatch(cs.out, cs.to); err != nil {
-			log.Warn("send failed", "carrier", cs.Name, "err", err)
+			cs.sendFailed(log, time.Now(), err)
 		}
 		// WriteBatch has copied or sent everything; the buffers are free.
 		for i, p := range cs.out {
