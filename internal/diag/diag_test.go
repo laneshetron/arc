@@ -312,10 +312,12 @@ func TestStoreQuotaConcurrent(t *testing.T) {
 		})
 	}
 	wg.Wait()
-	// Together they need 6 KiB of 5: at least one is refused, whichever
-	// ran out of room first, and what is kept is complete.
+	// Together they need 6 KiB of 5: either one ran out of room while the
+	// others were in progress, or one finished first and was then pruned
+	// for the last. Either way what remains is whole uploads, within the
+	// limit.
 	used := dirSize(t, filepath.Join(dir, "friend"))
-	if used > maxAccount || kept > 2 || used != int64(kept)*(2<<10) {
+	if used > maxAccount || used%(2<<10) != 0 || used > int64(kept)*(2<<10) {
 		t.Fatalf("account holds %d bytes after %d of 3 uploads were kept", used, kept)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "friend", "20261109T120000.000Z-10.77.0.9.jsonl")); err == nil {
