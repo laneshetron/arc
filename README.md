@@ -22,7 +22,7 @@ ARC is a multipath, carrier-agnostic overlay VPN. A TUN interface gives applicat
 
 ## Development
 
-Use Go 1.26.10 or a newer supported patched release. CI checks reachable
+Use Go 1.26.11 or a newer supported patched release. CI checks reachable
 vulnerabilities with govulncheck as well as running the tests.
 
 ```sh
