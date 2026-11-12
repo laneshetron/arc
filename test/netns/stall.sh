@@ -111,17 +111,33 @@ if [[ $last_hop != 0 ]]; then
   WIFI="parent 1:1"
 fi
 # A tbf change resets its fifo's limit to the tbf's own (here, in packets),
-# so the stall shrinks the fifo after stopping the bucket.
+# so the stall shrinks the fifo after stopping the bucket. Running again
+# sets the fifo's limit back explicitly as well, rather than rely on that,
+# and check_wifi confirms it after setup and after each run: a queue left
+# at HOLD would skew every later cell.
+FIFO=10000
 $R tc qdisc replace dev r0 $WIFI handle 10: tbf $RUN limit 10000
-$R tc qdisc replace dev r0 parent 10:1 handle 20: pfifo limit 10000
+$R tc qdisc replace dev r0 parent 10:1 handle 20: pfifo limit $FIFO
 $C tc qdisc replace dev c0 $WIFI handle 10: tbf $RUN limit 10000000
 wifi() { # wifi RUN|STOP
   ip netns exec arc-r tc qdisc change dev r0 $WIFI handle 10: tbf $1 limit 10000
   if [[ $1 == "$STOP" ]]; then
     ip netns exec arc-r tc qdisc change dev r0 parent 10:1 handle 20: pfifo limit "$HOLD"
+  else
+    ip netns exec arc-r tc qdisc change dev r0 parent 10:1 handle 20: pfifo limit $FIFO
   fi
   ip netns exec arc-c tc qdisc change dev c0 $WIFI handle 10: tbf $1 limit 10000000
 }
+check_wifi() { # the AP's queue and both buckets are as configured, running
+  local fifo tbf
+  fifo=$($R tc qdisc show dev r0 | awk '$2 == "pfifo" { print $NF }')
+  tbf=$($R tc qdisc show dev r0 | awk '$2 == "tbf" { for (i = 1; i < NF; i++) if ($i == "rate") print $(i + 1) }')
+  if [[ $fifo != "${FIFO}p" || $tbf != 800Mbit ]]; then
+    echo "AP queue not restored: pfifo limit $fifo, tbf rate $tbf" >&2
+    exit 1
+  fi
+}
+check_wifi
 start_stalls() {
   local stall=${STALL%ms} period=${PERIOD%ms}
   (
@@ -137,6 +153,7 @@ start_stalls() {
 stop_stalls() {
   if [[ -n $STALLER ]]; then kill "$STALLER"; wait "$STALLER" 2>/dev/null || true; STALLER=; fi
   wifi "$RUN"
+  check_wifi
 }
 
 tcp() { # tcp [IPERF_ARGS...]: prints goodput in Mbit/s, or 0

@@ -119,16 +119,16 @@ packets.
 
 ### 3.2 Negotiation and control
 
-- `AUTH_RESULT` features **bit 3 (`RETRANSMIT`)**: the relay will
+- `AUTH_RESULT` features **bit 4 (`RETRANSMIT`)**: the relay will
   retransmit downlink IP packets on request. A relay that doesn't
   advertise it never retransmits IP payloads.
-- New client → relay frame **`RETRANSMIT` (`0x17`, 5 bytes:
+- New client → relay frame **`RETRANSMIT` (`0x18`, 5 bytes:
   `seq:u32; mode:u8`)**, handled like `FEC` and `REDUNDANCY`: mode 0 off,
   1 on. Other modes are malformed. It is retransmitted until
   acknowledged, and the relay applies only a `seq` greater than the last
   applied. The client controls it because the client knows its link
   (§3.7).
-- Sent only when bit 3 is advertised. `0x17` is in the required range
+- Sent only when bit 4 is advertised. `0x18` is in the required range
   (§10): an old relay rejects the packet, so a client must not send it
   without the bit.
 
@@ -204,7 +204,7 @@ after the stall ends. This costs at most one extra ACK per gap.
 `-retransmit off|on`, defaulting to `on` once the measurements in §5
 justify it. The cost is near zero when nothing is lost: memory at the
 relay and 8 bytes per packet. The client asks for it on every session
-whose relay advertises bit 3. An `auto` mode, on only while downlink
+whose relay advertises bit 4. An `auto` mode, on only while downlink
 losses come in runs, can be added if `on` proves costly somewhere.
 
 ## 4. How it interacts with the tunneled transport
@@ -327,13 +327,17 @@ runs the same day as the change (a draft PR carrying main) for a baseline.
 
 ## 6. Spec changes
 
-- §10.1: frame `0x17 RETRANSMIT`, `AUTH_RESULT` features bit 3.
+- §10.1: frame `0x18 RETRANSMIT`, `AUTH_RESULT` features bit 4.
 - §10.2: immediate acknowledgement after a gap while retransmission is
   on. "A missing ACK does not trigger retransmission of IP payloads"
-  becomes "unless retransmission is negotiated (§11.4)".
+  becomes "unless retransmission is negotiated (§11.5)".
 - §11: "v1 does not retransmit TUN datagrams" gains the same exception.
-- New §11.4: this design's §3.
+- New §11.5: this design's §3.
 - `wire-registry.md`: the frame and the feature bit.
+
+These are the next free identifiers as of writing (`0x17`, bit 3 and
+§11.4 went to diagnostics uploads). Check the registry again when
+implementing, and take whatever is free then.
 
 ## 7. Implementation plan (one reviewed PR each)
 
