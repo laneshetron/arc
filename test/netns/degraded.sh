@@ -23,7 +23,7 @@
 #     goodput, uploading and downloading
 #   - with both links at 5% loss (RTT ~0 and 40 ms, uniform and in bursts),
 #     -redundancy auto at least halves ping loss and at least doubles TCP
-#     goodput
+#     goodput, each pooled over 3 alternating runs per mode
 #   - a session comes up within 15 s with both links at 70% loss
 #   - TCP runs over the TLS/TCP carrier when UDP is blocked (Part 3)
 #   - split TCP carries TCP at 50% loss, and at least doubles ARC's
@@ -73,14 +73,16 @@ PIDS+=("$ARC1")
 wait_until 10 grep -q "session established" "$WORK/client1.log" ||
   { cat "$WORK/client1.log"; exit 1; }
 
+# Ubuntu 26.04 confines wg with AppArmor to key files under /etc/wireguard,
+# so the private keys reach it through a pipe instead of a path.
 (umask 077; wg genkey >"$WORK/wg-relay.key"; wg genkey >"$WORK/wg-client.key")
 ip -n arc-r link add wg0 type wireguard
-$R wg set wg0 listen-port 51820 private-key "$WORK/wg-relay.key" \
+$R wg set wg0 listen-port 51820 private-key <(cat "$WORK/wg-relay.key") \
   peer "$(wg pubkey <"$WORK/wg-client.key")" allowed-ips 10.88.0.2/32
 ip -n arc-r addr add 10.88.0.1/24 dev wg0
 ip -n arc-r link set wg0 up
 ip -n arc-c link add wg0 type wireguard
-$C wg set wg0 private-key "$WORK/wg-client.key" \
+$C wg set wg0 private-key <(cat "$WORK/wg-client.key") \
   peer "$(wg pubkey <"$WORK/wg-relay.key")" persistent-keepalive 10 \
   allowed-ips 0.0.0.0/0 endpoint 192.168.10.2:51820
 ip -n arc-c addr add 10.88.0.2/24 dev wg0
@@ -340,9 +342,24 @@ sleep 1
 # in runs of several, so 300 pings see only a few bursts either way, and
 # one overlap of bursts on both links can cost redundancy its margin; those
 # scenarios send 1000.
-both_lossy() { # both_lossy NAME REDUNDANCY PINGS NETEM_ARGS...: sets BL_MBPS and BL_LOSS
-  local name=$1 mode=$2 pings=$3 avg
-  shift 3
+#
+# A single 10 s TCP run under 5% loss at 40 ms RTT varies several-fold
+# from run to run (a few retransmission timeouts more or less), more so
+# under bursty loss: across 36 CI runs, goodput without redundancy ranged
+# 1.2-11.7 Mbit/s (uniform) and 2-17.5 (bursty), and one run against one
+# failed "at least doubles" in about 1 in 10 (uniform) and 1 in 35
+# (bursty). So each mode gets ROUNDS runs, alternating off and on so that
+# drift in the runner's speed hits both, and the check compares their
+# pooled goodput (the mean of equal-length runs: the goodput of all of
+# them end to end). Resampling those CI runs, three rounds bring the
+# false-failure rate to about 1% (uniform, 40 ms) and 0.1% (bursty), while
+# a redundancy that did nothing would still fail it over 90% of the time
+# (and fail the ping check always). The pings are split across the rounds
+# and pooled the same way.
+ROUNDS=3
+both_lossy() { # both_lossy REDUNDANCY PINGS NETEM_ARGS...: sets BL_MBPS and BL_LOSS
+  local mode=$1 pings=$2 avg
+  shift 2
   start_multipath_client "$mode" "client-$mode.log"
   impair 0 "$@"
   impair 1 "$@"
@@ -350,27 +367,38 @@ both_lossy() { # both_lossy NAME REDUNDANCY PINGS NETEM_ARGS...: sets BL_MBPS an
   read -r BL_LOSS avg <<<"$(ping_stats "$pings")"
   unimpair 0
   unimpair 1
-  MP_ROWS+=("$(printf '%-34s redundancy %-6s TCP %6s Mbit/s, ping loss %s%%' "$name" "$mode" "$BL_MBPS" "$BL_LOSS")")
 }
+num() { awk -v v="$1" 'BEGIN { printf(v >= 100 ? "%.0f" : "%.3g", v) }'; } # 3 significant digits, no exponent
+mean() { num "$(awk 'BEGIN { for (i = 1; i < ARGC; i++) s += ARGV[i]; print s / (ARGC - 1) }' "$@")"; }
 compare_redundancy() { # compare_redundancy NAME PINGS NETEM_ARGS...
-  local name=$1 pings=$2 off_mbps off_loss
+  local name=$1 pings=$2 round mode off_mbps off_loss on_mbps on_loss
+  local -A mbps=() loss=()
   shift 2
-  both_lossy "$name" off "$pings" "$@"
-  off_mbps=$BL_MBPS off_loss=$BL_LOSS
-  both_lossy "$name" auto "$pings" "$@"
+  for ((round = 1; round <= ROUNDS; round++)); do
+    for mode in off auto; do
+      both_lossy "$mode" $(((pings + ROUNDS - 1) / ROUNDS)) "$@"
+      mbps[$mode]+=" $BL_MBPS" loss[$mode]+=" $(num "$BL_LOSS")"
+    done
+  done
+  off_mbps=$(mean ${mbps[off]}) off_loss=$(mean ${loss[off]})
+  on_mbps=$(mean ${mbps[auto]}) on_loss=$(mean ${loss[auto]})
+  for mode in off auto; do
+    MP_ROWS+=("$(printf '%-34s redundancy %-6s TCP %6s Mbit/s (runs%s), ping loss %s%% (runs%s)' \
+      "$name" "$mode" "$(mean ${mbps[$mode]})" "${mbps[$mode]}" "$(mean ${loss[$mode]})" "${loss[$mode]}")")
+  done
   if awk -v o="$off_loss" 'BEGIN { exit !(o < 2) }'; then
-    # Bursty loss can miss a 300-ping run entirely; then there is nothing
+    # Bursty loss can miss a short ping run entirely; then there is nothing
     # to halve, and the goodput check below carries the comparison.
     echo "  ping loss without redundancy was only $off_loss%; not comparing ($name)"
-  elif awk -v a="$BL_LOSS" -v o="$off_loss" 'BEGIN { exit !(a < o / 2) }'; then
-    pass "redundancy cut ping loss from $off_loss% to $BL_LOSS% ($name)"
+  elif awk -v a="$on_loss" -v o="$off_loss" 'BEGIN { exit !(a < o / 2) }'; then
+    pass "redundancy cut ping loss from $off_loss% to $on_loss% ($name; runs${loss[off]} against${loss[auto]})"
   else
-    fail "redundancy left ping loss at $BL_LOSS%, against $off_loss% without ($name)"
+    fail "redundancy left ping loss at $on_loss%, against $off_loss% without ($name; runs${loss[auto]} against${loss[off]})"
   fi
-  if awk -v a="$BL_MBPS" -v o="$off_mbps" 'BEGIN { exit !(a > 2 * o) }'; then
-    pass "redundancy raised TCP goodput from $off_mbps to $BL_MBPS Mbit/s ($name)"
+  if awk -v a="$on_mbps" -v o="$off_mbps" 'BEGIN { exit !(a > 2 * o) }'; then
+    pass "redundancy raised TCP goodput from $off_mbps to $on_mbps Mbit/s, mean of $ROUNDS ($name; runs${mbps[off]} against${mbps[auto]})"
   else
-    fail "redundancy gave $BL_MBPS Mbit/s TCP goodput, against $off_mbps without ($name)"
+    fail "redundancy gave $on_mbps Mbit/s TCP goodput, against $off_mbps without, mean of $ROUNDS ($name; runs${mbps[auto]} against${mbps[off]})"
   fi
 }
 compare_redundancy "both links at 5% loss" 300 loss 5%

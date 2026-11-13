@@ -98,13 +98,15 @@ PIDS=()
 $C ip route del 192.168.20.0/24 2>/dev/null || true
 
 # --- WireGuard -----------------------------------------------------------
+# Ubuntu 26.04 confines wg with AppArmor to key files under /etc/wireguard,
+# so the private keys reach it through a pipe instead of a path.
 (umask 077; wg genkey >"$WORK/wg-relay.key"; wg genkey >"$WORK/wg-client.key")
 ip -n arc-r link add wg0 type wireguard
-$R wg set wg0 listen-port 51820 private-key "$WORK/wg-relay.key" \
+$R wg set wg0 listen-port 51820 private-key <(cat "$WORK/wg-relay.key") \
   peer "$(wg pubkey <"$WORK/wg-client.key")" allowed-ips 10.88.0.2/32
 ip -n arc-r addr add 10.88.0.1/24 dev wg0
 ip -n arc-c link add wg0 type wireguard
-$C wg set wg0 private-key "$WORK/wg-client.key" \
+$C wg set wg0 private-key <(cat "$WORK/wg-client.key") \
   peer "$(wg pubkey <"$WORK/wg-relay.key")" allowed-ips 0.0.0.0/0 endpoint 192.168.10.2:51820
 ip -n arc-c addr add 10.88.0.2/24 dev wg0
 for mtu in 1420 1280; do
