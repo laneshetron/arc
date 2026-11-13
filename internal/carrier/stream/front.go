@@ -56,6 +56,11 @@ type FrontOptions struct {
 	// VisitorIdle closes a visitor's keep-alive connection after this
 	// long without a request (default 60 seconds).
 	VisitorIdle time.Duration
+	// Report, if set, learns of each carrier connection when it is
+	// upgraded and when it ends (see ConnReport). Visitors, including
+	// requests whose token did not admit them, are not reported. It is
+	// called from the connection's goroutine and must not block.
+	Report func(ConnReport)
 	// Idle closes a carrier connection that receives nothing for this
 	// long (default 5 minutes).
 	Idle time.Duration
@@ -73,6 +78,7 @@ type Front struct {
 	adm    *admission
 	cover  http.Handler
 	tokens [][]byte
+	report func(ConnReport)
 }
 
 // ListenFront starts the front on addr.
@@ -104,6 +110,7 @@ func ListenFront(addr string, opts FrontOptions) (*Front, error) {
 	// A browser-alike offer must succeed: the cover site is ordinary
 	// HTTPS, h2 included.
 	cfg.NextProtos = []string{"h2", "http/1.1"}
+	noteHello(cfg)
 	tcp, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, err
@@ -119,6 +126,7 @@ func ListenFront(addr string, opts FrontOptions) (*Front, error) {
 		adm:    adm,
 		cover:  opts.Site,
 		tokens: opts.Tokens,
+		report: opts.Report,
 	}
 	if f.cover == nil {
 		f.cover = http.HandlerFunc(defaultCover)
@@ -155,9 +163,13 @@ func (f *Front) handle(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		conn.SetDeadline(time.Time{}) // the header timeout must not govern the carrier
+		var raw *countedConn
 		if ac, ok := conn.(*tls.Conn).NetConn().(*admittedConn); ok {
-			if tcp, ok := ac.Conn.(*net.TCPConn); ok {
-				tcp.SetNoDelay(true)
+			raw, _ = ac.Conn.(*countedConn)
+			if raw != nil {
+				if tcp, ok := raw.Conn.(*net.TCPConn); ok {
+					tcp.SetNoDelay(true)
+				}
 			}
 			ac.permit.established() // a carrier now, off the visitor budgets
 		}
@@ -168,7 +180,20 @@ func (f *Front) handle(w http.ResponseWriter, r *http.Request) {
 			b, _ := bufrw.Reader.Peek(n)
 			pc = &prefixConn{Conn: conn, prefix: append([]byte(nil), b...)}
 		}
-		go f.reg.serve(pc)
+		report := f.report
+		if raw == nil {
+			report = nil
+		}
+		go func() {
+			var opened func(netip.AddrPort)
+			if report != nil {
+				opened = func(a netip.AddrPort) { report(raw.report(true, a, nil)) }
+			}
+			addr, err := f.reg.serve(pc, opened)
+			if report != nil && f.reg.ctx.Err() == nil {
+				report(raw.report(false, addr, err))
+			}
+		}()
 		return
 	}
 	f.cover.ServeHTTP(w, r)

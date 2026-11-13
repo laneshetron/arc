@@ -250,6 +250,7 @@ func run(args []string) error {
 
 	var streams engine.DatagramConn
 	tlsAddr := ""
+	attempts := engine.NewAttemptLog(log)
 	if *tlsListen != "" && *frontListen != "" {
 		return errors.New("-tls-listen and -front-listen are mutually exclusive: the engine carries one stream carrier")
 	}
@@ -261,7 +262,7 @@ func run(args []string) error {
 		ln, err := stream.Listen(*tlsListen, stream.ListenerOptions{
 			TLS: &tls.Config{Certificates: []tls.Certificate{cert}}, Camouflage: *tlsCamouflage,
 			MaxConns: *maxTLS, MaxPending: *maxTLSHandshakes, MaxConnsPerSource: *maxTLSPerSource,
-			HandshakeTimeout: *tlsHandshakeTimeout,
+			HandshakeTimeout: *tlsHandshakeTimeout, Report: attempts.TLS,
 		})
 		if err != nil {
 			return err
@@ -281,7 +282,7 @@ func run(args []string) error {
 			TLS:    &tls.Config{Certificates: []tls.Certificate{cert}},
 			Tokens: gw.Tokens(), Site: site,
 			MaxConns: *maxTLS, MaxPending: *maxTLSHandshakes, MaxConnsPerSource: *maxTLSPerSource,
-			HandshakeTimeout: *tlsHandshakeTimeout,
+			HandshakeTimeout: *tlsHandshakeTimeout, Report: attempts.TLS,
 		})
 		if err != nil {
 			return err
@@ -302,6 +303,7 @@ func run(args []string) error {
 			MaxSessions: *maxSessions, MaxPending: *maxPending, HandshakesPerSecond: *handshakeRate, HandshakesPerSource: *sourceRate,
 		},
 		Conn: conn, Streams: streams, TUN: dev, Gateway: gw, Logger: log, StatusInterval: *status,
+		Attempts: attempts,
 	}
 	if *diagDir != "" {
 		if err := os.MkdirAll(*diagDir, 0o700); err != nil {

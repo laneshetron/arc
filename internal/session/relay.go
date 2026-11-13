@@ -68,8 +68,8 @@ type RelayDatagram struct {
 }
 
 // RelayEvent is reported by Relay.PollEvent: SessionEstablished,
-// SessionClosed, StreamOpened, or RelayStreamUpdate. IP packets from
-// clients come from Relay.PollIP.
+// SessionClosed, StreamOpened, RelayStreamUpdate, or HandshakeFailed. IP
+// packets from clients come from Relay.PollIP.
 type RelayEvent interface{ relayEvent() }
 
 type SessionEstablished struct{ Session *RelaySession }
@@ -97,10 +97,21 @@ type RelayStreamUpdate struct {
 	ID      uint32
 }
 
+// HandshakeFailed reports a HANDSHAKE_INIT the relay admitted but could
+// not answer: its Noise message did not decrypt, as when the client
+// pinned another relay key, or the packet was corrupted. From is
+// unauthenticated, and Relay.HandshakesPerSource bounds how often one
+// source can cause this.
+type HandshakeFailed struct {
+	From netip.AddrPort
+	Err  error
+}
+
 func (SessionEstablished) relayEvent() {}
 func (SessionClosed) relayEvent()      {}
 func (StreamOpened) relayEvent()       {}
 func (RelayStreamUpdate) relayEvent()  {}
+func (HandshakeFailed) relayEvent()    {}
 
 // RelayStats counts relay-wide events.
 type RelayStats struct {
@@ -157,6 +168,8 @@ type RelaySession struct {
 	credential    []byte
 	result        wire.AuthResult
 	created       time.Time
+	established   time.Time // when the client authenticated; zero until then
+	initResends   int       // retransmitted HANDSHAKE_INITs: the client had not heard the response
 	resp          []byte
 	initKey       initKey
 	nextPathID    uint32
@@ -237,6 +250,7 @@ func (r *Relay) handleInit(now time.Time, from netip.AddrPort, b []byte) {
 	if s := r.inits[key]; s != nil {
 		// A retransmitted INIT: resend the cached response without new DH.
 		r.stats.RespRetransmits++
+		s.initResends++
 		r.out = append(r.out, RelayDatagram{Addr: from, Data: s.resp})
 		return
 	}
@@ -270,6 +284,7 @@ func (r *Relay) handleInit(now time.Time, from netip.AddrPort, b []byte) {
 		&init, relayCID, crypto.ResetToken(r.cfg.ResetSecret, relayCID))
 	if err != nil {
 		r.stats.HandshakeFailures++
+		r.events = append(r.events, HandshakeFailed{From: from, Err: err})
 		return
 	}
 	if r.pending >= r.cfg.MaxPending {
@@ -680,6 +695,7 @@ func (s *RelaySession) onAuth(now time.Time, credential []byte) bool {
 	}
 	s.result = result
 	s.state = StateActive
+	s.established = now
 	r.leavePending(s)
 	s.conn.queue(result)
 	s.conn.setProbeSizes(result.TunMTU, result.Features&(wire.FeatureRedundancy|wire.FeatureFEC) != 0)
@@ -773,6 +789,24 @@ func (s *RelaySession) State() State            { return s.state }
 func (s *RelaySession) Config() wire.AuthResult { return s.result }
 func (s *RelaySession) ClientStatic() []byte    { return s.clientStatic }
 func (s *RelaySession) Stats() Stats            { return s.conn.stats }
+
+// Handshake describes how the session began: the address its
+// HANDSHAKE_INIT came from, when it arrived, how many times the client
+// resent it, and when the client authenticated (zero if it never did).
+// A client resends its INIT only while it has not heard the response, so
+// resends of a handshake that never completed suggest the relay's replies
+// were not reaching the client.
+func (s *RelaySession) Handshake() HandshakeInfo {
+	return HandshakeInfo{From: s.initKey.addr, Started: s.created, Resends: s.initResends, Established: s.established}
+}
+
+// HandshakeInfo is what RelaySession.Handshake reports.
+type HandshakeInfo struct {
+	From        netip.AddrPort
+	Started     time.Time
+	Resends     int
+	Established time.Time
+}
 
 // Paths describes the session's joined paths.
 func (s *RelaySession) Paths(now time.Time) []PathInfo { return s.conn.pathInfo(now) }

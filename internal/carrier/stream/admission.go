@@ -4,6 +4,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"time"
 )
 
 // admissionLimits bound the TCP connections a relay endpoint holds,
@@ -146,7 +147,7 @@ func (l *admittedListener) Accept() (net.Conn, error) {
 			return nil, err
 		}
 		if p := l.adm.admit(c); p != nil {
-			return &admittedConn{Conn: c, permit: p}, nil
+			return &admittedConn{Conn: &countedConn{Conn: c, accepted: time.Now()}, permit: p}, nil
 		}
 		c.Close()
 	}

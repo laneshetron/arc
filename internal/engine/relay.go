@@ -43,6 +43,11 @@ type RelayConfig struct {
 	// Diagnostics, if set, keeps clients' diagnostics uploads (spec
 	// §11.4), and the relay advertises that it accepts them.
 	Diagnostics *diag.Store
+
+	// Attempts logs handshakes that never complete and TLS connections;
+	// nil logs to Logger. Pass the same one as Streams' Report, so
+	// sessions on TLS carriers are logged with their TCP peers.
+	Attempts *AttemptLog
 }
 
 // DialTimeout bounds how long the relay tries to connect a stream.
@@ -78,6 +83,10 @@ func RunRelay(ctx context.Context, cfg RelayConfig) error {
 	}
 	go readPackets(ctx, cfg.TUN, tunCh, errc)
 
+	attempts := cfg.Attempts
+	if attempts == nil {
+		attempts = NewAttemptLog(log)
+	}
 	cfg.Session.Authorize = cfg.Gateway.Authorize
 	cfg.Session.Diagnostics = cfg.Diagnostics != nil
 	r := session.NewRelay(cfg.Session, time.Now())
@@ -143,11 +152,16 @@ func RunRelay(ctx context.Context, cfg RelayConfig) error {
 			case session.SessionEstablished:
 				cfg.Gateway.Bind(e.Session)
 				addr := netip.AddrFrom4(e.Session.Config().IPv4)
-				log.Info("session established", "client", e.Session.Addr(time.Now()),
-					"address", addr, "account", cfg.Gateway.AccountName(addr))
+				attempts.established(e.Session, time.Now(), "address", addr, "account", cfg.Gateway.AccountName(addr))
+			case session.HandshakeFailed:
+				attempts.failed(e)
 			case session.SessionClosed:
-				addr := netip.AddrFrom4(e.Session.Config().IPv4)
-				log.Info("session closed", "address", addr, "account", cfg.Gateway.AccountName(addr), "reason", e.Err)
+				if e.Session.Handshake().Established.IsZero() {
+					attempts.unestablished(e.Session, e.Err)
+				} else {
+					addr := netip.AddrFrom4(e.Session.Config().IPv4)
+					log.Info("session closed", "address", addr, "account", cfg.Gateway.AccountName(addr), "reason", e.Err)
+				}
 				cfg.Gateway.Release(e.Session)
 				for k, b := range bridges {
 					if k.s == e.Session {

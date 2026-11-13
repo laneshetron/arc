@@ -44,6 +44,10 @@ type ListenerOptions struct {
 	// Queue bounds packets waiting to be written per connection;
 	// DefaultQueue if zero.
 	Queue int
+	// Report, if set, learns of each admitted connection when it becomes
+	// a carrier and when it ends (see ConnReport). It is called from the
+	// connection's goroutine and must not block.
+	Report func(ConnReport)
 }
 
 // Listener accepts TLS/TCP carrier connections for a relay. Each
@@ -52,7 +56,8 @@ type ListenerOptions struct {
 // a client that reconnects arrives from a new address and is revalidated
 // as after NAT rebinding (§14.5). It implements the engine's DatagramConn.
 type Listener struct {
-	ln   net.Listener
+	ln   net.Listener // TCP; the TLS handshake runs on each connection's goroutine
+	tls  *tls.Config
 	opts ListenerOptions
 	reg  *registry  // established carriers, by synthetic address
 	adm  *admission // every accepted connection, pending or established
@@ -100,12 +105,13 @@ func Listen(addr string, opts ListenerOptions) (*Listener, error) {
 	if opts.Camouflage {
 		cfg.NextProtos = append(cfg.NextProtos, browserALPN...)
 	}
+	noteHello(cfg)
 	tcp, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, err
 	}
 	l := &Listener{
-		ln: tls.NewListener(tcp, cfg), opts: opts, reg: newRegistry(opts.MaxConns, opts.Queue, opts.Idle),
+		ln: tcp, tls: cfg, opts: opts, reg: newRegistry(opts.MaxConns, opts.Queue, opts.Idle),
 		adm: newAdmission(opts.limits()),
 	}
 	go l.accept()
@@ -132,23 +138,33 @@ func (l *Listener) accept() {
 			time.Sleep(10 * time.Millisecond) // e.g. out of file descriptors
 			continue
 		}
-		tc := conn.(*tls.Conn)
-		p := l.adm.admit(tc)
+		p := l.adm.admit(conn)
 		if p == nil {
-			tc.Close()
+			conn.Close()
 			continue
 		}
-		go l.serve(tc, p)
+		go l.serve(&countedConn{Conn: conn, accepted: time.Now()}, p)
 	}
 }
 
-func (l *Listener) serve(conn *tls.Conn, p *permit) {
+func (l *Listener) serve(raw *countedConn, p *permit) {
+	conn := tls.Server(raw, l.tls)
+	var addr netip.AddrPort
+	var err error
+	report := func(open bool) {
+		if l.opts.Report != nil {
+			l.opts.Report(raw.report(open, addr, err))
+		}
+	}
 	defer func() {
 		conn.Close()
 		p.release()
+		if l.reg.ctx.Err() == nil { // not when the listener closes
+			report(false)
+		}
 	}()
 	ctx, cancel := context.WithTimeout(l.reg.ctx, l.opts.HandshakeTimeout)
-	err := conn.HandshakeContext(ctx)
+	err = conn.HandshakeContext(ctx)
 	cancel()
 	if err != nil {
 		return
@@ -158,17 +174,20 @@ func (l *Listener) serve(conn *tls.Conn, p *permit) {
 	// authenticates the client.
 	proto := conn.ConnectionState().NegotiatedProtocol
 	if proto != ALPN && !(l.opts.Camouflage && slices.Contains(browserALPN, proto)) {
-		conn.Close()
+		err = ErrALPN
 		return
 	}
-	if tcp, ok := conn.NetConn().(*net.TCPConn); ok {
+	if tcp, ok := raw.Conn.(*net.TCPConn); ok {
 		tcp.SetNoDelay(true)
 	}
 	if l.reg.ctx.Err() != nil {
 		return
 	}
 	p.established()
-	l.reg.serve(conn)
+	addr, err = l.reg.serve(conn, func(a netip.AddrPort) {
+		addr = a
+		report(true)
+	})
 }
 
 // WriteBatch queues each packet for the connection its address names.

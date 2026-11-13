@@ -231,6 +231,27 @@ abandoned, and empty uploads are refused. Other files you put in an
 account's directory count toward its 64 MiB but are never deleted.
 `-journal` without `-share-diagnostics` keeps the journal locally only.
 
+A client that never gets a session up never uploads, so the relay logs
+what it sees of attempts, with each client's address:
+
+- `handshake not completed`: a handshake arrived and the relay answered,
+  but the client never authenticated. `init_resends` counts how often the
+  client resent its first message; it does so only until it hears the
+  answer, so resends mean the relay's replies were not reaching it.
+  None means nothing after the first message arrived.
+- `handshake rejected: unknown token`, and `handshake failed`, for a
+  client pinning another relay key (or a corrupted packet).
+- `tls connection failed`, with the `stage` it stopped at: `tcp` (nothing
+  arrived), `client_hello` (a ClientHello started but did not finish, or
+  did not parse), `server_hello` (the relay answered and the handshake
+  then failed), or `alpn`; with its SNI and ALPN, bytes each way and
+  duration. A carrier that ends logs `tls carrier closed` likewise.
+- `session established` names the TLS carrier's TCP peer, not its
+  internal address, and adds `handshake_seconds` and `init_resends`.
+
+These lines are unauthenticated, so they are limited to 60 a minute; the
+next line logged counts those dropped as `suppressed`.
+
 The end-to-end test builds this setup in three network namespaces:
 
 ```sh
