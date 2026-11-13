@@ -251,7 +251,9 @@ func RunRelay(ctx context.Context, cfg RelayConfig) error {
 				for _, p := range s.Paths(now) {
 					log.Info("path", "session", lease, "account", account, "id", p.ID, "downlink", p.Primary, "healthy", p.Healthy,
 						"flows", p.Flows, "srtt", p.SRTT.Round(100*time.Microsecond), "loss", fmt.Sprintf("%.3f", p.Loss),
-						"stream_mbit", fmt.Sprintf("%.2f", p.StreamRate*8/1e6), "stream_inflight", p.StreamInflight)
+						"stream_mbit", fmt.Sprintf("%.2f", p.StreamRate*8/1e6), "stream_inflight", p.StreamInflight,
+						"stream_backoffs", fmt.Sprintf("delay=%d loss=%d idle=%d", p.StreamBackoffsDelay, p.StreamBackoffsLoss, p.StreamBackoffsIdle),
+						"stalls", p.StreamStalls)
 				}
 			}
 		case <-timer.C:

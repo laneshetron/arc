@@ -24,7 +24,8 @@ type streamEnd struct {
 	eof      bool
 	eofAt    time.Time
 	err      error
-	maxBufed int // most bytes received and not yet read, if reading is paused
+	maxBufed int  // most bytes received and not yet read, if reading is paused
+	holdFin  bool // keep the stream open once send is written, for more
 }
 
 // streamPair drives one stream's two ends through a network.
@@ -690,6 +691,58 @@ func TestStreamCongestionWithAckBlackouts(t *testing.T) {
 			t.Errorf("%v queue: %.1f%% dropped with ack blackouts, %.1f%% without; want at most 3 points more",
 				queue, 100*got.dropped, 100*base.dropped)
 		}
+	}
+}
+
+// TestStreamBurstPacingDebtIsIdle writes bursts through the real send loop
+// (StreamWrite flushes) with the pacing allowance nearly spent. A burst
+// whose last packet runs the allowance into debt left nothing waiting; the
+// send loop then asks rate control whether it may send again, and taking
+// that refusal for data waiting on pacing made the round busy rather than
+// idle, so that delay samples in it backed the rate off (see #40). A burst
+// that does leave data waiting on pacing makes the round busy.
+func TestStreamBurstPacingDebtIsIdle(t *testing.T) {
+	n, s := streamNetwork(t, 105)
+	id, err := n.client.OpenStream(n.now, tcpDst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !n.runUntil(10*time.Second, func() bool {
+		n.pump()
+		for _, e := range n.relayEvents {
+			if e, ok := e.(StreamOpened); ok && e.ID == id {
+				return true
+			}
+		}
+		return false
+	}) {
+		t.Fatal("relay never reported the stream")
+	}
+	p := s.conn.paths[0]
+	payload := p.maxPacket - 100 // fits one packet with its headers
+	if _, err := s.StreamWrite(n.now, id, make([]byte, payload)); err != nil {
+		t.Fatal(err)
+	}
+	n.runFor(time.Second) // rate control started; the packet acknowledged
+	burst := func(size int) bool {
+		t.Helper()
+		p.cc.refill(n.now, p.maxPacket)
+		p.cc.tokens, p.cc.tokensAt, p.cc.roundBlocked = 1, n.now, false
+		p.cc.roundEnd = n.now.Add(time.Hour) // the round stays open
+		if k, err := s.StreamWrite(n.now, id, make([]byte, size)); err != nil || k != size {
+			t.Fatalf("StreamWrite: %d/%d, %v", k, size, err)
+		}
+		if p.cc.tokens >= 0 {
+			t.Fatalf("tokens %.0f after the burst; the test needs pacing debt", p.cc.tokens)
+		}
+		return p.cc.roundBlocked
+	}
+	if burst(payload) {
+		t.Error("a burst that ended in pacing debt, with nothing left to send, made the round busy")
+	}
+	n.runFor(time.Second)
+	if !burst(3 * payload) {
+		t.Error("a burst that left data waiting on pacing did not make the round busy")
 	}
 }
 

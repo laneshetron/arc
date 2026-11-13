@@ -93,11 +93,14 @@ type PathInfo struct {
 	// second, and StreamInflight its bytes in flight; 0 if unused.
 	StreamRate     float64
 	StreamInflight int
-	MaxPacket      int
-	LastRecv       time.Time
-	Flows          int     // flows pinned to the path (§15.2)
-	Capacity       float64 // estimated, in bytes per second; 0 if unmeasured
-	Eligible       bool    // may take new flows
+	// Stream rate backoffs so far: for queueing delay, for a loss spike,
+	// and of those, in rounds that didn't use the rate; and stalls seen.
+	StreamBackoffsDelay, StreamBackoffsLoss, StreamBackoffsIdle, StreamStalls int
+	MaxPacket                                                                 int
+	LastRecv                                                                  time.Time
+	Flows                                                                     int     // flows pinned to the path (§15.2)
+	Capacity                                                                  float64 // estimated, in bytes per second; 0 if unmeasured
+	Eligible                                                                  bool    // may take new flows
 }
 
 type path struct {
@@ -249,6 +252,9 @@ type conn struct {
 	streams   streamSet // see stream.go
 	// streamWake is when pacing next lets stream data go, if it is waiting.
 	streamWake time.Time
+	// streamsBlocked records that stream data waited for flow-control
+	// credit in the current sendStreams, for rate control (streamcc.go).
+	streamsBlocked bool
 
 	plaintext    []byte
 	ptScratch    []byte // reused to build each outgoing packet's plaintext
@@ -381,6 +387,8 @@ func (c *conn) pathInfo(now time.Time) []PathInfo {
 			SRTT: p.rtt.srtt(), MinRTT: p.rtt.minRTT(), Loss: loss, MaxPacket: p.maxPacket, LastRecv: p.lastRecv,
 			Flows: p.flows, Capacity: p.capacity(now), Burst: p.burst,
 			StreamRate: p.cc.rate, StreamInflight: p.sent.streamBytes,
+			StreamBackoffsDelay: p.cc.backoffsDelay, StreamBackoffsLoss: p.cc.backoffsLoss,
+			StreamBackoffsIdle: p.cc.backoffsIdle, StreamStalls: p.cc.stalls,
 		}
 		if prim != nil {
 			info.Eligible = c.eligible(now, p, prim)
@@ -574,10 +582,18 @@ func (c *conn) sendStreams(now time.Time) {
 	srtt := p.rtt.srtt()
 	p.cc.update(now, p.cc.baseRTT(p.rtt.minRTT()), srtt, p.maxPacket)
 	budget := p.maxPacket - wire.DataHeaderLen - wire.AEADTagLen
+	c.streamsBlocked = false
 	for {
 		ok, wake := p.cc.canSend(now, p.sent.streamBytes, srtt, p.maxPacket)
 		if !ok {
 			c.streamWake = wake
+			// The round waited on the window or pacing only if data was
+			// waiting: a burst's last packet leaves pacing debt, and the
+			// loop asks again though nothing is left to send. Counting that
+			// made a burst's round busy, not idle, and it backed off.
+			if c.streamsWaiting() {
+				p.cc.roundBlocked = true
+			}
 			return
 		}
 		frames, used := c.streamFrames[:0], 0
@@ -596,6 +612,9 @@ func (c *conn) sendStreams(now time.Time) {
 		}
 		c.streamFrames = frames[:0]
 		if len(frames) == 0 {
+			if c.streamsBlocked {
+				p.cc.roundBlocked = true // not idle: waiting on the receiver
+			}
 			return
 		}
 		// The sent packet keeps the frames for retransmission.
