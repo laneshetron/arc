@@ -97,8 +97,10 @@ func TestTLSSeparatePendingAndPeerBudgets(t *testing.T) {
 	for _, tc := range []struct {
 		name                                         string
 		maxPending, maxPerPeer, pendingPerPeer, want int
+		refused                                      Refusals
 	}{
-		{"pending", 2, 10, 1, 2}, {"all-connections-per-peer", 10, 1, 10, 3},
+		{"pending", 2, 10, 1, 2, Refusals{SourcePending: 1, Pending: 1, Sources: 2}},
+		{"all-connections-per-peer", 10, 1, 10, 3, Refusals{Source: 1, Sources: 1}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ln := &admissionListener{conns: make(chan net.Conn, 4)}
@@ -119,6 +121,14 @@ func TestTLSSeparatePendingAndPeerBudgets(t *testing.T) {
 			l.adm.mu.Unlock()
 			if got != tc.want || pending != tc.want || first != 1 {
 				t.Fatalf("admitted=%d pending=%d first-peer=%d", got, pending, first)
+			}
+			r := l.Refusals()
+			if r.Full != tc.refused.Full || r.Pending != tc.refused.Pending || r.Source != tc.refused.Source ||
+				r.SourcePending != tc.refused.SourcePending || r.Sources != tc.refused.Sources || r.TopSourceRefusals != 1 {
+				t.Errorf("refusals %+v; want %+v", r, tc.refused)
+			}
+			if r := l.Refusals(); r.Total() != 0 || r.Sources != 0 {
+				t.Errorf("refusals not reset: %+v", r)
 			}
 			for range tc.want {
 				select {

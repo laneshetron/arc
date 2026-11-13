@@ -186,6 +186,28 @@ func TestAttemptLogPeerChurn(t *testing.T) {
 	}
 }
 
+// TestAttemptLogRefusals logs one line for what admission limits refused
+// in an interval, and nothing for a quiet one.
+func TestAttemptLogRefusals(t *testing.T) {
+	a, lines := newTestAttemptLog()
+	a.refusals(session.RelayStats{InitsRefusedFull: 3, InitsRefusedLimited: 40}, stream.Refusals{})
+	a.refusals(session.RelayStats{InitsRefusedFull: 3, InitsRefusedLimited: 40}, stream.Refusals{})
+	top := netip.MustParseAddr("198.51.100.7")
+	a.refusals(session.RelayStats{InitsRefusedFull: 3, InitsRefusedLimited: 45},
+		stream.Refusals{SourcePending: 9, Pending: 1, Sources: 2, TopSource: top, TopSourceRefusals: 9})
+	recs := lines.records(t)
+	if len(recs) != 2 {
+		t.Fatalf("%d lines: %v", len(recs), recs)
+	}
+	if r := recs[0]; r["udp_relay_full"] != 3.0 || r["udp_rate_limited"] != 40.0 || r["tls_sources"] != nil {
+		t.Errorf("first %v", r)
+	}
+	if r := recs[1]; r["udp_relay_full"] != 0.0 || r["udp_rate_limited"] != 5.0 || r["tls_source_handshakes_full"] != 9.0 ||
+		r["tls_handshakes_full"] != 1.0 || r["tls_top_source"] != top.String() || r["tls_top_source_refused"] != 9.0 {
+		t.Errorf("second %v", r)
+	}
+}
+
 // rejectionRelay runs a relay with one account, token "tok", leasing
 // from network, logging to the returned lines.
 func rejectionRelay(t *testing.T, ctx context.Context, network string) (*udp.Conn, crypto.StaticKey, *logLines) {

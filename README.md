@@ -253,6 +253,12 @@ what it sees of attempts, with each client's address:
   carrier closed` likewise.
 - `session established` names the TLS carrier's TCP peer, not its
   internal address, and adds `handshake_seconds` and `init_resends`.
+- `connections refused by admission limits`, at most once a minute and
+  only if any were: handshakes dropped because the relay was full
+  (`udp_relay_full`) or over its handshake rate (`udp_rate_limited`), and
+  TCP connections closed before TLS because a limit was reached, by
+  which limit, with how many sources and the one refused most
+  (`tls_top_source`).
 
 These lines are unauthenticated, so they are limited to 60 a minute; the
 next line logged counts those dropped as `suppressed`.

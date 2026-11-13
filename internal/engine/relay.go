@@ -48,7 +48,16 @@ type RelayConfig struct {
 	// nil logs to Logger. Pass the same one as Streams' Report, so
 	// sessions on TLS carriers are logged with their TCP peers.
 	Attempts *AttemptLog
+	// RefusalInterval is how often the relay logs the connections its
+	// admission limits refused, if any were (default a minute).
+	RefusalInterval time.Duration
 }
+
+// refuser is a Streams endpoint that counts the connections its
+// admission limits refused.
+type refuser interface{ Refusals() stream.Refusals }
+
+var _, _ refuser = (*stream.Listener)(nil), (*stream.Front)(nil)
 
 // DialTimeout bounds how long the relay tries to connect a stream.
 const DialTimeout = 15 * time.Second
@@ -98,6 +107,13 @@ func RunRelay(ctx context.Context, cfg RelayConfig) error {
 		defer t.Stop()
 		status = t.C
 	}
+	if cfg.RefusalInterval <= 0 {
+		cfg.RefusalInterval = time.Minute
+	}
+	refusalTicker := time.NewTicker(cfg.RefusalInterval)
+	defer refusalTicker.Stop()
+	refusers, _ := cfg.Streams.(refuser)
+
 	var out, sout, toTUN [][]byte
 	var to, sto []netip.AddrPort
 
@@ -257,6 +273,12 @@ func RunRelay(ctx context.Context, cfg RelayConfig) error {
 			}
 		case e := <-bridgeEvents:
 			e.b.handle(time.Now(), e)
+		case <-refusalTicker.C:
+			var tls stream.Refusals
+			if refusers != nil {
+				tls = refusers.Refusals()
+			}
+			attempts.refusals(r.Stats(), tls)
 		case <-status:
 			now := time.Now()
 			for _, s := range r.LiveSessions() {

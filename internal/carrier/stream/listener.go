@@ -63,6 +63,10 @@ type Listener struct {
 	adm  *admission // every accepted connection, pending or established
 }
 
+// Refusals returns the connections refused by admission limits since it
+// was last called.
+func (l *Listener) Refusals() Refusals { return l.adm.takeRefusals() }
+
 // streamPrefix is the first 8 bytes of synthetic addresses: a unique
 // local IPv6 prefix spelling "arc/1" that no UDP client can have.
 var streamPrefix = [8]byte{0xfd, 'a', 'r', 'c', '/', '1', 0, 0}

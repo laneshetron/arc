@@ -81,6 +81,10 @@ type Front struct {
 	report func(ConnReport)
 }
 
+// Refusals returns the connections refused by admission limits since it
+// was last called.
+func (f *Front) Refusals() Refusals { return f.adm.takeRefusals() }
+
 // ListenFront starts the front on addr.
 func ListenFront(addr string, opts FrontOptions) (*Front, error) {
 	if opts.MaxConns == 0 {

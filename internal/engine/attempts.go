@@ -44,6 +44,7 @@ type AttemptLog struct {
 	at         time.Time
 	suppressed int
 	peers      map[netip.AddrPort]attemptPeer // TLS carrier address -> TCP peer
+	lastStats  session.RelayStats             // as of the last refusals line
 }
 
 type attemptPeer struct {
@@ -205,6 +206,32 @@ func (a *AttemptLog) failed(e session.HandshakeFailed) {
 	from, carrier := a.source(e.From)
 	a.line(slog.LevelInfo, "handshake failed: not for this relay's key, or corrupted",
 		"client", from, "carrier", carrier, "err", e.Err)
+}
+
+// refusals logs, in one line, the connections admission limits refused
+// since it was last called: HANDSHAKE_INITs from stats (cumulative) and
+// TCP connections from tls (since the last call). These are not otherwise
+// logged, since a flood would make one line each. It logs nothing if
+// nothing was refused.
+func (a *AttemptLog) refusals(stats session.RelayStats, tls stream.Refusals) {
+	a.mu.Lock()
+	full := stats.InitsRefusedFull - a.lastStats.InitsRefusedFull
+	limited := stats.InitsRefusedLimited - a.lastStats.InitsRefusedLimited
+	a.lastStats = stats
+	a.mu.Unlock()
+	if full+limited == 0 && tls.Total() == 0 {
+		return
+	}
+	var args []any
+	if full+limited > 0 {
+		args = append(args, "udp_relay_full", full, "udp_rate_limited", limited)
+	}
+	if tls.Total() > 0 {
+		args = append(args, "tls_relay_full", tls.Full, "tls_handshakes_full", tls.Pending,
+			"tls_source_full", tls.Source, "tls_source_handshakes_full", tls.SourcePending,
+			"tls_sources", tls.Sources, "tls_top_source", tls.TopSource, "tls_top_source_refused", tls.TopSourceRefusals)
+	}
+	a.log.Warn("connections refused by admission limits", args...)
 }
 
 func seconds(d time.Duration) float64 { return d.Round(10 * time.Millisecond).Seconds() }

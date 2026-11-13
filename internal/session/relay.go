@@ -123,6 +123,11 @@ type RelayStats struct {
 	ResetsSent        uint64
 	SpoofedDropped    uint64
 	Migrations        uint64 // validated address changes on existing paths
+	// HANDSHAKE_INITs dropped unanswered: the relay already held
+	// MaxSessions authenticated sessions, or the handshake rate limits
+	// (relay-wide or per source) refused the work.
+	InitsRefusedFull    uint64
+	InitsRefusedLimited uint64
 }
 
 type initKey struct {
@@ -256,6 +261,7 @@ func (r *Relay) handleInit(now time.Time, from netip.AddrPort, b []byte) {
 		return
 	}
 	if len(r.live)-r.pending >= r.cfg.MaxSessions {
+		r.stats.InitsRefusedFull++
 		return
 	}
 	source := from.Addr().Unmap()
@@ -274,6 +280,7 @@ func (r *Relay) handleInit(now time.Time, from netip.AddrPort, b []byte) {
 	// fails. Failed handshakes do not increase pending and cannot be used
 	// as the only measure of cryptographic work under load.
 	if !r.admission.allow(now, source, r.cfg.HandshakesPerSecond, r.cfg.HandshakesPerSource, cookieValid) {
+		r.stats.InitsRefusedLimited++
 		return
 	}
 	relayCID, ok := r.newCID()
