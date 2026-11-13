@@ -11,9 +11,14 @@ import (
 // stalls. Each path instead paces stream data at a rate driven by two
 // congestion signals that random loss does not produce:
 //
-//   - queueing delay: the lowest RTT sample in a round rising more than
-//     queueTarget above the path's minimum RTT, as a filling bottleneck
-//     queue causes;
+//   - queueing delay: the lowest RTT sample in two rounds running rising
+//     more than queueTarget above the path's minimum RTT, as a filling
+//     bottleneck queue causes. On links whose delay varies by itself (Wi-Fi
+//     aggregation and contention, by tens of milliseconds), the target
+//     widens to three times the spread of a round's samples above its lowest: a
+//     standing queue delays every sample alike, while jitter scatters
+//     them, and a round of a few scattered samples rarely includes the
+//     path's luckiest;
 //   - a loss spike: the loss rate of a round's stream packets rising well
 //     above the path's baseline loss, as overrunning a policer or a
 //     shallow buffer causes. Steady loss, however heavy, becomes the
@@ -26,6 +31,17 @@ import (
 // a full queue is about the bottleneck's rate (by at most half, or three
 // quarters ending slow start, if too little was acknowledged to tell), and
 // it holds while the queue drains.
+//
+// Neither signal counts around a stall: acknowledgements stopping for far
+// longer than usual while data is outstanding, then resuming, as when Wi-Fi
+// leaves the channel for tens of milliseconds (a Mac's AWDL). The access
+// point drops what it can't hold meanwhile and every RTT sample jumps, but
+// the link's capacity hasn't changed: lost data is retransmitted and the
+// rate holds. A stall delays the samples around it by no more than its own
+// length, though, so queueing delay beyond that still counts: a congested
+// bottleneck whose acknowledgements also stop now and then (or stall
+// detection mistaking a congested path's ACK gaps for stalls) must still
+// back off, or its queue would fill and stay full.
 // A cap on bytes
 // in flight stops sending into an outage, which produces no
 // acknowledgements to clock it.
@@ -60,6 +76,21 @@ const (
 	// ccLossy is the baseline loss at which spare sending capacity goes to
 	// repeating stream data in flight (see conn.nextRepeatFrame).
 	ccLossy = 0.5
+	// ccJitterGain weighs each round's sample spread (mean less lowest) in
+	// the jitter estimate, from rounds of at least ccJitterSamples samples,
+	// and ccJitterTargets is how many jitters of delay count as a queue.
+	ccJitterGain    = 1.0 / 8
+	ccJitterSamples = 4
+	ccJitterTargets = 3
+	// ccRecent is how many of the latest RTT samples slow start takes the
+	// lowest of, so that one delayed sample doesn't end it.
+	ccRecent = 4
+	// A stall is acknowledgements stopping, while data is outstanding, for
+	// at least ccMinStall, ccStallGaps usual gaps between them, and the
+	// path's base RTT: on a long path with little in flight, a regular
+	// cadence of acknowledgements tens of milliseconds apart is normal.
+	ccMinStall  = 30 * time.Millisecond
+	ccStallGaps = 8
 )
 
 // queueTarget is the queueing delay a path's minimum RTT tolerates before
@@ -75,8 +106,12 @@ type streamCC struct {
 	tokensAt  time.Time
 
 	roundStart, roundEnd time.Time
-	roundMin             time.Duration // lowest RTT sample this round, 0 if none
-	roundLast            time.Duration // latest RTT sample this round
+	roundMin             time.Duration           // lowest RTT sample this round, 0 if none
+	recent               [ccRecent]time.Duration // latest RTT samples, newest at recentN-1 mod ccRecent
+	recentN              int
+	roundSum             time.Duration // sum of this round's RTT samples
+	roundN               int           // and their number
+	jitter               time.Duration // smoothed spread of a round's RTT samples above its lowest
 	roundSent            int           // stream bytes sent this round
 	roundAcked           int           // stream bytes acknowledged this round
 	// The previous round's delay signal and lowest RTT sample, and
@@ -94,6 +129,17 @@ type streamCC struct {
 
 	lastAck time.Time
 	ackGap  time.Duration // smoothed interval between acknowledgements
+	// lastSend is when stream data was last sent, and stallEnd when the
+	// last stall ended (its acknowledgements resumed). drained is set when
+	// the last acknowledgement left no stream data in flight, and
+	// firstSend is when data was next sent: the wait for the next
+	// acknowledgement starts there, not at the last one.
+	lastSend  time.Time
+	drained   bool
+	firstSend time.Time
+	stallEnd  time.Time
+	stallGap  time.Duration // the last stall's length
+	stalls    int
 
 	// The lowest RTT sample in the current and previous half of
 	// ccBaseWindow.
@@ -168,14 +214,19 @@ func (cc *streamCC) canSend(now time.Time, inflight int, srtt time.Duration, mss
 	return true, time.Time{}
 }
 
-func (cc *streamCC) onSent(size int) {
+func (cc *streamCC) onSent(now time.Time, size int) {
 	cc.tokens -= float64(size)
 	cc.roundSent += size
+	if !cc.lastSend.After(cc.lastAck) {
+		cc.firstSend = now // the first since the last acknowledgement
+	}
+	cc.lastSend = now
 }
 
 // onAck records an acknowledgement's outcome for stream packets: how many
-// were acknowledged and declared lost, and an RTT sample if it has one.
-func (cc *streamCC) onAck(now time.Time, acked, lost, ackedBytes int, rtt time.Duration) {
+// were acknowledged and declared lost, an RTT sample if it has one, and the
+// stream bytes still in flight after it.
+func (cc *streamCC) onAck(now time.Time, acked, lost, ackedBytes int, rtt time.Duration, inflight int) {
 	if cc.rate == 0 {
 		return
 	}
@@ -183,17 +234,42 @@ func (cc *streamCC) onAck(now time.Time, acked, lost, ackedBytes int, rtt time.D
 	cc.lost += lost
 	cc.roundAcked += ackedBytes
 	if rtt > 0 {
-		cc.roundLast = rtt
+		cc.recent[cc.recentN%ccRecent] = rtt
+		cc.recentN++
+		cc.roundSum += rtt
+		cc.roundN++
 		if cc.roundMin == 0 || rtt < cc.roundMin {
 			cc.roundMin = rtt
 		}
 	}
 	if acked > 0 {
-		if !cc.lastAck.IsZero() {
+		switch {
+		case cc.lastAck.IsZero():
+		case cc.drained:
+			// Nothing was in flight after the last acknowledgement, so
+			// none was overdue until data went out again, and the first
+			// acknowledgement of that takes a round trip anyway: a stall
+			// is one that comes later still. (Otherwise every pause
+			// between bursts was a stall.) The pause says nothing about
+			// the usual gap between acknowledgements.
+			wait := min(now.Sub(cc.firstSend), ccMaxAckGap)
+			if late := wait - cc.baseRTT(wait); cc.firstSend.After(cc.lastAck) &&
+				late >= max(ccMinStall, ccStallGaps*cc.ackGap) {
+				cc.stallEnd, cc.stallGap = now, late
+				cc.stalls++
+			}
+		default:
 			gap := min(now.Sub(cc.lastAck), ccMaxAckGap)
-			cc.ackGap += (gap - cc.ackGap) / 8
+			if gap >= max(ccMinStall, ccStallGaps*cc.ackGap, cc.baseRTT(0)) && cc.lastSend.After(cc.lastAck) {
+				// A stall's gap stays out of the usual gap, which would
+				// otherwise delay pausing for the next one.
+				cc.stallEnd, cc.stallGap = now, gap
+				cc.stalls++
+			} else {
+				cc.ackGap += (gap - cc.ackGap) / 8
+			}
 		}
-		cc.lastAck = now
+		cc.lastAck, cc.drained = now, inflight == 0
 	}
 }
 
@@ -203,13 +279,36 @@ func (cc *streamCC) update(now time.Time, minRTT, srtt time.Duration, mss int) {
 		return
 	}
 	// The round's lowest RTT sample shows a standing queue without
-	// mistaking jitter for one. Slow start, which doubles the rate each
-	// round, cannot wait for a whole round to show it and goes by the
-	// latest sample (as HyStart does).
-	target := queueTarget(minRTT)
+	// mistaking jitter for one, and a queue persists: steady state backs
+	// off only when two rounds running show it. Slow start, which doubles
+	// the rate each round, cannot wait for a whole round to show it and
+	// goes by the lowest of the latest few samples (as HyStart does).
+	// The jitter estimate starts at zero and takes rounds to form; the
+	// round's own spread stands in until it has. Rounds around a stall
+	// (see below) stay out of it: the stall scatters their samples, and
+	// on a congested path whose rounds are all near stalls the target
+	// would grow with the queue.
+	stalled := !cc.stallEnd.IsZero() && !cc.stallEnd.Add(srtt).Before(cc.roundStart)
+	var spread time.Duration
+	if cc.roundN >= ccJitterSamples && !stalled {
+		spread = cc.roundSum/time.Duration(cc.roundN) - cc.roundMin
+		cc.jitter += time.Duration(ccJitterGain * float64(spread-cc.jitter))
+	}
+	target := max(queueTarget(minRTT), ccJitterTargets*max(cc.jitter, spread))
+	recent := cc.recentMin()
 	delay := cc.roundMin > 0 && cc.roundMin-minRTT > target ||
-		cc.slowStart && cc.roundLast > 0 && cc.roundLast-minRTT > target
-	spike, judged := cc.judgeLoss(delay)
+		cc.slowStart && recent > 0 && recent-minRTT > target
+	prevDelay := cc.lastDelay
+	// Around a stall (rounds within an RTT of its end, when its losses are
+	// declared), loss says nothing about congestion, and delay only beyond
+	// what the stall itself explains: samples held up by it by at most its
+	// length. On a congested path the RTT, and so this window, grows with
+	// the queue until every round is near a stall; without the allowance a
+	// full queue went unnoticed for good.
+	if stalled {
+		delay = cc.roundMin > 0 && cc.roundMin-minRTT > target+cc.stallGap
+	}
+	spike, judged := cc.judgeLoss(delay || stalled)
 	feedback := cc.roundMin > 0 || judged
 	appLimited := float64(cc.roundSent) < cc.rate*now.Sub(cc.roundStart).Seconds()/2
 	// For a round after a backoff the queue still holds what was sent
@@ -235,9 +334,11 @@ func (cc *streamCC) update(now time.Time, minRTT, srtt time.Duration, mss int) {
 	} else {
 		cc.delayRounds, cc.delayMin = 0, 0
 	}
+	// A queue must persist; slow start can't wait to see it twice.
+	queued := delay && (prevDelay || cc.slowStart)
 	switch {
-	case (delay || spike) && settling:
-	case delay || spike:
+	case (queued || spike) && settling:
+	case queued || spike:
 		next, floor := cc.rate*ccBackoff, cc.rate/2
 		if cc.slowStart {
 			// Doubling overshot by up to the RTT the signal took to come
@@ -254,7 +355,7 @@ func (cc *streamCC) update(now time.Time, minRTT, srtt time.Duration, mss int) {
 		}
 		cc.rate = max(next, floor)
 		cc.backedOff = true
-	case !feedback || appLimited:
+	case stalled, !feedback || appLimited:
 	case cc.slowStart:
 		cc.rate *= ccSlowStartGain
 	case cc.rate < cc.capacity:
@@ -265,7 +366,20 @@ func (cc *streamCC) update(now time.Time, minRTT, srtt time.Duration, mss int) {
 	}
 	cc.rate = max(cc.rate, ccMinRate, 4*float64(mss)/srtt.Seconds())
 	cc.roundStart, cc.roundEnd = now, now.Add(max(srtt, ccMinRound))
-	cc.roundMin, cc.roundLast, cc.roundSent, cc.roundAcked = 0, 0, 0, 0
+	cc.roundMin, cc.roundSent, cc.roundAcked = 0, 0, 0
+	cc.roundSum, cc.roundN = 0, 0
+}
+
+// recentMin is the lowest of the latest ccRecent RTT samples, or 0 if
+// there are none.
+func (cc *streamCC) recentMin() time.Duration {
+	var m time.Duration
+	for i := range min(cc.recentN, ccRecent) {
+		if r := cc.recent[i]; m == 0 || r < m {
+			m = r
+		}
+	}
+	return m
 }
 
 // delivered estimates the rate the path carried this round: stream bytes
