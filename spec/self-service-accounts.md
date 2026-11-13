@@ -179,8 +179,8 @@ whose token never expires.
      redeemed, syncs the file, and continues as for a token: the session
      gets its lease and `AUTH_RESULT(success)`.
 4. `AUTH_RESULT` gains the device name the relay chose, as an optional
-   trailing `u8 len || name` (the value grows from 28 bytes to 29 + n). The client records it, and from then on authenticates
-   with its token.
+   trailing `u8 len || name` (the value grows from 28 bytes to 29 + n).
+   The client records it, and from then on authenticates with its token.
 
 Because redemption is an ordinary `AUTH`, all of §9.2's loss recovery
 applies: the client repeats `AUTH` until it hears `AUTH_RESULT`, the relay
