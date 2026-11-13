@@ -3,6 +3,7 @@ package session
 import (
 	"bytes"
 	"crypto/rand"
+	"fmt"
 	"io"
 	"net/netip"
 	"slices"
@@ -647,6 +648,16 @@ func (r *Relay) maybeReset(now time.Time, to netip.AddrPort, cid wire.CID, trigg
 	r.out = append(r.out, RelayDatagram{Addr: to, Data: reset.Append(nil)})
 }
 
+// authFailure is the error a session closes with when Authorize refuses
+// it: ErrAuthFailed, wrapping the Authorizer's own error so the relay's
+// log can tell a bad credential from, say, an exhausted address pool.
+func authFailure(err error, status uint8) error {
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrAuthFailed, err)
+	}
+	return fmt.Errorf("%w: status %d", ErrAuthFailed, status)
+}
+
 // onAuth handles an AUTH frame and reports whether the session survives.
 func (s *RelaySession) onAuth(now time.Time, credential []byte) bool {
 	r := s.relay
@@ -669,7 +680,7 @@ func (s *RelaySession) onAuth(now time.Time, credential []byte) bool {
 	if err != nil || result.Status != 0 {
 		failure := wire.AuthResult{Status: uint8(wire.CodeAuthFailed)}
 		s.conn.transmit(now, s.conn.path(0), []wire.Frame{failure, wire.CloseFrame{Code: wire.CodeAuthFailed}})
-		r.closeSession(now, s, ErrAuthFailed, false)
+		r.closeSession(now, s, authFailure(err, result.Status), false)
 		return false
 	}
 	s.credential = bytes.Clone(credential)

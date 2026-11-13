@@ -3,12 +3,14 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/netip"
 	"sync"
 	"time"
 
 	"github.com/laneshetron/arc/internal/carrier/stream"
+	"github.com/laneshetron/arc/internal/gateway"
 	"github.com/laneshetron/arc/internal/session"
 )
 
@@ -18,6 +20,11 @@ const (
 	attemptLinesPerMinute = 60
 	attemptPeers          = 4096 // TLS carriers' peers remembered for session lines
 	attemptPeerLinger     = 2 * time.Minute
+
+	// Bounds on what an unauthenticated ClientHello puts in a line.
+	attemptALPNs     = 8
+	attemptALPNBytes = 32
+	attemptSNIBytes  = 255
 )
 
 // AttemptLog logs what a relay sees of clients that have not, or not yet,
@@ -89,7 +96,7 @@ func (a *AttemptLog) TLS(r stream.ConnReport) {
 	}
 	args := []any{"peer", r.Peer, "seconds", seconds(r.Duration), "bytes_in", r.BytesIn, "bytes_out", r.BytesOut}
 	if r.Hello {
-		args = append(args, "sni", r.ServerName, "alpn", r.ALPN)
+		args = append(args, "sni", truncate(r.ServerName, attemptSNIBytes), "alpn", boundALPN(r.ALPN))
 	}
 	if r.Err != nil {
 		args = append(args, "err", r.Err)
@@ -99,14 +106,17 @@ func (a *AttemptLog) TLS(r stream.ConnReport) {
 		return
 	}
 	// Where it stopped: nothing arrived, a ClientHello did not finish
-	// arriving (or did not parse), the handshake failed after the
-	// relay's answer, or it finished with an ALPN the relay doesn't carry.
+	// arriving (or did not parse), the relay parsed it but sent nothing
+	// back, the handshake failed after the relay's answer, or it finished
+	// with an ALPN the relay doesn't carry.
 	stage := "tcp"
 	switch {
 	case errors.Is(r.Err, stream.ErrALPN):
 		stage = "alpn"
+	case r.Hello && r.BytesOut > 0:
+		stage = "after_server_hello"
 	case r.Hello:
-		stage = "server_hello"
+		stage = "after_client_hello"
 	case r.BytesIn > 0:
 		stage = "client_hello"
 	}
@@ -124,14 +134,25 @@ func (a *AttemptLog) notePeer(addr, peer netip.AddrPort, open bool) {
 		return
 	}
 	if len(a.peers) >= attemptPeers {
+		// Forget carriers closed long enough ago, or else the one closed
+		// first: open carriers are kept, closed ones only linger.
 		now := time.Now()
+		var oldest netip.AddrPort
+		var oldestAt time.Time
 		for k, e := range a.peers {
-			if !e.closed.IsZero() && now.Sub(e.closed) > attemptPeerLinger {
+			switch {
+			case e.closed.IsZero():
+			case now.Sub(e.closed) > attemptPeerLinger:
 				delete(a.peers, k)
+			case oldestAt.IsZero() || e.closed.Before(oldestAt):
+				oldest, oldestAt = k, e.closed
 			}
 		}
 		if len(a.peers) >= attemptPeers {
-			return // the session's lines show the carrier's address instead
+			if oldestAt.IsZero() {
+				return // all open: the session's lines show the carrier's address
+			}
+			delete(a.peers, oldest)
 		}
 	}
 	a.peers[addr] = attemptPeer{peer: peer}
@@ -165,8 +186,15 @@ func (a *AttemptLog) unestablished(s *session.RelaySession, err error) {
 	from, carrier := a.source(h.From)
 	args := []any{"client", from, "carrier", carrier, "seconds", seconds(time.Since(h.Started)),
 		"init_resends", h.Resends, "reason", err}
-	if errors.Is(err, session.ErrAuthFailed) {
+	switch {
+	case errors.Is(err, gateway.ErrBadCredential):
 		a.line(slog.LevelInfo, "handshake rejected: unknown token", args...)
+		return
+	case errors.Is(err, session.ErrCapacity):
+		a.line(slog.LevelInfo, "handshake rejected: relay at capacity", args...)
+		return
+	case errors.Is(err, session.ErrAuthFailed):
+		a.line(slog.LevelInfo, "handshake rejected: authorization failed", args...)
 		return
 	}
 	a.line(slog.LevelInfo, "handshake not completed", args...)
@@ -180,3 +208,25 @@ func (a *AttemptLog) failed(e session.HandshakeFailed) {
 }
 
 func seconds(d time.Duration) float64 { return d.Round(10 * time.Millisecond).Seconds() }
+
+// truncate cuts s to at most n bytes, marking the cut.
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
+}
+
+// boundALPN keeps the first attemptALPNs protocols a ClientHello offered,
+// each cut to attemptALPNBytes, and notes how many more there were.
+func boundALPN(protos []string) []string {
+	out := make([]string, 0, min(len(protos), attemptALPNs)+1)
+	for i, p := range protos {
+		if i == attemptALPNs {
+			out = append(out, fmt.Sprintf("(%d more)", len(protos)-i))
+			break
+		}
+		out = append(out, truncate(p, attemptALPNBytes))
+	}
+	return out
+}

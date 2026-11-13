@@ -94,6 +94,7 @@ func TestAttemptLogTLSStages(t *testing.T) {
 	for _, r := range []stream.ConnReport{
 		{Peer: peer, Err: errors.New("EOF")},
 		{Peer: peer, BytesIn: 100, Err: errors.New("EOF")},
+		{Peer: peer, Hello: true, BytesIn: 517, Err: errors.New("no certificate")},
 		{Peer: peer, Hello: true, ServerName: "cover.example", BytesIn: 517, BytesOut: 1800, Err: errors.New("connection reset by peer")},
 		{Peer: peer, Hello: true, BytesIn: 517, BytesOut: 1800, Err: stream.ErrALPN},
 	} {
@@ -106,7 +107,7 @@ func TestAttemptLogTLSStages(t *testing.T) {
 		}
 		stages = append(stages, r["stage"].(string))
 	}
-	if strings.Join(stages, ",") != "tcp,client_hello,server_hello,alpn" {
+	if strings.Join(stages, ",") != "tcp,client_hello,after_client_hello,after_server_hello,alpn" {
 		t.Errorf("stages %v", stages)
 	}
 }
@@ -134,57 +135,158 @@ func TestAttemptLogCarrierPeers(t *testing.T) {
 	}
 }
 
-// TestRelayLogsRejectedHandshake runs a client with an unknown token
-// against a relay: the relay logs the rejection with the client's
-// address, instead of a session closing at 0.0.0.0.
-func TestRelayLogsRejectedHandshake(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	loop := netip.MustParseAddrPort("127.0.0.1:0")
+// TestAttemptLogBoundsHello cuts what an unauthenticated ClientHello
+// can put in a line: a long SNI, many ALPN protocols, long ones.
+func TestAttemptLogBoundsHello(t *testing.T) {
+	a, lines := newTestAttemptLog()
+	alpn := []string{strings.Repeat("x", 1000)}
+	for range 100 {
+		alpn = append(alpn, "h2")
+	}
+	a.TLS(stream.ConnReport{Peer: netip.MustParseAddrPort("198.51.100.7:50000"), Hello: true,
+		ServerName: strings.Repeat("s", 5000), ALPN: alpn, Err: errors.New("EOF")})
+	r := lines.find(t, "tls connection failed")
+	if r == nil {
+		t.Fatal("no line")
+	}
+	got := r["alpn"].([]any)
+	if len(got) != attemptALPNs+1 || got[0] != strings.Repeat("x", attemptALPNBytes)+"..." ||
+		got[attemptALPNs] != "(93 more)" {
+		t.Errorf("alpn %v", got)
+	}
+	if sni := r["sni"].(string); len(sni) != attemptSNIBytes+3 {
+		t.Errorf("sni of %d bytes", len(sni))
+	}
+}
+
+// TestAttemptLogPeerChurn fills the peer map with carriers that just
+// closed: a new carrier still gets its peer remembered, at the cost of
+// the one closed first, while open carriers are kept.
+func TestAttemptLogPeerChurn(t *testing.T) {
+	a, _ := newTestAttemptLog()
+	carrier := func(i int) netip.AddrPort {
+		return netip.AddrPortFrom(netip.AddrFrom16([16]byte{0: 0xfd, 1: 0x61, 2: 0x72, 3: 0x63, 4: 0x2f, 5: 0x31, 14: byte(i >> 8), 15: byte(i)}), 0)
+	}
+	peer := func(i int) netip.AddrPort { return netip.AddrPortFrom(netip.MustParseAddr("198.51.100.7"), uint16(i)) }
+	a.TLS(stream.ConnReport{Open: true, Peer: peer(1), Addr: carrier(1)}) // stays open
+	for i := 2; i <= attemptPeers; i++ {
+		a.notePeer(carrier(i), peer(i), true)
+		a.notePeer(carrier(i), peer(i), false)
+	}
+	n := attemptPeers + 1
+	a.notePeer(carrier(n), peer(n), true)
+	if from, _ := a.source(carrier(n)); from != peer(n) {
+		t.Errorf("new carrier: %v; want %v", from, peer(n))
+	}
+	if from, _ := a.source(carrier(1)); from != peer(1) {
+		t.Errorf("open carrier evicted: %v", from)
+	}
+	if len(a.peers) != attemptPeers {
+		t.Errorf("%d peers remembered", len(a.peers))
+	}
+}
+
+// rejectionRelay runs a relay with one account, token "tok", leasing
+// from network, logging to the returned lines.
+func rejectionRelay(t *testing.T, ctx context.Context, network string) (*udp.Conn, crypto.StaticKey, *logLines) {
+	t.Helper()
 	relayKey, _ := crypto.GenerateStaticKey(nil)
-	gw, err := gateway.New(gateway.Config{Network: netip.MustParsePrefix("10.77.0.1/24"), TunMTU: 1280,
+	gw, err := gateway.New(gateway.Config{Network: netip.MustParsePrefix(network), TunMTU: 1280,
 		Accounts: []gateway.Account{{Name: "friend", Tokens: [][]byte{[]byte("tok")}}}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	relayConn, err := udp.Listen(loop, udp.Options{})
+	relayConn, err := udp.Listen(netip.MustParseAddrPort("127.0.0.1:0"), udp.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer relayConn.Close()
+	t.Cleanup(func() { relayConn.Close() })
 	relayTUN := newMemTUN()
-	defer relayTUN.Close()
+	t.Cleanup(func() { relayTUN.Close() })
 	attempts, lines := newTestAttemptLog()
 	go RunRelay(ctx, RelayConfig{
 		Session: session.RelayConfig{Static: relayKey, ResetSecret: [32]byte{1}, NoStreams: true},
 		Conn:    relayConn, TUN: relayTUN, Gateway: gw, Logger: slog.New(slog.NewJSONHandler(lines, nil)), Attempts: attempts,
 	})
+	return relayConn, relayKey, lines
+}
 
+func rejectionClient(t *testing.T, ctx context.Context, relay *udp.Conn, relayKey crypto.StaticKey, token string, established chan<- struct{}) *udp.Conn {
+	t.Helper()
 	key, _ := crypto.GenerateStaticKey(nil)
-	conn, err := udp.Listen(loop, udp.Options{})
+	conn, err := udp.Listen(netip.MustParseAddrPort("127.0.0.1:0"), udp.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
+	t.Cleanup(func() { conn.Close() })
 	tun := newMemTUN()
-	defer tun.Close()
+	t.Cleanup(func() { tun.Close() })
 	go RunClient(ctx, ClientConfig{
-		Session: session.ClientConfig{Static: key, RelayPublic: relayKey.Public, Credential: []byte("wrong")},
-		Relay:   relayConn.LocalAddr(), Carriers: []Carrier{{Name: "lo", Conn: conn}}, TUN: tun,
-		OnEstablished: func(wire.AuthResult) error { return nil },
+		Session: session.ClientConfig{Static: key, RelayPublic: relayKey.Public, Credential: []byte(token)},
+		Relay:   relay.LocalAddr(), Carriers: []Carrier{{Name: "lo", Conn: conn}}, TUN: tun,
+		OnEstablished: func(wire.AuthResult) error {
+			if established != nil {
+				select {
+				case established <- struct{}{}:
+				default:
+				}
+			}
+			return nil
+		},
 	})
+	return conn
+}
+
+// waitRejection waits for msg, from conn over udp, and no session closing.
+func waitRejection(t *testing.T, lines *logLines, msg string, conn *udp.Conn) map[string]any {
+	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if r := lines.find(t, "handshake rejected: unknown token"); r != nil {
+		if r := lines.find(t, msg); r != nil {
 			if r["client"] != conn.LocalAddr().String() || r["carrier"] != "udp" {
 				t.Errorf("rejection %v; want client %v over udp", r, conn.LocalAddr())
 			}
 			if lines.find(t, "session closed") != nil {
 				t.Error("also logged a session closing")
 			}
-			return
+			return r
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("no rejection logged: %v", lines.records(t))
+	t.Fatalf("no %q logged: %v", msg, lines.records(t))
+	return nil
+}
+
+// TestRelayLogsRejectedHandshake runs a client with an unknown token
+// against a relay: the relay logs the rejection with the client's
+// address, instead of a session closing at 0.0.0.0.
+func TestRelayLogsRejectedHandshake(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	relay, relayKey, lines := rejectionRelay(t, ctx, "10.77.0.1/24")
+	conn := rejectionClient(t, ctx, relay, relayKey, "wrong", nil)
+	waitRejection(t, lines, "handshake rejected: unknown token", conn)
+}
+
+// TestRelayLogsExhaustedPool: a valid token refused because the address
+// pool is used up is not logged as an unknown token.
+func TestRelayLogsExhaustedPool(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	relay, relayKey, lines := rejectionRelay(t, ctx, "10.77.0.1/30") // one client address
+	first := make(chan struct{}, 1)
+	rejectionClient(t, ctx, relay, relayKey, "tok", first)
+	select {
+	case <-first:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first client did not establish")
+	}
+	conn := rejectionClient(t, ctx, relay, relayKey, "tok", nil)
+	r := waitRejection(t, lines, "handshake rejected: authorization failed", conn)
+	if !strings.Contains(r["reason"].(string), gateway.ErrPoolExhausted.Error()) {
+		t.Errorf("reason %v; want the pool exhausted", r["reason"])
+	}
+	if lines.find(t, "handshake rejected: unknown token") != nil {
+		t.Error("logged as an unknown token")
+	}
 }

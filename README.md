@@ -239,13 +239,18 @@ what it sees of attempts, with each client's address:
   client resent its first message; it does so only until it hears the
   answer, so resends mean the relay's replies were not reaching it.
   None means nothing after the first message arrived.
-- `handshake rejected: unknown token`, and `handshake failed`, for a
-  client pinning another relay key (or a corrupted packet).
+- `handshake rejected: unknown token`; `handshake rejected: relay at
+  capacity`; `handshake rejected: authorization failed` for a valid token
+  refused for another `reason`, such as an exhausted address pool; and
+  `handshake failed`, for a client pinning another relay key (or a
+  corrupted packet).
 - `tls connection failed`, with the `stage` it stopped at: `tcp` (nothing
   arrived), `client_hello` (a ClientHello started but did not finish, or
-  did not parse), `server_hello` (the relay answered and the handshake
-  then failed), or `alpn`; with its SNI and ALPN, bytes each way and
-  duration. A carrier that ends logs `tls carrier closed` likewise.
+  did not parse), `after_client_hello` (the relay parsed it but sent
+  nothing back), `after_server_hello` (the relay answered and the
+  handshake then failed), or `alpn`; with its SNI and ALPN (cut short if
+  long), bytes each way and duration. A carrier that ends logs `tls
+  carrier closed` likewise.
 - `session established` names the TLS carrier's TCP peer, not its
   internal address, and adds `handshake_seconds` and `init_resends`.
 
