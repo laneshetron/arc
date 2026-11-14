@@ -144,6 +144,7 @@ func TestWriterLease(t *testing.T) {
 	c := &clock{t: t0}
 	var published []*State
 	a := newWriter(t, store, "a", c)
+	a.TokenFile = filepath.Join(t.TempDir(), "lease-token")
 	a.OnState = func(s *State) { published = append(published, s) }
 	a.Seed = func() (*State, error) { return Parse([]byte("lane tok relay\n"), c.Now()) }
 	if err := a.Acquire(ctx); err != nil {
@@ -159,10 +160,15 @@ func TestWriterLease(t *testing.T) {
 	if err := b.Acquire(ctx); !errors.As(err, &held) || held.Lease.Holder != "a" {
 		t.Fatalf("second holder: %v", err)
 	}
-	// The same holder, restarted, retakes its own.
+	// A holder's name proves nothing: another writer named a waits.
+	if err := newWriter(t, store, "a", c).Acquire(ctx); !errors.As(err, &held) {
+		t.Fatalf("same name took a live lease: %v", err)
+	}
+	// The same writer, restarted, retakes its own by the token it kept.
 	a2 := newWriter(t, store, "a", c)
+	a2.TokenFile = a.TokenFile
 	if err := a2.Acquire(ctx); err != nil {
-		t.Fatalf("same holder: %v", err)
+		t.Fatalf("restarted holder: %v", err)
 	}
 	// Which leaves the old a unable to commit: the object changed.
 	if err := a.Commit(ctx, func(s *State) error { _, err := AddAccount(s, "x", false, 0); return err }); !errors.Is(err, ErrNotWriter) || a.Serving() {
@@ -344,4 +350,136 @@ func TestControlSocket(t *testing.T) {
 		t.Error("unknown op accepted")
 	}
 	unlock()
+}
+
+// lossyStore's writes reach the store but, while lossy, report failure,
+// as a request whose response was lost does; while blind, reads fail too.
+type lossyStore struct {
+	Store
+	lossy, blind bool
+}
+
+func (s *lossyStore) Put(ctx context.Context, data []byte, ifMatch string) (string, error) {
+	v, err := s.Store.Put(ctx, data, ifMatch)
+	if err == nil && s.lossy {
+		return "", errors.New("connection reset")
+	}
+	return v, err
+}
+
+func (s *lossyStore) Get(ctx context.Context) ([]byte, string, error) {
+	if s.blind {
+		return nil, "", errors.New("store unreachable")
+	}
+	return s.Store.Get(ctx)
+}
+
+// TestUnconfirmedWrite: a write the store kept but did not confirm is
+// confirmed by reading it back, or, if it cannot be read, reported as
+// indeterminate, never as not made; the next write resolves it first,
+// so retrying does not repeat the change.
+func TestUnconfirmedWrite(t *testing.T) {
+	ctx := context.Background()
+	store := &lossyStore{Store: FileStore{Path: filepath.Join(t.TempDir(), "accounts")}}
+	c := &clock{t: t0}
+	w := newWriter(t, store, "a", c)
+	published := 0
+	w.OnState = func(*State) { published++ }
+	if err := w.Acquire(ctx); err != nil {
+		t.Fatal(err)
+	}
+	add := func(name string) error {
+		return w.Commit(ctx, func(s *State) error { _, err := AddAccount(s, name, false, 0); return err })
+	}
+
+	store.lossy = true
+	if err := add("x"); err != nil || w.State().AccountByName("x") == nil || published != 2 {
+		t.Fatalf("write read back: %v, published %d", err, published)
+	}
+
+	store.blind = true
+	resp := Do(ctx, w, Request{Op: "add-token", Args: []string{"x", "laptop"}}, t0)
+	if !strings.Contains(resp.Error, "may or may not") || !ValidToken([]byte(resp.Token)) {
+		t.Fatalf("unconfirmed add-token: %+v", resp)
+	}
+	if !w.Serving() {
+		t.Fatal("an unconfirmed write ended serving")
+	}
+	if err := add("y"); !errors.Is(err, ErrIndeterminate) {
+		t.Fatalf("commit over an unresolved write: %v", err)
+	}
+	// Once the store can be read, the device is found made: the token
+	// handed out is its, and adding it again is refused, not repeated.
+	store.lossy, store.blind = false, false
+	token := resp.Token
+	resp = Do(ctx, w, Request{Op: "add-token", Args: []string{"x", "laptop"}}, t0)
+	if !strings.Contains(resp.Error, "already has a device laptop") {
+		t.Fatalf("retried add-token: %+v", resp)
+	}
+	if d := w.State().device(w.State().AccountByName("x").ID, "laptop"); d == nil || d.TokenHash != TokenHash([]byte(token)) {
+		t.Fatal("the device found is not the one whose token was handed out")
+	}
+}
+
+// stuckStore's writes hang until released.
+type stuckStore struct {
+	Store
+	stuck   chan struct{}
+	release chan struct{}
+}
+
+func (s *stuckStore) Put(ctx context.Context, data []byte, ifMatch string) (string, error) {
+	if s.stuck != nil {
+		close(s.stuck)
+		s.stuck = nil
+		<-s.release
+	}
+	return s.Store.Put(ctx, data, ifMatch)
+}
+
+// TestStuckWrite: a write that hangs in the store blocks neither Serving
+// nor State, and the lease still ends on time, closing sessions, while
+// the write hangs.
+func TestStuckWrite(t *testing.T) {
+	ctx := context.Background()
+	store := &stuckStore{Store: FileStore{Path: filepath.Join(t.TempDir(), "accounts")}}
+	c := &clock{t: t0}
+	w := newWriter(t, store, "a", c)
+	lost := make(chan error, 1)
+	w.OnLost = func(err error) { lost <- err }
+	if err := w.Acquire(ctx); err != nil {
+		t.Fatal(err)
+	}
+	store.stuck, store.release = make(chan struct{}), make(chan struct{})
+	stuck := store.stuck
+	done := make(chan error)
+	go func() {
+		done <- w.Commit(ctx, func(s *State) error { _, err := AddAccount(s, "x", false, 0); return err })
+	}()
+	<-stuck
+	answered := make(chan bool)
+	go func() { answered <- w.Serving() && w.State() != nil }()
+	select {
+	case ok := <-answered:
+		if !ok {
+			t.Error("not serving during a stuck write")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serving waited for the store")
+	}
+	c.Add(DefaultLease)
+	w.expire()
+	select {
+	case <-lost:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the lease did not end while a write hung")
+	}
+	if w.Serving() {
+		t.Error("serving past the deadline")
+	}
+	close(store.release)
+	<-done
+	if w.Serving() {
+		t.Error("a write that returned after the deadline revived the lease")
+	}
 }

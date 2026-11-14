@@ -4,7 +4,7 @@
 # through `arc-relay accounts` on its control socket, and while it is
 # stopped by the same command acting as the writer. Covers what the
 # in-process tests cannot: the real binaries, the socket, the writer
-# lock, and the lease handed over across a restart.
+# lock, and the lease handed over across a restart and a crash.
 #
 # Usage: store.sh BIN_DIR   (BIN_DIR holds arc-client and arc-relay)
 set -euo pipefail
@@ -104,6 +104,25 @@ wait_for 10 "relay retakes the lease" bash -c "[ \$(grep -c 'accounts lease acqu
   fail "after restart: $(cat "$WORK/list.log" 2>/dev/null)"
 wait_for 20 "legacy client reconnects" bash -c "[ \$(grep -c 'session established' '$WORK/client-legacy.log') -ge 2 ]" &&
   pass "legacy client reconnected to the restarted relay"
+
+# After a crash, the relay retakes its own live lease at once: the token
+# it kept in its control directory proves the lease is its own.
+kill -9 "$RELAY_PID"; wait "$RELAY_PID" 2>/dev/null || true
+start_relay
+wait_for 10 "crashed relay retakes its lease" bash -c "[ \$(grep -c 'accounts lease acquired' '$WORK/relay.log') -ge 3 ]" &&
+  pass "a relay restarted after a crash retakes its own lease at once"
+
+# Another relay with the same holder name but its own control directory
+# is a different instance: it waits for the lease instead of taking it.
+$R "$BIN/arc-relay" run -listen 192.168.10.2:4435 -key-file "$WORK/relay.key" -reset-secret-file "$WORK/reset.secret" \
+  -accounts-store "$STORE" -accounts-control "$WORK/control-twin" -accounts-holder relay-1 \
+  -tun arc2 -network 10.79.0.1/16 >"$WORK/twin.log" 2>&1 &
+TWIN_PID=$!
+PIDS+=("$TWIN_PID")
+wait_for 10 "same-named relay waits" grep -q "waiting for the accounts lease" "$WORK/twin.log" &&
+  ! grep -q "accounts lease acquired" "$WORK/twin.log" && pass "a relay with the same holder name does not take a live lease" ||
+  fail "same-named relay: $(cat "$WORK/twin.log")"
+kill "$TWIN_PID"; wait "$TWIN_PID" 2>/dev/null || true
 
 # A second relay process on the host is refused by the writer lock.
 if $R "$BIN/arc-relay" run -listen 192.168.10.2:4434 -key-file "$WORK/relay.key" -reset-secret-file "$WORK/reset.secret" \

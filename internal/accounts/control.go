@@ -23,7 +23,9 @@ type Request struct {
 	MaxDevices int  `json:"max_devices,omitempty"`
 }
 
-// A Response answers a Request. Token is set by add-token.
+// A Response answers a Request. Token is set by add-token. An Error
+// may come with Output and Token, when the store did not confirm the
+// change (ErrIndeterminate): they are what the change would have made.
 type Response struct {
 	Output string `json:"output,omitempty"`
 	Token  string `json:"token,omitempty"`
@@ -69,10 +71,17 @@ func Do(ctx context.Context, w *Writer, req Request, now time.Time) Response {
 		}
 		return err
 	})
-	if err != nil {
-		if errors.Is(err, ErrUnavailable) {
-			err = fmt.Errorf("%w; nothing changed", err)
+	switch {
+	case errors.Is(err, ErrIndeterminate):
+		// Keep the token: the store may have its device.
+		msg := err.Error() + "; run list to see whether it was"
+		if token != nil {
+			msg += ", and if the device is there, this is its token: it is not shown again"
 		}
+		return Response{Output: out, Token: string(token), Error: msg}
+	case errors.Is(err, ErrUnavailable):
+		return Response{Error: err.Error() + "; nothing changed"}
+	case err != nil:
 		return Response{Error: err.Error()}
 	}
 	return Response{Output: out, Token: string(token)}
@@ -86,6 +95,10 @@ type Control struct{ Dir string }
 
 func (c Control) socket() string { return filepath.Join(c.Dir, "control.sock") }
 func (c Control) lock() string   { return filepath.Join(c.Dir, "accounts.lock") }
+
+// TokenFile is where the writer holding this directory's lock keeps its
+// lease token (Writer.TokenFile).
+func (c Control) TokenFile() string { return filepath.Join(c.Dir, "lease-token") }
 
 // ErrLocked: another writer on this host holds the lock.
 var ErrLocked = errors.New("accounts: another writer on this host holds the lock")

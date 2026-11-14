@@ -185,16 +185,19 @@ The commands talk to the running relay through its control socket
 (`-accounts-control`, default `/run/arc-relay`, root only). With the relay
 stopped, pass `-store` (the relay's `-accounts-store`) and they change the
 store themselves. Either way, a command succeeds only once the store has
-the change.
+the change. If the store does not confirm a write and cannot be read back,
+the command says the outcome is unknown (and `add-token` still prints the
+token, in case the device was added): run `list` to see.
 
 The store also holds a **writer lease**: the relay authenticates clients
 only while it holds it, renewing it every minute (`-accounts-lease`,
 default 15 minutes). A relay that cannot renew it, because the store is
 unreachable or another relay took it, stops after the lease runs out and
 closes its sessions; its clients are told the relay is full and keep
-retrying. A clean shutdown releases the lease. After a crash, a relay on
-the same host (same `-accounts-holder`, the hostname by default) retakes
-it at once; one elsewhere waits for it to expire, or for
+retrying. A clean shutdown releases the lease. After a crash, the relay
+restarted with the same `-accounts-control` directory retakes it at once,
+proven its own by the lease token it keeps there; any other relay, even one
+with the same `-accounts-holder` name, waits for it to expire, or for
 `arc-relay accounts -store … takeover`, which you run only when the old
 relay is gone. `-front-listen` still needs `-tokens-file`.
 

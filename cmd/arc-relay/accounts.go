@@ -103,7 +103,7 @@ flags:`)
 	defer unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	w := &accounts.Writer{Store: store, Holder: "cli-" + defaultHolder()}
+	w := &accounts.Writer{Store: store, Holder: "cli-" + defaultHolder(), TokenFile: ctl.TokenFile()}
 	if req.Op == "takeover" {
 		if err := w.Takeover(ctx); err != nil {
 			return err
@@ -126,12 +126,12 @@ flags:`)
 }
 
 func printResponse(r accounts.Response) error {
-	if r.Error != "" {
-		return errors.New(r.Error)
-	}
 	fmt.Print(r.Output)
 	if r.Token != "" {
 		fmt.Println(r.Token)
+	}
+	if r.Error != "" {
+		return errors.New(r.Error)
 	}
 	return nil
 }

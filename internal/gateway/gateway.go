@@ -49,6 +49,8 @@ type Config struct {
 	// Gate, if set, is asked before every authorization: false refuses
 	// it with ErrNotServing. A relay authenticating from an accounts
 	// store passes its writer's Serving (self-service-accounts.md §3.2).
+	// It is called with the gateway locked, so it must not block or call
+	// into the Gateway.
 	Gate func() bool
 
 	// HostAddrs are the relay host's own addresses outside the tunnel
@@ -237,13 +239,19 @@ func (g *Gateway) TakeRevocations() []Revocation {
 // A credential bound to a device key admits only a client with that key
 // (self-service-accounts.md §3.4).
 func (g *Gateway) Authorize(token, clientStatic []byte, prior *wire.AuthResult) (wire.AuthResult, error) {
+	hash := accounts.TokenHash(token)
+	// One lock from the gate to the lease, so that an Apply or Suspend
+	// either comes first, and refuses, or comes after, and revokes the
+	// lease this grants.
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	if g.cfg.Gate != nil && !g.cfg.Gate() {
 		return wire.AuthResult{}, ErrNotServing
 	}
-	hash := accounts.TokenHash(token)
-	g.mu.Lock()
 	c, ok := g.creds[hash]
-	g.mu.Unlock()
+	if testHookAuthorize != nil {
+		testHookAuthorize()
+	}
 	if !ok || c.account == nil {
 		return wire.AuthResult{}, ErrBadCredential
 	}
@@ -251,15 +259,13 @@ func (g *Gateway) Authorize(token, clientStatic []byte, prior *wire.AuthResult) 
 		return wire.AuthResult{}, ErrWrongKey
 	}
 	if prior != nil {
-		g.mu.Lock()
 		l, ok := g.leased[netip.AddrFrom4(prior.IPv4)]
-		g.mu.Unlock()
 		if !ok || l.account != c.account || l.revoked {
 			return wire.AuthResult{}, ErrWrongAccount
 		}
 		return wire.AuthResult{}, nil
 	}
-	addr, err := g.lease(c)
+	addr, err := g.leaseLocked(c)
 	if err != nil {
 		return wire.AuthResult{}, err
 	}
@@ -276,11 +282,13 @@ func (g *Gateway) Authorize(token, clientStatic []byte, prior *wire.AuthResult) 
 	return r, nil
 }
 
-// lease reserves an address that is neither the relay's own, the network
-// address, nor the broadcast address.
-func (g *Gateway) lease(c credential) (netip.Addr, error) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
+// testHookAuthorize, if set, runs in Authorize between finding the
+// credential and leasing an address.
+var testHookAuthorize func()
+
+// leaseLocked reserves an address that is neither the relay's own, the
+// network address, nor the broadcast address.
+func (g *Gateway) leaseLocked(c credential) (netip.Addr, error) {
 	l := lease{account: c.account, device: c.device, name: c.name}
 	if n := len(g.free); n > 0 {
 		addr := g.free[n-1]

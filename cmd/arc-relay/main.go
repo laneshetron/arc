@@ -154,7 +154,7 @@ func run(args []string) error {
 	resetFile := fs.String("reset-secret-file", "reset.secret", "stateless reset secret; created if missing, keep it across restarts")
 	storeURL := fs.String("accounts-store", "", "keep accounts in this store instead of reading -tokens-file once: file:PATH. The relay then changes accounts while it runs (arc-relay accounts), and authenticates only while it holds the store's writer lease; an empty store is seeded from -tokens-file, if it exists")
 	controlDir := fs.String("accounts-control", defaultControlDir, "with -accounts-store: directory for the control socket and the writer lock")
-	holder := fs.String("accounts-holder", defaultHolder(), "with -accounts-store: this relay's name in the writer lease (unique per relay host)")
+	holder := fs.String("accounts-holder", defaultHolder(), "with -accounts-store: this relay's name in the writer lease, for operators")
 	accountsLease := fs.Duration("accounts-lease", accounts.DefaultLease, "with -accounts-store: writer lease length, the longest a store outage goes unnoticed by clients, and the longest a revocation takes to reach a relay that lost the store")
 	tokensFile := fs.String("tokens-file", "tokens", "client accounts, one credential per line: NAME TOKEN [relay], or a bare TOKEN for an account of its own; accounts cannot reach each other's clients, and only \"relay\" accounts reach the relay's tunnel address")
 	var deny []netip.Prefix
@@ -282,6 +282,7 @@ func run(args []string) error {
 		}
 		defer unlock()
 		writer.OnState, writer.OnLost = gw.Apply, gw.Suspend
+		writer.TokenFile = ctl.TokenFile()
 		done := make(chan struct{})
 		go func() { writer.Run(ctx); close(done) }()
 		defer func() { stop(); <-done }() // release the lease on the way out
