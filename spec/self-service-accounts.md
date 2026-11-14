@@ -1,6 +1,6 @@
 # ARC — Self-Service Accounts: Invites and Devices
 
-**Status:** draft design, revision 3, feeds spec 0.3. Companion to the
+**Status:** draft design, revision 4, feeds spec 0.3. Companion to the
 ARC/1 handoff (`ARC-v1-Protocol-and-Implementation-Handoff.md`); section
 references (§N) point there. Nothing here is implemented yet.
 
@@ -76,10 +76,10 @@ bytes, hex), never derived from names or line numbers, so rewrites and
 renames cannot change them.
 
 ```text
-# arc-accounts 2
+# arc-accounts 2 generation=N
 account  ID NAME [relay] [max_devices=5] [invites=yes|no] [manage=yes|no]
-device   ID ACCOUNT_ID NAME token=SHA256 [key=CLIENT_STATIC] [via=INVITE_ID] [created=T]
-invite   ID ACCOUNT_ID HASH expires=T [by=DEVICE_ID req=REQUEST_ID] [redeemed=DEVICE_ID]
+device   ID ACCOUNT_ID NAME token=SHA256 front=F [key=CLIENT_STATIC] lineage=ID,... [via=INVITE_ID] [created=T]
+invite   ID ACCOUNT_ID HASH front=F expires=T [by=DEVICE_ID req=REQUEST_ID] [redeemed=DEVICE_ID]
 revoked  ID until=T [by=DEVICE_ID] [record=...]
 ```
 
@@ -90,18 +90,28 @@ revoked  ID until=T [by=DEVICE_ID] [record=...]
   packet (§3.8). The gateway accepts
   accounts with no devices.
 - **`device`** stores the SHA-256 of its token, not the token: tokens are
-  32 random bytes, so a plain hash suffices, and a copy of the file no
-  longer authenticates anyone. `key` is the Noise static public key the
-  device enrolled with; when present, the token authenticates only a
-  handshake from that key (§3.4). `via` records the invite it was
-  enrolled with, which gives every device its provenance (§3.7).
+  32 random bytes (encoded as in §3.4), so a plain hash suffices, and a
+  copy of the file no longer authenticates anyone. `key` is the Noise
+  static public key the device enrolled with; when present, the token
+  authenticates only a handshake from that key (§3.4).
+- **`lineage`** is the device's ancestry, immutable from enrollment: the
+  IDs of the device that minted its invite, that device's own minter, and
+  so on to a device enrolled by an operator invite, which has an empty
+  lineage. Descendant revocation (§3.7) reads it directly, so it does not
+  depend on invite records, which expire, or on ancestors still existing,
+  which may have been revoked. With at most 16 devices per account, a
+  lineage has at most 15 entries. `via` names the invite, for audit only.
+- **`front`** (on `device` and `invite`) is the front admission verifier
+  (§3.5), stored because it cannot be recomputed from the hash beside it.
 - **`invite`** stores the SHA-256 of its secret. `by`/`req` identify an
   invite a device minted, for idempotency (§3.6).
-- **`revoked`** keeps a revoked device's ID until its records could no
-  longer be restored from a backup (§3.2), so a restore cannot revive it.
-  A revocation made by a device (§3.8) also keeps `by=` that device and
-  the revoked device's whole record, for 7 days, so the operator can
-  undo it.
+- **`generation`** in the header increases by one with every committed
+  transaction (§3.2).
+- **`revoked`** keeps a revoked device's ID, and its lineage, for 7
+  days, for audit and so a late redemption retry from it is recognized
+  and refused. A revocation made by a device (§3.8) also keeps `by=` that
+  device and the revoked device's whole record, so the operator can undo
+  it within those 7 days.
 - Device names are letters, digits, `.`, `_` and `-`, at most 32 bytes,
   unique within the account. The client proposes one (its hostname by
   default); the relay appends `-2`, `-3`, … on a clash.
@@ -136,21 +146,40 @@ is its only writer** and serializes every mutation:
   (token hash → device → account) is replaced atomically per
   transaction. Removing an account or device closes its live sessions
   (`CLOSE(AUTH_FAILED)`) and releases their leases.
-- **Backups and their failure.** Deployment may back the file up (the
-  reference infra copies it to SSM `/arc/tokens`) through a hook the
-  relay runs after each transaction, with the transaction's generation
-  number. The file carries that generation; a restore never replaces a
-  local file of a higher generation.
-  - Enrollments and mints do not wait for the backup. If an instance is
-    replaced before a backup catches up, a device enrolled since is lost
-    from the relay, but its client still holds its token and its invite
-    shows unredeemed in the restored file, so the client's retry (§3.4)
-    re-redeems it with the same token, if the invite has not expired.
-  - **Revocations wait.** A `revoke` or `rotate` reports success only once
-    the hook has confirmed a backup at or after its generation; until
-    then it reports the revocation as local only and exits nonzero. That
-    way, instance replacement cannot restore a revoked device. The
-    `revoked` record covers the same case for backups taken earlier.
+- **The store is the commit point.** Accounts live in a durable store
+  outside the instance, with conditional writes; the local file is a
+  cache of the latest committed generation. A transaction commits by
+  writing generation N+1 to the store **only if** the store still holds
+  N (S3 `PutObject` with `If-Match` on N's ETag, in the reference
+  infra), then writes the local file and publishes the new state. Every
+  mutation the relay acknowledges (a redemption's `AUTH_RESULT`, a minted
+  `INVITE`, a revocation's answer, an operator command's success) has
+  been committed to the store first. A redeemed invite therefore cannot
+  come back unredeemed, nor a revoked device come back authorized, after
+  any restore: there is no later state that was acknowledged but not
+  stored.
+- **Fail closed on mutations, not on service.** If the store cannot be
+  written, mutations fail and say so (`CAPACITY` for redemptions and
+  mints, which clients retry; an error for operator commands), while
+  sessions keep authenticating from the state already committed. A
+  conditional write that finds a generation other than N means another
+  writer exists: the relay stops mutating, logs an error, and keeps
+  serving the state it has.
+- **Start-up.** The relay reads the store's latest generation. With a
+  local file of the same generation, it uses the file. If the store is
+  unreachable, it may serve a local file, but accepts no mutations until
+  the store confirms that generation is still the latest. With no local
+  file and no store, it accepts no one, and keeps retrying the store,
+  rather than start from anything it cannot prove current.
+- **Size.** The file is bounded: at most 256 accounts and 16 devices
+  each, invites and tombstones bounded by their caps and lifetimes, well
+  under 1 MiB. The reference store is a versioned, KMS-encrypted S3
+  object; SSM Parameter Store (4 or 8 KB per value) keeps only the
+  relay's identity and secrets. Old object versions give the operator a
+  history, but are never restored automatically.
+- **Enrollment latency.** A redemption waits for one conditional write to
+  the store, typically tens of milliseconds within a region, once per
+  device.
 
 ### 3.3 Invite string
 
@@ -193,8 +222,12 @@ folder of files, whose token never expires.
 
 `arc-client enroll [-device NAME] <invite>`:
 
-1. Generates the device's static key and a 32-byte random token, and
-   writes both, with the relay settings from the invite, to its profile
+1. Generates the device's static key and a token: 32 random bytes,
+   base64url-encoded without padding (43 ASCII characters). The encoded
+   string is the token everywhere: in the profile, in `AUTH`, in the
+   enrollment credential, and as the input to its SHA-256 and front
+   derivation. Tokens in the accounts file are printable ASCII, which the
+   parser enforces. It writes both, with the relay settings from the invite, to its profile
    directory **before** connecting. An interrupted redemption is retried
    with the same key and token, never new ones.
 2. Connects as `arc-client run` would, on every carrier the invite allows,
@@ -205,8 +238,8 @@ folder of files, whose token never expires.
    u8 len || token || u8 len || device_name
    ```
 
-   The leading zero byte cannot begin a token, which is text, so the
-   relay tells the two apart without a new frame type.
+   The leading zero byte cannot begin a token, which is printable ASCII
+   (step 1), so the relay tells the two apart without a new frame type.
 3. The relay, in its Authorizer, which already receives the client's
    static key (§9.1):
    - looks the invite up by ID and compares the secret's hash in constant
@@ -258,16 +291,22 @@ certificate it is talking to. Anything in that header must be assumed
 captured by an active man in the middle. So:
 
 - An enrolling client presents
-  `front_admission = SHA-256("ARC/1 front admission" || secret)[0:16]`
-  as its bearer, never the secret. The relay stores it with the invite.
-  It admits one carrier upgrade, nothing more; it cannot redeem the
-  invite, since redemption needs the secret, which travels only inside
-  Noise.
+  `front_admission = SHA-256("ARC/1 front admission" || secret)[0:16]`,
+  as 32 lowercase hex characters, as its bearer, never the secret. It
+  admits one carrier upgrade, nothing more; it cannot redeem the invite,
+  since redemption needs the secret, which travels only inside Noise.
 - Enrolled devices likewise present
-  `SHA-256("ARC/1 front admission" || token)[0:16]` rather than the token
-  itself, which the relay can check against a stored value per device.
-  (Today's front sends the token itself; legacy devices keep doing so
-  until they re-enroll.)
+  `SHA-256("ARC/1 front admission" || token)[0:16]`, in hex, rather than
+  the token itself. (Today's front sends the token itself; legacy
+  devices keep doing so until they re-enroll.)
+- **Persisted verifiers.** Neither value can be recomputed from the
+  SHA-256 hash stored beside it, so each record stores its own: the
+  invite's `front=` is written when the invite is created and removed
+  with the invite; the device's when it enrolls, computed by the relay from
+  the token in the enrollment credential, and removed with the device. A verifier only passes the
+  front: someone holding the file can confirm the front is ARC's, which
+  the relay's address already tells them, but cannot redeem or
+  authenticate.
 - Admissions by an invite's value share a small budget (a few
   concurrent upgrades per invite) and lapse when it is redeemed or
   expires.
@@ -291,12 +330,24 @@ frame type they would reject.
 
 **Minting, and its idempotency.** The client picks a random `request_id`
 and **persists it before sending**, retransmitting `INVITE_REQUEST`
-until answered, across sessions and restarts. The relay records the
-minted invite with `by=` the device and `req=` the request ID, and
-answers any later request with the same (device, request ID) with the
-same invite, across sessions and relay restarts, for as long as the
-invite record is kept. A lost answer therefore never mints a second
-invite or consumes a second slot of the cap.
+until answered, across sessions and restarts. A minted invite's ID and
+secret are **derived**, not random, so the relay can answer a repeat
+without storing the secret:
+
+```text
+invite_id = HMAC-SHA256(invite_key, "ARC/1 invite id"     || device_id || request_id)[0:8]
+secret    = HMAC-SHA256(invite_key, "ARC/1 invite secret" || device_id || request_id)[0:16]
+```
+
+`invite_key` is a 32-byte relay secret kept with the relay's identity
+(SSM, like the reset secret), never in the accounts file, so a copy of
+the file still yields no secret. The relay records the invite with
+`by=`/`req=`; a later request with the same (device, request ID)
+recomputes the same invite and answers with it, across sessions and
+relay restarts, for as long as the record is kept. A lost answer never
+mints a second invite or consumes a second slot of the cap. Operator
+invites stay random: the command prints the invite once, and an
+operator who loses it cancels it and mints another.
 
 - The invite is for the session's own account, and carries no access
   beyond the account's policy.
@@ -309,10 +360,13 @@ invite or consumes a second slot of the cap.
 
 ### 3.7 Revocation and incident recovery
 
-Every device records the invite it came from (`via`), and every minted
-invite the device that minted it (`by`), so the relay knows each device's
-**descendants**: devices enrolled through invites it minted, and theirs in
-turn. Operator invites have no `by`; their devices are roots.
+Every device carries its `lineage` (§3.1), set once when it enrolls: its
+minter's lineage followed by its minter. A device's **descendants** are
+the devices whose lineage contains it: those enrolled through invites it
+minted, and theirs in turn. Traversal reads only the device records, so
+it is complete however long ago they enrolled and whether or not the
+devices between them still exist. Devices enrolled by operator invites
+have empty lineages; they are roots.
 
 - `revoke ACCOUNT/DEVICE` revokes one device: its record goes, its live
   sessions close, and its unredeemed invites are cancelled.
@@ -354,11 +408,17 @@ its account's devices and revoke them.
   tree. `arc-client revoke NAME [-descendants]` revokes one; a device may
   revoke itself (for instance before being given away).
 - Requests are retransmitted until answered. Revoking is idempotent: a
-  device already revoked answers status 0. Like an operator revocation,
-  the answer waits until the change is durable and the backup has
-  confirmed it (§3.2). If the backup hook fails, the revocation still
-  takes effect at once and the status is `NOT_BACKED_UP`; the relay keeps
-  retrying the backup.
+  device already revoked answers status 0. Like every mutation, the
+  answer waits until the revocation is committed to the store (§3.2); if
+  the store cannot be written, it fails with `CAPACITY` and the client
+  retries, and nothing is revoked yet.
+
+**Availability trade-off.** `manage=yes` is the default because the
+common case is a person cutting off their own lost device, quickly. The
+cost is that any device of the account at least 24 hours old, including a
+stolen one, can revoke the others: management trades availability for
+the owner's speed. An operator who prefers the other way sets
+`manage=no` on an account, and revocations then stay with the operator.
 
 **A thief holds a device too.** Whoever has the stolen laptop can use
 these same frames against the owner's other devices. The design does not
@@ -400,9 +460,12 @@ out of nothing the operator cannot restore.
   descendants are revoked with it (§3.7). It can also revoke the owner's
   other devices, once it is 24 hours old; the operator can undo that for
   7 days (§3.8).
-- **Stolen accounts file or backup:** holds token and secret hashes only.
-- **Restore after revocation:** prevented by revocations waiting for the
-  backup, and by `revoked` records (§3.2).
+- **Stolen accounts file or store object:** holds token and secret hashes
+  and front verifiers only; minted invite secrets need `invite_key`,
+  kept elsewhere.
+- **Restore after revocation or redemption:** impossible, since every
+  acknowledged change is committed to the store first and start-up uses
+  the store's latest generation (§3.2).
 - **The invite leaks the relay's address:** as today's files do.
 
 ## 5. Spec changes
@@ -415,8 +478,7 @@ out of nothing the operator cannot restore.
   `DEVICES`. `AUTH_RESULT` is unchanged.
 - §16.3 (front): the admission bearer is a value derived from the
   credential, never the credential.
-- Close codes: `11 INVITE_USED`, `12 INVITE_EXPIRED`, `13 REVOKED`,
-  `14 NOT_BACKED_UP`.
+- Close codes: `11 INVITE_USED`, `12 INVITE_EXPIRED`, `13 REVOKED`.
 - wire-registry.md and the wire fixtures, accordingly.
 
 ## 6. Implementation plan (one reviewed PR each)
@@ -425,7 +487,10 @@ out of nothing the operator cannot restore.
    migration from today's format, token hashes, in-place gateway updates
    keeping `*Account` identity, transactions with `fsync`, the control
    socket and offline `flock`, `arc-relay accounts` commands, revocation
-   closing live sessions, the backup hook and generations.
+   closing live sessions, generations, the store as the commit point
+   with conditional writes, and fail-closed start-up. Tests: a lost store
+   write refuses the mutation; a conflicting generation stops mutation;
+   a fresh instance with no store reachable accepts no one.
 2. **Invites and redemption:** invite records, the enrollment credential,
    key binding, `ENROLLED`, `INVITE_USED`/`INVITE_EXPIRED`, the fallback,
    `arc-client enroll` and client profiles (`arc-client run -profile
@@ -433,16 +498,20 @@ out of nothing the operator cannot restore.
    first `AUTH` dropped; with the answer lost past the invite's expiry; a
    second redemption refused; a copied token refused from another key.
 3. **Device-minted invites:** `INVITES`, the request frames with
-   persisted request IDs, caps, logging, `revoke -descendants` and
-   `rotate`.
+   persisted request IDs, derived invite secrets and `invite_key`, caps,
+   logging, lineage-based `revoke -descendants` and `rotate`. Tests: an
+   `INVITE` answer lost across a relay restart, then the same request
+   answered with the same invite; descendants revoked after the invites
+   linking them expired and an intermediate device was revoked.
 4. **Devices managing devices:** `DEVICES`, the list and revoke frames,
    cooling-off, soft revocation and `restore`, `CLOSE(REVOKED)`,
    `arc-client devices` and `revoke`. netns tests: revoke a device from
    another while it is connected; a device younger than 24 hours refused;
    restore after a device revocation.
-5. **Infra:** the SSM backup hook with revocations waiting for it;
-   `add-account.sh` prints an invite; `secrets.sh` stops owning
-   `/arc/tokens`; README.
+5. **Infra:** a versioned, KMS-encrypted S3 bucket for the accounts
+   object, with the instance role allowed conditional writes to it;
+   `invite_key` in SSM; `add-account.sh` prints an invite; `secrets.sh`
+   stops owning `/arc/tokens`, which is migrated once; README.
 6. **Front admission** by derived values, with the front.
 
 ## 7. Open questions
