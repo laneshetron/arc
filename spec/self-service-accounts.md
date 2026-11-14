@@ -1,6 +1,6 @@
 # ARC — Self-Service Accounts: Invites and Devices
 
-**Status:** draft design, revision 4, feeds spec 0.3. Companion to the
+**Status:** draft design, revision 5, feeds spec 0.3. Companion to the
 ARC/1 handoff (`ARC-v1-Protocol-and-Implementation-Handoff.md`); section
 references (§N) point there. Nothing here is implemented yet.
 
@@ -79,7 +79,7 @@ renames cannot change them.
 # arc-accounts 2 generation=N
 account  ID NAME [relay] [max_devices=5] [invites=yes|no] [manage=yes|no]
 device   ID ACCOUNT_ID NAME token=SHA256 front=F [key=CLIENT_STATIC] lineage=ID,... [via=INVITE_ID] [created=T]
-invite   ID ACCOUNT_ID HASH front=F expires=T [by=DEVICE_ID req=REQUEST_ID] [redeemed=DEVICE_ID]
+invite   ID ACCOUNT_ID HASH front=F expires=T [by=DEVICE_ID req=REQUEST_ID gen=N] [redeemed=DEVICE_ID]
 revoked  ID until=T [by=DEVICE_ID] [record=...]
 ```
 
@@ -94,13 +94,17 @@ revoked  ID until=T [by=DEVICE_ID] [record=...]
   copy of the file no longer authenticates anyone. `key` is the Noise
   static public key the device enrolled with; when present, the token
   authenticates only a handshake from that key (§3.4).
-- **`lineage`** is the device's ancestry, immutable from enrollment: the
-  IDs of the device that minted its invite, that device's own minter, and
-  so on to a device enrolled by an operator invite, which has an empty
-  lineage. Descendant revocation (§3.7) reads it directly, so it does not
-  depend on invite records, which expire, or on ancestors still existing,
-  which may have been revoked. With at most 16 devices per account, a
-  lineage has at most 15 entries. `via` names the invite, for audit only.
+- **`lineage`** is the device's ancestry, immutable from enrollment,
+  **oldest first**: the root (a device enrolled by an operator invite,
+  whose own lineage is empty), then each device below it, ending with
+  the device that minted this one's invite. A new device's lineage is its
+  minter's lineage followed by its minter. Descendant revocation (§3.7)
+  reads it directly, so it does not depend on invite records, which
+  expire, or on ancestors still existing, which may have been revoked.
+  Because revoked ancestors stay in it, its length is not bounded by the
+  device cap; it is bounded instead by a **maximum depth** of 8: a device
+  whose lineage already has 7 entries cannot mint invites (`CAPACITY`),
+  so no lineage exceeds 8. `via` names the invite, for audit only.
 - **`front`** (on `device` and `invite`) is the front admission verifier
   (§3.5), stored because it cannot be recomputed from the hash beside it.
 - **`invite`** stores the SHA-256 of its secret. `by`/`req` identify an
@@ -134,10 +138,13 @@ is its only writer** and serializes every mutation:
 - Operator commands (`arc-relay accounts add|invite|revoke|rotate|list`)
   are clients of a control socket the relay listens on
   (`/run/arc-relay/control.sock`, mode 0600, root only). They do not open
-  the file. With the relay stopped, the same commands edit the file
-  directly under an exclusive `flock` on a separate, never-renamed lock
-  file (`accounts.lock`), which the relay also takes at start, so the two
-  never write concurrently.
+  the file. With the relay stopped, the same commands act as the writer
+  themselves: they take an exclusive `flock` on a separate, never-renamed
+  lock file (`accounts.lock`), which the relay also takes at start, for
+  local exclusion only, then acquire the writer lease and commit to the
+  store exactly as the relay does (below). They report success only once
+  the store has the change; a local-only edit is never a success. If the
+  lease is held by a live relay elsewhere, they refuse and say where.
 - **Gateway identity across changes.** The gateway keeps one `*Account`
   per account ID for the relay's lifetime and updates it in place under
   its lock; mutations never re-parse the file into new objects. Leases,
@@ -151,26 +158,58 @@ is its only writer** and serializes every mutation:
   cache of the latest committed generation. A transaction commits by
   writing generation N+1 to the store **only if** the store still holds
   N (S3 `PutObject` with `If-Match` on N's ETag, in the reference
-  infra), then writes the local file and publishes the new state. Every
+  infra), then writes the local file and publishes the new state. The
+  local file is never authoritative: if writing it fails after the store
+  accepted the commit, the change still stands (it is published in memory
+  and logged as an error), the relay retries the local write, and any
+  restart re-reads the store, which has it. Every
   mutation the relay acknowledges (a redemption's `AUTH_RESULT`, a minted
   `INVITE`, a revocation's answer, an operator command's success) has
   been committed to the store first. A redeemed invite therefore cannot
   come back unredeemed, nor a revoked device come back authorized, after
   any restore: there is no later state that was acknowledged but not
   stored.
-- **Fail closed on mutations, not on service.** If the store cannot be
-  written, mutations fail and say so (`CAPACITY` for redemptions and
-  mints, which clients retry; an error for operator commands), while
-  sessions keep authenticating from the state already committed. A
-  conditional write that finds a generation other than N means another
-  writer exists: the relay stops mutating, logs an error, and keeps
-  serving the state it has.
-- **Start-up.** The relay reads the store's latest generation. With a
-  local file of the same generation, it uses the file. If the store is
-  unreachable, it may serve a local file, but accepts no mutations until
-  the store confirms that generation is still the latest. With no local
-  file and no store, it accepts no one, and keeps retrying the store,
-  rather than start from anything it cannot prove current.
+- **One relay at a time: the writer lease.** Conditional writes stop
+  lost updates, but not a second, stale relay serving revoked devices
+  from its cache, for instance an old instance still running while its
+  replacement takes over. So the store also holds a **lease**: an object
+  naming one holder (instance ID, random holder token) and an expiry,
+  written with the same conditional writes. Only the holder may commit,
+  and each commit also checks the lease is still its own.
+  - The holder renews the lease every minute; its length `L` is 15
+    minutes by default.
+  - **Authenticating needs a live lease.** A relay authenticates new
+    sessions only while its lease is unexpired by its own monotonic
+    clock, less a safety margin (1 minute) for clock rate differences.
+    Another relay can acquire the lease only after it expires, or when
+    the holder releases it on a clean shutdown, so two relays never
+    authenticate from different states at the same time.
+  - **Losing the lease closes everything.** When its lease expires
+    unrenewed, or a renewal or commit finds another holder, a relay stops
+    authenticating, closes all its sessions (`CLOSE(UNAUTHORIZED)`), and
+    keeps trying to reacquire the lease. Clients reconnect, to whichever
+    relay holds it. A revocation committed by the holder therefore takes
+    effect at once on the holder, and on any stale relay within `L` at
+    most.
+  - **Store outages.** While the store is unreachable, the holder keeps
+    serving, from its committed state, until its lease runs out: an
+    outage shorter than `L` is invisible to clients; a longer one stops
+    new authentications and closes sessions, since the relay can no
+    longer prove it is the only one serving. Mutations fail throughout
+    (`CAPACITY` for redemptions, mints and device revocations, which
+    clients retry; an error for operator commands). `L` is the trade-off
+    between outage tolerance and how stale a revocation can be on a relay
+    that lost contact; the operator can change it.
+  - **Taking over from a dead holder.** A replacement instance waits for
+    the old lease to expire, unless the operator runs
+    `arc-relay accounts takeover`, asserting the old instance is gone,
+    which breaks the lease. A clean shutdown releases it, so ordinary
+    instance replacement does not wait.
+- **Start-up.** The relay acquires the lease, then reads the store's
+  latest generation, and uses its local file only if it is that
+  generation. Without the lease (store unreachable, or held elsewhere),
+  it authenticates no one and keeps trying, rather than serve anything it
+  cannot prove current.
 - **Size.** The file is bounded: at most 256 accounts and 16 devices
   each, invites and tombstones bounded by their caps and lifetimes, well
   under 1 MiB. The reference store is a versioned, KMS-encrypted S3
@@ -335,17 +374,26 @@ secret are **derived**, not random, so the relay can answer a repeat
 without storing the secret:
 
 ```text
-invite_id = HMAC-SHA256(invite_key, "ARC/1 invite id"     || device_id || request_id)[0:8]
-secret    = HMAC-SHA256(invite_key, "ARC/1 invite secret" || device_id || request_id)[0:16]
+invite_id = HMAC-SHA256(invite_key, "ARC/1 invite id"     || device_id || request_id || u64(gen))[0:8]
+secret    = HMAC-SHA256(invite_key, "ARC/1 invite secret" || device_id || request_id || u64(gen))[0:16]
 ```
 
 `invite_key` is a 32-byte relay secret kept with the relay's identity
 (SSM, like the reset secret), never in the accounts file, so a copy of
 the file still yields no secret. The relay records the invite with
-`by=`/`req=`; a later request with the same (device, request ID)
-recomputes the same invite and answers with it, across sessions and
-relay restarts, for as long as the record is kept. A lost answer never
-mints a second invite or consumes a second slot of the cap. Operator
+`by=`/`req=` and `gen=`, the generation of the transaction that created
+it; a later request with the same (device, request ID) finds the record,
+recomputes the same invite from its `gen`, and answers with it, across
+sessions and relay restarts, for as long as the record is kept. A lost
+answer never mints a second invite or consumes a second slot of the cap.
+
+**An old secret never comes back.** Generations only increase and each
+names one transaction, so a request whose record is gone (expired and
+past its retention) can only be minted afresh, at a new generation, with
+a different ID and secret; the expired invite stays dead. While the
+record is kept, a repeat of an expired invite's request is answered
+`INVITE_EXPIRED`, not reissued. The client gives up on a request it has
+had no answer to for an hour, and discards its `request_id`. Operator
 invites stay random: the command prints the invite once, and an
 operator who loses it cancels it and mints another.
 
@@ -466,6 +514,9 @@ out of nothing the operator cannot restore.
 - **Restore after revocation or redemption:** impossible, since every
   acknowledged change is committed to the store first and start-up uses
   the store's latest generation (§3.2).
+- **Stale relay:** a relay that has lost the writer lease authenticates
+  no one and closes its sessions within `L` (§3.2); revocations reach it
+  no later than that.
 - **The invite leaks the relay's address:** as today's files do.
 
 ## 5. Spec changes
@@ -490,7 +541,12 @@ out of nothing the operator cannot restore.
    closing live sessions, generations, the store as the commit point
    with conditional writes, and fail-closed start-up. Tests: a lost store
    write refuses the mutation; a conflicting generation stops mutation;
-   a fresh instance with no store reachable accepts no one.
+   a fresh instance with no store reachable accepts no one. The writer
+   lease, with tests: a second relay waits for the lease and the first
+   closes its sessions when it expires; a store outage shorter than `L`
+   keeps sessions up and refuses mutations; an offline `revoke` commits
+   to the store and is seen by the next relay; a local write failing
+   after a commit loses nothing.
 2. **Invites and redemption:** invite records, the enrollment credential,
    key binding, `ENROLLED`, `INVITE_USED`/`INVITE_EXPIRED`, the fallback,
    `arc-client enroll` and client profiles (`arc-client run -profile
@@ -501,8 +557,10 @@ out of nothing the operator cannot restore.
    persisted request IDs, derived invite secrets and `invite_key`, caps,
    logging, lineage-based `revoke -descendants` and `rotate`. Tests: an
    `INVITE` answer lost across a relay restart, then the same request
-   answered with the same invite; descendants revoked after the invites
-   linking them expired and an intermediate device was revoked.
+   answered with the same invite; a repeat after the invite expired
+   answered `INVITE_EXPIRED`, and after its record is gone minted with a
+   new secret; descendants revoked after the invites linking them expired
+   and an intermediate device was revoked; minting refused at depth 8.
 4. **Devices managing devices:** `DEVICES`, the list and revoke frames,
    cooling-off, soft revocation and `restore`, `CLOSE(REVOKED)`,
    `arc-client devices` and `revoke`. netns tests: revoke a device from
