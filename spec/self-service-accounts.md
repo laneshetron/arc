@@ -1,6 +1,6 @@
 # ARC — Self-Service Accounts: Invites and Devices
 
-**Status:** draft design, revision 5, feeds spec 0.3. Companion to the
+**Status:** draft design, revision 6, feeds spec 0.3. Companion to the
 ARC/1 handoff (`ARC-v1-Protocol-and-Implementation-Handoff.md`); section
 references (§N) point there. Nothing here is implemented yet.
 
@@ -76,9 +76,9 @@ bytes, hex), never derived from names or line numbers, so rewrites and
 renames cannot change them.
 
 ```text
-# arc-accounts 2 generation=N
+# arc-accounts 2 generation=N lease=HOLDER,TOKEN,EXPIRES
 account  ID NAME [relay] [max_devices=5] [invites=yes|no] [manage=yes|no]
-device   ID ACCOUNT_ID NAME token=SHA256 front=F [key=CLIENT_STATIC] lineage=ID,... [via=INVITE_ID] [created=T]
+device   ID ACCOUNT_ID NAME token=SHA256 front=F [key=CLIENT_STATIC] lineage=ID,... [via=INVITE_ID] created=T
 invite   ID ACCOUNT_ID HASH front=F expires=T [by=DEVICE_ID req=REQUEST_ID gen=N] [redeemed=DEVICE_ID]
 revoked  ID until=T [by=DEVICE_ID] [record=...]
 ```
@@ -102,9 +102,12 @@ revoked  ID until=T [by=DEVICE_ID] [record=...]
   reads it directly, so it does not depend on invite records, which
   expire, or on ancestors still existing, which may have been revoked.
   Because revoked ancestors stay in it, its length is not bounded by the
-  device cap; it is bounded instead by a **maximum depth** of 8: a device
-  whose lineage already has 7 entries cannot mint invites (`CAPACITY`),
-  so no lineage exceeds 8. `via` names the invite, for audit only.
+  device cap. It is bounded instead by one invariant: **every lineage has
+  at most 7 entries**, so a chain is at most 8 devices, root included.
+  Enrollment checks it exactly: a device may be enrolled through a minted
+  invite only if `len(minter.lineage) + 1 <= 7`, and a device whose own
+  lineage already has 7 entries is refused `CAPACITY` when it asks to
+  mint. `via` names the invite, for audit only.
 - **`front`** (on `device` and `invite`) is the front admission verifier
   (§3.5), stored because it cannot be recomputed from the hash beside it.
 - **`invite`** stores the SHA-256 of its secret. `by`/`req` identify an
@@ -122,8 +125,14 @@ revoked  ID until=T [by=DEVICE_ID] [record=...]
 - **Migration.** A file without the header is today's format
   (`NAME TOKEN [relay]`, or a bare `TOKEN`). The relay reads it, and on
   its first write converts it: one `account` per name, one `device` per
-  token (named `legacy-1`, `legacy-2`, …, with no `key`), tokens hashed.
-  Legacy devices stay unbound to a key.
+  token (named `legacy-1`, `legacy-2`, …, with no `key`), tokens hashed,
+  `created=` the time of migration. Legacy devices stay unbound to a key,
+  and keep exactly what they have today, network access, and nothing
+  more: **only key-bound devices may mint invites or manage devices**
+  (§3.6, §3.8), whatever the account's policy. A copied legacy token,
+  which is a bearer credential, therefore cannot revoke anyone. A legacy
+  device gains those rights by enrolling again, through an operator
+  invite.
 
 ### 3.2 One writer: the running relay
 
@@ -172,12 +181,23 @@ is its only writer** and serializes every mutation:
 - **One relay at a time: the writer lease.** Conditional writes stop
   lost updates, but not a second, stale relay serving revoked devices
   from its cache, for instance an old instance still running while its
-  replacement takes over. So the store also holds a **lease**: an object
-  naming one holder (instance ID, random holder token) and an expiry,
-  written with the same conditional writes. Only the holder may commit,
-  and each commit also checks the lease is still its own.
+  replacement takes over. So the store also holds a **lease**, naming one
+  holder (instance ID, random holder token) and an expiry.
+  - **The lease lives in the accounts object itself**, in its header, so
+    one conditional write covers both. Acquiring, renewing, releasing and
+    breaking the lease are commits like any other: each writes a new
+    generation with `If-Match` on the ETag the writer last read. A writer
+    whose lease was broken or taken over therefore cannot commit, even
+    with an accounts change it prepared before: the takeover changed the
+    object, so its `If-Match` fails. No second object, and no separate
+    check that could go stale between checking and writing.
+  - A writer also refuses to commit, or renew, once its lease has expired
+    by its own clock; a write that fails its `If-Match` means the lease
+    is gone, and is handled as losing it (below).
   - The holder renews the lease every minute; its length `L` is 15
-    minutes by default.
+    minutes by default. Renewals bump the generation like any commit,
+    about 1,440 a day, which S3 object versioning keeps as history; a
+    lifecycle rule expires noncurrent versions after 30 days.
   - **Authenticating needs a live lease.** A relay authenticates new
     sessions only while its lease is unexpired by its own monotonic
     clock, less a safety margin (1 minute) for clock rate differences.
@@ -355,7 +375,8 @@ The front is not deployed today; this lands with it.
 ### 3.6 Frames
 
 `AUTH_RESULT` advertises features bit 4, `INVITES`, when the session's
-account may mint invites (`invites=yes`, the default).
+account may mint invites (`invites=yes`, the default) and its device is
+key-bound (§3.1).
 
 | Type | Name | Value | Direction |
 |---|---|---|---|
@@ -438,7 +459,7 @@ retrying as for a network failure.
 
 A person who loses a laptop should be able to cut it off from their
 desktop at once, without reaching the operator. With features bit 5,
-`DEVICES` (account policy `manage=yes`, the default), a device may list
+`DEVICES` (account policy `manage=yes`, the default, for key-bound devices), a device may list
 its account's devices and revoke them.
 
 | Type | Name | Value | Direction |
@@ -473,8 +494,12 @@ these same frames against the owner's other devices. The design does not
 try to decide who is the owner; it bounds the damage and keeps recovery
 with the operator:
 
+- **Key-bound only.** Only a device bound to a Noise static key may list
+  or revoke devices (§3.1); a legacy, bearer-only device may not, even
+  under `manage=yes`.
 - **Cooling-off.** A device may revoke other devices only once it has
-  been enrolled for 24 hours (its own revocation is always allowed). A
+  been enrolled for 24 hours, measured from its `created` time (its own
+  revocation is always allowed). A
   device an attacker enrolls through a stolen device's invites cannot
   purge the account before the owner notices, and descendants revoke
   with their ancestor anyway.
@@ -542,7 +567,9 @@ out of nothing the operator cannot restore.
    with conditional writes, and fail-closed start-up. Tests: a lost store
    write refuses the mutation; a conflicting generation stops mutation;
    a fresh instance with no store reachable accepts no one. The writer
-   lease, with tests: a second relay waits for the lease and the first
+   lease in the accounts object's header, with tests: a writer whose
+   lease was broken by `takeover` fails to commit a change it prepared
+   before; a second relay waits for the lease and the first
    closes its sessions when it expires; a store outage shorter than `L`
    keeps sessions up and refuses mutations; an offline `revoke` commits
    to the store and is seen by the next relay; a local write failing
@@ -560,7 +587,9 @@ out of nothing the operator cannot restore.
    answered with the same invite; a repeat after the invite expired
    answered `INVITE_EXPIRED`, and after its record is gone minted with a
    new secret; descendants revoked after the invites linking them expired
-   and an intermediate device was revoked; minting refused at depth 8.
+   and an intermediate device was revoked; a device with a 6-entry lineage
+   may mint and its child enrolls with 7; a device with 7 is refused;
+   a legacy device's `INVITE_REQUEST` and `REVOKE_REQUEST` refused.
 4. **Devices managing devices:** `DEVICES`, the list and revoke frames,
    cooling-off, soft revocation and `restore`, `CLOSE(REVOKED)`,
    `arc-client devices` and `revoke`. netns tests: revoke a device from
