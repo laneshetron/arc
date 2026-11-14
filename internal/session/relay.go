@@ -3,6 +3,7 @@ package session
 import (
 	"bytes"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"net/netip"
@@ -20,7 +21,8 @@ import (
 // configuration, so an Authorizer that leases addresses must not lease
 // another, and should reject a credential of a different principal than
 // the one prior's lease belongs to. A non-nil error or a nonzero Status
-// rejects the client.
+// rejects the client; an error wrapping ErrCapacity rejects it as the
+// relay being full, which the client retries.
 type Authorizer func(credential, clientStatic []byte, prior *wire.AuthResult) (wire.AuthResult, error)
 
 // RelayConfig configures a relay endpoint.
@@ -684,6 +686,13 @@ func (s *RelaySession) onAuth(now time.Time, credential []byte) bool {
 		prior = &s.result
 	}
 	result, err := r.cfg.Authorize(credential, s.clientStatic, prior)
+	if errors.Is(err, ErrCapacity) {
+		// The Authorizer cannot decide now (for instance, its relay is
+		// not serving accounts): the client may retry, as when full.
+		s.conn.transmit(now, s.conn.path(0), []wire.Frame{wire.AuthResult{Status: uint8(wire.CodeCapacity)}, wire.CloseFrame{Code: wire.CodeCapacity}})
+		r.closeSession(now, s, err, false)
+		return false
+	}
 	if err != nil || result.Status != 0 {
 		failure := wire.AuthResult{Status: uint8(wire.CodeAuthFailed)}
 		s.conn.transmit(now, s.conn.path(0), []wire.Frame{failure, wire.CloseFrame{Code: wire.CodeAuthFailed}})
@@ -757,6 +766,18 @@ func (r *Relay) leavePending(s *RelaySession) {
 		delete(r.inits, s.initKey)
 		r.pending--
 	}
+}
+
+// Revoke closes s because its credential no longer admits it: the
+// client is told with CLOSE(code), and SessionClosed reports err.
+func (r *Relay) Revoke(now time.Time, s *RelaySession, code wire.ErrorCode, err error) {
+	if s.state == StateClosed {
+		return
+	}
+	if p := s.primary(now); p != nil {
+		s.conn.transmit(now, p, []wire.Frame{wire.CloseFrame{Code: code}})
+	}
+	r.closeSession(now, s, err, false)
 }
 
 func (r *Relay) closeSession(now time.Time, s *RelaySession, err error, notify bool) {

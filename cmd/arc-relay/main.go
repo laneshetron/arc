@@ -15,6 +15,12 @@
 //
 //	arc-relay run ... -deny 172.31.0.0/16
 //
+// To change accounts while the relay runs, keep them in a store instead
+// (seeded from the tokens file when empty), and use arc-relay accounts:
+//
+//	arc-relay run ... -accounts-store file:/var/lib/arc/accounts
+//	arc-relay accounts add-token lane laptop
+//
 // For networks that block UDP, also accept TLS/TCP carriers (clients use
 // -tls and, for a self-signed certificate, -tls-ca relay.crt):
 //
@@ -50,6 +56,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/laneshetron/arc/internal/accounts"
 	"github.com/laneshetron/arc/internal/carrier/stream"
 	"github.com/laneshetron/arc/internal/carrier/udp"
 	"github.com/laneshetron/arc/internal/crypto"
@@ -76,6 +83,8 @@ func main() {
 		err = gencert(os.Args[2:])
 	case "run":
 		err = run(os.Args[2:])
+	case "accounts":
+		err = accountsCmd(os.Args[2:])
 	default:
 		usage()
 	}
@@ -86,7 +95,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: arc-relay genkey | pubkey | gencert [flags] | run [flags]")
+	fmt.Fprintln(os.Stderr, "usage: arc-relay genkey | pubkey | gencert [flags] | run [flags] | accounts [flags] COMMAND")
 	os.Exit(2)
 }
 
@@ -143,6 +152,10 @@ func run(args []string) error {
 	listen := fs.String("listen", "0.0.0.0:4433", "UDP address to listen on")
 	keyFile := fs.String("key-file", "relay.key", "relay static private key (from genkey)")
 	resetFile := fs.String("reset-secret-file", "reset.secret", "stateless reset secret; created if missing, keep it across restarts")
+	storeURL := fs.String("accounts-store", "", "keep accounts in this store instead of reading -tokens-file once: file:PATH. The relay then changes accounts while it runs (arc-relay accounts), and authenticates only while it holds the store's writer lease; an empty store is seeded from -tokens-file, if it exists")
+	controlDir := fs.String("accounts-control", defaultControlDir, "with -accounts-store: directory for the control socket and the writer lock")
+	holder := fs.String("accounts-holder", defaultHolder(), "with -accounts-store: this relay's name in the writer lease (unique per relay host)")
+	accountsLease := fs.Duration("accounts-lease", accounts.DefaultLease, "with -accounts-store: writer lease length, the longest a store outage goes unnoticed by clients, and the longest a revocation takes to reach a relay that lost the store")
 	tokensFile := fs.String("tokens-file", "tokens", "client accounts, one credential per line: NAME TOKEN [relay], or a bare TOKEN for an account of its own; accounts cannot reach each other's clients, and only \"relay\" accounts reach the relay's tunnel address")
 	var deny []netip.Prefix
 	fs.Func("deny", "IPv4 prefix no client may reach, by IP forwarding or split TCP, e.g. the relay's VPC (repeatable); the relay host's own addresses stay reachable for \"relay\" accounts", func(v string) error {
@@ -205,21 +218,47 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
-	lines, err := keyfile.ReadLines(*tokensFile)
-	if err != nil {
-		return err
-	}
-	if len(lines) == 0 {
-		return fmt.Errorf("%s: no tokens", *tokensFile)
-	}
-	accounts, err := gateway.ParseAccounts(lines)
-	if err != nil {
-		return fmt.Errorf("%s: %w", *tokensFile, err)
+	var staticAccounts []gateway.Account
+	var writer *accounts.Writer
+	if *storeURL == "" {
+		lines, err := keyfile.ReadLines(*tokensFile)
+		if err != nil {
+			return err
+		}
+		if len(lines) == 0 {
+			return fmt.Errorf("%s: no tokens", *tokensFile)
+		}
+		if staticAccounts, err = gateway.ParseAccounts(lines); err != nil {
+			return fmt.Errorf("%s: %w", *tokensFile, err)
+		}
+	} else {
+		if *frontListen != "" {
+			return errors.New("-front-listen needs -tokens-file: the front admits by plaintext tokens, which -accounts-store does not keep")
+		}
+		store, err := openStore(*storeURL)
+		if err != nil {
+			return err
+		}
+		writer = &accounts.Writer{Store: store, Holder: *holder, Lease: *accountsLease, Log: log,
+			Seed: func() (*accounts.State, error) {
+				data, err := os.ReadFile(*tokensFile)
+				if errors.Is(err, os.ErrNotExist) {
+					return &accounts.State{}, nil
+				}
+				if err != nil {
+					return nil, err
+				}
+				log.Info("accounts store is empty; seeding it from the tokens file", "file", *tokensFile)
+				return accounts.Parse(data, time.Now())
+			}}
 	}
 	gwCfg := gateway.Config{
 		Network: netPrefix, TunMTU: uint16(*mtu),
 		Keepalive: session.DefaultKeepalive, Idle: session.DefaultIdleTimeout,
-		Accounts: accounts, Deny: deny,
+		Accounts: staticAccounts, Deny: deny,
+	}
+	if writer != nil {
+		gwCfg.Gate = writer.Serving
 	}
 	if gwCfg.HostAddrs, err = hostAddrs(); err != nil {
 		return err
@@ -232,6 +271,25 @@ func run(args []string) error {
 	gw, err := gateway.New(gwCfg)
 	if err != nil {
 		return err
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if writer != nil {
+		ctl := accounts.Control{Dir: *controlDir}
+		unlock, err := ctl.Lock()
+		if err != nil {
+			return fmt.Errorf("-accounts-control %s: %w", *controlDir, err)
+		}
+		defer unlock()
+		writer.OnState, writer.OnLost = gw.Apply, gw.Suspend
+		done := make(chan struct{})
+		go func() { writer.Run(ctx); close(done) }()
+		defer func() { stop(); <-done }() // release the lease on the way out
+		go func() {
+			if err := ctl.Serve(ctx, writer); err != nil {
+				log.Error("accounts control socket stopped", "err", err)
+			}
+		}()
 	}
 
 	dev, err := tun.Create(*tunName, *mtu)
@@ -291,11 +349,9 @@ func run(args []string) error {
 		streams, tlsAddr = front, front.Addr().String()
 	}
 
-	log.Info("relay listening", "addr", conn.LocalAddr(), "tls", tlsAddr, "tun", dev.Name(), "network", netPrefix, "accounts", len(accounts),
+	log.Info("relay listening", "addr", conn.LocalAddr(), "tls", tlsAddr, "tun", dev.Name(), "network", netPrefix, "accounts_store", *storeURL,
 		"host_addrs", gwCfg.HostAddrs, "deny", deny, "diagnostics_dir", *diagDir,
 		"public_key", keyfile.Encode(static.Public))
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	rcfg := engine.RelayConfig{
 		Session: session.RelayConfig{
 			Static: static, ResetSecret: resetSecret, IdleTimeout: gwCfg.Idle + 10*time.Second,

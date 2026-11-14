@@ -5,7 +5,7 @@
 package gateway
 
 import (
-	"crypto/subtle"
+	"bytes"
 	"errors"
 	"fmt"
 	"net/netip"
@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/laneshetron/arc/internal/accounts"
 	"github.com/laneshetron/arc/internal/session"
 	"github.com/laneshetron/arc/internal/wire"
 )
@@ -21,6 +22,12 @@ var (
 	ErrPoolExhausted = errors.New("gateway: address pool exhausted")
 	ErrBadCredential = errors.New("gateway: unknown credential")
 	ErrWrongAccount  = errors.New("gateway: credential of another account")
+	ErrWrongKey      = errors.New("gateway: credential bound to another device key")
+	ErrRevoked       = errors.New("gateway: device revoked")
+	// ErrNotServing: the relay does not hold the accounts lease, so it
+	// cannot prove its accounts are current. It wraps session.ErrCapacity,
+	// so the client is told the relay is full and retries.
+	ErrNotServing = fmt.Errorf("gateway: not serving accounts: %w", session.ErrCapacity)
 )
 
 // Config describes the tunnel network.
@@ -39,6 +46,10 @@ type Config struct {
 	// Tokens is shorthand for accounts of one token each, with no relay
 	// access, named token1, token2, ...
 	Tokens [][]byte
+	// Gate, if set, is asked before every authorization: false refuses
+	// it with ErrNotServing. A relay authenticating from an accounts
+	// store passes its writer's Serving (self-service-accounts.md §3.2).
+	Gate func() bool
 
 	// HostAddrs are the relay host's own addresses outside the tunnel
 	// network (its LAN or VPC address, say). Like the relay's tunnel
@@ -53,34 +64,59 @@ type Config struct {
 	Deny []netip.Prefix
 }
 
-// A lease is a tunnel address and the account it was leased to. The
-// session is nil until the session is established.
+// A lease is a tunnel address and the account and device it was leased
+// to. The session is nil until the session is established. A revoked
+// lease's device no longer admits it; it is released when its session
+// closes.
 type lease struct {
 	account *Account
+	device  accounts.ID
+	name    string // the device's
 	session *session.RelaySession
+	revoked bool
 }
 
-// Gateway leases addresses and maps them to sessions. Authorize and the
-// routing methods may be called from different goroutines.
-type Gateway struct {
-	cfg      Config
-	accounts []Account
+// A credential is what a token, by its hash, admits.
+type credential struct {
+	account *Account
+	device  accounts.ID
+	name    string
+	key     []byte // the Noise static key it is bound to, if any
+}
 
-	mu     sync.Mutex
-	next   netip.Addr
-	leased map[netip.Addr]lease
-	free   []netip.Addr
+// A Revocation is a session the relay must close: its device was
+// revoked, or the relay stopped serving accounts.
+type Revocation struct {
+	Session *session.RelaySession
+	Code    wire.ErrorCode
+	Err     error
+}
+
+// Gateway leases addresses and maps them to sessions. Authorize, Apply
+// and the routing methods may be called from different goroutines.
+type Gateway struct {
+	cfg Config
+
+	mu       sync.Mutex
+	accounts map[accounts.ID]*Account // one per account for the gateway's life, updated in place
+	creds    map[[32]byte]credential  // by token hash; replaced whole by Apply
+	static   [][]byte                 // Config's plaintext tokens, for the front
+	next     netip.Addr
+	leased   map[netip.Addr]lease
+	free     []netip.Addr
+	revoke   []Revocation
+	kick     chan struct{}
 }
 
 func New(cfg Config) (*Gateway, error) {
 	if !cfg.Network.Addr().Is4() || cfg.Network.Bits() > 30 {
 		return nil, errors.New("gateway: network must be an IPv4 prefix of /30 or larger")
 	}
-	accounts := slices.Clone(cfg.Accounts)
+	accts := slices.Clone(cfg.Accounts)
 	for i, t := range cfg.Tokens {
-		accounts = append(accounts, Account{Name: fmt.Sprintf("token%d", i+1), Tokens: [][]byte{t}})
+		accts = append(accts, Account{Name: fmt.Sprintf("token%d", i+1), Tokens: [][]byte{t}})
 	}
-	if err := validate(accounts); err != nil {
+	if err := validate(accts); err != nil {
 		return nil, err
 	}
 	cfg.HostAddrs = slices.Clone(cfg.HostAddrs)
@@ -92,38 +128,138 @@ func New(cfg Config) (*Gateway, error) {
 			return nil, fmt.Errorf("gateway: deny prefix %v is not IPv4", p)
 		}
 	}
-	return &Gateway{cfg: cfg, accounts: accounts, next: cfg.Network.Masked().Addr().Next(), leased: map[netip.Addr]lease{}}, nil
+	g := &Gateway{cfg: cfg, accounts: map[accounts.ID]*Account{}, creds: map[[32]byte]credential{},
+		next: cfg.Network.Masked().Addr().Next(), leased: map[netip.Addr]lease{}, kick: make(chan struct{}, 1)}
+	for i := range accts {
+		a := &accts[i]
+		var id accounts.ID
+		id[0], id[1], id[7] = byte(i>>8), byte(i), 0xff // static accounts' IDs, never random ones' concern
+		g.accounts[id] = a
+		for j, t := range a.Tokens {
+			g.creds[accounts.TokenHash(t)] = credential{account: a, device: deviceID(id, j), name: fmt.Sprintf("token%d", j+1)}
+			g.static = append(g.static, t)
+		}
+	}
+	return g, nil
 }
 
-// Tokens returns every account's tokens, for admission checks made
-// before a session exists (the HTTPS front's upgrade).
-func (g *Gateway) Tokens() [][]byte {
-	var out [][]byte
-	for _, a := range g.accounts {
-		out = append(out, a.Tokens...)
+func deviceID(account accounts.ID, i int) accounts.ID {
+	account[6] = byte(i + 1)
+	return account
+}
+
+// Tokens returns the tokens of Config's accounts, for admission checks
+// made before a session exists (the HTTPS front's upgrade). Accounts
+// from Apply keep only token hashes, so they have none here.
+func (g *Gateway) Tokens() [][]byte { return g.static }
+
+// Apply replaces the gateway's accounts and devices with st's. An
+// account keeps its *Account across calls (by ID), so leases, refreshes
+// and isolation are unaffected. Leases whose device or account st no
+// longer has are revoked: their sessions are queued for closing (see
+// Revocations), and Bind refuses those not yet established.
+func (g *Gateway) Apply(st *accounts.State) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	seen := map[accounts.ID]bool{}
+	for _, ra := range st.Accounts {
+		seen[ra.ID] = true
+		a := g.accounts[ra.ID]
+		if a == nil {
+			a = &Account{}
+			g.accounts[ra.ID] = a
+		}
+		a.Name, a.RelayAccess, a.Tokens = ra.Name, ra.RelayAccess, nil
 	}
-	return out
+	for id := range g.accounts {
+		if !seen[id] {
+			delete(g.accounts, id)
+		}
+	}
+	creds := map[[32]byte]credential{}
+	devices := map[accounts.ID]bool{}
+	for _, d := range st.Devices {
+		creds[d.TokenHash] = credential{account: g.accounts[d.Account], device: d.ID, name: d.Name, key: d.Key}
+		devices[d.ID] = true
+	}
+	g.creds, g.static = creds, nil
+	for addr, l := range g.leased {
+		if !l.revoked && !devices[l.device] {
+			g.revokeLocked(addr, l, wire.CodeAuthFailed, ErrRevoked)
+		}
+	}
+}
+
+// Suspend revokes every lease, because the relay stopped serving
+// accounts (it lost the accounts lease): every session is queued for
+// closing with UNAUTHORIZED, and its client reconnects, to whichever
+// relay serves the accounts.
+func (g *Gateway) Suspend(err error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for addr, l := range g.leased {
+		if !l.revoked {
+			g.revokeLocked(addr, l, wire.CodeUnauthorized, fmt.Errorf("%w: %v", ErrNotServing, err))
+		}
+	}
+}
+
+func (g *Gateway) revokeLocked(addr netip.Addr, l lease, code wire.ErrorCode, err error) {
+	l.revoked = true
+	g.leased[addr] = l
+	if l.session != nil {
+		g.revoke = append(g.revoke, Revocation{Session: l.session, Code: code, Err: err})
+		select {
+		case g.kick <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// Revocations signals when sessions are queued for closing; TakeRevocations
+// returns them.
+func (g *Gateway) Revocations() <-chan struct{} { return g.kick }
+
+// TakeRevocations returns and forgets the sessions queued for closing.
+func (g *Gateway) TakeRevocations() []Revocation {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	r := g.revoke
+	g.revoke = nil
+	return r
 }
 
 // Authorize implements session.Authorizer: it checks the credential and,
 // on first authentication, leases an address to the credential's
 // account. A lease keeps the account it was leased to, so a refresh must
 // present a credential of that same account.
-func (g *Gateway) Authorize(credential, _ []byte, prior *wire.AuthResult) (wire.AuthResult, error) {
-	a := g.account(credential)
-	if a == nil {
+//
+// A credential bound to a device key admits only a client with that key
+// (self-service-accounts.md §3.4).
+func (g *Gateway) Authorize(token, clientStatic []byte, prior *wire.AuthResult) (wire.AuthResult, error) {
+	if g.cfg.Gate != nil && !g.cfg.Gate() {
+		return wire.AuthResult{}, ErrNotServing
+	}
+	hash := accounts.TokenHash(token)
+	g.mu.Lock()
+	c, ok := g.creds[hash]
+	g.mu.Unlock()
+	if !ok || c.account == nil {
 		return wire.AuthResult{}, ErrBadCredential
+	}
+	if c.key != nil && !bytes.Equal(c.key, clientStatic) {
+		return wire.AuthResult{}, ErrWrongKey
 	}
 	if prior != nil {
 		g.mu.Lock()
 		l, ok := g.leased[netip.AddrFrom4(prior.IPv4)]
 		g.mu.Unlock()
-		if !ok || l.account != a {
+		if !ok || l.account != c.account || l.revoked {
 			return wire.AuthResult{}, ErrWrongAccount
 		}
 		return wire.AuthResult{}, nil
 	}
-	addr, err := g.lease(a)
+	addr, err := g.lease(c)
 	if err != nil {
 		return wire.AuthResult{}, err
 	}
@@ -140,30 +276,16 @@ func (g *Gateway) Authorize(credential, _ []byte, prior *wire.AuthResult) (wire.
 	return r, nil
 }
 
-// account returns the account holding credential, or nil. It compares
-// every token, so its timing does not depend on which one matched.
-func (g *Gateway) account(credential []byte) *Account {
-	match := -1
-	for i, a := range g.accounts {
-		for _, t := range a.Tokens {
-			match = subtle.ConstantTimeSelect(subtle.ConstantTimeCompare(t, credential), i, match)
-		}
-	}
-	if match < 0 {
-		return nil
-	}
-	return &g.accounts[match]
-}
-
 // lease reserves an address that is neither the relay's own, the network
 // address, nor the broadcast address.
-func (g *Gateway) lease(a *Account) (netip.Addr, error) {
+func (g *Gateway) lease(c credential) (netip.Addr, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	l := lease{account: c.account, device: c.device, name: c.name}
 	if n := len(g.free); n > 0 {
 		addr := g.free[n-1]
 		g.free = g.free[:n-1]
-		g.leased[addr] = lease{account: a}
+		g.leased[addr] = l
 		return addr, nil
 	}
 	for g.cfg.Network.Contains(g.next) {
@@ -172,21 +294,26 @@ func (g *Gateway) lease(a *Account) (netip.Addr, error) {
 		if addr == g.cfg.Network.Addr() || !g.cfg.Network.Contains(addr.Next()) {
 			continue // the relay itself, or the broadcast address
 		}
-		g.leased[addr] = lease{account: a}
+		g.leased[addr] = l
 		return addr, nil
 	}
 	return netip.Addr{}, ErrPoolExhausted
 }
 
-// Bind records the session that owns its leased address.
-func (g *Gateway) Bind(s *session.RelaySession) {
+// Bind records the session that owns its leased address. It returns
+// false if the lease was revoked after it was granted (its device was
+// revoked, or the relay stopped serving), and the caller closes s.
+func (g *Gateway) Bind(s *session.RelaySession) bool {
 	a := netip.AddrFrom4(s.Config().IPv4)
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if l, ok := g.leased[a]; ok {
-		l.session = s
-		g.leased[a] = l
+	l, ok := g.leased[a]
+	if !ok || l.revoked {
+		return false
 	}
+	l.session = s
+	g.leased[a] = l
+	return true
 }
 
 // Release returns a closed session's address to the pool.
@@ -211,6 +338,14 @@ func (g *Gateway) AccountName(addr netip.Addr) string {
 	return ""
 }
 
+// DeviceName returns the name of the device an address is leased to, or
+// "" if it is not leased.
+func (g *Gateway) DeviceName(addr netip.Addr) string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.leased[addr].name
+}
+
 // Lookup returns the session leasing the packet's destination address, or
 // nil. Packets for other addresses are not forwarded to any client
 // (§17.2), and neither are packets from another account's client: the
@@ -226,7 +361,7 @@ func (g *Gateway) Lookup(pkt []byte) *session.RelaySession {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	l, ok := g.leased[dst]
-	if !ok {
+	if !ok || l.revoked {
 		return nil
 	}
 	if g.cfg.Network.Contains(src) && src != g.cfg.Network.Addr() {
@@ -242,7 +377,16 @@ func (g *Gateway) Lookup(pkt []byte) *session.RelaySession {
 // lease (§11), so the policy follows the session's lease, not the packet:
 // see allowForward.
 func (g *Gateway) AllowForward(s *session.RelaySession, pkt []byte) bool {
-	return g.allowForward(netip.AddrFrom4(s.Config().IPv4), pkt)
+	from := netip.AddrFrom4(s.Config().IPv4)
+	return !g.isRevoked(from) && g.allowForward(from, pkt)
+}
+
+// isRevoked reports whether the lease of addr is revoked, or gone.
+func (g *Gateway) isRevoked(addr netip.Addr) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	l, ok := g.leased[addr]
+	return !ok || l.revoked
 }
 
 // allowForward applies AllowForward's policy to a packet from the client
@@ -265,7 +409,8 @@ func (g *Gateway) allowForward(from netip.Addr, pkt []byte) bool {
 // terminates streams at the relay, so a stream to another client is
 // refused even within an account.
 func (g *Gateway) AllowDial(s *session.RelaySession, dst netip.AddrPort) bool {
-	return g.allowDial(netip.AddrFrom4(s.Config().IPv4), dst)
+	from := netip.AddrFrom4(s.Config().IPv4)
+	return !g.isRevoked(from) && g.allowDial(from, dst)
 }
 
 func (g *Gateway) allowDial(from netip.Addr, dst netip.AddrPort) bool {

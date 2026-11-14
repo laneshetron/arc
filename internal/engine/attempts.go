@@ -191,6 +191,12 @@ func (a *AttemptLog) unestablished(s *session.RelaySession, err error) {
 	case errors.Is(err, gateway.ErrBadCredential):
 		a.line(slog.LevelInfo, "handshake rejected: unknown token", args...)
 		return
+	case errors.Is(err, gateway.ErrNotServing):
+		a.line(slog.LevelInfo, "handshake rejected: relay not serving accounts", args...)
+		return
+	case errors.Is(err, gateway.ErrWrongKey):
+		a.line(slog.LevelWarn, "handshake rejected: token bound to another device key", args...)
+		return
 	case errors.Is(err, session.ErrCapacity):
 		a.line(slog.LevelInfo, "handshake rejected: relay at capacity", args...)
 		return

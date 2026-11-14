@@ -163,10 +163,40 @@ friend  c47a…
 
 A name may repeat, giving its account several tokens. The relay reads
 the file only at startup, so changing it means restarting the relay, which
-interrupts every session. Several tokens allow a staged migration (add the
-new token, move clients to it, then remove the old one, a restart each
-time) but not yet an uninterrupted rotation, which needs credentials the
-relay can reload.
+interrupts every session.
+
+#### Changing accounts while the relay runs
+
+With `-accounts-store file:PATH`, the relay keeps its accounts in a store
+instead, and changes them without restarting
+([spec/self-service-accounts.md](spec/self-service-accounts.md)). An empty
+store is seeded from `-tokens-file` (each token becomes a device named
+`legacy-N`), and the store keeps only hashes of tokens.
+
+```sh
+arc-relay accounts list
+arc-relay accounts add alexei                 # -relay, -max-devices N
+arc-relay accounts add-token alexei laptop    # prints the new token once
+arc-relay accounts revoke alexei/laptop       # closes its session at once
+arc-relay accounts remove alexei
+```
+
+The commands talk to the running relay through its control socket
+(`-accounts-control`, default `/run/arc-relay`, root only). With the relay
+stopped, pass `-store` (the relay's `-accounts-store`) and they change the
+store themselves. Either way, a command succeeds only once the store has
+the change.
+
+The store also holds a **writer lease**: the relay authenticates clients
+only while it holds it, renewing it every minute (`-accounts-lease`,
+default 15 minutes). A relay that cannot renew it, because the store is
+unreachable or another relay took it, stops after the lease runs out and
+closes its sessions; its clients are told the relay is full and keep
+retrying. A clean shutdown releases the lease. After a crash, a relay on
+the same host (same `-accounts-holder`, the hostname by default) retakes
+it at once; one elsewhere waits for it to expire, or for
+`arc-relay accounts -store … takeover`, which you run only when the old
+relay is gone. `-front-listen` still needs `-tokens-file`.
 
 Clients of one account can reach each other's tunnel addresses; clients of
 different accounts never can. (Split TCP never connects a stream to another
