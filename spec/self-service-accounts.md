@@ -1,6 +1,6 @@
 # ARC — Self-Service Accounts: Invites and Devices
 
-**Status:** draft design, revision 2, feeds spec 0.3. Companion to the
+**Status:** draft design, revision 3, feeds spec 0.3. Companion to the
 ARC/1 handoff (`ARC-v1-Protocol-and-Implementation-Handoff.md`); section
 references (§N) point there. Nothing here is implemented yet.
 
@@ -77,15 +77,17 @@ renames cannot change them.
 
 ```text
 # arc-accounts 2
-account  ID NAME [relay] [max_devices=5] [invites=yes|no]
+account  ID NAME [relay] [max_devices=5] [invites=yes|no] [manage=yes|no]
 device   ID ACCOUNT_ID NAME token=SHA256 [key=CLIENT_STATIC] [via=INVITE_ID] [created=T]
 invite   ID ACCOUNT_ID HASH expires=T [by=DEVICE_ID req=REQUEST_ID] [redeemed=DEVICE_ID]
-revoked  ID until=T
+revoked  ID until=T [by=DEVICE_ID] [record=...]
 ```
 
 - **`account`** exists independently of devices, so an account can be
   created, with its policy, before anyone enrolls. Policy (`relay`,
-  `max_devices`, `invites`) lives once per account. The gateway accepts
+  `max_devices`, `invites`, `manage`) lives once per account.
+  `max_devices` is at most 16, so an account's device list fits in one
+  packet (§3.8). The gateway accepts
   accounts with no devices.
 - **`device`** stores the SHA-256 of its token, not the token: tokens are
   32 random bytes, so a plain hash suffices, and a copy of the file no
@@ -97,6 +99,9 @@ revoked  ID until=T
   invite a device minted, for idempotency (§3.6).
 - **`revoked`** keeps a revoked device's ID until its records could no
   longer be restored from a backup (§3.2), so a restore cannot revive it.
+  A revocation made by a device (§3.8) also keeps `by=` that device and
+  the revoked device's whole record, for 7 days, so the operator can
+  undo it.
 - Device names are letters, digits, `.`, `_` and `-`, at most 32 bytes,
   unique within the account. The client proposes one (its hostname by
   default); the relay appends `-2`, `-3`, … on a clash.
@@ -319,6 +324,65 @@ turn. Operator invites have no `by`; their devices are roots.
   when it is unclear which device was compromised.
 - `list` shows each account's devices as a tree by provenance, with each
   device's key fingerprint, creation time and last session.
+- `restore ACCOUNT/DEVICE` reinstates a device that **another device**
+  revoked, within 7 days, with its original ID, token hash and key (§3.8).
+  Operator revocations are final.
+
+A revoked device's sessions close with `CLOSE(REVOKED)`. Its client
+reports that the device was revoked, and stops reconnecting, instead of
+retrying as for a network failure.
+
+### 3.8 Devices managing devices
+
+A person who loses a laptop should be able to cut it off from their
+desktop at once, without reaching the operator. With features bit 5,
+`DEVICES` (account policy `manage=yes`, the default), a device may list
+its account's devices and revoke them.
+
+| Type | Name | Value | Direction |
+|---|---|---|---|
+| `0x1B` | `DEVICES_REQUEST` | `request_id[8]` | client → relay, with bit 5 |
+| `0x1C` | `DEVICES` | `request_id[8]; status:u8; n:u8;` n × `device_id[8]; parent[8]; created:u32; last_seen:u32; key[8]; u8 len; name` | relay → client |
+| `0x1D` | `REVOKE_REQUEST` | `request_id[8]; device_id[8]; flags:u8` (bit 0: descendants) | client → relay, with bit 5 |
+| `0x1E` | `REVOKE_RESULT` | `request_id[8]; status:u8` | relay → client |
+
+- `parent` is the device that minted the invite a device came from, zero
+  for one enrolled by an operator invite; `key` is the first 8 bytes of
+  its static key, for comparing with what the device itself shows. At 16
+  devices with 32-byte names, `DEVICES` is about 1,050 bytes.
+- `arc-client devices` lists them, marking this device and showing the
+  tree. `arc-client revoke NAME [-descendants]` revokes one; a device may
+  revoke itself (for instance before being given away).
+- Requests are retransmitted until answered. Revoking is idempotent: a
+  device already revoked answers status 0. Like an operator revocation,
+  the answer waits until the change is durable and the backup has
+  confirmed it (§3.2). If the backup hook fails, the revocation still
+  takes effect at once and the status is `NOT_BACKED_UP`; the relay keeps
+  retrying the backup.
+
+**A thief holds a device too.** Whoever has the stolen laptop can use
+these same frames against the owner's other devices. The design does not
+try to decide who is the owner; it bounds the damage and keeps recovery
+with the operator:
+
+- **Cooling-off.** A device may revoke other devices only once it has
+  been enrolled for 24 hours (its own revocation is always allowed). A
+  device an attacker enrolls through a stolen device's invites cannot
+  purge the account before the owner notices, and descendants revoke
+  with their ancestor anyway.
+- **Undoable.** Revocations by devices are soft: the operator can
+  `restore` the owner's devices for 7 days, then `revoke -descendants`
+  the thief's. Operator revocations are not undoable by devices.
+- **Logged.** Every revocation by a device is a warning line naming the
+  account, the revoking device and the revoked one, so the operator sees
+  it without being told.
+- **No escalation.** Revoking grants nothing: a device cannot raise the
+  device cap, change the account's policy, or touch another account.
+
+In the common case, the owner acts first: they revoke the lost device
+(with `-descendants`) from another, and the thief's device is closed out
+before it can do anything. If the thief acts first, the owner is locked
+out of nothing the operator cannot restore.
 
 ## 4. Threats
 
@@ -333,7 +397,9 @@ turn. Operator invites have no `by`; their devices are roots.
   enrolled under this design (§3.4).
 - **Stolen device:** can mint invites until revoked, bounded by the device
   cap and 2 outstanding invites, and every mint is logged. Its
-  descendants are revoked with it (§3.7).
+  descendants are revoked with it (§3.7). It can also revoke the owner's
+  other devices, once it is 24 hours old; the operator can undo that for
+  7 days (§3.8).
 - **Stolen accounts file or backup:** holds token and secret hashes only.
 - **Restore after revocation:** prevented by revocations waiting for the
   backup, and by `revoked` records (§3.2).
@@ -343,11 +409,14 @@ turn. Operator invites have no `by`; their devices are roots.
 
 - §9.2: `AUTH` carries either a token or an enrollment credential (§3.4
   here). A device's token may be bound to its Noise static key.
-- §10.1: frames `0x18 ENROLLED`, `0x19 INVITE_REQUEST`, `0x1A INVITE`;
-  `AUTH_RESULT` feature bit 4 `INVITES`. `AUTH_RESULT` is unchanged.
+- §10.1: frames `0x18 ENROLLED`, `0x19 INVITE_REQUEST`, `0x1A INVITE`,
+  `0x1B DEVICES_REQUEST`, `0x1C DEVICES`, `0x1D REVOKE_REQUEST`,
+  `0x1E REVOKE_RESULT`; `AUTH_RESULT` feature bits 4 `INVITES` and 5
+  `DEVICES`. `AUTH_RESULT` is unchanged.
 - §16.3 (front): the admission bearer is a value derived from the
   credential, never the credential.
-- Close codes: `11 INVITE_USED`, `12 INVITE_EXPIRED`.
+- Close codes: `11 INVITE_USED`, `12 INVITE_EXPIRED`, `13 REVOKED`,
+  `14 NOT_BACKED_UP`.
 - wire-registry.md and the wire fixtures, accordingly.
 
 ## 6. Implementation plan (one reviewed PR each)
@@ -366,16 +435,21 @@ turn. Operator invites have no `by`; their devices are roots.
 3. **Device-minted invites:** `INVITES`, the request frames with
    persisted request IDs, caps, logging, `revoke -descendants` and
    `rotate`.
-4. **Infra:** the SSM backup hook with revocations waiting for it;
+4. **Devices managing devices:** `DEVICES`, the list and revoke frames,
+   cooling-off, soft revocation and `restore`, `CLOSE(REVOKED)`,
+   `arc-client devices` and `revoke`. netns tests: revoke a device from
+   another while it is connected; a device younger than 24 hours refused;
+   restore after a device revocation.
+5. **Infra:** the SSM backup hook with revocations waiting for it;
    `add-account.sh` prints an invite; `secrets.sh` stops owning
    `/arc/tokens`; README.
-5. **Front admission** by derived values, with the front.
+6. **Front admission** by derived values, with the front.
 
 ## 7. Open questions
 
-- Should a device be able to list and revoke its account's other devices
-  (a lost laptop revoked from the desktop), or is that the operator's
-  job in v1?
 - Notify the operator out of band when a device mints an invite, or is
   the log enough?
 - Device cap, invite TTLs and the 7-day retention of redeemed invites.
+- Is 24 hours the right cooling-off? It also stops an owner's brand-new
+  device from revoking a lost one on its first day; the owner's older
+  devices, or the operator, still can.
