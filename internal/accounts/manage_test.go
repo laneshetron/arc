@@ -112,3 +112,75 @@ func TestRestore(t *testing.T) {
 		t.Error("restored an operator revocation")
 	}
 }
+
+// TestRevokeCascadeAfterParent: a descendant revocation still reaches the
+// invitees of a device already revoked on its own.
+func TestRevokeCascadeAfterParent(t *testing.T) {
+	st := &State{}
+	root := enrollRoot(t, st, 6)
+	a := mintAndEnroll(t, st, root, "a", t0)
+	b := mintAndEnroll(t, st, a, "b", t0)
+	day := t0.Add(CoolingOff)
+	if _, err := RevokeByDevice(st, root.ID, a.ID, false, day); err != nil {
+		t.Fatal(err)
+	}
+	if st.DeviceByID(b.ID) == nil {
+		t.Fatal("a plain revocation revoked b")
+	}
+	gone, err := RevokeByDevice(st, root.ID, a.ID, true, day)
+	if err != nil || len(gone) != 1 || gone[0] != b || st.DeviceByID(b.ID) != nil {
+		t.Fatalf("cascade after the parent: %v %v", gone, err)
+	}
+	// An operator revocation's tombstone counts too.
+	c := mintAndEnroll(t, st, root, "c", day)
+	d := mintAndEnroll(t, st, c, "d", day)
+	if _, err := Revoke(st, "alexei/c", day, false); err != nil {
+		t.Fatal(err)
+	}
+	if gone, err := RevokeByDevice(st, root.ID, c.ID, true, day); err != nil || len(gone) != 1 || gone[0].ID != d.ID {
+		t.Fatalf("cascade after an operator revocation: %v %v", gone, err)
+	}
+}
+
+// TestRevokeCoolingOffCascade: a young device may revoke itself, but not
+// take its descendants with it.
+func TestRevokeCoolingOffCascade(t *testing.T) {
+	st := &State{}
+	root := enrollRoot(t, st, 6)
+	a := mintAndEnroll(t, st, root, "a", t0)
+	mintAndEnroll(t, st, a, "b", t0)
+	if _, err := RevokeByDevice(st.Clone(), a.ID, a.ID, true, t0); !errors.Is(err, ErrCoolingOff) {
+		t.Fatalf("young device revoked its descendants: %v", err)
+	}
+	if gone, err := RevokeByDevice(st.Clone(), a.ID, a.ID, false, t0); err != nil || len(gone) != 1 {
+		t.Fatalf("young device revoking itself: %v %v", gone, err)
+	}
+}
+
+// TestRotateEndsRestore: a rotation makes earlier revocations by devices
+// final, so restore cannot bring back a pre-rotation device.
+func TestRotateEndsRestore(t *testing.T) {
+	st := &State{}
+	root := enrollRoot(t, st, 6)
+	a := mintAndEnroll(t, st, root, "a", t0)
+	day := t0.Add(CoolingOff)
+	if _, err := RevokeByDevice(st, root.ID, a.ID, false, day); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Rotate(st, "alexei", day); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Restore(st, "alexei/a", day.Add(time.Hour)); err == nil {
+		t.Error("restored a device revoked before the rotation")
+	}
+	// Every tombstone keeps the revoked token's hash, through the file.
+	back, err := Parse(st.Marshal(), day)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tb := range back.Revoked {
+		if tb.ID == a.ID && tb.TokenHash != a.TokenHash {
+			t.Errorf("tombstone token %x, want %x", tb.TokenHash, a.TokenHash)
+		}
+	}
+}

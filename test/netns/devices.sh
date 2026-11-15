@@ -106,6 +106,14 @@ fi
 wait_for 10 "the revoked laptop's client stops" bash -c "! kill -0 $LAPTOP 2>/dev/null" &&
   grep -q "revoked" "$WORK/run-laptop.log" && pass "the revoked laptop's session closed with REVOKED and its client stopped" ||
   fail "laptop client: $(tail -n 3 "$WORK/run-laptop.log")"
+# Its token is now refused REVOKED, so the device learns why even without
+# the CLOSE.
+if client devices revoked -profile "$WORK/laptop"; then
+  fail "a revoked device listed devices"
+else
+  grep -q "this device has been revoked" "$WORK/devices-revoked.log" && pass "a revoked device is told so when it connects again" ||
+    fail "revoked device: $(tail -n 3 "$WORK/devices-revoked.log")"
+fi
 grep -q 'level=WARN msg="device revoked by a device" account=alexei by=desktop device=laptop' "$WORK/relay.log" &&
   pass "the relay warned of the revocation, naming both devices" || fail "no warning in the relay's log"
 

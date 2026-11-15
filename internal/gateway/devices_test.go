@@ -3,6 +3,7 @@ package gateway
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log/slog"
 	"net/netip"
 	"strings"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/laneshetron/arc/internal/accounts"
 	"github.com/laneshetron/arc/internal/invite"
+	"github.com/laneshetron/arc/internal/session"
 	"github.com/laneshetron/arc/internal/wire"
 )
 
@@ -171,5 +173,62 @@ func TestRevokeDeviceStoreDown(t *testing.T) {
 	mu.Unlock()
 	if a := f.revoke(f.desktop, req); a.Status != 0 {
 		t.Fatalf("after the store came back: %+v", a)
+	}
+}
+
+// TestRevokeRepeatAfterRestore: a revocation's repeat, after the operator
+// restored the device, is answered as done and revokes nothing again.
+func TestRevokeRepeatAfterRestore(t *testing.T) {
+	f := newManageFixture(t)
+	f.advance(accounts.CoolingOff)
+	req := wire.RevokeRequest{RequestID: [8]byte{1}, DeviceID: f.device("laptop").ID}
+	if a := f.revoke(f.desktop, req); a.Status != 0 {
+		t.Fatalf("revoke: %+v", a)
+	}
+	if err := f.w.Commit(context.Background(), func(st *accounts.State) error {
+		_, err := accounts.Restore(st, "alexei/laptop", f.now)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if a := f.revoke(f.desktop, req); a.Status != 0 {
+		t.Fatalf("repeat: %+v", a)
+	}
+	time.Sleep(50 * time.Millisecond) // a commit, were one started
+	if f.device("laptop") == nil {
+		t.Fatal("the repeat revoked the restored laptop")
+	}
+	// A new request is a new decision.
+	req.RequestID = [8]byte{2}
+	if a := f.revoke(f.desktop, req); a.Status != 0 || f.device("laptop") != nil {
+		t.Fatalf("new request: %+v", a)
+	}
+}
+
+// TestAuthRevoked: a revoked device's token is refused REVOKED, not
+// AUTH_FAILED, so a client that missed CLOSE(REVOKED) still learns it,
+// until a restore admits it again.
+func TestAuthRevoked(t *testing.T) {
+	f := newManageFixture(t)
+	f.advance(accounts.CoolingOff)
+	if a := f.revoke(f.desktop, wire.RevokeRequest{RequestID: [8]byte{1}, DeviceID: f.device("laptop").ID}); a.Status != 0 {
+		t.Fatalf("revoke: %+v", a)
+	}
+	_, err := f.g.Authorize(f.token, f.key, nil)
+	var ae *session.AuthError
+	if !errors.As(err, &ae) || ae.Code != wire.CodeRevoked {
+		t.Fatalf("revoked token: %v", err)
+	}
+	if _, err := f.g.Authorize(invite.NewToken(), f.key, nil); errors.As(err, &ae) {
+		t.Errorf("an unknown token was told REVOKED: %v", err)
+	}
+	if err := f.w.Commit(context.Background(), func(st *accounts.State) error {
+		_, err := accounts.Restore(st, "alexei/laptop", f.now)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.g.Authorize(f.token, f.key, nil); err != nil {
+		t.Errorf("restored laptop: %v", err)
 	}
 }

@@ -58,3 +58,21 @@ func TestPrintInvite(t *testing.T) {
 		t.Errorf("request kept after the invite was written: %v", err)
 	}
 }
+
+// TestOpenEnrolledErrors: an error after the profile is locked releases
+// the lock (and does not panic), so the next command can take it.
+func TestOpenEnrolledErrors(t *testing.T) {
+	dir := t.TempDir()
+	if _, _, _, _, err := openEnrolled(dir); err == nil {
+		t.Fatal("opened an empty profile")
+	}
+	os.WriteFile(dir+"/profile", []byte("relay=192.0.2.1:4433\n"), 0o600)
+	if _, _, _, _, err := openEnrolled(dir); err == nil {
+		t.Fatal("opened a profile with no key")
+	}
+	unlock, err := lockProfile(dir)
+	if err != nil {
+		t.Fatalf("the lock was kept after an error: %v", err)
+	}
+	unlock()
+}

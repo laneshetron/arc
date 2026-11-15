@@ -128,10 +128,11 @@ type Invite struct {
 
 // A Tombstone remembers a revoked device until Until.
 type Tombstone struct {
-	ID    ID
-	Until time.Time
-	By    ID     // the device that revoked it, for a device's revocation
-	Rest  string // the revoked record, for restore
+	ID        ID
+	Until     time.Time
+	TokenHash [32]byte // the revoked token's hash, to tell its holder it was revoked; zero if unknown
+	By        ID       // the device that revoked it, for a device's revocation
+	Rest      string   // the revoked record, for restore
 }
 
 // A Lease names the one writer that may commit and authenticate (§3.2).
@@ -369,6 +370,9 @@ func (s *State) Marshal() []byte {
 	}
 	for _, t := range s.Revoked {
 		fmt.Fprintf(&b, "revoked %v until=%s", t.ID, stamp(t.Until))
+		if t.TokenHash != ([32]byte{}) {
+			fmt.Fprintf(&b, " token=%x", t.TokenHash)
+		}
 		if !t.By.IsZero() {
 			fmt.Fprintf(&b, " by=%v", t.By)
 		}
@@ -556,6 +560,9 @@ func (s *State) parseRecord(line string) error {
 		t := &Tombstone{ID: id(pos[0]), By: optID("by"), Rest: opts["record"]}
 		if err == nil {
 			t.Until, err = parseStamp(opts["until"])
+		}
+		if v, ok := opts["token"]; ok && err == nil {
+			err = hexInto(t.TokenHash[:], v, "token")
 		}
 		s.Revoked = append(s.Revoked, t)
 	default:

@@ -140,12 +140,14 @@ type Gateway struct {
 	revoke   []Revocation
 	kick     chan struct{}
 
-	st         *accounts.State // the last applied, for enrollments; nil with static accounts
-	enrolling  map[enrollKey]*enrollment
-	minting    map[accounts.ID]*pending  // by device: at most one commit in flight each
-	revoking   map[accounts.ID]*pending  // likewise, for REVOKE_REQUEST
-	committing int                       // commits for devices' requests not yet done
-	seen       map[accounts.ID]time.Time // when each device's last session ended
+	st            *accounts.State // the last applied, for enrollments; nil with static accounts
+	enrolling     map[enrollKey]*enrollment
+	minting       map[accounts.ID]*pending  // by device: at most one commit in flight each
+	revoking      map[accounts.ID]*pending  // likewise, for REVOKE_REQUEST
+	revokedReqs   map[revokeKey]time.Time   // REVOKE_REQUESTs done, for their repeats
+	revokedTokens map[[32]byte]bool         // revoked devices' token hashes, while their tombstones last
+	committing    int                       // commits for devices' requests not yet done
+	seen          map[accounts.ID]time.Time // when each device's last session ended
 }
 
 // A pending is a device's request (an invite, a revocation) waiting for
@@ -194,7 +196,7 @@ func New(cfg Config) (*Gateway, error) {
 			return nil, fmt.Errorf("gateway: deny prefix %v is not IPv4", p)
 		}
 	}
-	g := &Gateway{cfg: cfg, accounts: map[accounts.ID]*Account{}, creds: map[[32]byte]credential{}, enrolling: map[enrollKey]*enrollment{}, minting: map[accounts.ID]*pending{}, revoking: map[accounts.ID]*pending{}, seen: map[accounts.ID]time.Time{},
+	g := &Gateway{cfg: cfg, accounts: map[accounts.ID]*Account{}, creds: map[[32]byte]credential{}, enrolling: map[enrollKey]*enrollment{}, minting: map[accounts.ID]*pending{}, revoking: map[accounts.ID]*pending{}, revokedReqs: map[revokeKey]time.Time{}, seen: map[accounts.ID]time.Time{},
 		next: cfg.Network.Masked().Addr().Next(), leased: map[netip.Addr]lease{}, kick: make(chan struct{}, 1)}
 	for i := range accts {
 		a := &accts[i]
@@ -253,6 +255,12 @@ func (g *Gateway) Apply(st *accounts.State) {
 	g.logMintedLocked(st)
 	g.logRevokedLocked(st)
 	g.creds, g.static, g.st = creds, nil, st
+	g.revokedTokens = map[[32]byte]bool{}
+	for _, t := range st.Revoked {
+		if t.TokenHash != ([32]byte{}) {
+			g.revokedTokens[t.TokenHash] = true
+		}
+	}
 	for addr, l := range g.leased {
 		if !l.revoked && !devices[l.device] {
 			g.revokeLocked(addr, l, wire.CodeRevoked, ErrRevoked)
@@ -367,6 +375,11 @@ func (g *Gateway) authorizeLocked(token, clientStatic []byte, prior *wire.AuthRe
 	c, ok := g.creds[hash]
 	if testHookAuthorize != nil {
 		testHookAuthorize()
+	}
+	if !ok && g.revokedTokens[hash] {
+		// Its holder learns it was revoked, as CLOSE(REVOKED) would have
+		// told it, in case that was lost.
+		return wire.AuthResult{}, &session.AuthError{Code: wire.CodeRevoked, Err: fmt.Errorf("%w: %w", ErrBadCredential, ErrRevoked)}
 	}
 	if !ok || c.account == nil {
 		return wire.AuthResult{}, ErrBadCredential
@@ -809,6 +822,11 @@ func mintRefusal(err error) wire.ErrorCode {
 // sweepMinting forgets finished requests whose clients never came back
 // for the answer.
 func (g *Gateway) sweepMinting(now time.Time) {
+	for k, at := range g.revokedReqs {
+		if now.Sub(at) > RevokeMemory {
+			delete(g.revokedReqs, k)
+		}
+	}
 	for _, m := range []map[accounts.ID]*pending{g.minting, g.revoking} {
 		for k, p := range m {
 			if p.done && now.Sub(p.started) > 5*time.Minute {

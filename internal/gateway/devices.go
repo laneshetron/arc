@@ -73,9 +73,17 @@ func (g *Gateway) revokeDevice(addr netip.Addr, s *session.RelaySession, req wir
 			return wire.RevokeResult{}, false
 		}
 		delete(g.revoking, d.ID)
+		if p.err == nil {
+			g.revokedReqs[revokeKey{d.ID, p.request}] = p.started
+		}
 		if p.request == request && p.err != nil && revokeRefused(p.err) {
 			return refuse, true
 		}
+	}
+	// A request done is answered as done, whatever has happened since:
+	// a repeat must not revoke a device the operator has restored.
+	if _, ok := g.revokedReqs[revokeKey{d.ID, request}]; ok {
+		return wire.RevokeResult{}, true
 	}
 	// The applied state decides: a refusal, or nothing left to revoke,
 	// is answered at once; anything else is committed.
@@ -101,6 +109,13 @@ func (g *Gateway) revokeDevice(addr netip.Addr, s *session.RelaySession, req wir
 	})
 	return wire.RevokeResult{}, false
 }
+
+// A revokeKey names a device's REVOKE_REQUEST.
+type revokeKey struct{ device, request accounts.ID }
+
+// RevokeMemory is how long the relay remembers a revocation it did, to
+// answer the request's repeats: longer than a client repeats one.
+const RevokeMemory = 10 * time.Minute
 
 // revokeRefused reports whether a revocation error is final for the
 // request (the client is told UNAUTHORIZED), rather than one to retry.

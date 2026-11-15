@@ -31,33 +31,34 @@ func (s *State) MayManage(d *Device) bool {
 // account, and with descendants every device whose lineage holds target.
 // The revocations are soft: each tombstone keeps by and the revoked
 // record, so the operator can restore it (Restore) while the tombstone
-// lasts. A target already revoked is no error, and revokes nothing. It
-// returns the devices revoked.
+// lasts. A target already revoked is no error: it revokes only the
+// target's surviving descendants, if asked. A device enrolled less than
+// CoolingOff ago may revoke itself, but no other device, directly or as
+// a descendant. It returns the devices revoked.
 func RevokeByDevice(st *State, by, target ID, descendants bool, now time.Time) ([]*Device, error) {
 	d := st.DeviceByID(by)
 	if d == nil || !st.MayManage(d) {
 		return nil, ErrNoManage
 	}
-	t := st.DeviceByID(target)
-	if t == nil {
-		if slices.ContainsFunc(st.Revoked, func(x *Tombstone) bool { return x.ID == target }) {
-			return nil, nil
-		}
+	var gone []*Device
+	switch t := st.DeviceByID(target); {
+	case t != nil && t.Account == d.Account:
+		gone = append(gone, t)
+	case t != nil, !slices.ContainsFunc(st.Revoked, func(x *Tombstone) bool { return x.ID == target }):
 		return nil, ErrNoDevice
 	}
-	switch {
-	case t.Account != d.Account:
-		return nil, ErrNoDevice
-	case t != d && now.Sub(d.Created) < CoolingOff:
-		return nil, ErrCoolingOff
-	}
-	gone := []*Device{t}
+	// Already revoked, the target's descendants may still be live: a
+	// lineage lies within one account, so those of d's account are its.
 	if descendants {
-		for _, x := range st.Devices {
-			if slices.Contains(x.Lineage, t.ID) {
+		for _, x := range st.DevicesOf(d.Account) {
+			if slices.Contains(x.Lineage, target) {
 				gone = append(gone, x)
 			}
 		}
+	}
+	// The cooling-off covers every device revoked, not only the target.
+	if now.Sub(d.Created) < CoolingOff && slices.ContainsFunc(gone, func(x *Device) bool { return x != d }) {
+		return nil, ErrCoolingOff
 	}
 	for _, x := range gone {
 		st.revoke(x, now, by)

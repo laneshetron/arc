@@ -666,6 +666,8 @@ func (c *Client) onAuthResult(now time.Time, r wire.AuthResult) {
 			err = ErrInviteUsed
 		case wire.CodeInviteExpired:
 			err = ErrInviteExpired
+		case wire.CodeRevoked:
+			err = ErrRevoked
 		}
 		c.state, c.err = StateClosed, err
 		c.events = append(c.events, Closed{Err: err})

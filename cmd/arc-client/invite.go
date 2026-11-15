@@ -133,12 +133,13 @@ func printInvite(p *profile, tmpl *invite.Invite, answer *wire.Invite) error {
 // openEnrolled locks and loads the enrolled device's profile in dir,
 // with its static key and token. The caller calls unlock when done.
 func openEnrolled(dir string) (p *profile, static crypto.StaticKey, token []byte, unlock func(), err error) {
-	if unlock, err = lockProfile(dir); err != nil {
+	locked, err := lockProfile(dir)
+	if err != nil {
 		return nil, static, nil, nil, err
 	}
 	defer func() {
 		if err != nil {
-			unlock()
+			locked()
 		}
 	}()
 	if p, err = loadProfile(dir); err != nil {
@@ -157,7 +158,7 @@ func openEnrolled(dir string) (p *profile, static crypto.StaticKey, token []byte
 	if err != nil || len(tokens) != 1 {
 		return nil, static, nil, nil, fmt.Errorf("%s: unreadable token", dir)
 	}
-	return p, static, []byte(tokens[0]), unlock, nil
+	return p, static, []byte(tokens[0]), locked, nil
 }
 
 // pendingRequest returns the ID of the profile's unanswered request for an

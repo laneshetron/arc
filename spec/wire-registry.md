@@ -70,7 +70,7 @@ Other bits are sent as zero and ignored on receipt.
 
 ## Error / close codes (§10.1)
 
-`0 NO_ERROR` · `1 MALFORMED` · `2 AUTH_FAILED` · `3 UNAUTHORIZED` · `4 PATH_UNAVAILABLE` · `5 CAPACITY` · `6 UNSUPPORTED` · `7 SESSION_EXPIRED` · `8 PROTOCOL_VIOLATION` · `9 CONNECT_FAILED` · `10 ABORTED` · `11 INVITE_USED` · `12 INVITE_EXPIRED` · `13 REVOKED` (9 and 10 in `STREAM_RESET`; 11 and 12 refuse an enrollment, in `AUTH_RESULT.status` and `CLOSE`; 13 closes a revoked device's sessions)
+`0 NO_ERROR` · `1 MALFORMED` · `2 AUTH_FAILED` · `3 UNAUTHORIZED` · `4 PATH_UNAVAILABLE` · `5 CAPACITY` · `6 UNSUPPORTED` · `7 SESSION_EXPIRED` · `8 PROTOCOL_VIOLATION` · `9 CONNECT_FAILED` · `10 ABORTED` · `11 INVITE_USED` · `12 INVITE_EXPIRED` · `13 REVOKED` (9 and 10 in `STREAM_RESET`; 11 and 12 refuse an enrollment, in `AUTH_RESULT.status` and `CLOSE`; 13 refuses or closes a revoked device's sessions, in `AUTH_RESULT.status` and `CLOSE`)
 
 ## Cryptography (§8.6, §9, §13, §14.7)
 

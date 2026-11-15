@@ -130,6 +130,13 @@ func Rotate(st *State, account string, now time.Time) (string, error) {
 		st.revoke(d, now, ID{})
 	}
 	st.Invites = slices.DeleteFunc(st.Invites, func(i *Invite) bool { return i.Account == a.ID })
+	// Devices revoked by devices before the rotation stay revoked: their
+	// revocations become final, like the operator's.
+	for _, t := range st.Revoked {
+		if d, err := parseDevice(t.Rest); err == nil && d.Account == a.ID {
+			t.By, t.Rest = ID{}, ""
+		}
+	}
 	return fmt.Sprintf("rotated account %s: revoked its %d devices and cancelled its invites\n", account, len(devices)), nil
 }
 
@@ -143,7 +150,7 @@ func (st *State) device(account ID, name string) *Device {
 }
 
 func (st *State) tombstone(d *Device, now time.Time, by ID) {
-	t := &Tombstone{ID: d.ID, Until: now.Add(TombstoneLife).UTC().Truncate(time.Second), By: by}
+	t := &Tombstone{ID: d.ID, Until: now.Add(TombstoneLife).UTC().Truncate(time.Second), TokenHash: d.TokenHash, By: by}
 	if !by.IsZero() {
 		t.Rest = d.record()
 	}

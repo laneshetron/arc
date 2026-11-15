@@ -316,7 +316,8 @@ arc-client revoke -profile ~/.config/arc/relay laptop  # -descendants: its invit
 
 Only devices that enrolled with a key may, while their account allows it
 (`manage=yes`, the default), and a device may revoke others only once it
-has been enrolled for 24 hours (it may always revoke itself). A revoked
+has been enrolled for 24 hours (it may always revoke itself, but not its
+descendants with it). A revoked
 device's sessions close at once, and its client stops reconnecting. Since
 a stolen device can use these commands too, revocations by devices are
 soft: the relay logs each as a warning, and for 7 days the operator can
@@ -328,7 +329,8 @@ arc-relay accounts restore alexei/desktop      # same ID, token and key as befor
 arc-relay accounts revoke -descendants alexei/laptop
 ```
 
-Operator revocations are final.
+Operator revocations are final, and `rotate` makes earlier revocations by
+devices final too.
 
 ### Diagnostics
 
