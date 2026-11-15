@@ -1,6 +1,7 @@
 package s3store
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/hex"
@@ -11,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -29,7 +31,10 @@ type fakeS3 struct {
 	// failAfterPut, while positive, makes a PUT apply and then answer 500,
 	// as a response lost after S3 took the write; the client retries.
 	failAfterPut int
-	puts         int
+	// inFlight, while positive, answers a PUT 409 without applying it, as
+	// S3 does while another conditional write to the object is in flight.
+	inFlight int
+	puts     int
 }
 
 func etag(b []byte) string { h := md5.Sum(b); return `"` + hex.EncodeToString(h[:]) + `"` }
@@ -54,6 +59,11 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPut:
 		f.puts++
 		body, _ := io.ReadAll(r.Body)
+		if f.inFlight > 0 {
+			f.inFlight--
+			fail(http.StatusConflict, "ConditionalRequestConflict")
+			return
+		}
 		if m := r.Header.Get("If-Match"); m != "" && (!exists || m != etag(cur)) {
 			fail(http.StatusPreconditionFailed, "PreconditionFailed")
 			return
@@ -185,5 +195,63 @@ func TestRealS3(t *testing.T) {
 	}
 	if err := w.Release(ctx); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestInFlightConflict: a 409 leaves the object unchanged and is no sign
+// of another writer: it is retried, and if it persists the commit fails
+// as unavailable, without losing the lease.
+func TestInFlightConflict(t *testing.T) {
+	ctx := context.Background()
+	defer func(old []time.Duration) { conflictRetries = old }(conflictRetries)
+	conflictRetries = []time.Duration{time.Millisecond, time.Millisecond}
+	s, f := fakeStore(t)
+	w := &accounts.Writer{Store: s, Holder: "a"}
+	lost := 0
+	w.OnLost = func(error) { lost++ }
+	if err := w.Acquire(ctx); err != nil {
+		t.Fatal(err)
+	}
+	add := func(name string) error {
+		return w.Commit(ctx, func(st *accounts.State) error { _, err := accounts.AddAccount(st, name, false, 0); return err })
+	}
+	f.mu.Lock()
+	f.inFlight = 2
+	f.mu.Unlock()
+	if err := add("x"); err != nil {
+		t.Fatalf("after two 409s: %v", err)
+	}
+	f.mu.Lock()
+	f.inFlight = 10
+	f.mu.Unlock()
+	if err := add("y"); !errors.Is(err, accounts.ErrUnavailable) {
+		t.Fatalf("persistent 409: %v", err)
+	}
+	if lost != 0 || !w.Serving() || w.State().AccountByName("y") != nil {
+		t.Fatalf("after a persistent 409: lost %d, serving %v", lost, w.Serving())
+	}
+	f.mu.Lock()
+	f.inFlight = 0
+	f.mu.Unlock()
+	if err := add("y"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestObjectSizeLimit: Put refuses an object Get could not read back,
+// and one at the limit round-trips.
+func TestObjectSizeLimit(t *testing.T) {
+	ctx := context.Background()
+	s, _ := fakeStore(t)
+	big := bytes.Repeat([]byte("a"), maxObject)
+	v, err := s.Put(ctx, big, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if data, _, err := s.Get(ctx); err != nil || !bytes.Equal(data, big) {
+		t.Fatalf("reading back %d bytes: %v", len(data), err)
+	}
+	if _, err := s.Put(ctx, append(big, 'a'), v); err == nil || !strings.Contains(err.Error(), "limit") {
+		t.Fatalf("over the limit: %v", err)
 	}
 }

@@ -179,7 +179,12 @@ object, replaced whole by conditional writes:
   the instance role, which needs `s3:GetObject` and `s3:PutObject` on the
   object and `s3:ListBucket` on the bucket (without it, S3 answers a
   missing object with 403, and the relay will not seed an empty store).
-  Turn on versioning, which keeps every generation as history.
+  With SSE-KMS, it also needs `kms:GenerateDataKey` (writes) and
+  `kms:Decrypt` (reads, including the read-back after an unconfirmed
+  write) on the bucket's key: granted already for the AWS-managed
+  `aws/s3` key by its key policy, but for a customer-managed key in both
+  the key policy and the role's policy. Turn on versioning, which keeps
+  every generation as history.
 - `file:PATH`: a local file, for a relay whose accounts need not survive
   its host.
 

@@ -15,6 +15,13 @@ import (
 	"time"
 )
 
+// MaxStateSize bounds the serialized accounts (§3.2): the caps keep
+// them well under it, and a commit that would pass it is refused, so a
+// store never holds accounts too large to read back.
+const MaxStateSize = 1 << 20
+
+var maxStateSize = MaxStateSize // for tests
+
 // Writer lease defaults (§3.2).
 const (
 	DefaultLease   = 15 * time.Minute
@@ -92,6 +99,7 @@ type Writer struct {
 	// a clock stepped back must not extend it. Only the lease in the
 	// store, read by other relays, is a wall-clock time.
 	serveUntil atomic.Int64
+	unresolved atomic.Bool          // a changed write's outcome is unknown: see Serving
 	mono       func() time.Duration // for tests; nil uses monotonic time since start
 }
 
@@ -134,9 +142,23 @@ func (w *Writer) log() *slog.Logger {
 // Serving reports whether this writer holds a live lease: only then may
 // its relay authenticate new sessions (§3.2). It does not wait for a
 // write in progress.
-func (w *Writer) Serving() bool {
+//
+// It is false, though the lease is live, while an accounts change is
+// unresolved (ErrIndeterminate): the relay's credentials may be stale,
+// a revoked device's among them, so it admits no one until the store's
+// state is known again. Sessions already open stay up.
+func (w *Writer) Serving() bool { return w.live() && !w.unresolved.Load() }
+
+// live reports whether this writer's lease is unexpired by its clock.
+func (w *Writer) live() bool {
 	d := w.serveUntil.Load()
 	return d != 0 && int64(w.monoNow()) < d
+}
+
+// setPending records the write whose outcome is unknown, or none.
+func (w *Writer) setPending(p *pendingWrite) {
+	w.pending = p
+	w.unresolved.Store(p != nil && p.changed && p.cause != nil)
 }
 
 // holding reports whether this writer considers itself the holder,
@@ -210,7 +232,7 @@ func (w *Writer) acquireLocked(ctx context.Context, force bool) error {
 			return err
 		}
 	}
-	w.pending = nil
+	w.setPending(nil)
 	if l := st.Lease; !force && l.Held(w.now()) && !w.ownLease(l) {
 		return &HeldError{Lease: l}
 	}
@@ -267,7 +289,7 @@ func (w *Writer) Commit(ctx context.Context, change func(*State) error) error {
 	if err := w.resolveLocked(ctx); err != nil {
 		return err
 	}
-	if !w.Serving() {
+	if !w.live() {
 		return ErrNotWriter
 	}
 	next := w.st.Clone()
@@ -282,7 +304,7 @@ func (w *Writer) renewLocked(ctx context.Context) error {
 	if err := w.resolveLocked(ctx); err != nil {
 		return err
 	}
-	if !w.Serving() {
+	if !w.live() {
 		return ErrNotWriter
 	}
 	return w.putLocked(ctx, w.st.Clone(), false)
@@ -299,13 +321,16 @@ func (w *Writer) putLocked(ctx context.Context, next *State, changed bool) error
 		return err
 	}
 	data := next.Marshal()
+	if len(data) > maxStateSize {
+		return fmt.Errorf("accounts: the change would make the accounts %d bytes, over the %d-byte limit", len(data), maxStateSize)
+	}
 	version, err := w.Store.Put(ctx, data, w.version)
 	switch {
 	case errors.Is(err, ErrConflict):
 		// A store's client may retry a write it already made, which then
 		// fails its own condition: the store having exactly these bytes
 		// means it was this write.
-		w.pending = &pendingWrite{data: data, next: next, sent: sent, sentAt: sentAt, changed: changed, acquire: w.acquiring, cause: err}
+		w.setPending(&pendingWrite{data: data, next: next, sent: sent, sentAt: sentAt, changed: changed, acquire: w.acquiring, cause: err})
 		cur, version, gerr := w.Store.Get(ctx)
 		switch {
 		case gerr != nil && !errors.Is(gerr, ErrNotFound):
@@ -315,15 +340,15 @@ func (w *Writer) putLocked(ctx context.Context, next *State, changed bool) error
 			w.adoptLocked(version)
 			return nil
 		}
-		w.pending = nil
+		w.setPending(nil)
 		w.lose(err)
 		return ErrNotWriter
 	case err != nil:
 		// A store can keep a write whose response is lost: read it back.
-		w.pending = &pendingWrite{data: data, next: next, sent: sent, sentAt: sentAt, changed: changed, acquire: w.acquiring, cause: err}
+		w.setPending(&pendingWrite{data: data, next: next, sent: sent, sentAt: sentAt, changed: changed, acquire: w.acquiring, cause: err})
 		return w.resolveLocked(ctx)
 	}
-	w.pending = &pendingWrite{data: data, next: next, sent: sent, sentAt: sentAt, changed: changed, acquire: w.acquiring}
+	w.setPending(&pendingWrite{data: data, next: next, sent: sent, sentAt: sentAt, changed: changed, acquire: w.acquiring})
 	w.adoptLocked(version)
 	return nil
 }
@@ -345,12 +370,12 @@ func (w *Writer) resolveLocked(ctx context.Context) error {
 		w.adoptLocked(version)
 		return nil
 	case version == w.version && (err == nil || w.version == ""):
-		w.pending = nil
+		w.setPending(nil)
 		return fmt.Errorf("%w: %v", ErrUnavailable, p.cause)
 	}
 	// Neither: another writer changed the store, so this one lost the
 	// lease, perhaps after its write was made.
-	w.pending = nil
+	w.setPending(nil)
 	w.lose(errors.New("the store changed while a write was unconfirmed"))
 	return fmt.Errorf("%w: %v; the store has since changed, and this relay lost the accounts lease", ErrIndeterminate, p.cause)
 }
@@ -359,7 +384,7 @@ func (w *Writer) resolveLocked(ctx context.Context) error {
 // version, current.
 func (w *Writer) adoptLocked(version string) {
 	p := w.pending
-	w.pending = nil
+	w.setPending(nil)
 	w.setState(p.next, version)
 	w.saveToken()
 	if w.Cache != "" {
@@ -413,7 +438,7 @@ func (w *Writer) Release(ctx context.Context) error {
 	if err := w.resolveLocked(ctx); err != nil {
 		return err
 	}
-	if !w.Serving() {
+	if !w.live() {
 		return nil
 	}
 	w.lose(errors.New("lease released"))
@@ -443,7 +468,7 @@ func (w *Writer) Run(ctx context.Context) {
 		}
 	}()
 	for ctx.Err() == nil {
-		if w.Serving() {
+		if w.live() {
 			// Taken meanwhile, by an operator's takeover (Do).
 			w.hold(ctx)
 			continue
@@ -511,7 +536,7 @@ func (w *Writer) watch(ctx context.Context) {
 // write in progress, so the relay's sessions close on time even while
 // the store hangs.
 func (w *Writer) expire() {
-	if w.holding() && !w.Serving() {
+	if w.holding() && !w.live() {
 		w.lose(errors.New("lease expired before it could be renewed"))
 	}
 }

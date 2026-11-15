@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -73,7 +74,36 @@ func (s *Store) Get(ctx context.Context) ([]byte, string, error) {
 	return data, aws.ToString(out.ETag), nil
 }
 
+// conflictRetries bounds retries of a write S3 answered 409: another
+// conditional write to the object was in flight. The condition is
+// retried as it was, so a retry cannot overwrite anything.
+var conflictRetries = []time.Duration{100 * time.Millisecond, 300 * time.Millisecond, time.Second}
+
 func (s *Store) Put(ctx context.Context, data []byte, ifMatch string) (string, error) {
+	// The writer keeps the state well under this (accounts.MaxStateSize);
+	// a larger object could not be read back.
+	if len(data) > maxObject {
+		return "", fmt.Errorf("s3://%s/%s: %d bytes is over the %d-byte limit", s.Bucket, s.Key, len(data), maxObject)
+	}
+	for i := 0; ; i++ {
+		v, err := s.put(ctx, data, ifMatch)
+		if !errors.Is(err, errInFlight) || i == len(conflictRetries) {
+			return v, err
+		}
+		select {
+		case <-ctx.Done():
+			return "", fmt.Errorf("s3://%s/%s: %w", s.Bucket, s.Key, ctx.Err())
+		case <-time.After(conflictRetries[i]):
+		}
+	}
+}
+
+// errInFlight: S3 answered 409 ConditionalRequestConflict. It does not
+// say the object changed, so it is not accounts.ErrConflict: a writer
+// given it reads the object back, and is fenced only if it changed.
+var errInFlight = errors.New("another conditional write to the object was in flight (409)")
+
+func (s *Store) put(ctx context.Context, data []byte, ifMatch string) (string, error) {
 	in := &s3.PutObjectInput{Bucket: &s.Bucket, Key: &s.Key, Body: bytes.NewReader(data),
 		ContentType: aws.String("text/plain; charset=utf-8")}
 	if ifMatch != "" {
@@ -83,13 +113,15 @@ func (s *Store) Put(ctx context.Context, data []byte, ifMatch string) (string, e
 	}
 	out, err := s.Client.PutObject(ctx, in)
 	if err != nil {
-		// 412: the object is not at ifMatch (or exists, for If-None-Match).
-		// 409: another conditional write to it was in flight. Either way,
-		// another writer may have committed. A retry of this very write
-		// that S3 had already applied also fails 412; the writer tells
-		// that apart by reading the object back.
-		if c := status(err); c == http.StatusPreconditionFailed || c == http.StatusConflict {
+		// 412: the object is not at ifMatch (or exists, for If-None-Match):
+		// another writer committed. A retry of this very write that S3
+		// had already applied also fails 412; the writer tells that apart
+		// by reading the object back.
+		switch status(err) {
+		case http.StatusPreconditionFailed:
 			return "", fmt.Errorf("%w: %v", accounts.ErrConflict, err)
+		case http.StatusConflict:
+			return "", fmt.Errorf("s3://%s/%s: %w: %v", s.Bucket, s.Key, errInFlight, err)
 		}
 		return "", fmt.Errorf("s3://%s/%s: %w", s.Bucket, s.Key, err)
 	}
