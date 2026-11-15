@@ -302,6 +302,20 @@ func (w *Writer) putLocked(ctx context.Context, next *State, changed bool) error
 	version, err := w.Store.Put(ctx, data, w.version)
 	switch {
 	case errors.Is(err, ErrConflict):
+		// A store's client may retry a write it already made, which then
+		// fails its own condition: the store having exactly these bytes
+		// means it was this write.
+		w.pending = &pendingWrite{data: data, next: next, sent: sent, sentAt: sentAt, changed: changed, acquire: w.acquiring, cause: err}
+		cur, version, gerr := w.Store.Get(ctx)
+		switch {
+		case gerr != nil && !errors.Is(gerr, ErrNotFound):
+			return fmt.Errorf("%w: %v; reading the store back: %v", ErrIndeterminate, err, gerr)
+		case gerr == nil && bytes.Equal(cur, data):
+			w.log().Warn("accounts write confirmed by reading the store back", "generation", next.Generation, "err", err)
+			w.adoptLocked(version)
+			return nil
+		}
+		w.pending = nil
 		w.lose(err)
 		return ErrNotWriter
 	case err != nil:
@@ -429,6 +443,11 @@ func (w *Writer) Run(ctx context.Context) {
 		}
 	}()
 	for ctx.Err() == nil {
+		if w.Serving() {
+			// Taken meanwhile, by an operator's takeover (Do).
+			w.hold(ctx)
+			continue
+		}
 		if err := w.Acquire(ctx); err != nil {
 			wait := acquireBackoff
 			var held *HeldError

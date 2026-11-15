@@ -10,20 +10,30 @@ import (
 	"time"
 
 	"github.com/laneshetron/arc/internal/accounts"
+	"github.com/laneshetron/arc/internal/accounts/s3store"
 )
 
 const defaultControlDir = "/run/arc-relay"
 
 // openStore opens the accounts store a -accounts-store URL names:
-// file:PATH (or a bare path) for a local file.
+// s3://BUCKET/KEY for an S3 object, or file:PATH (or a bare path) for a
+// local file.
 func openStore(url string) (accounts.Store, error) {
 	switch {
+	case strings.HasPrefix(url, "s3://"):
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		s, err := s3store.Open(ctx, url)
+		if err != nil {
+			return nil, fmt.Errorf("-accounts-store: %w", err)
+		}
+		return s, nil
 	case strings.HasPrefix(url, "file://"):
 		return accounts.FileStore{Path: strings.TrimPrefix(url, "file://")}, nil
 	case strings.HasPrefix(url, "file:"):
 		return accounts.FileStore{Path: strings.TrimPrefix(url, "file:")}, nil
 	case strings.Contains(url, "://"):
-		return nil, fmt.Errorf("-accounts-store %q: unsupported scheme (want file:PATH)", url)
+		return nil, fmt.Errorf("-accounts-store %q: unsupported scheme (want s3://BUCKET/KEY or file:PATH)", url)
 	case url == "":
 		return nil, errors.New("-accounts-store is empty")
 	}
@@ -56,6 +66,7 @@ commands:
   add-token ACCOUNT [DEVICE] add a device with a new token, printed once
   revoke ACCOUNT/DEVICE      revoke one device
   takeover                   break the lease of a writer known to be dead
+                             (a running relay here takes it at once)
 flags:`)
 		fs.PrintDefaults()
 	}
@@ -76,14 +87,12 @@ flags:`)
 	ctl := accounts.Control{Dir: *controlDir}
 	req := accounts.Request{Op: rest[0], Args: rest[1:], Relay: *relay, MaxDevices: *maxDevices}
 
-	if req.Op != "takeover" {
-		resp, err := ctl.Send(req)
-		if err == nil {
-			return printResponse(resp)
-		}
-		if !errors.Is(err, accounts.ErrNoRelay) {
-			return err
-		}
+	resp, err := ctl.Send(req)
+	if err == nil {
+		return printResponse(resp)
+	}
+	if !errors.Is(err, accounts.ErrNoRelay) {
+		return err
 	}
 	// No relay here: act as the writer.
 	if *storeURL == "" {

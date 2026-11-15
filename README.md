@@ -167,11 +167,21 @@ interrupts every session.
 
 #### Changing accounts while the relay runs
 
-With `-accounts-store file:PATH`, the relay keeps its accounts in a store
-instead, and changes them without restarting
+With `-accounts-store`, the relay keeps its accounts in a store instead,
+and changes them without restarting
 ([spec/self-service-accounts.md](spec/self-service-accounts.md)). An empty
 store is seeded from `-tokens-file` (each token becomes a device named
-`legacy-N`), and the store keeps only hashes of tokens.
+`legacy-N`), and the store keeps only hashes of tokens. The store is one
+object, replaced whole by conditional writes:
+
+- `s3://BUCKET/KEY`: an S3 object, so accounts outlive the relay's host.
+  Credentials and the region (`AWS_REGION`) come from the environment or
+  the instance role, which needs `s3:GetObject` and `s3:PutObject` on the
+  object and `s3:ListBucket` on the bucket (without it, S3 answers a
+  missing object with 403, and the relay will not seed an empty store).
+  Turn on versioning, which keeps every generation as history.
+- `file:PATH`: a local file, for a relay whose accounts need not survive
+  its host.
 
 ```sh
 arc-relay accounts list
@@ -198,8 +208,9 @@ retrying. A clean shutdown releases the lease. After a crash, the relay
 restarted with the same `-accounts-control` directory retakes it at once,
 proven its own by the lease token it keeps there; any other relay, even one
 with the same `-accounts-holder` name, waits for it to expire, or for
-`arc-relay accounts -store … takeover`, which you run only when the old
-relay is gone. `-front-listen` still needs `-tokens-file`.
+`arc-relay accounts takeover`, which you run only when the old relay is
+gone: on the waiting relay's host, that relay takes the lease at once
+(with no relay running, pass `-store`). `-front-listen` still needs `-tokens-file`.
 
 Clients of one account can reach each other's tunnel addresses; clients of
 different accounts never can. (Split TCP never connects a stream to another

@@ -122,6 +122,18 @@ PIDS+=("$TWIN_PID")
 wait_for 10 "same-named relay waits" grep -q "waiting for the accounts lease" "$WORK/twin.log" &&
   ! grep -q "accounts lease acquired" "$WORK/twin.log" && pass "a relay with the same holder name does not take a live lease" ||
   fail "same-named relay: $(cat "$WORK/twin.log")"
+
+# The operator, asserting the holder is gone, has the waiting relay take
+# over through its control socket; the old holder loses the lease at its
+# next renewal and closes its sessions.
+if "$BIN/arc-relay" accounts -control "$WORK/control-twin" takeover >"$WORK/takeover.log" 2>&1; then
+  grep -q "accounts lease acquired" "$WORK/twin.log" && pass "takeover through a waiting relay's control socket" ||
+    fail "takeover: the waiting relay did not log the lease"
+else
+  fail "takeover: $(cat "$WORK/takeover.log")"
+fi
+wait_for 90 "old holder loses the lease" grep -q "accounts lease lost" "$WORK/relay.log" &&
+  pass "the old holder lost the lease after the takeover"
 kill "$TWIN_PID"; wait "$TWIN_PID" 2>/dev/null || true
 
 # A second relay process on the host is refused by the writer lock.

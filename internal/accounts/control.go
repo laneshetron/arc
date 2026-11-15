@@ -16,7 +16,7 @@ import (
 
 // A Request is one operator command (self-service-accounts.md §3.2).
 type Request struct {
-	Op   string   `json:"op"` // add, remove, add-token, revoke, list
+	Op   string   `json:"op"` // add, remove, add-token, revoke, list, takeover
 	Args []string `json:"args"`
 	// Flags for add: relay access and a device cap.
 	Relay      bool `json:"relay,omitempty"`
@@ -41,6 +41,17 @@ func Do(ctx context.Context, w *Writer, req Request, now time.Time) Response {
 			return Response{Error: "no accounts loaded yet (the writer has not acquired the lease)"}
 		}
 		return Response{Output: List(st)}
+	}
+	if req.Op == "takeover" {
+		// A relay waiting for the lease of one that is gone breaks it
+		// itself: the operator asserts the holder is dead.
+		if len(req.Args) != 0 {
+			return Response{Error: "takeover: wrong number of arguments"}
+		}
+		if err := w.Takeover(ctx); err != nil {
+			return Response{Error: err.Error()}
+		}
+		return Response{Output: fmt.Sprintf("lease broken and taken by %s\n", w.Holder)}
 	}
 	var out string
 	var token []byte

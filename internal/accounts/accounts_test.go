@@ -613,3 +613,63 @@ func TestReleaseResponseLost(t *testing.T) {
 		t.Fatal("serving alongside the successor")
 	}
 }
+
+// retriedStore applies a write and then, once, reports a conflict, as a
+// client retrying a write it already made sees its condition fail.
+type retriedStore struct {
+	Store
+	once bool
+}
+
+func (s *retriedStore) Put(ctx context.Context, data []byte, ifMatch string) (string, error) {
+	v, err := s.Store.Put(ctx, data, ifMatch)
+	if err == nil && s.once {
+		s.once = false
+		return "", ErrConflict
+	}
+	return v, err
+}
+
+// TestRetriedWriteConflict: a conflict caused by this writer's own write,
+// retried, is confirmed by reading the store back, not taken for losing
+// the lease.
+func TestRetriedWriteConflict(t *testing.T) {
+	ctx := context.Background()
+	store := &retriedStore{Store: FileStore{Path: filepath.Join(t.TempDir(), "accounts")}}
+	c := &clock{t: t0}
+	w := newWriter(t, store, "a", c)
+	lost := 0
+	w.OnLost = func(error) { lost++ }
+	if err := w.Acquire(ctx); err != nil {
+		t.Fatal(err)
+	}
+	store.once = true
+	if err := w.Commit(ctx, func(s *State) error { _, err := AddAccount(s, "x", false, 0); return err }); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if lost != 0 || !w.Serving() || w.State().AccountByName("x") == nil {
+		t.Fatalf("after a retried write: lost %d, serving %v", lost, w.Serving())
+	}
+	// A real conflict still loses the lease.
+	if err := newWriter(t, store, "b", c).Takeover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Commit(ctx, func(*State) error { return nil }); !errors.Is(err, ErrNotWriter) || lost != 1 {
+		t.Fatalf("after a takeover: %v, lost %d", err, lost)
+	}
+}
+
+// TestTakeoverThroughDo: a waiting writer, told to take over, breaks the
+// live lease and serves.
+func TestTakeoverThroughDo(t *testing.T) {
+	ctx := context.Background()
+	store := FileStore{Path: filepath.Join(t.TempDir(), "accounts")}
+	c := &clock{t: t0}
+	if err := newWriter(t, store, "dead", c).Acquire(ctx); err != nil {
+		t.Fatal(err)
+	}
+	w := newWriter(t, store, "b", c)
+	if resp := Do(ctx, w, Request{Op: "takeover"}, t0); resp.Error != "" || !w.Serving() {
+		t.Fatalf("takeover: %+v, serving %v", resp, w.Serving())
+	}
+}
