@@ -79,11 +79,12 @@ type Writer struct {
 
 	// mu serializes the store's writes, and with them every field below
 	// but the atomics, which publish what Serving and State read.
-	mu      sync.Mutex
-	st      *State
-	version string
-	token   string
-	pending *pendingWrite // a write whose outcome is unknown
+	mu        sync.Mutex
+	st        *State
+	version   string
+	token     string
+	pending   *pendingWrite // a write whose outcome is unknown
+	acquiring bool
 
 	cur        atomic.Pointer[State]
 	serveUntil atomic.Int64 // by Now, in Unix nanoseconds: the end of serving, or 0 when not the holder
@@ -95,6 +96,7 @@ type pendingWrite struct {
 	next    *State
 	sent    time.Time
 	changed bool
+	acquire bool // an acquisition: once made, it starts serving
 	cause   error
 }
 
@@ -171,6 +173,7 @@ func (w *Writer) acquireLocked(ctx context.Context, force bool) error {
 	data, version, err := w.Store.Get(ctx)
 	if err == nil && w.pending != nil && bytes.Equal(data, w.pending.data) {
 		// An acquisition the store did not confirm, made after all.
+		w.pending.acquire = true
 		w.adoptLocked(version)
 		w.log().Info("accounts lease acquired", "holder", w.Holder, "generation", w.st.Generation)
 		return nil
@@ -198,11 +201,14 @@ func (w *Writer) acquireLocked(ctx context.Context, force bool) error {
 	var tok [16]byte
 	rand.Read(tok[:])
 	w.token = hex.EncodeToString(tok[:])
+	// Serving stays off until the write below is in the store and its
+	// state applied: until then the relay's credentials may be stale.
+	w.serveUntil.Store(0)
 	w.setState(st, version)
-	// Provisional, for putLocked; set by the write below.
-	w.setDeadline(w.now().Add(w.lease() - w.margin()))
-	if err := w.putLocked(ctx, st.Clone(), true); err != nil {
-		w.serveUntil.Store(0)
+	w.acquiring = true
+	err = w.putLocked(ctx, st.Clone(), true)
+	w.acquiring = false
+	if err != nil {
 		return err
 	}
 	w.log().Info("accounts lease acquired", "holder", w.Holder, "generation", w.st.Generation)
@@ -284,10 +290,10 @@ func (w *Writer) putLocked(ctx context.Context, next *State, changed bool) error
 		return ErrNotWriter
 	case err != nil:
 		// A store can keep a write whose response is lost: read it back.
-		w.pending = &pendingWrite{data: data, next: next, sent: sent, changed: changed, cause: err}
+		w.pending = &pendingWrite{data: data, next: next, sent: sent, changed: changed, acquire: w.acquiring, cause: err}
 		return w.resolveLocked(ctx)
 	}
-	w.pending = &pendingWrite{data: data, next: next, sent: sent, changed: changed}
+	w.pending = &pendingWrite{data: data, next: next, sent: sent, changed: changed, acquire: w.acquiring}
 	w.adoptLocked(version)
 	return nil
 }
@@ -325,21 +331,27 @@ func (w *Writer) adoptLocked(version string) {
 	p := w.pending
 	w.pending = nil
 	w.setState(p.next, version)
-	// The lease in the store runs from no earlier than sent; Truncate
-	// can only shorten it, and the margin covers clock rate differences.
-	// A writer that already gave up the lease (it expired while the
-	// write was in flight) stays given up: its sessions are closed.
-	if old := w.serveUntil.Load(); old != 0 {
-		w.serveUntil.CompareAndSwap(old, p.sent.Add(w.lease()-w.margin()-time.Second).UnixNano())
-	}
 	w.saveToken()
 	if w.Cache != "" {
 		if err := WriteFileAtomic(w.Cache, p.data); err != nil {
 			w.log().Error("accounts cache not written; the store has the change", "file", w.Cache, "err", err)
 		}
 	}
+	// The relay has the state before it serves by it.
 	if p.changed && w.OnState != nil {
 		w.OnState(p.next)
+	}
+	// The lease in the store runs from no earlier than sent; Truncate
+	// can only shorten it, and the margin covers clock rate differences.
+	until := p.sent.Add(w.lease() - w.margin() - time.Second).UnixNano()
+	if p.acquire {
+		w.serveUntil.Store(until)
+		return
+	}
+	// A writer that already gave up the lease (it expired while the
+	// write was in flight) stays given up: its sessions are closed.
+	if old := w.serveUntil.Load(); old != 0 {
+		w.serveUntil.CompareAndSwap(old, until)
 	}
 }
 
@@ -415,31 +427,41 @@ func (w *Writer) Run(ctx context.Context) {
 	}
 }
 
-// hold renews the lease until it is lost or ctx is done.
+// hold renews the lease until it is lost or ctx is done. Expiry is
+// watched apart from renewal, which waits for the lock, so a write stuck
+// in the store cannot keep the relay's sessions open past the lease.
 func (w *Writer) hold(ctx context.Context) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go w.watch(ctx)
 	tick := time.NewTicker(w.renew())
 	defer tick.Stop()
-	for {
-		if !w.holding() {
-			return
-		}
-		// The deadline is read without the lock: expiry must be noticed
-		// even while a write is stuck in the store.
-		expire := time.NewTimer(max(w.deadline().Sub(w.now()), 0))
+	for w.holding() {
 		select {
 		case <-ctx.Done():
-			expire.Stop()
 			return
-		case <-expire.C:
-			w.expire()
 		case <-tick.C:
-			expire.Stop()
 			w.mu.Lock()
 			err := w.renewLocked(ctx)
 			w.mu.Unlock()
 			if err != nil && !errors.Is(err, ErrNotWriter) {
 				w.log().Warn("accounts lease not renewed; serving until it expires", "err", err)
 			}
+		}
+	}
+}
+
+// watch ends the lease at its deadline, which renewals move, until it
+// is lost or ctx is done. It never takes the lock.
+func (w *Writer) watch(ctx context.Context) {
+	for w.holding() {
+		t := time.NewTimer(max(w.deadline().Sub(w.now()), 0))
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return
+		case <-t.C:
+			w.expire()
 		}
 	}
 }

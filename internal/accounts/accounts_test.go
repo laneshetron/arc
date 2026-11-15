@@ -483,3 +483,73 @@ func TestStuckWrite(t *testing.T) {
 		t.Error("a write that returned after the deadline revived the lease")
 	}
 }
+
+// TestServingAfterAcquisition: a writer serves only once its
+// acquisition is in the store and its state applied, not while the
+// write hangs.
+func TestServingAfterAcquisition(t *testing.T) {
+	ctx := context.Background()
+	store := &stuckStore{Store: FileStore{Path: filepath.Join(t.TempDir(), "accounts")}}
+	c := &clock{t: t0}
+	w := newWriter(t, store, "a", c)
+	w.OnState = func(*State) {
+		if w.Serving() {
+			t.Error("serving before the state was applied")
+		}
+	}
+	store.stuck, store.release = make(chan struct{}), make(chan struct{})
+	stuck := store.stuck
+	done := make(chan error)
+	go func() { done <- w.Acquire(ctx) }()
+	<-stuck
+	if w.Serving() {
+		t.Error("serving while the acquisition hangs")
+	}
+	close(store.release)
+	if err := <-done; err != nil || !w.Serving() {
+		t.Fatalf("after acquiring: %v, serving %v", err, w.Serving())
+	}
+}
+
+// TestHoldExpiresDuringStuckWrite: a running writer whose store hangs
+// past renewals and the lease's end still loses the lease on time,
+// closing its sessions, though renewal waits for the hung write.
+func TestHoldExpiresDuringStuckWrite(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store := &stuckStore{Store: FileStore{Path: filepath.Join(t.TempDir(), "accounts")}}
+	w := &Writer{Store: store, Holder: "a", Lease: 3 * time.Second, Renew: 100 * time.Millisecond, Margin: 500 * time.Millisecond}
+	lost := make(chan time.Time, 1)
+	w.OnLost = func(error) { lost <- time.Now() }
+	if err := w.Acquire(ctx); err != nil {
+		t.Fatal(err)
+	}
+	deadline := w.deadline()
+	held := make(chan struct{})
+	go func() { w.hold(ctx); close(held) }()
+	store.stuck, store.release = make(chan struct{}), make(chan struct{})
+	stuck := store.stuck
+	done := make(chan error)
+	go func() {
+		done <- w.Commit(ctx, func(s *State) error { _, err := AddAccount(s, "x", false, 0); return err })
+	}()
+	<-stuck
+	select {
+	case at := <-lost:
+		if late := at.Sub(deadline); late > time.Second {
+			t.Errorf("lease lost %v after its deadline", late)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the lease was not lost while a write hung")
+	}
+	close(store.release)
+	<-done
+	select {
+	case <-held:
+	case <-time.After(5 * time.Second):
+		t.Fatal("hold kept going after the lease was lost")
+	}
+	if w.Serving() {
+		t.Error("serving after the lease was lost")
+	}
+}

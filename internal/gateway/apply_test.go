@@ -205,3 +205,46 @@ func TestAuthorizeDuringStuckWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestStaleCredentialDuringAcquisition: a relay reacquiring the lease
+// admits nobody until the store's state is applied, so a device revoked
+// elsewhere while it held stale credentials is refused even while the
+// acquisition hangs.
+func TestStaleCredentialDuringAcquisition(t *testing.T) {
+	ctx := context.Background()
+	store := &stuckStore{Store: accounts.FileStore{Path: filepath.Join(t.TempDir(), "accounts")}}
+	st, ta, _ := twoAccounts(t)
+	w := &accounts.Writer{Store: store, Holder: "a", Seed: func() (*accounts.State, error) { return st, nil }}
+	if err := w.Acquire(ctx); err != nil {
+		t.Fatal(err)
+	}
+	g := storeGateway(t, w.State(), w.Serving)
+	// Another writer takes over and revokes the device; this relay's
+	// gateway still has its credential.
+	other := &accounts.Writer{Store: store, Holder: "b"}
+	if err := other.Takeover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := other.Commit(ctx, func(s *accounts.State) error { _, err := accounts.Revoke(s, "a/laptop", time.Now()); return err }); err != nil {
+		t.Fatal(err)
+	}
+	if err := other.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	w.OnState = g.Apply
+	store.stuck, store.release = make(chan struct{}), make(chan struct{})
+	stuck := store.stuck
+	done := make(chan error)
+	go func() { done <- w.Acquire(ctx) }()
+	<-stuck
+	if _, err := g.Authorize(ta, nil, nil); !errors.Is(err, ErrNotServing) {
+		t.Errorf("stale credential during a hung acquisition: %v", err)
+	}
+	close(store.release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.Authorize(ta, nil, nil); !errors.Is(err, ErrBadCredential) {
+		t.Errorf("revoked credential after acquiring: %v", err)
+	}
+}
