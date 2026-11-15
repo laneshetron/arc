@@ -31,7 +31,7 @@ F = dict(PADDING=0x00, AUTH=0x01, AUTH_RESULT=0x02, IP_PACKET=0x03, IP_FRAGMENT=
          PATH_ABANDON=0x09, PING=0x0A, ACK=0x0B, CLOSE=0x0C, ERROR=0x0D,
          IP_DATAGRAM=0x0E, REDUNDANCY=0x0F, FEC_REPAIR=0x10, FEC=0x11, STREAM_OPEN=0x12,
          STREAM=0x13, MAX_STREAM_DATA=0x14, MAX_DATA=0x15, STREAM_RESET=0x16,
-         DIAGNOSTICS_OPEN=0x17)
+         DIAGNOSTICS_OPEN=0x17, ENROLLED=0x18)
 
 CLIENT_CID = bytes.fromhex("c1c2c3c4c5c6c7c8")
 RELAY_CID = bytes.fromhex("a1a2a3a4a5a6a7a8")
@@ -235,6 +235,8 @@ def build():
         ("MAX_DATA", F["MAX_DATA"], struct.pack("!Q", 24 << 20), {"max": 24 << 20}),
         ("STREAM_RESET", F["STREAM_RESET"], struct.pack("!IHQ", 3, 9, 1234), {"stream_id": 3, "code": 9, "final": 1234}),
         ("DIAGNOSTICS_OPEN", F["DIAGNOSTICS_OPEN"], struct.pack("!I", 5), {"stream_id": 5}),
+        ("ENROLLED", F["ENROLLED"], bytes.fromhex("d1d2d3d4d5d6d7d8") + bytes([6]) + b"laptop",
+         {"device_id_hex": "d1d2d3d4d5d6d7d8", "name": "laptop"}),
         ("UNKNOWN_EXTENSION", 0x9F, b"\xAA\xBB", {"ignorable": True}),
     ]
     fixtures["frames"] = [
@@ -353,6 +355,10 @@ def build():
         {"name": "stream_reset wrong size", "hex": frame(0x16, struct.pack("!IH", 1, 9)).hex()},
         {"name": "diagnostics_open stream zero", "hex": frame(0x17, struct.pack("!I", 0)).hex()},
         {"name": "diagnostics_open wrong size", "hex": frame(0x17, struct.pack("!IH", 1, 0)).hex()},
+        {"name": "enrolled empty name", "hex": frame(0x18, bytes(8) + bytes([0])).hex()},
+        {"name": "enrolled name length mismatch", "hex": frame(0x18, bytes(8) + bytes([5]) + b"abc").hex()},
+        {"name": "enrolled name too long", "hex": frame(0x18, bytes(8) + bytes([33]) + b"a" * 33).hex()},
+        {"name": "enrolled name invalid", "hex": frame(0x18, bytes(8) + bytes([3]) + b"a b").hex()},
         {"name": "redundancy unknown mode", "hex": frame(0x0F, struct.pack("!IB", 1, 2)).hex()},
         {"name": "path_join wrong size", "hex": "06000700000000000000"},
         {"name": "ping with value", "hex": "0a000100"},

@@ -6,7 +6,9 @@ package engine
 
 import (
 	"context"
+	"net"
 	"net/netip"
+	"sync"
 	"time"
 
 	"github.com/laneshetron/arc/internal/bufpool"
@@ -17,6 +19,28 @@ import (
 type PacketDevice interface {
 	Read() ([][]byte, error)
 	Write(pkts [][]byte) error
+}
+
+// NullDevice is a PacketDevice that carries nothing, for a client that
+// needs a session but no tunnel, such as one enrolling. Close ends its
+// Read.
+type NullDevice struct {
+	once sync.Once
+	done chan struct{}
+}
+
+func NewNullDevice() *NullDevice { return &NullDevice{done: make(chan struct{})} }
+
+func (d *NullDevice) Read() ([][]byte, error) {
+	<-d.done
+	return nil, net.ErrClosed
+}
+
+func (d *NullDevice) Write([][]byte) error { return nil }
+
+func (d *NullDevice) Close() error {
+	d.once.Do(func() { close(d.done) })
+	return nil
 }
 
 // DatagramConn is a datagram carrier, normally a *udp.Conn.

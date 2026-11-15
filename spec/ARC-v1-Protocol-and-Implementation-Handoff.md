@@ -300,6 +300,19 @@ Client                                          Relay
 - The relay caches the `HANDSHAKE_RESP` for each completed `HANDSHAKE_INIT` while the session is pending. If byte-identical INIT bytes arrive from the same source, it re-sends the cached response without doing a new Diffie-Hellman computation. INITs from different sources are separate handshakes: the relay keeps a pending session for each, and those the client does not authenticate expire.
 - Until `AUTH_RESULT` arrives, the client repeats `AUTH` in new `DATA` packets at the INIT interval, rather than on its loss-recovery timer, which backs off. It gives up 10 s after processing the response. The relay MUST process duplicate `AUTH` idempotently, and it answers each one.
 - The relay keeps a session that has not authenticated for 20 s from its INIT, covering both client phases.
+- A relay that cannot decide an `AUTH` at once (an enrollment, below, waiting for its write to the accounts store) MAY leave it unanswered; the client's repeated `AUTH` gets the answer once the relay has it.
+
+**Enrollment** (spec/self-service-accounts.md §3.4). `AUTH` carries either a token or an **enrollment credential**, which redeems a single-use invite and registers the token the client generated, bound to its static key:
+
+```text
+"\x00ARC-ENROLL1" || invite_id[8] || secret[16] || u8 len || token || u8 len || device_name
+```
+
+- Tokens are printable ASCII, so the leading zero byte tells the two apart. A token registered by enrollment authenticates only a handshake from the static key it enrolled with.
+- An unknown invite or wrong secret is `AUTH_FAILED`, like a wrong token. An invite another device redeemed is `INVITE_USED`, and one past its expiry `INVITE_EXPIRED`, in both `AUTH_RESULT.status` and `CLOSE`. An account at its device cap is `CAPACITY`.
+- The relay answers a repeat of an enrollment it already made (the same invite, token and static key) with success, even after the invite has expired.
+- With a successful `AUTH_RESULT`, and only in answer to an enrollment credential, the relay sends `ENROLLED` with the device's ID and name. `AUTH_RESULT` is unchanged.
+- A client that may have enrolled before losing the answer, and is then refused `INVITE_USED`, `INVITE_EXPIRED` or `AUTH_FAILED`, tries once more with its token: success means it was enrolled.
 
 **Resource limits.** The relay MUST implement handshake timeouts, a cap on pending handshakes, per-source rate limits, and the cookie mechanism in §9.3.
 
@@ -376,6 +389,7 @@ frame_value:  frame_length bytes
 | `15` | `MAX_DATA` | 8 bytes: `max:u64` (§11.3) | Both, if negotiated | Yes |
 | `16` | `STREAM_RESET` | 14 bytes: `stream_id:u32; code:u16; final:u64` (§11.3) | Both, if negotiated | Yes |
 | `17` | `DIAGNOSTICS_OPEN` | 4 bytes: `stream_id:u32` (§11.4) | Client → relay, if negotiated | Yes |
+| `18` | `ENROLLED` | `device_id:8B; len:u8; name` (name 1–32 bytes of letters, digits, `.`, `_`, `-`; §9.2) | Relay → client, only after an enrollment credential | Yes |
 
 **`AUTH_RESULT`:**
 - `status=0` means success. Any other value is a failure, and all other fields MUST then be zero.
@@ -392,7 +406,7 @@ frame_value:  frame_length bytes
 - `offset + data_len <= total_len`, and `20 <= total_len <= 65535`.
 - Fragments whose byte ranges overlap with conflicting contents cause the whole datagram to be discarded.
 
-**`ERROR` codes:** `1 MALFORMED`, `2 AUTH_FAILED`, `3 UNAUTHORIZED`, `4 PATH_UNAVAILABLE`, `5 CAPACITY`, `6 UNSUPPORTED`, `7 SESSION_EXPIRED`, `8 PROTOCOL_VIOLATION`, `9 CONNECT_FAILED`, `10 ABORTED` (the last two for `STREAM_RESET`, §11.3). Unknown values are informational and MUST NOT crash an implementation. `CLOSE` and `PATH_ABANDON` use the same code space, plus `0 NO_ERROR`.
+**`ERROR` codes:** `1 MALFORMED`, `2 AUTH_FAILED`, `3 UNAUTHORIZED`, `4 PATH_UNAVAILABLE`, `5 CAPACITY`, `6 UNSUPPORTED`, `7 SESSION_EXPIRED`, `8 PROTOCOL_VIOLATION`, `9 CONNECT_FAILED`, `10 ABORTED` (these two for `STREAM_RESET`, §11.3), `11 INVITE_USED`, `12 INVITE_EXPIRED` (these two refuse an enrollment, §9.2). Unknown values are informational and MUST NOT crash an implementation. `CLOSE` and `PATH_ABANDON` use the same code space, plus `0 NO_ERROR`.
 
 ### 10.2 `ACK` frame
 

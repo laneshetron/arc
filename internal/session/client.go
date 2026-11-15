@@ -77,6 +77,13 @@ type ClientEvent interface{ clientEvent() }
 // Established reports that the session is active.
 type Established struct{ Config wire.AuthResult }
 
+// Enrolled reports the relay's ENROLLED: the client's enrollment
+// credential made it the device DeviceID, named Name (§9.2).
+type Enrolled struct {
+	DeviceID [8]byte
+	Name     string
+}
+
 // PathValidated reports that a path opened with OpenPath can carry traffic.
 type PathValidated struct{ ID uint32 }
 
@@ -100,6 +107,7 @@ type Closed struct{ Err error }
 type StreamUpdate struct{ ID uint32 }
 
 func (Established) clientEvent()       {}
+func (Enrolled) clientEvent()          {}
 func (PathValidated) clientEvent()     {}
 func (PathClosed) clientEvent()        {}
 func (Closed) clientEvent()            {}
@@ -134,10 +142,11 @@ type Client struct {
 	nextInit      time.Time // next HANDSHAKE_INIT, or next AUTH while authenticating
 	authenticated time.Time
 
-	conn    *conn
-	config  wire.AuthResult
-	slots   []pathSlot
-	current *path // primary path
+	conn     *conn
+	config   wire.AuthResult
+	enrolled bool // ENROLLED reported
+	slots    []pathSlot
+	current  *path // primary path
 	// Loss-driven moves of the primary (loss.go): when the next check is
 	// due and the earliest the primary may move again.
 	lossCheckAt, lossMoveAt time.Time
@@ -390,6 +399,11 @@ func (c *Client) handleData(now time.Time, b []byte) {
 		switch f := f.(type) {
 		case wire.AuthResult:
 			c.onAuthResult(now, f)
+		case wire.Enrolled:
+			if !c.enrolled {
+				c.enrolled = true
+				c.events = append(c.events, Enrolled{DeviceID: f.DeviceID, Name: f.Name})
+			}
 			if c.state == StateClosed {
 				return
 			}
@@ -572,8 +586,13 @@ func (c *Client) onAuthResult(now time.Time, r wire.AuthResult) {
 	}
 	if r.Status != 0 {
 		err := ErrAuthFailed
-		if r.Status == uint8(wire.CodeCapacity) {
+		switch wire.ErrorCode(r.Status) {
+		case wire.CodeCapacity:
 			err = ErrCapacity
+		case wire.CodeInviteUsed:
+			err = ErrInviteUsed
+		case wire.CodeInviteExpired:
+			err = ErrInviteExpired
 		}
 		c.state, c.err = StateClosed, err
 		c.events = append(c.events, Closed{Err: err})

@@ -218,7 +218,7 @@ func TestAuthChecksActiveCapacityBeforeLeasing(t *testing.T) {
 	calls := 0
 	cfg := defaultRelayConfig()
 	cfg.MaxSessions = 1
-	cfg.Authorize = func(c, k []byte, prior *wire.AuthResult) (wire.AuthResult, error) {
+	cfg.Authorize = func(c, k []byte, prior *wire.AuthResult) (Authorization, error) {
 		calls++
 		return testAuthorizer(c, k, prior)
 	}
@@ -359,10 +359,10 @@ func TestSkippedSlotsRefillAfterExpiry(t *testing.T) {
 func TestRefreshSeesTheSessionsLease(t *testing.T) {
 	cfg := defaultRelayConfig()
 	var priors []*wire.AuthResult
-	cfg.Authorize = func(c, k []byte, prior *wire.AuthResult) (wire.AuthResult, error) {
+	cfg.Authorize = func(c, k []byte, prior *wire.AuthResult) (Authorization, error) {
 		priors = append(priors, prior)
 		if prior != nil && string(c) != "good" {
-			return wire.AuthResult{Status: uint8(wire.CodeAuthFailed)}, nil // another principal's
+			return Authorization{Result: wire.AuthResult{Status: uint8(wire.CodeAuthFailed)}}, nil // another principal's
 		}
 		return testAuthorizer(c, k, prior)
 	}

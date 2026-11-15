@@ -243,6 +243,36 @@ account needs the host's other addresses, a host firewall rule such as
 defense for IP forwarding (not for split TCP, which only the relay's own
 checks cover).
 
+#### Enrolling devices with invites
+
+With `-accounts-store`, a device can enroll itself: the operator prints a
+single-use invite for an account, and its holder redeems it with
+`arc-client enroll`, over ARC itself, on the carriers the invite names
+([spec/self-service-accounts.md](spec/self-service-accounts.md) §3.3–3.4).
+
+```sh
+# on the relay host (or through its control socket)
+arc-relay accounts invite -address 203.0.113.7 alexei            # UDP 4433
+arc-relay accounts invite -address 203.0.113.7 -tls-port 443 \
+    -tls-cover s3.amazonaws.com -tls-fingerprint chrome -ttl 24h alexei
+# on the device
+arc-client enroll -profile ~/.config/arc/relay arc1:...
+sudo arc-client run -profile ~/.config/arc/relay -full-tunnel
+```
+
+The invite (about 100 characters) holds the relay's address, ports and
+pinned key, and a secret that only travels inside the Noise handshake.
+`enroll` makes the device a key and a token, writes them with the relay's
+settings to the profile directory **before** connecting, and registers
+the token, bound to that key: a copied token is refused from any other
+machine. An interrupted enrollment is rerun with the same command and
+resumes with the same key and token, which the relay recognizes even
+after the invite has expired. An invite another device already redeemed,
+or one past its expiry (48 hours by default), is refused, and the relay
+logs a warning for the first. `run -profile` fills in `-relay`,
+`-relay-key`, `-token-file`, `-key-file` and the TLS settings; flags given
+on the command line win. The store keeps only the invite's hash.
+
 ### Diagnostics
 
 When someone else runs a client on a network that interferes with ARC,

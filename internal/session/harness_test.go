@@ -124,11 +124,11 @@ func mustKey(seed byte) crypto.StaticKey {
 	return k
 }
 
-func testAuthorizer(credential, _ []byte, _ *wire.AuthResult) (wire.AuthResult, error) {
+func testAuthorizer(credential, _ []byte, _ *wire.AuthResult) (Authorization, error) {
 	if string(credential) != "good" {
-		return wire.AuthResult{}, errors.New("bad credential")
+		return Authorization{}, errors.New("bad credential")
 	}
-	return wire.AuthResult{IPv4: lease, Prefix4: 16, TunMTU: 1280, DNSv4: [4]byte{10, 77, 0, 1}}, nil
+	return Authorization{Result: wire.AuthResult{IPv4: lease, Prefix4: 16, TunMTU: 1280, DNSv4: [4]byte{10, 77, 0, 1}}}, nil
 }
 
 func defaultRelayConfig() RelayConfig {

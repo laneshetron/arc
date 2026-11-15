@@ -34,6 +34,7 @@ const (
 	FrameMaxData       FrameType = 0x15
 	FrameStreamReset   FrameType = 0x16
 	FrameDiagOpen      FrameType = 0x17
+	FrameEnrolled      FrameType = 0x18
 
 	// Frame types at or above FirstExtensionFrame are optional extensions
 	// that receivers may ignore; unknown types below it are required.
@@ -44,7 +45,7 @@ var frameNames = [...]string{
 	"PADDING", "AUTH", "AUTH_RESULT", "IP_PACKET", "IP_FRAGMENT", "NEW_PATH", "PATH_JOIN",
 	"PATH_CHALLENGE", "PATH_RESPONSE", "PATH_ABANDON", "PING", "ACK", "CLOSE", "ERROR",
 	"IP_DATAGRAM", "REDUNDANCY", "FEC_REPAIR", "FEC", "STREAM_OPEN", "STREAM", "MAX_STREAM_DATA",
-	"MAX_DATA", "STREAM_RESET", "DIAGNOSTICS_OPEN",
+	"MAX_DATA", "STREAM_RESET", "DIAGNOSTICS_OPEN", "ENROLLED",
 }
 
 func (t FrameType) String() string {
@@ -80,6 +81,9 @@ const (
 	// Stream reset codes (§11.3).
 	CodeConnectFailed ErrorCode = 9  // the relay could not connect to the destination
 	CodeAborted       ErrorCode = 10 // the TCP connection failed or was reset
+	// Enrollment refusals (§9.2), in AUTH_RESULT and CLOSE.
+	CodeInviteUsed    ErrorCode = 11 // another device redeemed the invite
+	CodeInviteExpired ErrorCode = 12
 )
 
 const (
@@ -163,6 +167,17 @@ type StreamOpen struct {
 type DiagOpen struct {
 	ID uint32
 }
+
+// Enrolled tells a client that enrolled with an invite the device it
+// became: its ID and the name the relay chose (§9.2). Relay to client
+// only, and only after an enrollment credential.
+type Enrolled struct {
+	DeviceID [8]byte
+	Name     string
+}
+
+// MaxDeviceName is the longest device name in ENROLLED.
+const MaxDeviceName = 32
 
 // Stream carries bytes of a stream starting at Offset. Fin marks the end of
 // the sender's data at Offset+len(Data).
@@ -311,6 +326,7 @@ func (MaxStreamData) Type() FrameType { return FrameMaxStreamData }
 func (MaxData) Type() FrameType       { return FrameMaxData }
 func (StreamReset) Type() FrameType   { return FrameStreamReset }
 func (DiagOpen) Type() FrameType      { return FrameDiagOpen }
+func (Enrolled) Type() FrameType      { return FrameEnrolled }
 func (u Unknown) Type() FrameType     { return u.FrameType }
 
 // AppendFrame appends the TLV encoding of f to b. It panics if the encoded
@@ -400,6 +416,12 @@ func (o StreamOpen) appendValue(b []byte) []byte {
 
 func (o DiagOpen) appendValue(b []byte) []byte {
 	return binary.BigEndian.AppendUint32(b, o.ID)
+}
+
+func (e Enrolled) appendValue(b []byte) []byte {
+	b = append(b, e.DeviceID[:]...)
+	b = append(b, byte(len(e.Name)))
+	return append(b, e.Name...)
 }
 
 func (f Stream) appendValue(b []byte) []byte {
@@ -509,6 +531,7 @@ var (
 	errFECMode          = malformed("FEC unknown mode")
 	errStreamOpen       = malformed("STREAM_OPEN destination invalid")
 	errStreamID         = malformed("stream ID zero")
+	errEnrolledName     = malformed("ENROLLED device name invalid")
 	errStreamFlags      = malformed("STREAM unknown flags")
 	errStreamOffset     = malformed("stream offset or limit too large")
 	errIPVersion        = malformed("IP_PACKET has unknown IP version")
@@ -658,6 +681,16 @@ func parseValue(t FrameType, v []byte) (Frame, error) {
 			return nil, errStreamID
 		}
 		return o, nil
+
+	case FrameEnrolled:
+		if len(v) < 10 || int(v[8]) != len(v)-9 || len(v)-9 > MaxDeviceName {
+			return nil, errFrameSize
+		}
+		e := Enrolled{DeviceID: [8]byte(v[:8]), Name: string(v[9:])}
+		if !validDeviceName(e.Name) {
+			return nil, errEnrolledName
+		}
+		return e, nil
 
 	case FrameStream:
 		if len(v) < streamFixed {
@@ -849,4 +882,17 @@ func parseAck(v []byte) (Frame, error) {
 		return nil, err
 	}
 	return a, nil
+}
+
+// validDeviceName: letters, digits, '.', '_' and '-', not "." or "..".
+func validDeviceName(s string) bool {
+	if s == "" || s == "." || s == ".." {
+		return false
+	}
+	for _, c := range []byte(s) {
+		if !('a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || '0' <= c && c <= '9' || c == '.' || c == '_' || c == '-') {
+			return false
+		}
+	}
+	return true
 }

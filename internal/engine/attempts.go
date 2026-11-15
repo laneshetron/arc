@@ -188,6 +188,19 @@ func (a *AttemptLog) unestablished(s *session.RelaySession, err error) {
 	args := []any{"client", from, "carrier", carrier, "seconds", seconds(time.Since(h.Started)),
 		"init_resends", h.Resends, "reason", err}
 	switch {
+	case errors.Is(err, gateway.ErrUnknownInvite):
+		a.line(slog.LevelInfo, "handshake rejected: unknown invite", args...)
+		return
+	case errors.Is(err, gateway.ErrInviteUsed):
+		// Someone else redeemed it first: the operator should know.
+		a.line(slog.LevelWarn, "handshake rejected: invite already used by another device", args...)
+		return
+	case errors.Is(err, gateway.ErrInviteExpired):
+		a.line(slog.LevelInfo, "handshake rejected: invite expired", args...)
+		return
+	case errors.Is(err, gateway.ErrDeviceCap):
+		a.line(slog.LevelInfo, "handshake rejected: account at its device cap", args...)
+		return
 	case errors.Is(err, gateway.ErrBadCredential):
 		a.line(slog.LevelInfo, "handshake rejected: unknown token", args...)
 		return

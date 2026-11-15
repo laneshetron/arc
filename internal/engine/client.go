@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -40,6 +41,10 @@ type ClientConfig struct {
 	// each time a session becomes active. A reconnect may lease a
 	// different address.
 	OnEstablished func(wire.AuthResult) error
+	// OnEnrolled, if set, is called with the relay's ENROLLED, after
+	// OnEstablished, for a session that enrolled with an invite. An
+	// error closes the session and RunClient returns it.
+	OnEnrolled func(session.Enrolled) error
 
 	// ReconnectDelay is the pause before replacing a session that ended
 	// for a reason other than authentication failure. Default 1 s.
@@ -289,6 +294,15 @@ func RunClient(ctx context.Context, cfg ClientConfig) error {
 							}
 						}
 					}()
+				}
+			case session.Enrolled:
+				log.Info("enrolled", "device", e.Name, "id", hex.EncodeToString(e.DeviceID[:]))
+				if cfg.OnEnrolled != nil {
+					if err := cfg.OnEnrolled(e); err != nil {
+						c.Close(time.Now())
+						flushTransmits(c, carriers, hs.pinned, log)
+						return err
+					}
 				}
 			case session.PathValidated:
 				log.Info("path validated", "path", e.ID)

@@ -52,6 +52,9 @@ jobs:
       - name: accounts store end to end in network namespaces
         if: success() || failure()
         run: sudo ./test/netns/store.sh bin
+      - name: enrollment end to end in network namespaces
+        if: success() || failure()
+        run: sudo ./test/netns/enroll.sh bin
 
   degraded:
     runs-on: ubuntu-latest

@@ -132,6 +132,16 @@ func List(st *State) string {
 			}
 			fmt.Fprintf(tw, "  %s%s\t%v\t%s, created %s\n", strings.Repeat("  ", len(d.Lineage)), d.Name, d.ID, key, stamp(d.Created))
 		}
+		for _, i := range st.Invites {
+			if i.Account != a.ID {
+				continue
+			}
+			state := "unredeemed, expires " + stamp(i.Expires)
+			if !i.Redeemed.IsZero() {
+				state = fmt.Sprintf("redeemed by %v", i.Redeemed)
+			}
+			fmt.Fprintf(tw, "  invite %v\t\t%s\n", i.ID, state)
+		}
 	}
 	tw.Flush()
 	return b.String()
