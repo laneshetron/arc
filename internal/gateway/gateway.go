@@ -39,7 +39,9 @@ var (
 	ErrDeviceCap     = fmt.Errorf("gateway: account at its device cap: %w", session.ErrCapacity)
 )
 
-// maxEnrolling bounds the enrollments waiting for their commits.
+// maxEnrolling bounds the enrollments waiting for their commits, or for
+// their clients to hear the outcome. Each invite has at most one commit
+// in flight.
 const maxEnrolling = 64
 
 // Config describes the tunnel network.
@@ -574,7 +576,22 @@ func (g *Gateway) enrollLocked(credential, clientStatic []byte, prior *wire.Auth
 		return session.Authorization{}, g.enrollError(accounts.ErrInviteExpired, i)
 	case prior != nil:
 		return session.Authorization{}, ErrWrongAccount
-	case len(g.enrolling) >= maxEnrolling:
+	}
+	// One commit per invite at a time: only one redemption can succeed,
+	// so another device's waits for the outcome instead of taking a slot
+	// (someone holding an invite can't fill the slots with new keys).
+	// Finished ones for the invite are dropped; repeated, they are
+	// decided afresh, against the invite as the store now has it.
+	for k, o := range g.enrolling {
+		if k.invite != i.ID {
+			continue
+		}
+		if !o.done {
+			return session.Authorization{}, session.ErrAuthPending
+		}
+		delete(g.enrolling, k)
+	}
+	if len(g.enrolling) >= maxEnrolling {
 		return session.Authorization{}, fmt.Errorf("gateway: too many enrollments in progress: %w", session.ErrCapacity)
 	}
 	p := &enrollment{started: now}

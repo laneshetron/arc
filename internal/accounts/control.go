@@ -55,6 +55,9 @@ func (r *InviteRequest) template(relayKey []byte) (*invite.Invite, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invite: relay address: %w", err)
 	}
+	if addr = addr.Unmap(); !addr.Is4() {
+		return nil, errors.New("invite: the relay address must be IPv4 (clients reach relays over IPv4 only)")
+	}
 	v := &invite.Invite{Addr: addr, UDPPort: r.UDPPort, TLSPort: r.TLSPort, Fingerprint: r.Fingerprint, ServerName: r.ServerName,
 		RelayKey: [32]byte(relayKey)}
 	if r.UDPPort != 0 {

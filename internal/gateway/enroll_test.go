@@ -152,3 +152,65 @@ func TestEnrollStoreDown(t *testing.T) {
 		t.Fatalf("store down: %v", err)
 	}
 }
+
+// TestEnrollFloodOneInvite: someone holding an invite who redeems it
+// with many keys holds one commit, not the gateway's enrollment slots;
+// another invite still enrolls, and the flood's keys are refused once the
+// first redemption is made.
+func TestEnrollFloodOneInvite(t *testing.T) {
+	f := newEnrollFixture(t)
+	var other *accounts.Invite
+	var otherSecret [16]byte
+	err := f.w.Commit(context.Background(), func(st *accounts.State) (err error) {
+		other, otherSecret, err = accounts.AddInvite(st, "alexei", time.Hour, f.now)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	release, calls := make(chan struct{}), 0
+	var cmu sync.Mutex
+	f.g.cfg.Commit = func(ctx context.Context, fn func(*accounts.State) error) error {
+		cmu.Lock()
+		calls++
+		first := calls == 1
+		cmu.Unlock()
+		if first {
+			<-release // the flooded invite's commit hangs
+		}
+		return f.w.Commit(ctx, fn)
+	}
+
+	first, firstCred := bytes.Repeat([]byte{1}, 32), f.credential(invite.NewToken(), "first")
+	if _, err := f.g.AuthorizeSession(firstCred, first, nil); !errors.Is(err, session.ErrAuthPending) {
+		t.Fatalf("first redemption: %v", err)
+	}
+	for n := range 2 * maxEnrolling {
+		key := bytes.Repeat([]byte{byte(n + 2)}, 32)
+		if _, err := f.g.AuthorizeSession(f.credential(invite.NewToken(), "flood"), key, nil); !errors.Is(err, session.ErrAuthPending) {
+			t.Fatalf("flood %d: %v", n, err)
+		}
+	}
+	f.g.mu.Lock()
+	n := len(f.g.enrolling)
+	f.g.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("%d enrollments tracked for one invite, want 1", n)
+	}
+
+	// Another invite enrolls while the flood waits.
+	e := &invite.Enrollment{ID: other.ID, Secret: otherSecret, Token: invite.NewToken(), Name: "phone"}
+	if a, err := f.enroll(e.Credential(), bytes.Repeat([]byte{0xee}, 32)); err != nil || a.Enrolled == nil {
+		t.Fatalf("other invite during the flood: %+v %v", a, err)
+	}
+
+	close(release)
+	if a, err := f.enroll(firstCred, first); err != nil || a.Enrolled == nil || a.Enrolled.Name != "first" {
+		t.Fatalf("first redemption: %+v %v", a, err)
+	}
+	var ae *session.AuthError
+	_, err = f.enroll(f.credential(invite.NewToken(), "flood"), bytes.Repeat([]byte{2}, 32))
+	if !errors.As(err, &ae) || ae.Code != wire.CodeInviteUsed {
+		t.Fatalf("flood key after the first redemption: %v", err)
+	}
+}

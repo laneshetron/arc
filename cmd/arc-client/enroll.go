@@ -61,11 +61,19 @@ func enroll(args []string) error {
 	if inv.Carriers&invite.CarrierFront != 0 {
 		return errors.New("this invite is for the relay's HTTPS front, which enrollment does not support yet")
 	}
+	if !inv.Addr.Unmap().Is4() {
+		return fmt.Errorf("this invite's relay address %v is IPv6, which arc-client does not support yet", inv.Addr)
+	}
 	if len(*device) > invite.MaxDeviceName {
 		return fmt.Errorf("-device: at most %d bytes", invite.MaxDeviceName)
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 
+	unlock, err := lockProfile(*dir)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	p, static, token, err := prepareProfile(*dir, inv)
 	if err != nil {
 		return err
@@ -178,7 +186,7 @@ func connectOnce(ctx context.Context, log *slog.Logger, p *profile, binds []stri
 		return fmt.Errorf("profile relay-key: %w", err)
 	}
 	carriers, closeCarriers, err := openCarriers(log, carrierOptions{
-		Relay: relay, Binds: binds, TLS: p.settings["tls"], TLSCover: p.settings["tls-cover"],
+		Relay: relay, Binds: binds, NoUDP: p.settings["no-udp"] == "true", TLS: p.settings["tls"], TLSCover: p.settings["tls-cover"],
 		TLSFingerprint: p.settings["tls-fingerprint"],
 	})
 	if err != nil {

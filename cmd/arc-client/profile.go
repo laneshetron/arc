@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/laneshetron/arc/internal/invite"
 	"github.com/laneshetron/arc/internal/keyfile"
@@ -28,7 +29,10 @@ type profile struct {
 
 // Profile keys. The relay keys are run's flag names, which -profile
 // fills in.
-var profileKeys = []string{"relay", "relay-key", "tls", "tls-cover", "tls-fingerprint", "device", "device-id", "invite"}
+var profileKeys = []string{"relay", "relay-key", "no-udp", "tls", "tls-cover", "tls-fingerprint", "device", "device-id", "invite"}
+
+// runKeys are the profile keys that set run's flags.
+var runKeys = []string{"relay", "relay-key", "no-udp", "tls", "tls-cover", "tls-fingerprint"}
 
 func (p *profile) path(name string) string { return filepath.Join(p.dir, name) }
 
@@ -76,24 +80,61 @@ func (p *profile) save() error {
 	return writePrivate(p.path("profile"), []byte(b.String()))
 }
 
+// writePrivate replaces path with data, readable only by its owner,
+// through a temporary file of its own.
 func writePrivate(path string, data []byte) error {
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*.tmp") // mode 0600
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	tmp := f.Name()
+	_, err = f.Write(data)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Rename(tmp, path)
+	}
+	if err != nil {
+		os.Remove(tmp)
+	}
+	return err
 }
 
-// fromInvite sets the relay settings an invite gives.
+// lockProfile takes dir's lock, creating dir, for an enrollment into it:
+// a second one waiting for the same profile could make another key and
+// token while the first redeems the invite with its own. The lock is
+// released when the returned function is called or the process exits.
+func lockProfile(dir string) (func(), error) {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(filepath.Join(dir, ".lock"), os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, fmt.Errorf("%s: another arc-client enroll is using this profile", dir)
+		}
+		return nil, fmt.Errorf("%s: lock: %w", dir, err)
+	}
+	return func() { f.Close() }, nil
+}
+
+// fromInvite sets the relay settings an invite gives: the carriers it
+// offers, and no others.
 func (p *profile) fromInvite(v *invite.Invite) {
 	port := v.UDPPort
 	if v.Carriers&invite.CarrierUDP == 0 {
 		port = v.TLSPort // the session's address; no UDP carrier answers there
+		p.settings["no-udp"] = "true"
 	}
-	p.settings["relay"] = netip.AddrPortFrom(v.Addr, port).String()
+	p.settings["relay"] = netip.AddrPortFrom(v.Addr.Unmap(), port).String()
 	p.settings["relay-key"] = keyfile.Encode(v.RelayKey[:])
 	if v.Carriers&invite.CarrierTLS != 0 {
-		p.settings["tls"] = netip.AddrPortFrom(v.Addr, v.TLSPort).String()
+		p.settings["tls"] = netip.AddrPortFrom(v.Addr.Unmap(), v.TLSPort).String()
 		p.settings["tls-cover"] = v.ServerName
 		p.settings["tls-fingerprint"] = v.Fingerprint
 	}
@@ -111,7 +152,7 @@ func (p *profile) apply(fs *flag.FlagSet) error {
 	set := map[string]bool{}
 	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
 	defaults := map[string]string{"token-file": p.path("token"), "key-file": p.path("key")}
-	for _, k := range []string{"relay", "relay-key", "tls", "tls-cover", "tls-fingerprint"} {
+	for _, k := range runKeys {
 		if v := p.settings[k]; v != "" {
 			defaults[k] = v
 		}

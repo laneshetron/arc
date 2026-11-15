@@ -59,7 +59,7 @@ func accountsCmd(args []string) error {
 	relay := fs.Bool("relay", false, "add: the account's clients may reach the relay host")
 	inviteAddr := fs.String("address", "", "invite: the relay's public address, which the invite's holder connects to")
 	inviteUDP := fs.Uint("udp-port", 4433, "invite: the relay's UDP port (0: no UDP carrier)")
-	inviteTLS := fs.Uint("tls-port", 0, "invite: the relay's TLS port (0: no TLS carrier)")
+	inviteTLS := fs.Uint("tls-port", 0, "invite: the relay's TLS port (0: no TLS carrier); the relay must run with -tls-camouflage, since enrolled devices pose as browsers")
 	inviteCover := fs.String("tls-cover", "", "invite: the host name the TLS carrier poses as (required with -tls-port)")
 	inviteFP := fs.String("tls-fingerprint", "", "invite: shape the TLS ClientHello as this browser's: chrome, edge, safari, ios, or firefox")
 	inviteTTL := fs.Duration("ttl", accounts.DefaultInviteTTL, "invite: how long the invite lasts")

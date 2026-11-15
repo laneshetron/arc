@@ -260,6 +260,12 @@ arc-client enroll -profile ~/.config/arc/relay arc1:...
 sudo arc-client run -profile ~/.config/arc/relay -full-tunnel
 ```
 
+A TLS invite's device poses as a browser (the cover name, and the
+fingerprint if given), so a relay inviting with `-tls-port` runs with
+`-tls-camouflage`. An invite without a UDP port makes a profile with
+`no-udp=true`: the device opens only its TLS carrier. Invites are for
+IPv4 addresses only, as clients reach relays over IPv4.
+
 The invite (about 100 characters) holds the relay's address, ports and
 pinned key, and a secret that only travels inside the Noise handshake.
 `enroll` makes the device a key and a token, writes them with the relay's

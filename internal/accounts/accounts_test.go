@@ -774,3 +774,18 @@ func TestRedeem(t *testing.T) {
 		t.Errorf("past the cap: %v", err)
 	}
 }
+
+// TestInviteTemplate: invites are minted only for addresses clients can
+// reach, IPv4.
+func TestInviteTemplate(t *testing.T) {
+	key := bytes.Repeat([]byte{1}, 32)
+	for addr, ok := range map[string]bool{"203.0.113.7": true, "::ffff:203.0.113.7": true, "2001:db8::1": false} {
+		v, err := (&InviteRequest{Address: addr, UDPPort: 4433}).template(key)
+		if (err == nil) != ok {
+			t.Errorf("%s: %v", addr, err)
+		}
+		if ok && err == nil && !v.Addr.Is4() {
+			t.Errorf("%s: invite address %v", addr, v.Addr)
+		}
+	}
+}

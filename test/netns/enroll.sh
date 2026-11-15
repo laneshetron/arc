@@ -4,7 +4,9 @@
 # `arc-client enroll` (self-service-accounts.md §3.4), then the profile it
 # wrote used by `arc-client run -profile`. Covers enrolling under heavy
 # loss, a lost answer retried past the invite's expiry, a second
-# redemption refused, and a copied token refused from another key.
+# redemption refused, a copied token refused from another key, a second
+# enroll into a profile in use refused, and a TLS-only invite enrolling
+# with no UDP carrier.
 #
 # Usage: enroll.sh BIN_DIR   (BIN_DIR holds arc-client and arc-relay)
 set -euo pipefail
@@ -35,12 +37,14 @@ wait_for() { # wait_for SECONDS DESCRIPTION COMMAND...
 setup_topology 10.77.0.0/16
 
 "$BIN/arc-relay" genkey >"$WORK/relay.key"
+"$BIN/arc-relay" gencert -hosts 192.168.10.2 -cert "$WORK/relay.crt" -key "$WORK/relay.tls.key"
 : >"$WORK/tokens"
 CTL="$WORK/control"
 ACCOUNTS=("$BIN/arc-relay" accounts -control "$CTL")
 $R "$BIN/arc-relay" run -listen 192.168.10.2:4433 -key-file "$WORK/relay.key" \
   -reset-secret-file "$WORK/reset.secret" -tokens-file "$WORK/tokens" \
   -accounts-store "file:$WORK/accounts" -accounts-control "$CTL" \
+  -tls-listen 192.168.10.2:8443 -tls-cert "$WORK/relay.crt" -tls-key "$WORK/relay.tls.key" -tls-camouflage \
   -network 10.77.0.1/16 >>"$WORK/relay.log" 2>&1 &
 PIDS+=($!)
 wait_for 10 "relay holds the lease" grep -q "accounts lease acquired" "$WORK/relay.log"
@@ -121,7 +125,18 @@ mkdir -p "$WORK/tablet"
 # Write the profile and stop before connecting: a relay that is not
 # reachable yet (the client's link down).
 ip -n arc-c link set c0 down
-enroll tablet-prep "$WORK/tablet" "$SHORT" -device tablet -timeout 2s || true
+enroll tablet-prep "$WORK/tablet" "$SHORT" -device tablet -timeout 3s &
+PREP=$!
+sleep 1
+# Meanwhile a second enroll into the same profile is refused: it would
+# make its own key and token while the first redeems with the first's.
+if enroll tablet-twin "$WORK/tablet" "$SHORT" -device tablet -timeout 2s; then
+  fail "two enrolls into one profile at once"
+else
+  grep -q "another arc-client enroll is using this profile" "$WORK/enroll-tablet-twin.log" &&
+    pass "a second enroll into a profile in use is refused" || fail "twin: $(tail -n 3 "$WORK/enroll-tablet-twin.log")"
+fi
+wait "$PREP" || true
 ip -n arc-c link set c0 up
 cp -a "$WORK/tablet" "$WORK/tablet.before"
 if enroll tablet "$WORK/tablet" "$SHORT" -device tablet; then
@@ -140,6 +155,17 @@ fi
 "${ACCOUNTS[@]}" list >"$WORK/list.log"
 [[ $(grep -c "^  tablet" "$WORK/list.log") -eq 1 ]] && pass "the retry made no second device" ||
   fail "devices after the retry: $(cat "$WORK/list.log")"
+
+# A TLS-only invite: the profile opens no UDP carrier, and enrolls and
+# connects over TLS alone.
+TLSONLY=$(invite -udp-port 0 -tls-port 8443 -tls-cover www.example.com)
+if enroll tls "$WORK/tls" "$TLSONLY" -device tlsonly; then
+  grep -q "^no-udp=true" "$WORK/tls/profile" && grep -q "tls carrier will pose" "$WORK/enroll-tls.log" &&
+    ! grep -q "msg=carrier carrier=c0 " "$WORK/enroll-tls.log" &&
+    pass "a TLS-only invite enrolls with no UDP carrier" || fail "TLS-only: $(cat "$WORK/tls/profile"; tail -n 5 "$WORK/enroll-tls.log")"
+else
+  fail "TLS-only enroll: $(tail -n 5 "$WORK/enroll-tls.log")"
+fi
 
 echo
 if [[ $failures -eq 0 ]]; then echo "enroll: all checks passed"; else echo "enroll: $failures check(s) failed"; exit 1; fi

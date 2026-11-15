@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -20,6 +21,7 @@ type carrierOptions struct {
 	Relay      netip.AddrPort
 	Binds      []string
 	NoOffload  bool
+	NoUDP      bool // only the TLS and front carriers
 	FullTunnel bool
 	Mark       uint32
 
@@ -29,8 +31,9 @@ type carrierOptions struct {
 	Front, FrontToken        string
 }
 
-// openCarriers opens a UDP carrier per interface, and a TLS or front
-// carrier per interface when asked. The returned function closes them.
+// openCarriers opens a UDP carrier per interface, unless NoUDP, and a TLS
+// or front carrier per interface when asked. The returned function closes
+// them.
 func openCarriers(log *slog.Logger, o carrierOptions) ([]engine.Carrier, func(), error) {
 	var closers []io.Closer
 	closeAll := func() {
@@ -41,6 +44,12 @@ func openCarriers(log *slog.Logger, o carrierOptions) ([]engine.Carrier, func(),
 	fail := func(err error) ([]engine.Carrier, func(), error) {
 		closeAll()
 		return nil, nil, err
+	}
+	if o.NoUDP && o.TLS == "" && o.Front == "" {
+		return fail(errors.New("-no-udp needs -tls or -front"))
+	}
+	if !o.Relay.Addr().Unmap().Is4() {
+		return fail(fmt.Errorf("relay %v: only IPv4 relays are supported", o.Relay.Addr()))
 	}
 	binds := append([]string(nil), o.Binds...)
 	// Each carrier talks only to the relay, so its socket is connected.
@@ -66,6 +75,9 @@ func openCarriers(log *slog.Logger, o carrierOptions) ([]engine.Carrier, func(),
 	}
 	carriers := make([]engine.Carrier, 0, len(binds))
 	for _, iface := range binds {
+		if o.NoUDP {
+			break
+		}
 		name := iface
 		if name == "" {
 			name = "default"
