@@ -130,9 +130,11 @@ type Invite struct {
 type Tombstone struct {
 	ID        ID
 	Until     time.Time
-	TokenHash [32]byte // the revoked token's hash, to tell its holder it was revoked; zero if unknown
-	By        ID       // the device that revoked it, for a device's revocation
-	Rest      string   // the revoked record, for restore
+	TokenHash [32]byte  // the revoked token's hash, to tell its holder it was revoked; zero if unknown
+	By        ID        // the device that revoked it, for a device's revocation
+	Request   ID        // with By, the REVOKE_REQUEST that did, so its repeats are answered as done
+	Restored  time.Time // when the operator restored the device; zero if not
+	Rest      string    // the revoked record, for restore; cleared once restored or made final
 }
 
 // A Lease names the one writer that may commit and authenticate (§3.2).
@@ -376,6 +378,12 @@ func (s *State) Marshal() []byte {
 		if !t.By.IsZero() {
 			fmt.Fprintf(&b, " by=%v", t.By)
 		}
+		if !t.Request.IsZero() {
+			fmt.Fprintf(&b, " req=%v", t.Request)
+		}
+		if !t.Restored.IsZero() {
+			fmt.Fprintf(&b, " restored=%s", stamp(t.Restored))
+		}
 		if t.Rest != "" {
 			fmt.Fprintf(&b, " record=%s", t.Rest)
 		}
@@ -557,12 +565,18 @@ func (s *State) parseRecord(line string) error {
 		if len(pos) != 1 {
 			return errors.New("want revoked ID until=T")
 		}
-		t := &Tombstone{ID: id(pos[0]), By: optID("by"), Rest: opts["record"]}
+		t := &Tombstone{ID: id(pos[0]), By: optID("by"), Request: optID("req"), Rest: opts["record"]}
 		if err == nil {
 			t.Until, err = parseStamp(opts["until"])
 		}
 		if v, ok := opts["token"]; ok && err == nil {
 			err = hexInto(t.TokenHash[:], v, "token")
+		}
+		if v, ok := opts["restored"]; ok && err == nil {
+			t.Restored, err = parseStamp(v)
+		}
+		if err == nil && !t.Request.IsZero() && t.By.IsZero() {
+			err = errors.New("req= without by=")
 		}
 		s.Revoked = append(s.Revoked, t)
 	default:

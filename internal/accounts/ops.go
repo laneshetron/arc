@@ -36,7 +36,7 @@ func RemoveAccount(st *State, name string, now time.Time) (string, error) {
 	}
 	n := 0
 	for _, d := range st.DevicesOf(a.ID) {
-		st.tombstone(d, now, ID{})
+		st.tombstone(d, now, ID{}, ID{})
 		n++
 	}
 	st.Devices = slices.DeleteFunc(st.Devices, func(d *Device) bool { return d.Account == a.ID })
@@ -103,16 +103,17 @@ func Revoke(st *State, target string, now time.Time, descendants bool) (string, 
 	}
 	var b strings.Builder
 	for _, x := range gone {
-		st.revoke(x, now, ID{})
+		st.revoke(x, now, ID{}, ID{})
 		fmt.Fprintf(&b, "revoked %s/%s\n", account, x.Name)
 	}
 	return b.String(), nil
 }
 
 // revoke removes a device, cancels its unredeemed invites, and leaves a
-// tombstone. A revocation by a device (by) keeps the record, for Restore.
-func (st *State) revoke(d *Device, now time.Time, by ID) {
-	st.tombstone(d, now, by)
+// tombstone. A revocation by a device (by, for its request) keeps the
+// record, for Restore.
+func (st *State) revoke(d *Device, now time.Time, by, request ID) {
+	st.tombstone(d, now, by, request)
 	st.Devices = slices.DeleteFunc(st.Devices, func(x *Device) bool { return x == d })
 	st.Invites = slices.DeleteFunc(st.Invites, func(i *Invite) bool { return i.By == d.ID && i.Redeemed.IsZero() })
 }
@@ -127,14 +128,15 @@ func Rotate(st *State, account string, now time.Time) (string, error) {
 	}
 	devices := st.DevicesOf(a.ID)
 	for _, d := range devices {
-		st.revoke(d, now, ID{})
+		st.revoke(d, now, ID{}, ID{})
 	}
 	st.Invites = slices.DeleteFunc(st.Invites, func(i *Invite) bool { return i.Account == a.ID })
 	// Devices revoked by devices before the rotation stay revoked: their
-	// revocations become final, like the operator's.
+	// revocations become final, like the operator's (the request stays,
+	// to answer its repeats).
 	for _, t := range st.Revoked {
 		if d, err := parseDevice(t.Rest); err == nil && d.Account == a.ID {
-			t.By, t.Rest = ID{}, ""
+			t.Rest = ""
 		}
 	}
 	return fmt.Sprintf("rotated account %s: revoked its %d devices and cancelled its invites\n", account, len(devices)), nil
@@ -149,8 +151,10 @@ func (st *State) device(account ID, name string) *Device {
 	return nil
 }
 
-func (st *State) tombstone(d *Device, now time.Time, by ID) {
-	t := &Tombstone{ID: d.ID, Until: now.Add(TombstoneLife).UTC().Truncate(time.Second), TokenHash: d.TokenHash, By: by}
+func (st *State) tombstone(d *Device, now time.Time, by, request ID) {
+	// A restored device's earlier tombstone gives way to this one.
+	st.Revoked = slices.DeleteFunc(st.Revoked, func(x *Tombstone) bool { return x.ID == d.ID })
+	t := &Tombstone{ID: d.ID, Until: now.Add(TombstoneLife).UTC().Truncate(time.Second), TokenHash: d.TokenHash, By: by, Request: request}
 	if !by.IsZero() {
 		t.Rest = d.record()
 	}

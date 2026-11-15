@@ -207,12 +207,6 @@ this device may revoke itself. The operator can undo it for 7 days.`)
 		fs.Usage()
 		os.Exit(2)
 	}
-	// The relay remembers a revocation it did for 10 minutes
-	// (gateway.RevokeMemory), to answer its repeats as done; repeats past
-	// that would be judged afresh.
-	if *m.timeout > 10*time.Minute {
-		return errors.New("-timeout: at most 10m for revoke")
-	}
 	name := rest[0]
 	var target, me *wire.DeviceInfo
 	err := m.exchange(func(static crypto.StaticKey) *engine.Request {

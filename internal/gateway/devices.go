@@ -73,21 +73,14 @@ func (g *Gateway) revokeDevice(addr netip.Addr, s *session.RelaySession, req wir
 			return wire.RevokeResult{}, false
 		}
 		delete(g.revoking, d.ID)
-		if p.err == nil {
-			g.revokedReqs[revokeKey{d.ID, p.request}] = p.started
-		}
 		if p.request == request && p.err != nil && revokeRefused(p.err) {
 			return refuse, true
 		}
 	}
-	// A request done is answered as done, whatever has happened since:
-	// a repeat must not revoke a device the operator has restored.
-	if _, ok := g.revokedReqs[revokeKey{d.ID, request}]; ok {
-		return wire.RevokeResult{}, true
-	}
-	// The applied state decides: a refusal, or nothing left to revoke,
-	// is answered at once; anything else is committed.
-	gone, err := accounts.RevokeByDevice(g.st.Clone(), d.ID, target, req.Descendants, now)
+	// The applied state decides: a refusal, or nothing left to revoke
+	// (such as a request already done, which its tombstones record, even
+	// past a restore), is answered at once; anything else is committed.
+	gone, err := accounts.RevokeByDevice(g.st.Clone(), d.ID, request, target, req.Descendants, now)
 	switch {
 	case err != nil && revokeRefused(err):
 		return refuse, true
@@ -101,7 +94,7 @@ func (g *Gateway) revokeDevice(addr netip.Addr, s *session.RelaySession, req wir
 	// Apply, given the committed state, logs it and closes the revoked
 	// devices' sessions.
 	g.startCommitLocked(g.revoking, d.ID, request, now, func(st *accounts.State) error {
-		gone, err := accounts.RevokeByDevice(st, d.ID, target, req.Descendants, now)
+		gone, err := accounts.RevokeByDevice(st, d.ID, request, target, req.Descendants, now)
 		if err == nil && len(gone) == 0 {
 			return errNoChange
 		}
@@ -109,13 +102,6 @@ func (g *Gateway) revokeDevice(addr netip.Addr, s *session.RelaySession, req wir
 	})
 	return wire.RevokeResult{}, false
 }
-
-// A revokeKey names a device's REVOKE_REQUEST.
-type revokeKey struct{ device, request accounts.ID }
-
-// RevokeMemory is how long the relay remembers a revocation it did, to
-// answer the request's repeats: longer than a client repeats one.
-const RevokeMemory = 10 * time.Minute
 
 // revokeRefused reports whether a revocation error is final for the
 // request (the client is told UNAUTHORIZED), rather than one to retry.
@@ -163,12 +149,16 @@ func (g *Gateway) logRevokedLocked(st *accounts.State) {
 	if g.st == nil || g.cfg.Log == nil {
 		return
 	}
-	known := map[accounts.ID]bool{}
+	type key struct {
+		id    accounts.ID
+		until int64
+	}
+	known := map[key]bool{}
 	for _, t := range g.st.Revoked {
-		known[t.ID] = true
+		known[key{t.ID, t.Until.Unix()}] = true
 	}
 	for _, t := range st.Revoked {
-		if t.By.IsZero() || known[t.ID] {
+		if t.By.IsZero() || !t.Restored.IsZero() || known[key{t.ID, t.Until.Unix()}] {
 			continue
 		}
 		account, by, revoked := "", t.By.String(), t.ID.String()

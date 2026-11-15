@@ -28,14 +28,19 @@ func (s *State) MayManage(d *Device) bool {
 }
 
 // RevokeByDevice has the device by revoke target, a device of its own
-// account, and with descendants every device whose lineage holds target.
-// The revocations are soft: each tombstone keeps by and the revoked
-// record, so the operator can restore it (Restore) while the tombstone
-// lasts. A target already revoked is no error: it revokes only the
+// account, and with descendants every device whose lineage holds target,
+// for by's REVOKE_REQUEST request. The revocations are soft: each
+// tombstone keeps by and the revoked record, so the operator can restore
+// it (Restore) while the tombstone lasts. It also keeps request, so a
+// repeat of the request, while the tombstone lasts, is done and revokes
+// nothing, even after a restore. A target already revoked is no error: it revokes only the
 // target's surviving descendants, if asked. A device enrolled less than
 // CoolingOff ago may revoke itself, but no other device, directly or as
 // a descendant. It returns the devices revoked.
-func RevokeByDevice(st *State, by, target ID, descendants bool, now time.Time) ([]*Device, error) {
+func RevokeByDevice(st *State, by, request, target ID, descendants bool, now time.Time) ([]*Device, error) {
+	if !request.IsZero() && slices.ContainsFunc(st.Revoked, func(t *Tombstone) bool { return t.By == by && t.Request == request }) {
+		return nil, nil
+	}
 	d := st.DeviceByID(by)
 	if d == nil || !st.MayManage(d) {
 		return nil, ErrNoManage
@@ -61,7 +66,7 @@ func RevokeByDevice(st *State, by, target ID, descendants bool, now time.Time) (
 		return nil, ErrCoolingOff
 	}
 	for _, x := range gone {
-		st.revoke(x, now, by)
+		st.revoke(x, now, by, request)
 	}
 	return gone, nil
 }
@@ -70,7 +75,7 @@ func RevokeByDevice(st *State, by, target ID, descendants bool, now time.Time) (
 // that a device revoked, and the device's record, or nil.
 func (st *State) restorable(account ID, name string, now time.Time) (*Tombstone, *Device) {
 	for _, t := range st.Revoked {
-		if t.By.IsZero() || t.Rest == "" || !now.Before(t.Until) {
+		if t.By.IsZero() || t.Rest == "" || !t.Restored.IsZero() || !now.Before(t.Until) {
 			continue
 		}
 		if d, err := parseDevice(t.Rest); err == nil && d.Account == account && d.Name == name {
@@ -102,7 +107,8 @@ func Restore(st *State, target string, now time.Time) (string, error) {
 	case len(st.DevicesOf(a.ID)) >= a.MaxDevices:
 		return "", fmt.Errorf("account %s is at its device cap (%d)", account, a.MaxDevices)
 	}
-	st.Revoked = slices.DeleteFunc(st.Revoked, func(x *Tombstone) bool { return x == t })
+	// The tombstone stays, spent, to answer the revoking request's repeats.
+	t.Rest, t.Restored = "", now.UTC().Truncate(time.Second)
 	st.Devices = append(st.Devices, d)
 	return fmt.Sprintf("restored %s/%s\n", account, name), st.Validate()
 }
