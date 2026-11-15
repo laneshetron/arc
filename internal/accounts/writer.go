@@ -384,7 +384,10 @@ func (w *Writer) resolveLocked(ctx context.Context) error {
 // version, current.
 func (w *Writer) adoptLocked(version string) {
 	p := w.pending
-	w.setPending(nil)
+	// unresolved stays set until OnState has applied the state below: the
+	// relay's credentials stay stale until then.
+	w.pending = nil
+	defer w.unresolved.Store(false)
 	w.setState(p.next, version)
 	w.saveToken()
 	if w.Cache != "" {
