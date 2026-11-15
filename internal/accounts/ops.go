@@ -152,8 +152,10 @@ func (st *State) device(account ID, name string) *Device {
 }
 
 func (st *State) tombstone(d *Device, now time.Time, by, request ID) {
-	// A restored device's earlier tombstone gives way to this one.
-	st.Revoked = slices.DeleteFunc(st.Revoked, func(x *Tombstone) bool { return x.ID == d.ID })
+	// A restored device's earlier tombstones stay, spent, beside this one:
+	// each records the request that revoked it, whose repeats it answers
+	// until it expires (RevokeByDevice).
+	st.Revoked = slices.DeleteFunc(st.Revoked, func(x *Tombstone) bool { return x.ID == d.ID && x.Restored.IsZero() })
 	t := &Tombstone{ID: d.ID, Until: now.Add(TombstoneLife).UTC().Truncate(time.Second), TokenHash: d.TokenHash, By: by, Request: request}
 	if !by.IsZero() {
 		t.Rest = d.record()

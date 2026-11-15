@@ -150,15 +150,15 @@ func (g *Gateway) logRevokedLocked(st *accounts.State) {
 		return
 	}
 	type key struct {
-		id    accounts.ID
-		until int64
+		id, by, request accounts.ID
+		until           int64
 	}
 	known := map[key]bool{}
 	for _, t := range g.st.Revoked {
-		known[key{t.ID, t.Until.Unix()}] = true
+		known[key{t.ID, t.By, t.Request, t.Until.Unix()}] = true
 	}
 	for _, t := range st.Revoked {
-		if t.By.IsZero() || !t.Restored.IsZero() || known[key{t.ID, t.Until.Unix()}] {
+		if t.By.IsZero() || !t.Restored.IsZero() || known[key{t.ID, t.By, t.Request, t.Until.Unix()}] {
 			continue
 		}
 		account, by, revoked := "", t.By.String(), t.ID.String()

@@ -213,13 +213,27 @@ func TestRevokeRequestDurable(t *testing.T) {
 		t.Fatalf("repeat after restore: %v %v", gone, err)
 	}
 	// A new request revokes it again, and that one can be restored.
-	if gone, err := RevokeByDevice(st, root.ID, NewID(), a.ID, false, day); err != nil || len(gone) != 1 {
+	req2 := NewID()
+	if gone, err := RevokeByDevice(st, root.ID, req2, a.ID, false, day); err != nil || len(gone) != 1 {
 		t.Fatalf("new request: %v %v", gone, err)
 	}
+	reload()
 	if _, err := Restore(st, "alexei/a", day); err != nil {
 		t.Fatalf("second restore: %v", err)
 	}
+	reload()
+	// Both requests stay recorded: neither's repeat revokes it again.
+	for i, r := range []ID{req, req2} {
+		if gone, err := RevokeByDevice(st, root.ID, r, a.ID, false, day); err != nil || len(gone) != 0 || st.DeviceByID(a.ID) == nil {
+			t.Fatalf("repeat of request %d after the second restore: %v %v", i+1, gone, err)
+		}
+	}
 	if err := st.Validate(); err != nil {
 		t.Fatal(err)
+	}
+	// They last as long as their tombstones, then are pruned.
+	st.Prune(day.Add(TombstoneLife))
+	if len(st.Revoked) != 0 {
+		t.Errorf("%d tombstones past their life", len(st.Revoked))
 	}
 }
