@@ -409,7 +409,7 @@ frame_value:  frame_length bytes
 - Fragments whose byte ranges overlap with conflicting contents cause the whole datagram to be discarded.
 
 **`INVITE_REQUEST` and `INVITE`** (spec/self-service-accounts.md §3.6). A device asks for a single-use invite to its own account, for a new device to enroll with (§9.2):
-- The client picks a random `request_id`, keeps it (across sessions and restarts) until answered or for at most an hour, and sends `INVITE_REQUEST` reliably, repeating it every 2 s until `INVITE` arrives: the relay may leave a request unanswered while it writes the invite to its accounts store.
+- The client picks a random, nonzero `request_id` (a frame with a zero one is malformed), keeps it (across sessions and restarts) until answered or for at most an hour, and sends `INVITE_REQUEST` reliably, repeating it every 2 s until `INVITE` arrives: the relay may leave a request unanswered while it writes the invite to its accounts store.
 - The relay answers a repeat of a request (the same device and `request_id`) with the same invite for as long as it keeps the invite's record, and with `INVITE_EXPIRED` once that invite has expired; it never mints a second invite for one request.
 - `status=0` carries the invite: its ID, its secret and its expiry (Unix seconds). Otherwise every field but `request_id` and `status` MUST be zero: `CAPACITY` (the account is at its device cap, has 2 unredeemed invites, or the device's lineage is full), `INVITE_EXPIRED`, or `UNAUTHORIZED` (the device may not mint invites).
 - The client builds the invite string from the relay settings it already has.

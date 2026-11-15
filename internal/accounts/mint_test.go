@@ -2,8 +2,10 @@ package accounts
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -234,5 +236,51 @@ func TestRotate(t *testing.T) {
 	}
 	if len(st.Revoked) != 2 {
 		t.Errorf("%d tombstones, want 2", len(st.Revoked))
+	}
+}
+
+// A minted invite's record must survive the store: a writer that reloads
+// it (on restart or takeover) must parse what the last one wrote.
+func TestMintRecordsReload(t *testing.T) {
+	ctx := context.Background()
+	store := FileStore{Path: filepath.Join(t.TempDir(), "accounts")}
+	c := &clock{t: t0}
+	tokens := filepath.Join(t.TempDir(), "lease-token")
+	var root *Device
+	w := newWriter(t, store, "a", c)
+	w.TokenFile = tokens
+	w.Seed = func() (*State, error) { st := &State{}; root = enrollRoot(t, st, 5); return st, nil }
+	if err := w.Acquire(ctx); err != nil {
+		t.Fatal(err)
+	}
+	mint := func(request ID) error {
+		return w.Commit(ctx, func(st *State) error {
+			_, _, _, err := MintInvite(st, testInviteKey, root.ID, request, c.Now())
+			return err
+		})
+	}
+	if err := mint(ID{}); !errors.Is(err, ErrNotPermitted) {
+		t.Fatalf("zero request: %v", err)
+	}
+	// Records the file cannot hold are refused before they are written.
+	err := w.Commit(ctx, func(st *State) error {
+		st.Invites = append(st.Invites, &Invite{ID: NewID(), Account: root.Account, By: root.ID,
+			Expires: c.Now().Add(time.Hour)})
+		return nil
+	})
+	if err == nil {
+		t.Fatal("committed a minted invite without its request")
+	}
+	req := NewID()
+	if err := mint(req); err != nil {
+		t.Fatal(err)
+	}
+	w2 := newWriter(t, store, "a", c)
+	w2.TokenFile = tokens
+	if err := w2.Acquire(ctx); err != nil {
+		t.Fatalf("reloading: %v", err)
+	}
+	if i := w2.State().MintedBy(root.ID, req); i == nil {
+		t.Fatalf("reloaded state lacks the invite: %s", w2.State().Marshal())
 	}
 }

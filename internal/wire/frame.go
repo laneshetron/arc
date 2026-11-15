@@ -571,6 +571,7 @@ var (
 	errStreamID         = malformed("stream ID zero")
 	errEnrolledName     = malformed("ENROLLED device name invalid")
 	errInviteFields     = malformed("INVITE refusal with nonzero fields")
+	errInviteRequestID  = malformed("invite request_id zero")
 	errStreamFlags      = malformed("STREAM unknown flags")
 	errStreamOffset     = malformed("stream offset or limit too large")
 	errIPVersion        = malformed("IP_PACKET has unknown IP version")
@@ -735,6 +736,9 @@ func parseValue(t FrameType, v []byte) (Frame, error) {
 		if len(v) != 8 {
 			return nil, errFrameSize
 		}
+		if [8]byte(v) == [8]byte{} {
+			return nil, errInviteRequestID
+		}
 		return InviteRequest{RequestID: [8]byte(v)}, nil
 
 	case FrameInvite:
@@ -743,6 +747,9 @@ func parseValue(t FrameType, v []byte) (Frame, error) {
 		}
 		i := Invite{RequestID: [8]byte(v[:8]), Status: ErrorCode(v[8]), ID: [8]byte(v[9:17]), Secret: [16]byte(v[17:33]),
 			Expires: binary.BigEndian.Uint32(v[33:37])}
+		if i.RequestID == [8]byte{} {
+			return nil, errInviteRequestID
+		}
 		if i.Status != 0 && (i.ID != [8]byte{} || i.Secret != [16]byte{} || i.Expires != 0) {
 			return nil, errInviteFields
 		}

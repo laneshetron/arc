@@ -98,6 +98,9 @@ func MintInvite(st *State, key []byte, device, request ID, now time.Time) (i *In
 	if len(key) != InviteKeySize {
 		return nil, secret, false, errors.New("accounts: no invite key")
 	}
+	if request.IsZero() { // the store's records cannot hold it (Validate)
+		return nil, secret, false, fmt.Errorf("%w: zero request ID", ErrNotPermitted)
+	}
 	d := st.DeviceByID(device)
 	if d == nil || !st.MayMint(d) {
 		return nil, secret, false, ErrNotPermitted

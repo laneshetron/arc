@@ -139,9 +139,10 @@ type Gateway struct {
 	revoke   []Revocation
 	kick     chan struct{}
 
-	st        *accounts.State // the last applied, for enrollments; nil with static accounts
-	enrolling map[enrollKey]*enrollment
-	minting   map[accounts.ID]*minting // by device: at most one commit in flight each
+	st         *accounts.State // the last applied, for enrollments; nil with static accounts
+	enrolling  map[enrollKey]*enrollment
+	minting    map[accounts.ID]*minting // by device: at most one commit in flight each
+	committing int                      // minting commits not yet done
 }
 
 // A minting is a device's invite request waiting for its commit.
@@ -152,7 +153,7 @@ type minting struct {
 	err     error
 }
 
-// maxMinting bounds the invite requests waiting for their commits.
+// maxMinting bounds the minting commits in flight.
 const maxMinting = 64
 
 // An enrollment is a redemption waiting for its commit, keyed by what
@@ -244,11 +245,36 @@ func (g *Gateway) Apply(st *accounts.State) {
 			mint: len(g.cfg.InviteKey) == accounts.InviteKeySize && g.cfg.Commit != nil && st.MayMint(d)}
 		devices[d.ID] = true
 	}
+	g.logMintedLocked(st)
 	g.creds, g.static, g.st = creds, nil, st
 	for addr, l := range g.leased {
 		if !l.revoked && !devices[l.device] {
 			g.revokeLocked(addr, l, wire.CodeAuthFailed, ErrRevoked)
 		}
+	}
+}
+
+// logMintedLocked logs the invites devices minted that st has and the
+// last applied state lacks: the audit of minting follows the state the
+// relay adopts, so a mint whose write was confirmed only later (say, by
+// resolving an indeterminate write) is logged too, as are mints by
+// another relay before this one took over.
+func (g *Gateway) logMintedLocked(st *accounts.State) {
+	if g.st == nil || g.cfg.Log == nil {
+		return
+	}
+	for _, i := range st.Invites {
+		if i.By.IsZero() || g.st.InviteByID(i.ID) != nil {
+			continue
+		}
+		account, device := "", ""
+		if a := st.AccountByID(i.Account); a != nil {
+			account = a.Name
+		}
+		if d := st.DeviceByID(i.By); d != nil {
+			device = d.Name
+		}
+		g.cfg.Log.Info("invite minted", "account", account, "device", device, "invite", i.ID.String(), "expires", i.Expires)
 	}
 }
 
@@ -711,35 +737,29 @@ func (g *Gateway) mint(addr netip.Addr, s *session.RelaySession, req wire.Invite
 		return wire.Invite{}, false
 	case !minted:
 		return wire.Invite{ID: i.ID, Secret: secret, Expires: uint32(i.Expires.Unix())}, true
-	case len(g.minting) >= maxMinting:
+	case g.committing >= maxMinting:
 		return wire.Invite{}, false
 	}
 	p := &minting{request: request, started: now}
 	g.minting[device] = p
-	account := l.account.Name
+	g.committing++
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		var made *accounts.Invite
 		err := g.cfg.Commit(ctx, func(st *accounts.State) error {
-			i, _, minted, err := accounts.MintInvite(st, g.cfg.InviteKey, device, request, now)
+			_, _, minted, err := accounts.MintInvite(st, g.cfg.InviteKey, device, request, now)
 			if err == nil && !minted {
 				return errNoChange
-			}
-			if minted {
-				made = i
 			}
 			return err
 		})
 		if errors.Is(err, errNoChange) {
 			err = nil
 		}
-		if err == nil && made != nil && g.cfg.Log != nil {
-			g.cfg.Log.Info("invite minted", "account", account, "device", l.name, "invite", made.ID.String(),
-				"expires", made.Expires)
-		}
+		// Apply, given the committed state, logs the mint.
 		g.mu.Lock()
 		p.done, p.err = true, err
+		g.committing--
 		g.mu.Unlock()
 	}()
 	return wire.Invite{}, false

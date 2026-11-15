@@ -49,7 +49,7 @@ All other type values are reserved: drop them silently.
 | `0x1B`–`0x7F` | reserved, required | — | reject the packet |
 | `0x80`–`0xFF` | extensions, ignorable | — | ignore |
 
-`IP_DATAGRAM` and `REDUNDANCY` are sent only when `AUTH_RESULT` advertises features bit 0 (§11.1), and `FEC_REPAIR` and `FEC` only with bit 1 (§11.2), which also allows `IP_DATAGRAM`. The stream frames (`0x12`–`0x16`) are sent only with bit 2 (§11.3), and `DIAGNOSTICS_OPEN` only with bit 3, which also allows `0x13`–`0x16` for the upload (§11.4). Stream IDs are never 0, and stream offsets and limits stay below 2^62. `ENROLLED` is sent only with a successful `AUTH_RESULT` answering an enrollment credential (§9.2), so clients that authenticate with tokens never receive it. `INVITE_REQUEST` is sent only with bit 4, and `INVITE` only in answer to it; a refusing `INVITE` has every field but `request_id` and `status` zero.
+`IP_DATAGRAM` and `REDUNDANCY` are sent only when `AUTH_RESULT` advertises features bit 0 (§11.1), and `FEC_REPAIR` and `FEC` only with bit 1 (§11.2), which also allows `IP_DATAGRAM`. The stream frames (`0x12`–`0x16`) are sent only with bit 2 (§11.3), and `DIAGNOSTICS_OPEN` only with bit 3, which also allows `0x13`–`0x16` for the upload (§11.4). Stream IDs are never 0, and stream offsets and limits stay below 2^62. `ENROLLED` is sent only with a successful `AUTH_RESULT` answering an enrollment credential (§9.2), so clients that authenticate with tokens never receive it. `INVITE_REQUEST` is sent only with bit 4, and `INVITE` only in answer to it; `request_id` is never zero, and a refusing `INVITE` has every field but `request_id` and `status` zero.
 
 ## AUTH_RESULT features (§10.1)
 

@@ -3,7 +3,9 @@ package gateway
 import (
 	"bytes"
 	"context"
+	"log/slog"
 	"net/netip"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -177,4 +179,90 @@ func TestMintPolicyOff(t *testing.T) {
 	if err != nil || r.Features&wire.FeatureInvites != 0 {
 		t.Errorf("invites=no still offered: %#x %v", r.Features, err)
 	}
+}
+
+// TestMintSlotsFreed: requests whose commits are done, but whose clients
+// never came back, take no slot from other devices.
+func TestMintSlotsFreed(t *testing.T) {
+	f := newMintFixture(t)
+	f.g.mu.Lock()
+	for range maxMinting {
+		f.g.minting[accounts.NewID()] = &minting{request: accounts.NewID(), started: f.now, done: true}
+	}
+	f.g.mu.Unlock()
+	if a := f.ask([8]byte{1}); a.Status != 0 {
+		t.Fatalf("answer: %+v", a)
+	}
+	f.g.mu.Lock()
+	defer f.g.mu.Unlock()
+	if f.g.committing != 0 {
+		t.Errorf("%d commits counted after they finished", f.g.committing)
+	}
+}
+
+// TestMintAuditIndeterminate: a mint whose write the store took but did
+// not confirm is logged once the relay adopts the state that has it.
+func TestMintAuditIndeterminate(t *testing.T) {
+	f := newMintFixture(t)
+	var logs bytes.Buffer
+	var logMu sync.Mutex
+	f.g.cfg.Log = slog.New(slog.NewTextHandler(&lockedWriter{w: &logs, mu: &logMu}, nil))
+	var mu sync.Mutex
+	hold, first := true, true
+	var held *accounts.State
+	f.w.OnState = func(st *accounts.State) {
+		mu.Lock()
+		defer mu.Unlock()
+		if hold {
+			held = st
+			return
+		}
+		f.g.Apply(st)
+	}
+	commit := f.g.cfg.Commit
+	f.g.cfg.Commit = func(ctx context.Context, fn func(*accounts.State) error) error {
+		err := commit(ctx, fn)
+		mu.Lock()
+		defer mu.Unlock()
+		if err == nil && first {
+			first = false
+			return accounts.ErrIndeterminate // the write made, its answer lost
+		}
+		return err
+	}
+	if _, ok := f.g.mint(f.addr, nil, wire.InviteRequest{RequestID: [8]byte{1}}); ok {
+		t.Fatal("answered before the commit")
+	}
+	for done := false; !done; time.Sleep(5 * time.Millisecond) {
+		f.g.mu.Lock()
+		for _, p := range f.g.minting {
+			done = p.done
+		}
+		f.g.mu.Unlock()
+	}
+	// The writer resolves the write and adopts its state.
+	mu.Lock()
+	hold = false
+	st := held
+	mu.Unlock()
+	f.g.Apply(st)
+	if a := f.ask([8]byte{1}); a.Status != 0 {
+		t.Fatalf("answer: %+v", a)
+	}
+	logMu.Lock()
+	defer logMu.Unlock()
+	if n := strings.Count(logs.String(), "invite minted"); n != 1 {
+		t.Errorf("%d audit entries, want 1:\n%s", n, logs.String())
+	}
+}
+
+type lockedWriter struct {
+	w  *bytes.Buffer
+	mu *sync.Mutex
+}
+
+func (l *lockedWriter) Write(b []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(b)
 }

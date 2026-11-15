@@ -111,10 +111,12 @@ func inviteCmd(args []string) error {
 	default:
 		return err
 	}
-	// The request is answered for good, whatever the answer.
+	if answer.Status == 0 {
+		return printInvite(p, tmpl, answer)
+	}
+	// A refusal is final for the request: a rerun makes a new one.
 	os.Remove(p.path("invite-request"))
 	switch answer.Status {
-	case 0:
 	case wire.CodeCapacity:
 		return fmt.Errorf("the relay refused: the account is at its device cap or has %d invites outstanding, or this device may invite no further (its lineage is full)", accounts.MaxOutstanding)
 	case wire.CodeInviteExpired:
@@ -124,13 +126,25 @@ func inviteCmd(args []string) error {
 	default:
 		return fmt.Errorf("the relay refused the request (code %d)", answer.Status)
 	}
+}
+
+// printInvite writes the minted invite to stdout, and only once it is
+// written forgets the request: until then a rerun repeats the request,
+// and the relay answers it with the same invite.
+func printInvite(p *profile, tmpl *invite.Invite, answer *wire.Invite) error {
 	tmpl.ID, tmpl.Secret = answer.ID, answer.Secret
 	if err := tmpl.Validate(); err != nil {
-		return err
+		return fmt.Errorf("the relay's invite: %w", err)
 	}
 	expires := time.Unix(int64(answer.Expires), 0)
 	fmt.Fprintf(os.Stderr, "single-use invite to this account, expires %s; enroll a device with:\n  arc-client enroll -profile DIR INVITE\n", expires.Format(time.RFC3339))
-	fmt.Println(tmpl.String())
+	if _, err := fmt.Fprintln(os.Stdout, tmpl.String()); err != nil {
+		return fmt.Errorf("writing the invite: %w (rerun to get it again)", err)
+	}
+	// Kept, the request would only get this invite again.
+	if err := os.Remove(p.path("invite-request")); err != nil && !errors.Is(err, os.ErrNotExist) {
+		fmt.Fprintf(os.Stderr, "warning: %v\n", err)
+	}
 	return nil
 }
 
@@ -145,12 +159,14 @@ func pendingRequest(p *profile, now time.Time) ([8]byte, error) {
 		if len(f) == 2 {
 			b, herr := hex.DecodeString(f[0])
 			t, terr := strconv.ParseInt(f[1], 10, 64)
-			if herr == nil && terr == nil && len(b) == 8 && now.Sub(time.Unix(t, 0)) < requestLife {
+			if herr == nil && terr == nil && len(b) == 8 && [8]byte(b) != [8]byte{} && now.Sub(time.Unix(t, 0)) < requestLife {
 				return [8]byte(b), nil
 			}
 		}
 	}
-	rand.Read(id[:])
+	for id == [8]byte{} { // zero is malformed on the wire
+		rand.Read(id[:])
+	}
 	line := fmt.Sprintf("%x %d\n", id, now.Unix())
 	return id, writePrivate(p.path("invite-request"), []byte(line))
 }
