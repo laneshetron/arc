@@ -315,7 +315,7 @@ func TestOps(t *testing.T) {
 	if !strings.Contains(List(st), "device-1") {
 		t.Errorf("list:\n%s", List(st))
 	}
-	if _, err := Revoke(st, "alexei/device-1", t0); err != nil {
+	if _, err := Revoke(st, "alexei/device-1", t0, false); err != nil {
 		t.Fatal(err)
 	}
 	if len(st.Devices) != 1 || len(st.Revoked) != 1 || !st.Revoked[0].Until.Equal(t0.Add(TombstoneLife)) {

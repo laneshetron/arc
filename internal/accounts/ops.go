@@ -76,8 +76,11 @@ func AddToken(st *State, account, device string, now time.Time) (string, []byte,
 }
 
 // Revoke revokes one device, ACCOUNT/DEVICE: its record goes, its
-// unredeemed invites are cancelled, and a tombstone keeps its ID.
-func Revoke(st *State, target string, now time.Time) (string, error) {
+// unredeemed invites are cancelled, and a tombstone keeps its ID. With
+// descendants, it also revokes every device whose lineage holds it
+// (§3.7): those enrolled through its invites, and theirs in turn,
+// however long ago and whatever became of the devices between.
+func Revoke(st *State, target string, now time.Time, descendants bool) (string, error) {
 	account, device, ok := strings.Cut(target, "/")
 	if !ok {
 		return "", fmt.Errorf("want ACCOUNT/DEVICE, not %q", target)
@@ -90,10 +93,44 @@ func Revoke(st *State, target string, now time.Time) (string, error) {
 	if d == nil {
 		return "", fmt.Errorf("account %s has no device %s", account, device)
 	}
+	gone := []*Device{d}
+	if descendants {
+		for _, x := range st.Devices {
+			if slices.Contains(x.Lineage, d.ID) {
+				gone = append(gone, x)
+			}
+		}
+	}
+	var b strings.Builder
+	for _, x := range gone {
+		st.revoke(x, now)
+		fmt.Fprintf(&b, "revoked %s/%s\n", account, x.Name)
+	}
+	return b.String(), nil
+}
+
+// revoke removes a device, cancels its unredeemed invites, and leaves a
+// tombstone.
+func (st *State) revoke(d *Device, now time.Time) {
 	st.tombstone(d, now, ID{})
 	st.Devices = slices.DeleteFunc(st.Devices, func(x *Device) bool { return x == d })
 	st.Invites = slices.DeleteFunc(st.Invites, func(i *Invite) bool { return i.By == d.ID && i.Redeemed.IsZero() })
-	return fmt.Sprintf("revoked %s\n", target), nil
+}
+
+// Rotate revokes every device and invite of an account and keeps the
+// account and its policy (§3.7), for when it is unclear which device was
+// compromised. The caller adds a fresh operator invite.
+func Rotate(st *State, account string, now time.Time) (string, error) {
+	a := st.AccountByName(account)
+	if a == nil {
+		return "", fmt.Errorf("no account %s", account)
+	}
+	devices := st.DevicesOf(a.ID)
+	for _, d := range devices {
+		st.revoke(d, now)
+	}
+	st.Invites = slices.DeleteFunc(st.Invites, func(i *Invite) bool { return i.Account == a.ID })
+	return fmt.Sprintf("rotated account %s: revoked its %d devices and cancelled its invites\n", account, len(devices)), nil
 }
 
 func (st *State) device(account ID, name string) *Device {
@@ -139,6 +176,13 @@ func List(st *State) string {
 			state := "unredeemed, expires " + stamp(i.Expires)
 			if !i.Redeemed.IsZero() {
 				state = fmt.Sprintf("redeemed by %v", i.Redeemed)
+			}
+			if !i.By.IsZero() {
+				by := i.By.String()
+				if d := st.DeviceByID(i.By); d != nil {
+					by = d.Name
+				}
+				state += ", minted by " + by
 			}
 			fmt.Fprintf(tw, "  invite %v\t\t%s\n", i.ID, state)
 		}

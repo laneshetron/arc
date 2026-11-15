@@ -19,12 +19,15 @@ import (
 
 // A Request is one operator command (self-service-accounts.md §3.2).
 type Request struct {
-	Op   string   `json:"op"` // add, remove, add-token, invite, revoke, list, takeover
+	Op   string   `json:"op"` // add, remove, add-token, invite, revoke, rotate, list, takeover
 	Args []string `json:"args"`
 	// Flags for add: relay access and a device cap.
 	Relay      bool `json:"relay,omitempty"`
 	MaxDevices int  `json:"max_devices,omitempty"`
-	// For invite: how to reach the relay, and how long the invite lasts.
+	// For revoke: revoke the device's descendants too (§3.7).
+	Descendants bool `json:"descendants,omitempty"`
+	// For invite and rotate: how to reach the relay, and how long the
+	// invite lasts.
 	Invite *InviteRequest `json:"invite,omitempty"`
 	// RelayKey is the relay's static public key, which an invite pins.
 	// Control.Serve sets it to the running relay's.
@@ -108,7 +111,7 @@ func Do(ctx context.Context, w *Writer, req Request, now time.Time) Response {
 		}
 		return ""
 	}
-	want := map[string]int{"add": 1, "remove": 1, "add-token": 1, "invite": 1, "revoke": 1}
+	want := map[string]int{"add": 1, "remove": 1, "add-token": 1, "invite": 1, "revoke": 1, "rotate": 1}
 	n, ok := want[req.Op]
 	if !ok {
 		return Response{Error: fmt.Sprintf("unknown operation %q", req.Op)}
@@ -118,7 +121,7 @@ func Do(ctx context.Context, w *Writer, req Request, now time.Time) Response {
 	}
 	var inv *invite.Invite // the invite string, once its ID and secret are set
 	var tmpl *invite.Invite
-	if req.Op == "invite" {
+	if req.Op == "invite" || req.Op == "rotate" {
 		var err error
 		if tmpl, err = req.Invite.template(req.RelayKey); err != nil {
 			return Response{Error: err.Error()}
@@ -132,16 +135,21 @@ func Do(ctx context.Context, w *Writer, req Request, now time.Time) Response {
 			out, err = RemoveAccount(st, arg(0), now)
 		case "add-token":
 			out, token, err = AddToken(st, arg(0), arg(1), now)
+		case "rotate":
+			if out, err = Rotate(st, arg(0), now); err != nil {
+				return err
+			}
+			fallthrough
 		case "invite":
 			var i *Invite
 			var secret [16]byte
 			if i, secret, err = AddInvite(st, arg(0), req.Invite.TTL, now); err == nil {
 				inv = tmpl
 				inv.ID, inv.Secret = i.ID, secret
-				out = fmt.Sprintf("invite %v for account %s, single use, expires %s\n", i.ID, arg(0), stamp(i.Expires))
+				out += fmt.Sprintf("invite %v for account %s, single use, expires %s\n", i.ID, arg(0), stamp(i.Expires))
 			}
 		case "revoke":
-			out, err = Revoke(st, arg(0), now)
+			out, err = Revoke(st, arg(0), now, req.Descendants)
 		}
 		return err
 	})

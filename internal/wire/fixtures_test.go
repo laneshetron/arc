@@ -269,6 +269,16 @@ func checkFrameFields(t *testing.T, fr Frame, fields map[string]any) {
 		if v.ID != uint32(num("stream_id")) {
 			t.Errorf("DIAGNOSTICS_OPEN = %+v", v)
 		}
+	case InviteRequest:
+		if hex.EncodeToString(v.RequestID[:]) != fields["request_id_hex"] {
+			t.Errorf("INVITE_REQUEST = %+v", v)
+		}
+	case Invite:
+		if hex.EncodeToString(v.RequestID[:]) != fields["request_id_hex"] || v.Status != ErrorCode(num("status")) ||
+			hex.EncodeToString(v.ID[:]) != fields["invite_id_hex"] || hex.EncodeToString(v.Secret[:]) != fields["secret_hex"] ||
+			v.Expires != uint32(num("expires")) {
+			t.Errorf("INVITE = %+v", v)
+		}
 	case Enrolled:
 		if hex.EncodeToString(v.DeviceID[:]) != fields["device_id_hex"] || v.Name != fields["name"] {
 			t.Errorf("ENROLLED = %+v", v)

@@ -35,6 +35,8 @@ const (
 	FrameStreamReset   FrameType = 0x16
 	FrameDiagOpen      FrameType = 0x17
 	FrameEnrolled      FrameType = 0x18
+	FrameInviteRequest FrameType = 0x19
+	FrameInvite        FrameType = 0x1A
 
 	// Frame types at or above FirstExtensionFrame are optional extensions
 	// that receivers may ignore; unknown types below it are required.
@@ -46,6 +48,7 @@ var frameNames = [...]string{
 	"PATH_CHALLENGE", "PATH_RESPONSE", "PATH_ABANDON", "PING", "ACK", "CLOSE", "ERROR",
 	"IP_DATAGRAM", "REDUNDANCY", "FEC_REPAIR", "FEC", "STREAM_OPEN", "STREAM", "MAX_STREAM_DATA",
 	"MAX_DATA", "STREAM_RESET", "DIAGNOSTICS_OPEN", "ENROLLED",
+	"INVITE_REQUEST", "INVITE",
 }
 
 func (t FrameType) String() string {
@@ -148,6 +151,9 @@ const (
 	// FeatureDiagnostics: the relay accepts DIAGNOSTICS_OPEN and keeps what
 	// the client uploads on the stream for its operator (§11.4).
 	FeatureDiagnostics uint64 = 1 << 3
+	// FeatureInvites: the session's device may ask for invites to its
+	// account with INVITE_REQUEST (self-service-accounts.md §3.6).
+	FeatureInvites uint64 = 1 << 4
 )
 
 // MaxStreamOffset bounds stream offsets and flow control limits, so that
@@ -178,6 +184,26 @@ type Enrolled struct {
 
 // MaxDeviceName is the longest device name in ENROLLED.
 const MaxDeviceName = 32
+
+// InviteRequest asks the relay for an invite to the session's account
+// (§10.1). The client picks RequestID at random, keeps it until answered,
+// and repeats the request with it: the relay answers a repeat with the
+// same invite. Client to relay only, with FeatureInvites.
+type InviteRequest struct {
+	RequestID [8]byte
+}
+
+// Invite answers an InviteRequest: with Status 0, the invite's ID, its
+// secret and its expiry (Unix seconds); otherwise a code (CAPACITY,
+// INVITE_EXPIRED, UNAUTHORIZED) and every other field zero. Relay to
+// client only.
+type Invite struct {
+	RequestID [8]byte
+	Status    ErrorCode
+	ID        [8]byte
+	Secret    [16]byte
+	Expires   uint32
+}
 
 // Stream carries bytes of a stream starting at Offset. Fin marks the end of
 // the sender's data at Offset+len(Data).
@@ -327,6 +353,8 @@ func (MaxData) Type() FrameType       { return FrameMaxData }
 func (StreamReset) Type() FrameType   { return FrameStreamReset }
 func (DiagOpen) Type() FrameType      { return FrameDiagOpen }
 func (Enrolled) Type() FrameType      { return FrameEnrolled }
+func (InviteRequest) Type() FrameType { return FrameInviteRequest }
+func (Invite) Type() FrameType        { return FrameInvite }
 func (u Unknown) Type() FrameType     { return u.FrameType }
 
 // AppendFrame appends the TLV encoding of f to b. It panics if the encoded
@@ -422,6 +450,16 @@ func (e Enrolled) appendValue(b []byte) []byte {
 	b = append(b, e.DeviceID[:]...)
 	b = append(b, byte(len(e.Name)))
 	return append(b, e.Name...)
+}
+
+func (r InviteRequest) appendValue(b []byte) []byte { return append(b, r.RequestID[:]...) }
+
+func (i Invite) appendValue(b []byte) []byte {
+	b = append(b, i.RequestID[:]...)
+	b = append(b, byte(i.Status))
+	b = append(b, i.ID[:]...)
+	b = append(b, i.Secret[:]...)
+	return binary.BigEndian.AppendUint32(b, i.Expires)
 }
 
 func (f Stream) appendValue(b []byte) []byte {
@@ -532,6 +570,7 @@ var (
 	errStreamOpen       = malformed("STREAM_OPEN destination invalid")
 	errStreamID         = malformed("stream ID zero")
 	errEnrolledName     = malformed("ENROLLED device name invalid")
+	errInviteFields     = malformed("INVITE refusal with nonzero fields")
 	errStreamFlags      = malformed("STREAM unknown flags")
 	errStreamOffset     = malformed("stream offset or limit too large")
 	errIPVersion        = malformed("IP_PACKET has unknown IP version")
@@ -691,6 +730,23 @@ func parseValue(t FrameType, v []byte) (Frame, error) {
 			return nil, errEnrolledName
 		}
 		return e, nil
+
+	case FrameInviteRequest:
+		if len(v) != 8 {
+			return nil, errFrameSize
+		}
+		return InviteRequest{RequestID: [8]byte(v)}, nil
+
+	case FrameInvite:
+		if len(v) != 37 {
+			return nil, errFrameSize
+		}
+		i := Invite{RequestID: [8]byte(v[:8]), Status: ErrorCode(v[8]), ID: [8]byte(v[9:17]), Secret: [16]byte(v[17:33]),
+			Expires: binary.BigEndian.Uint32(v[33:37])}
+		if i.Status != 0 && (i.ID != [8]byte{} || i.Secret != [16]byte{} || i.Expires != 0) {
+			return nil, errInviteFields
+		}
+		return i, nil
 
 	case FrameStream:
 		if len(v) < streamFixed {

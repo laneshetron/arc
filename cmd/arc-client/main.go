@@ -5,6 +5,7 @@
 //	arc-client run -relay 192.0.2.1:4433 -relay-key BASE64 -token-file token -route 198.51.100.0/24
 //	arc-client enroll -profile ~/.config/arc/relay arc1:...
 //	arc-client run -profile ~/.config/arc/relay -full-tunnel
+//	arc-client invite -profile ~/.config/arc/relay
 package main
 
 import (
@@ -42,8 +43,10 @@ func main() {
 		err = run(os.Args[2:])
 	case len(os.Args) >= 2 && os.Args[1] == "enroll":
 		err = enroll(os.Args[2:])
+	case len(os.Args) >= 2 && os.Args[1] == "invite":
+		err = inviteCmd(os.Args[2:])
 	default:
-		fmt.Fprintln(os.Stderr, "usage: arc-client run [flags]\n       arc-client enroll [flags] INVITE")
+		fmt.Fprintln(os.Stderr, "usage: arc-client run [flags]\n       arc-client enroll [flags] INVITE\n       arc-client invite [flags]")
 		os.Exit(2)
 	}
 	if err != nil {

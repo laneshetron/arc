@@ -102,7 +102,10 @@ func TestStoreRevokesLiveSession(t *testing.T) {
 	if r := lines.find(t, "session established"); r == nil || r["device"] != "laptop" {
 		t.Errorf("established line %v", r)
 	}
-	if err := w.Commit(ctx, func(st *accounts.State) error { _, err := accounts.Revoke(st, "alexei/laptop", time.Now()); return err }); err != nil {
+	if err := w.Commit(ctx, func(st *accounts.State) error {
+		_, err := accounts.Revoke(st, "alexei/laptop", time.Now(), false)
+		return err
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := wait(t, done, "the client to stop"); !errors.Is(err, session.ErrAuthFailed) {

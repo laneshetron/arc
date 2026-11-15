@@ -55,6 +55,9 @@ jobs:
       - name: enrollment end to end in network namespaces
         if: success() || failure()
         run: sudo ./test/netns/enroll.sh bin
+      - name: device-minted invites end to end in network namespaces
+        if: success() || failure()
+        run: sudo ./test/netns/invites.sh bin
 
   degraded:
     runs-on: ubuntu-latest

@@ -44,10 +44,12 @@ All other type values are reserved: drop them silently.
 | `0x16` | `STREAM_RESET` | 14 (`stream_id:u32; code:u16; final:u64`) | yes |
 | `0x17` | `DIAGNOSTICS_OPEN` | 4 (`stream_id:u32`) | yes |
 | `0x18` | `ENROLLED` | 10–41 (`device_id[8]; len:u8; name`, name 1–32 bytes) | yes |
-| `0x19`–`0x7F` | reserved, required | — | reject the packet |
+| `0x19` | `INVITE_REQUEST` | 8 (`request_id[8]`) | yes |
+| `0x1A` | `INVITE` | 37 (`request_id[8]; status:u8; invite_id[8]; secret[16]; expires:u32`) | yes |
+| `0x1B`–`0x7F` | reserved, required | — | reject the packet |
 | `0x80`–`0xFF` | extensions, ignorable | — | ignore |
 
-`IP_DATAGRAM` and `REDUNDANCY` are sent only when `AUTH_RESULT` advertises features bit 0 (§11.1), and `FEC_REPAIR` and `FEC` only with bit 1 (§11.2), which also allows `IP_DATAGRAM`. The stream frames (`0x12`–`0x16`) are sent only with bit 2 (§11.3), and `DIAGNOSTICS_OPEN` only with bit 3, which also allows `0x13`–`0x16` for the upload (§11.4). Stream IDs are never 0, and stream offsets and limits stay below 2^62. `ENROLLED` is sent only with a successful `AUTH_RESULT` answering an enrollment credential (§9.2), so clients that authenticate with tokens never receive it.
+`IP_DATAGRAM` and `REDUNDANCY` are sent only when `AUTH_RESULT` advertises features bit 0 (§11.1), and `FEC_REPAIR` and `FEC` only with bit 1 (§11.2), which also allows `IP_DATAGRAM`. The stream frames (`0x12`–`0x16`) are sent only with bit 2 (§11.3), and `DIAGNOSTICS_OPEN` only with bit 3, which also allows `0x13`–`0x16` for the upload (§11.4). Stream IDs are never 0, and stream offsets and limits stay below 2^62. `ENROLLED` is sent only with a successful `AUTH_RESULT` answering an enrollment credential (§9.2), so clients that authenticate with tokens never receive it. `INVITE_REQUEST` is sent only with bit 4, and `INVITE` only in answer to it; a refusing `INVITE` has every field but `request_id` and `status` zero.
 
 ## AUTH_RESULT features (§10.1)
 
@@ -57,6 +59,7 @@ All other type values are reserved: drop them silently.
 | 1 | `FEC` | relay accepts `IP_DATAGRAM`, `FEC_REPAIR` and `FEC` (§11.2) |
 | 2 | `STREAMS` | relay accepts `STREAM_OPEN` and carries streams to TCP destinations (§11.3) |
 | 3 | `DIAGNOSTICS` | relay accepts `DIAGNOSTICS_OPEN`, keeping clients' diagnostics uploads (§11.4) |
+| 4 | `INVITES` | the session's device may ask for invites to its account with `INVITE_REQUEST` (§10.1) |
 
 Other bits are sent as zero and ignored on receipt.
 
