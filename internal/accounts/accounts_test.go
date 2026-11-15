@@ -12,14 +12,29 @@ import (
 
 var t0 = time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)
 
-// clock is a settable time for writers under test.
+// clock is a settable time for writers under test: a wall clock and a
+// monotonic one, which Add advances together and Step does not.
 type clock struct {
-	mu sync.Mutex
-	t  time.Time
+	mu   sync.Mutex
+	t    time.Time
+	mono time.Duration
 }
 
 func (c *clock) Now() time.Time { c.mu.Lock(); defer c.mu.Unlock(); return c.t }
+func (c *clock) Mono() time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.mono
+}
 func (c *clock) Add(d time.Duration) {
+	c.mu.Lock()
+	c.t = c.t.Add(d)
+	c.mono += d
+	c.mu.Unlock()
+}
+
+// Step moves the wall clock alone, as an operator or NTP stepping it.
+func (c *clock) Step(d time.Duration) {
 	c.mu.Lock()
 	c.t = c.t.Add(d)
 	c.mu.Unlock()
@@ -135,7 +150,7 @@ func TestFileStoreConditionalWrites(t *testing.T) {
 
 func newWriter(t *testing.T, store Store, holder string, c *clock) *Writer {
 	t.Helper()
-	return &Writer{Store: store, Holder: holder, Now: c.Now}
+	return &Writer{Store: store, Holder: holder, Now: c.Now, mono: c.Mono}
 }
 
 func TestWriterLease(t *testing.T) {
@@ -524,7 +539,7 @@ func TestHoldExpiresDuringStuckWrite(t *testing.T) {
 	if err := w.Acquire(ctx); err != nil {
 		t.Fatal(err)
 	}
-	deadline := w.deadline()
+	deadline := time.Now().Add(w.remaining())
 	held := make(chan struct{})
 	go func() { w.hold(ctx); close(held) }()
 	store.stuck, store.release = make(chan struct{}), make(chan struct{})
@@ -551,5 +566,50 @@ func TestHoldExpiresDuringStuckWrite(t *testing.T) {
 	}
 	if w.Serving() {
 		t.Error("serving after the lease was lost")
+	}
+}
+
+// TestWallClockStepBack: the wall clock stepped back does not extend
+// serving, which runs by elapsed time.
+func TestWallClockStepBack(t *testing.T) {
+	ctx := context.Background()
+	c := &clock{t: t0}
+	w := newWriter(t, FileStore{Path: filepath.Join(t.TempDir(), "accounts")}, "a", c)
+	if err := w.Acquire(ctx); err != nil {
+		t.Fatal(err)
+	}
+	c.Step(-time.Hour)
+	c.Add(DefaultLease - DefaultMargin)
+	if w.Serving() {
+		t.Fatal("serving past the lease's elapsed time after the wall clock stepped back")
+	}
+}
+
+// TestReleaseResponseLost: a release the store took but did not confirm
+// leaves the writer not serving, its sessions closed, and a successor
+// free to acquire.
+func TestReleaseResponseLost(t *testing.T) {
+	ctx := context.Background()
+	store := &lossyStore{Store: FileStore{Path: filepath.Join(t.TempDir(), "accounts")}}
+	c := &clock{t: t0}
+	w := newWriter(t, store, "a", c)
+	lost := 0
+	w.OnLost = func(error) { lost++ }
+	if err := w.Acquire(ctx); err != nil {
+		t.Fatal(err)
+	}
+	store.lossy = true
+	if err := w.Release(ctx); err == nil {
+		t.Fatal("an unconfirmed release reported success")
+	}
+	if w.Serving() || lost != 1 {
+		t.Fatalf("after an unconfirmed release: serving %v, lost %d", w.Serving(), lost)
+	}
+	store.lossy = false
+	if err := newWriter(t, store, "b", c).Acquire(ctx); err != nil {
+		t.Fatalf("successor: %v", err)
+	}
+	if w.Serving() {
+		t.Fatal("serving alongside the successor")
 	}
 }
