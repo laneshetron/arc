@@ -1,0 +1,175 @@
+package gateway
+
+import (
+	"bytes"
+	"context"
+	"log/slog"
+	"net/netip"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/laneshetron/arc/internal/accounts"
+	"github.com/laneshetron/arc/internal/invite"
+	"github.com/laneshetron/arc/internal/wire"
+)
+
+// manageFixture is a mintFixture with a second key-bound device, the
+// desktop, enrolled beside the laptop.
+type manageFixture struct {
+	*mintFixture
+	desktop     netip.Addr
+	desktopKey  []byte
+	desktopName string
+}
+
+func newManageFixture(t *testing.T) *manageFixture {
+	t.Helper()
+	f := &manageFixture{mintFixture: newMintFixture(t), desktopKey: bytes.Repeat([]byte{9}, 32)}
+	var inv *accounts.Invite
+	var secret [16]byte
+	if err := f.w.Commit(context.Background(), func(st *accounts.State) (err error) {
+		inv, secret, err = accounts.AddInvite(st, "alexei", time.Hour, f.now)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	e := &invite.Enrollment{ID: inv.ID, Secret: secret, Token: invite.NewToken(), Name: "desktop"}
+	a, err := f.enroll(e.Credential(), f.desktopKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Result.Features&wire.FeatureDevices == 0 {
+		t.Fatalf("a key-bound device may not manage devices: features %#x", a.Result.Features)
+	}
+	f.desktop = netip.AddrFrom4(a.Result.IPv4)
+	return f
+}
+
+// revoke repeats a request from the device leasing addr until answered.
+func (f *manageFixture) revoke(addr netip.Addr, req wire.RevokeRequest) wire.RevokeResult {
+	f.t.Helper()
+	for range 500 {
+		if a, ok := f.g.revokeDevice(addr, nil, req); ok {
+			return a
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	f.t.Fatal("revocation still unanswered")
+	return wire.RevokeResult{}
+}
+
+func (f *manageFixture) device(name string) *accounts.Device {
+	for _, d := range f.w.State().Devices {
+		if d.Name == name {
+			return d
+		}
+	}
+	return nil
+}
+
+func TestListDevices(t *testing.T) {
+	f := newManageFixture(t)
+	d, ok := f.g.listDevices(f.desktop, nil)
+	if !ok || d.Status != 0 || len(d.Devices) != 2 {
+		t.Fatalf("list: %+v %v", d, ok)
+	}
+	for _, x := range d.Devices {
+		want := f.device(x.Name)
+		if want == nil || x.ID != want.ID || !bytes.Equal(x.Key[:], want.Key[:8]) || x.Created != uint32(want.Created.Unix()) {
+			t.Errorf("listed %+v, want %+v", x, want)
+		}
+	}
+	// A legacy device is refused.
+	var tok []byte
+	if err := f.w.Commit(context.Background(), func(st *accounts.State) (err error) {
+		_, tok, err = accounts.AddToken(st, "alexei", "old", f.now)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	r, err := f.g.Authorize(tok, nil, nil)
+	if err != nil || r.Features&wire.FeatureDevices != 0 {
+		t.Fatalf("legacy device: features %#x, %v", r.Features, err)
+	}
+	if d, _ := f.g.listDevices(netip.AddrFrom4(r.IPv4), nil); d.Status != wire.CodeUnauthorized {
+		t.Errorf("legacy device listed: %+v", d)
+	}
+}
+
+func TestRevokeDevice(t *testing.T) {
+	f := newManageFixture(t)
+	var logs bytes.Buffer
+	var logMu sync.Mutex
+	f.g.cfg.Log = slog.New(slog.NewTextHandler(&lockedWriter{w: &logs, mu: &logMu}, nil))
+	laptop := f.device("laptop")
+	req := wire.RevokeRequest{RequestID: [8]byte{1}, DeviceID: laptop.ID}
+
+	// Too young to revoke another device.
+	if a := f.revoke(f.desktop, req); a.Status != wire.CodeUnauthorized {
+		t.Fatalf("young device revoked another: %+v", a)
+	}
+	if f.device("laptop") == nil {
+		t.Fatal("refused, yet revoked")
+	}
+	f.advance(accounts.CoolingOff)
+	req.RequestID = [8]byte{2}
+	if a := f.revoke(f.desktop, req); a.Status != 0 {
+		t.Fatalf("revoke: %+v", a)
+	}
+	if f.device("laptop") != nil {
+		t.Fatal("answered, yet not revoked")
+	}
+	f.g.mu.Lock()
+	revoked := f.g.leased[f.addr].revoked
+	f.g.mu.Unlock()
+	if !revoked {
+		t.Error("the laptop's lease survives")
+	}
+	// Repeated: answered at once.
+	if a, ok := f.g.revokeDevice(f.desktop, nil, req); !ok || a.Status != 0 {
+		t.Errorf("repeat: %+v %v", a, ok)
+	}
+	logMu.Lock()
+	defer logMu.Unlock()
+	if !strings.Contains(logs.String(), "device revoked by a device") || !strings.Contains(logs.String(), "by=desktop") ||
+		!strings.Contains(logs.String(), "device=laptop") {
+		t.Errorf("no warning naming both devices:\n%s", logs.String())
+	}
+}
+
+// TestRevokeDeviceStoreDown: a revocation the store cannot take stays
+// unanswered, and nothing is revoked, until the store is back.
+func TestRevokeDeviceStoreDown(t *testing.T) {
+	f := newManageFixture(t)
+	f.advance(accounts.CoolingOff)
+	commit := f.g.cfg.Commit
+	var mu sync.Mutex
+	down := true
+	f.g.cfg.Commit = func(ctx context.Context, fn func(*accounts.State) error) error {
+		mu.Lock()
+		d := down
+		mu.Unlock()
+		if d {
+			return accounts.ErrUnavailable
+		}
+		return commit(ctx, fn)
+	}
+	req := wire.RevokeRequest{RequestID: [8]byte{1}, DeviceID: f.device("laptop").ID}
+	for range 30 {
+		if a, ok := f.g.revokeDevice(f.desktop, nil, req); ok {
+			t.Fatalf("answered with the store down: %+v", a)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if f.device("laptop") == nil {
+		t.Fatal("revoked with the store down")
+	}
+	mu.Lock()
+	down = false
+	mu.Unlock()
+	if a := f.revoke(f.desktop, req); a.Status != 0 {
+		t.Fatalf("after the store came back: %+v", a)
+	}
+}

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/laneshetron/arc/internal/accounts"
+	"github.com/laneshetron/arc/internal/crypto"
 	"github.com/laneshetron/arc/internal/engine"
 	"github.com/laneshetron/arc/internal/invite"
 	"github.com/laneshetron/arc/internal/keyfile"
@@ -57,32 +58,14 @@ func inviteCmd(args []string) error {
 		os.Exit(2)
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	unlock, err := lockProfile(*dir)
+	p, static, token, unlock, err := openEnrolled(*dir)
 	if err != nil {
 		return err
 	}
 	defer unlock()
-	p, err := loadProfile(*dir)
-	if err != nil {
-		return err
-	}
-	switch {
-	case !p.exists():
-		return fmt.Errorf("-profile %s: no profile there (run arc-client enroll)", *dir)
-	case p.settings["invite"] != "":
-		return fmt.Errorf("-profile %s: enrollment not finished; rerun arc-client enroll -profile %s", *dir, *dir)
-	}
 	tmpl, err := p.inviteTemplate()
 	if err != nil {
 		return err
-	}
-	static, err := keyfile.LoadStatic(p.path("key"))
-	if err != nil {
-		return err
-	}
-	tokens, err := keyfile.ReadLines(p.path("token"))
-	if err != nil || len(tokens) != 1 {
-		return fmt.Errorf("%s: unreadable token", *dir)
 	}
 	req, err := pendingRequest(p, time.Now())
 	if err != nil {
@@ -94,12 +77,11 @@ func inviteCmd(args []string) error {
 	ctx, cancel := context.WithTimeout(ctx, *timeout)
 	defer cancel()
 	var answer *wire.Invite
-	err = connectOnce(ctx, log, p, binds, static, []byte(tokens[0]), func(cfg *engine.ClientConfig) {
-		cfg.InviteRequest = &req
-		cfg.OnInvite = func(a session.InviteAnswer) error {
+	err = connectOnce(ctx, log, p, binds, static, token, func(cfg *engine.ClientConfig) {
+		cfg.Request = engine.InviteRequest(req, func(a session.InviteAnswer) error {
 			answer = &a.Invite
 			return errAnswered
-		}
+		})
 	})
 	switch {
 	case errors.Is(err, errAnswered):
@@ -146,6 +128,36 @@ func printInvite(p *profile, tmpl *invite.Invite, answer *wire.Invite) error {
 		fmt.Fprintf(os.Stderr, "warning: %v\n", err)
 	}
 	return nil
+}
+
+// openEnrolled locks and loads the enrolled device's profile in dir,
+// with its static key and token. The caller calls unlock when done.
+func openEnrolled(dir string) (p *profile, static crypto.StaticKey, token []byte, unlock func(), err error) {
+	if unlock, err = lockProfile(dir); err != nil {
+		return nil, static, nil, nil, err
+	}
+	defer func() {
+		if err != nil {
+			unlock()
+		}
+	}()
+	if p, err = loadProfile(dir); err != nil {
+		return nil, static, nil, nil, err
+	}
+	switch {
+	case !p.exists():
+		return nil, static, nil, nil, fmt.Errorf("-profile %s: no profile there (run arc-client enroll)", dir)
+	case p.settings["invite"] != "":
+		return nil, static, nil, nil, fmt.Errorf("-profile %s: enrollment not finished; rerun arc-client enroll -profile %s", dir, dir)
+	}
+	if static, err = keyfile.LoadStatic(p.path("key")); err != nil {
+		return nil, static, nil, nil, err
+	}
+	tokens, err := keyfile.ReadLines(p.path("token"))
+	if err != nil || len(tokens) != 1 {
+		return nil, static, nil, nil, fmt.Errorf("%s: unreadable token", dir)
+	}
+	return p, static, []byte(tokens[0]), unlock, nil
 }
 
 // pendingRequest returns the ID of the profile's unanswered request for an

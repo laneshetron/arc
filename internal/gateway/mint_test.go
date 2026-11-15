@@ -187,7 +187,7 @@ func TestMintSlotsFreed(t *testing.T) {
 	f := newMintFixture(t)
 	f.g.mu.Lock()
 	for range maxMinting {
-		f.g.minting[accounts.NewID()] = &minting{request: accounts.NewID(), started: f.now, done: true}
+		f.g.minting[accounts.NewID()] = &pending{request: accounts.NewID(), started: f.now, done: true}
 	}
 	f.g.mu.Unlock()
 	if a := f.ask([8]byte{1}); a.Status != 0 {

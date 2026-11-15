@@ -82,6 +82,33 @@ type Device struct {
 	Created   time.Time
 }
 
+// record is the device's line in the file.
+func (d *Device) record() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "device %v %v %s token=%x front=%x", d.ID, d.Account, d.Name, d.TokenHash, d.Front)
+	if d.Key != nil {
+		fmt.Fprintf(&b, " key=%x", d.Key)
+	}
+	fmt.Fprintf(&b, " lineage=%s", joinIDs(d.Lineage))
+	if !d.Via.IsZero() {
+		fmt.Fprintf(&b, " via=%v", d.Via)
+	}
+	fmt.Fprintf(&b, " created=%s", stamp(d.Created))
+	return b.String()
+}
+
+// parseDevice reads a device's line, as record writes it.
+func parseDevice(line string) (*Device, error) {
+	var s State
+	if !strings.HasPrefix(line, "device ") {
+		return nil, errors.New("not a device record")
+	}
+	if err := s.parseRecord(line); err != nil {
+		return nil, err
+	}
+	return s.Devices[0], nil
+}
+
 // Bound reports whether the device's token authenticates only its own key.
 func (d *Device) Bound() bool { return d.Key != nil }
 
@@ -327,15 +354,8 @@ func (s *State) Marshal() []byte {
 		fmt.Fprintf(&b, " max_devices=%d invites=%s manage=%s\n", a.MaxDevices, yesNo(a.Invites), yesNo(a.Manage))
 	}
 	for _, d := range s.Devices {
-		fmt.Fprintf(&b, "device %v %v %s token=%x front=%x", d.ID, d.Account, d.Name, d.TokenHash, d.Front)
-		if d.Key != nil {
-			fmt.Fprintf(&b, " key=%x", d.Key)
-		}
-		fmt.Fprintf(&b, " lineage=%s", joinIDs(d.Lineage))
-		if !d.Via.IsZero() {
-			fmt.Fprintf(&b, " via=%v", d.Via)
-		}
-		fmt.Fprintf(&b, " created=%s\n", stamp(d.Created))
+		b.WriteString(d.record())
+		b.WriteByte('\n')
 	}
 	for _, i := range s.Invites {
 		fmt.Fprintf(&b, "invite %v %v %x front=%x expires=%s", i.ID, i.Account, i.SecretHash, i.Front, stamp(i.Expires))

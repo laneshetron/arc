@@ -279,6 +279,33 @@ func checkFrameFields(t *testing.T, fr Frame, fields map[string]any) {
 			v.Expires != uint32(num("expires")) {
 			t.Errorf("INVITE = %+v", v)
 		}
+	case DevicesRequest:
+		if hex.EncodeToString(v.RequestID[:]) != fields["request_id_hex"] {
+			t.Errorf("DEVICES_REQUEST = %+v", v)
+		}
+	case Devices:
+		list := fields["devices"].([]any)
+		if hex.EncodeToString(v.RequestID[:]) != fields["request_id_hex"] || v.Status != ErrorCode(num("status")) || len(v.Devices) != len(list) {
+			t.Errorf("DEVICES = %+v", v)
+			break
+		}
+		for i, x := range v.Devices {
+			want := list[i].(map[string]any)
+			if hex.EncodeToString(x.ID[:]) != want["device_id_hex"] || hex.EncodeToString(x.Parent[:]) != want["parent_hex"] ||
+				float64(x.Created) != want["created"] || float64(x.LastSeen) != want["last_seen"] ||
+				hex.EncodeToString(x.Key[:]) != want["key_hex"] || x.Name != want["name"] {
+				t.Errorf("DEVICES[%d] = %+v", i, x)
+			}
+		}
+	case RevokeRequest:
+		if hex.EncodeToString(v.RequestID[:]) != fields["request_id_hex"] || hex.EncodeToString(v.DeviceID[:]) != fields["device_id_hex"] ||
+			v.Descendants != fields["descendants"] {
+			t.Errorf("REVOKE_REQUEST = %+v", v)
+		}
+	case RevokeResult:
+		if hex.EncodeToString(v.RequestID[:]) != fields["request_id_hex"] || v.Status != ErrorCode(num("status")) {
+			t.Errorf("REVOKE_RESULT = %+v", v)
+		}
 	case Enrolled:
 		if hex.EncodeToString(v.DeviceID[:]) != fields["device_id_hex"] || v.Name != fields["name"] {
 			t.Errorf("ENROLLED = %+v", v)

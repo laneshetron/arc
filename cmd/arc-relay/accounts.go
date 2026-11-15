@@ -77,6 +77,8 @@ commands:
                              (-address, -udp-port, -tls-port, -tls-cover, -ttl)
   revoke ACCOUNT/DEVICE      revoke one device (-descendants: and every device
                              enrolled through its invites, and theirs)
+  restore ACCOUNT/DEVICE     reinstate a device that another device revoked,
+                             within 7 days (operator revocations are final)
   rotate ACCOUNT             revoke every device and invite of the account,
                              keep its policy, and print a fresh invite
                              (the invite flags, as for invite)

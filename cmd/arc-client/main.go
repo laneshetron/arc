@@ -45,8 +45,13 @@ func main() {
 		err = enroll(os.Args[2:])
 	case len(os.Args) >= 2 && os.Args[1] == "invite":
 		err = inviteCmd(os.Args[2:])
+	case len(os.Args) >= 2 && os.Args[1] == "devices":
+		err = devicesCmd(os.Args[2:])
+	case len(os.Args) >= 2 && os.Args[1] == "revoke":
+		err = revokeCmd(os.Args[2:])
 	default:
-		fmt.Fprintln(os.Stderr, "usage: arc-client run [flags]\n       arc-client enroll [flags] INVITE\n       arc-client invite [flags]")
+		fmt.Fprintln(os.Stderr, "usage: arc-client run [flags]\n       arc-client enroll [flags] INVITE\n       arc-client invite [flags]\n"+
+			"       arc-client devices [flags]\n       arc-client revoke [flags] DEVICE")
 		os.Exit(2)
 	}
 	if err != nil {

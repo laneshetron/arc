@@ -30,6 +30,37 @@ type Carrier struct {
 	Fallback bool
 }
 
+// A Request is an exchange of requests the relay answers, each sent
+// reliably and repeated until answered, since the relay may hold one it
+// cannot answer yet.
+type Request struct {
+	// Send sends the exchange's current request, once each session is
+	// active, then every Repeat until Answer ends the exchange. An error
+	// (such as session.ErrNoInvites, from a relay that offers the device
+	// none) closes the session, and RunClient returns it.
+	Send func(*session.Client) error
+	// Answer is given each answer the relay sends: an InviteAnswer,
+	// DevicesAnswer or RevokeAnswer, which may answer an earlier request.
+	// more says the exchange goes on, and its next request is sent at
+	// once; an error closes the session, and RunClient returns it.
+	Answer func(session.ClientEvent) (more bool, err error)
+	Repeat time.Duration // default 2 s
+}
+
+// InviteRequest is a Request for an invite with request ID id, whose
+// answer goes to answer (§3.6).
+func InviteRequest(id [8]byte, answer func(session.InviteAnswer) error) *Request {
+	return &Request{
+		Send: func(c *session.Client) error { return c.RequestInvite(id) },
+		Answer: func(e session.ClientEvent) (bool, error) {
+			if a, ok := e.(session.InviteAnswer); ok && a.RequestID == id {
+				return false, answer(a)
+			}
+			return true, nil
+		},
+	}
+}
+
 // ClientConfig configures a client engine.
 type ClientConfig struct {
 	Session  session.ClientConfig
@@ -45,15 +76,10 @@ type ClientConfig struct {
 	// OnEstablished, for a session that enrolled with an invite. An
 	// error closes the session and RunClient returns it.
 	OnEnrolled func(session.Enrolled) error
-	// InviteRequest, if set, asks the relay for an invite with this
-	// request ID once each session is active, repeating it every
-	// InviteRepeat until answered (self-service-accounts.md §3.6); the
-	// answer goes to OnInvite, whose error closes the session and
-	// RunClient returns it. A relay that offers this device no invites
-	// ends RunClient with session.ErrNoInvites.
-	InviteRequest *[8]byte
-	OnInvite      func(session.InviteAnswer) error
-	InviteRepeat  time.Duration // default 2 s
+	// Request, if set, runs a request-and-answer exchange with the relay
+	// on each active session: asking for an invite, the device list, or
+	// a revocation (self-service-accounts.md §3.6, §3.8).
+	Request *Request
 
 	// ReconnectDelay is the pause before replacing a session that ended
 	// for a reason other than authentication failure. Default 1 s.
@@ -223,19 +249,37 @@ func RunClient(ctx context.Context, cfg ClientConfig) error {
 	}
 	var reconnectAt time.Time
 	var toTUN [][]byte
-	var inviteAt time.Time // the next INVITE_REQUEST; zero for none
-	if cfg.InviteRepeat <= 0 {
-		cfg.InviteRepeat = 2 * time.Second
+	var requestAt time.Time // the next repeat of cfg.Request's request; zero for none
+	requestDone := false    // cfg.Request's exchange has ended
+	if cfg.Request != nil && cfg.Request.Repeat <= 0 {
+		cfg.Request.Repeat = 2 * time.Second
 	}
-	requestInvite := func(now time.Time) error {
-		inviteAt = now.Add(cfg.InviteRepeat)
-		err := c.RequestInvite(*cfg.InviteRequest)
-		if errors.Is(err, session.ErrNoInvites) {
+	sendRequest := func(now time.Time) error {
+		requestAt = now.Add(cfg.Request.Repeat)
+		if err := cfg.Request.Send(c); err != nil && !errors.Is(err, session.ErrNotActive) {
 			c.Close(now)
 			flushTransmits(c, carriers, hs.pinned, log)
 			return err
 		}
 		c.Tick(now)
+		return nil
+	}
+	// answered hands cfg.Request an answer.
+	answered := func(e session.ClientEvent) error {
+		if cfg.Request == nil || requestAt.IsZero() {
+			return nil
+		}
+		more, err := cfg.Request.Answer(e)
+		now := time.Now()
+		switch {
+		case err != nil:
+			c.Close(now)
+			flushTransmits(c, carriers, hs.pinned, log)
+			return err
+		case more:
+			return sendRequest(now)
+		}
+		requestAt, requestDone = time.Time{}, true
 		return nil
 	}
 
@@ -300,8 +344,8 @@ func RunClient(ctx context.Context, cfg ClientConfig) error {
 						return err
 					}
 				}
-				if cfg.InviteRequest != nil {
-					if err := requestInvite(time.Now()); err != nil {
+				if cfg.Request != nil && !requestDone {
+					if err := sendRequest(time.Now()); err != nil {
 						return err
 					}
 				}
@@ -333,17 +377,9 @@ func RunClient(ctx context.Context, cfg ClientConfig) error {
 						return err
 					}
 				}
-			case session.InviteAnswer:
-				if cfg.InviteRequest == nil || e.RequestID != *cfg.InviteRequest {
-					break
-				}
-				inviteAt = time.Time{}
-				if cfg.OnInvite != nil {
-					if err := cfg.OnInvite(e); err != nil {
-						c.Close(time.Now())
-						flushTransmits(c, carriers, hs.pinned, log)
-						return err
-					}
+			case session.InviteAnswer, session.DevicesAnswer, session.RevokeAnswer:
+				if err := answered(e); err != nil {
+					return err
 				}
 			case session.PathValidated:
 				log.Info("path validated", "path", e.ID)
@@ -366,7 +402,7 @@ func RunClient(ctx context.Context, cfg ClientConfig) error {
 				for _, b := range bridges {
 					b.finish(true) // the session's streams are gone
 				}
-				uploadAt, upload, inviteAt = time.Time{}, nil, time.Time{}
+				uploadAt, upload, requestAt = time.Time{}, nil, time.Time{}
 				if errors.Is(e.Err, session.ErrAuthFailed) {
 					return e.Err
 				}
@@ -404,8 +440,8 @@ func RunClient(ctx context.Context, cfg ClientConfig) error {
 		if !uploadAt.IsZero() && (deadline.IsZero() || uploadAt.Before(deadline)) {
 			deadline = uploadAt
 		}
-		if !inviteAt.IsZero() && (deadline.IsZero() || inviteAt.Before(deadline)) {
-			deadline = inviteAt
+		if !requestAt.IsZero() && (deadline.IsZero() || requestAt.Before(deadline)) {
+			deadline = requestAt
 		}
 		if !reconnectAt.IsZero() {
 			deadline = reconnectAt
@@ -483,8 +519,8 @@ func RunClient(ctx context.Context, cfg ClientConfig) error {
 					upload = startUpload(ctx, c, cfg.Diagnostics, bridges, bridgeEvents, log, now)
 				}
 			}
-			if !inviteAt.IsZero() && !now.Before(inviteAt) && c.State() == session.StateActive {
-				if err := requestInvite(now); err != nil {
+			if !requestAt.IsZero() && !now.Before(requestAt) && c.State() == session.StateActive {
+				if err := sendRequest(now); err != nil {
 					return err
 				}
 			}

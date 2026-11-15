@@ -392,12 +392,16 @@ frame_value:  frame_length bytes
 | `18` | `ENROLLED` | `device_id:8B; len:u8; name` (name 1–32 bytes of letters, digits, `.`, `_`, `-`; §9.2) | Relay → client, only after an enrollment credential | Yes |
 | `19` | `INVITE_REQUEST` | 8 bytes: `request_id:8B` (below) | Client → relay, with features bit 4 | Yes |
 | `1A` | `INVITE` | 37 bytes: `request_id:8B; status:u8; invite_id:8B; secret:16B; expires:u32` (below) | Relay → client, answering `INVITE_REQUEST` | Yes |
+| `1B` | `DEVICES_REQUEST` | 8 bytes: `request_id:8B` (below) | Client → relay, with features bit 5 | Yes |
+| `1C` | `DEVICES` | `request_id:8B; status:u8; n:u8;` n × `device_id:8B; parent:8B; created:u32; last_seen:u32; key:8B; len:u8; name` (below) | Relay → client, answering `DEVICES_REQUEST` | Yes |
+| `1D` | `REVOKE_REQUEST` | 17 bytes: `request_id:8B; device_id:8B; flags:u8` (below) | Client → relay, with features bit 5 | Yes |
+| `1E` | `REVOKE_RESULT` | 9 bytes: `request_id:8B; status:u8` (below) | Relay → client, answering `REVOKE_REQUEST` | Yes |
 
 **`AUTH_RESULT`:**
 - `status=0` means success. Any other value is a failure, and all other fields MUST then be zero.
 - `tun_mtu` MUST be at least 1280 on success.
 - `dns_ipv4=0` means the relay supplied no resolver. Full-tunnel mode MUST then get an authenticated resolver setting from trusted, explicit client configuration.
-- `features` bit 0 (`REDUNDANCY`): the relay accepts `IP_DATAGRAM` and `REDUNDANCY` (§11.1). Bit 1 (`FEC`): the relay accepts `IP_DATAGRAM`, `FEC_REPAIR` and `FEC` (§11.2). Bit 2 (`STREAMS`): the relay accepts `STREAM_OPEN` and carries streams (§11.3). Bit 3 (`DIAGNOSTICS`): the relay accepts `DIAGNOSTICS_OPEN` (§11.4). Bit 4 (`INVITES`): the session's device may ask for invites to its account (`INVITE_REQUEST`, below). A relay MUST send other bits as zero, and a client MUST ignore bits it does not know.
+- `features` bit 0 (`REDUNDANCY`): the relay accepts `IP_DATAGRAM` and `REDUNDANCY` (§11.1). Bit 1 (`FEC`): the relay accepts `IP_DATAGRAM`, `FEC_REPAIR` and `FEC` (§11.2). Bit 2 (`STREAMS`): the relay accepts `STREAM_OPEN` and carries streams (§11.3). Bit 3 (`DIAGNOSTICS`): the relay accepts `DIAGNOSTICS_OPEN` (§11.4). Bit 4 (`INVITES`): the session's device may ask for invites to its account (`INVITE_REQUEST`, below). Bit 5 (`DEVICES`): the session's device may list and revoke its account's devices (`DEVICES_REQUEST`, `REVOKE_REQUEST`, below). A relay MUST send other bits as zero, and a client MUST ignore bits it does not know.
 - IPv6 configuration and pushed routes are deferred to an extension frame.
 - The relay controls address assignment by deployment policy. Receiving an address does not by itself authorize inbound Internet exposure.
 
@@ -414,7 +418,13 @@ frame_value:  frame_length bytes
 - `status=0` carries the invite: its ID, its secret and its expiry (Unix seconds). Otherwise every field but `request_id` and `status` MUST be zero: `CAPACITY` (the account is at its device cap, has 2 unredeemed invites, or the device's lineage is full), `INVITE_EXPIRED`, or `UNAUTHORIZED` (the device may not mint invites).
 - The client builds the invite string from the relay settings it already has.
 
-**`ERROR` codes:** `1 MALFORMED`, `2 AUTH_FAILED`, `3 UNAUTHORIZED`, `4 PATH_UNAVAILABLE`, `5 CAPACITY`, `6 UNSUPPORTED`, `7 SESSION_EXPIRED`, `8 PROTOCOL_VIOLATION`, `9 CONNECT_FAILED`, `10 ABORTED` (these two for `STREAM_RESET`, §11.3), `11 INVITE_USED`, `12 INVITE_EXPIRED` (these two refuse an enrollment, §9.2). Unknown values are informational and MUST NOT crash an implementation. `CLOSE` and `PATH_ABANDON` use the same code space, plus `0 NO_ERROR`.
+**`DEVICES_REQUEST`, `DEVICES`, `REVOKE_REQUEST` and `REVOKE_RESULT`** (spec/self-service-accounts.md §3.8). A device lists its account's devices, and revokes them:
+- Each request carries a random, nonzero `request_id` (a frame with a zero one is malformed), and is sent reliably, repeated every 2 s until answered: the relay may leave a request unanswered while it is not serving, or while it writes a revocation to its accounts store.
+- `DEVICES` with `status=0` lists at most 16 devices. `parent` is the device whose invite enrolled it (zero for an operator invite); `created` and `last_seen` are Unix seconds (`last_seen` 0 when the relay has seen no session of it); `key` is the first 8 bytes of its static key (zero for a device bound to none); `name` is 1–32 bytes of letters, digits, `.`, `_` and `-`. Any other status (`UNAUTHORIZED`) has `n=0`.
+- `REVOKE_REQUEST` names a device of the account; flags bit 0 also revokes every device enrolled through its invites, and theirs in turn, and other bits MUST be zero. The relay answers `status=0` once the revocation is committed, or at once if the device was already revoked; `UNAUTHORIZED` if the device may not manage devices, names no device of its account, or (to revoke another device) was enrolled less than 24 hours ago. A device may revoke itself; its session then closes with `REVOKED` instead.
+- A revoked device's sessions close with `REVOKED`, and its client stops reconnecting.
+
+**`ERROR` codes:** `1 MALFORMED`, `2 AUTH_FAILED`, `3 UNAUTHORIZED`, `4 PATH_UNAVAILABLE`, `5 CAPACITY`, `6 UNSUPPORTED`, `7 SESSION_EXPIRED`, `8 PROTOCOL_VIOLATION`, `9 CONNECT_FAILED`, `10 ABORTED` (these two for `STREAM_RESET`, §11.3), `11 INVITE_USED`, `12 INVITE_EXPIRED` (these two refuse an enrollment, §9.2), `13 REVOKED` (in `CLOSE`: the session's device was revoked; the client stops reconnecting). Unknown values are informational and MUST NOT crash an implementation. `CLOSE` and `PATH_ABANDON` use the same code space, plus `0 NO_ERROR`.
 
 ### 10.2 `ACK` frame
 

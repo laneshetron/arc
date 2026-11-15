@@ -111,7 +111,7 @@ func Do(ctx context.Context, w *Writer, req Request, now time.Time) Response {
 		}
 		return ""
 	}
-	want := map[string]int{"add": 1, "remove": 1, "add-token": 1, "invite": 1, "revoke": 1, "rotate": 1}
+	want := map[string]int{"add": 1, "remove": 1, "add-token": 1, "invite": 1, "revoke": 1, "rotate": 1, "restore": 1}
 	n, ok := want[req.Op]
 	if !ok {
 		return Response{Error: fmt.Sprintf("unknown operation %q", req.Op)}
@@ -150,6 +150,8 @@ func Do(ctx context.Context, w *Writer, req Request, now time.Time) Response {
 			}
 		case "revoke":
 			out, err = Revoke(st, arg(0), now, req.Descendants)
+		case "restore":
+			out, err = Restore(st, arg(0), now)
 		}
 		return err
 	})

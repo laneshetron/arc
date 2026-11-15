@@ -46,10 +46,14 @@ All other type values are reserved: drop them silently.
 | `0x18` | `ENROLLED` | 10–41 (`device_id[8]; len:u8; name`, name 1–32 bytes) | yes |
 | `0x19` | `INVITE_REQUEST` | 8 (`request_id[8]`) | yes |
 | `0x1A` | `INVITE` | 37 (`request_id[8]; status:u8; invite_id[8]; secret[16]; expires:u32`) | yes |
-| `0x1B`–`0x7F` | reserved, required | — | reject the packet |
+| `0x1B` | `DEVICES_REQUEST` | 8 (`request_id[8]`) | yes |
+| `0x1C` | `DEVICES` | 10 + n × (33 + len) (`request_id[8]; status:u8; n:u8;` n × `device_id[8]; parent[8]; created:u32; last_seen:u32; key[8]; u8 len; name`) | yes |
+| `0x1D` | `REVOKE_REQUEST` | 17 (`request_id[8]; device_id[8]; flags:u8`) | yes |
+| `0x1E` | `REVOKE_RESULT` | 9 (`request_id[8]; status:u8`) | yes |
+| `0x1F`–`0x7F` | reserved, required | — | reject the packet |
 | `0x80`–`0xFF` | extensions, ignorable | — | ignore |
 
-`IP_DATAGRAM` and `REDUNDANCY` are sent only when `AUTH_RESULT` advertises features bit 0 (§11.1), and `FEC_REPAIR` and `FEC` only with bit 1 (§11.2), which also allows `IP_DATAGRAM`. The stream frames (`0x12`–`0x16`) are sent only with bit 2 (§11.3), and `DIAGNOSTICS_OPEN` only with bit 3, which also allows `0x13`–`0x16` for the upload (§11.4). Stream IDs are never 0, and stream offsets and limits stay below 2^62. `ENROLLED` is sent only with a successful `AUTH_RESULT` answering an enrollment credential (§9.2), so clients that authenticate with tokens never receive it. `INVITE_REQUEST` is sent only with bit 4, and `INVITE` only in answer to it; `request_id` is never zero, and a refusing `INVITE` has every field but `request_id` and `status` zero.
+`IP_DATAGRAM` and `REDUNDANCY` are sent only when `AUTH_RESULT` advertises features bit 0 (§11.1), and `FEC_REPAIR` and `FEC` only with bit 1 (§11.2), which also allows `IP_DATAGRAM`. The stream frames (`0x12`–`0x16`) are sent only with bit 2 (§11.3), and `DIAGNOSTICS_OPEN` only with bit 3, which also allows `0x13`–`0x16` for the upload (§11.4). Stream IDs are never 0, and stream offsets and limits stay below 2^62. `ENROLLED` is sent only with a successful `AUTH_RESULT` answering an enrollment credential (§9.2), so clients that authenticate with tokens never receive it. `INVITE_REQUEST` is sent only with bit 4, and `INVITE` only in answer to it; `request_id` is never zero, and a refusing `INVITE` has every field but `request_id` and `status` zero. `DEVICES_REQUEST` and `REVOKE_REQUEST` are sent only with bit 5, and `DEVICES` and `REVOKE_RESULT` only in answer to them; their `request_id` is never zero, a refusing `DEVICES` lists no devices, `DEVICES` lists at most 16, and `REVOKE_REQUEST` names a nonzero device and sets only flags bit 0.
 
 ## AUTH_RESULT features (§10.1)
 
@@ -60,12 +64,13 @@ All other type values are reserved: drop them silently.
 | 2 | `STREAMS` | relay accepts `STREAM_OPEN` and carries streams to TCP destinations (§11.3) |
 | 3 | `DIAGNOSTICS` | relay accepts `DIAGNOSTICS_OPEN`, keeping clients' diagnostics uploads (§11.4) |
 | 4 | `INVITES` | the session's device may ask for invites to its account with `INVITE_REQUEST` (§10.1) |
+| 5 | `DEVICES` | the session's device may list and revoke its account's devices with `DEVICES_REQUEST` and `REVOKE_REQUEST` (§10.1) |
 
 Other bits are sent as zero and ignored on receipt.
 
 ## Error / close codes (§10.1)
 
-`0 NO_ERROR` · `1 MALFORMED` · `2 AUTH_FAILED` · `3 UNAUTHORIZED` · `4 PATH_UNAVAILABLE` · `5 CAPACITY` · `6 UNSUPPORTED` · `7 SESSION_EXPIRED` · `8 PROTOCOL_VIOLATION` · `9 CONNECT_FAILED` · `10 ABORTED` · `11 INVITE_USED` · `12 INVITE_EXPIRED` (9 and 10 in `STREAM_RESET`; 11 and 12 refuse an enrollment, in `AUTH_RESULT.status` and `CLOSE`)
+`0 NO_ERROR` · `1 MALFORMED` · `2 AUTH_FAILED` · `3 UNAUTHORIZED` · `4 PATH_UNAVAILABLE` · `5 CAPACITY` · `6 UNSUPPORTED` · `7 SESSION_EXPIRED` · `8 PROTOCOL_VIOLATION` · `9 CONNECT_FAILED` · `10 ABORTED` · `11 INVITE_USED` · `12 INVITE_EXPIRED` · `13 REVOKED` (9 and 10 in `STREAM_RESET`; 11 and 12 refuse an enrollment, in `AUTH_RESULT.status` and `CLOSE`; 13 closes a revoked device's sessions)
 
 ## Cryptography (§8.6, §9, §13, §14.7)
 

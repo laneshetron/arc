@@ -103,16 +103,16 @@ func Revoke(st *State, target string, now time.Time, descendants bool) (string, 
 	}
 	var b strings.Builder
 	for _, x := range gone {
-		st.revoke(x, now)
+		st.revoke(x, now, ID{})
 		fmt.Fprintf(&b, "revoked %s/%s\n", account, x.Name)
 	}
 	return b.String(), nil
 }
 
 // revoke removes a device, cancels its unredeemed invites, and leaves a
-// tombstone.
-func (st *State) revoke(d *Device, now time.Time) {
-	st.tombstone(d, now, ID{})
+// tombstone. A revocation by a device (by) keeps the record, for Restore.
+func (st *State) revoke(d *Device, now time.Time, by ID) {
+	st.tombstone(d, now, by)
 	st.Devices = slices.DeleteFunc(st.Devices, func(x *Device) bool { return x == d })
 	st.Invites = slices.DeleteFunc(st.Invites, func(i *Invite) bool { return i.By == d.ID && i.Redeemed.IsZero() })
 }
@@ -127,7 +127,7 @@ func Rotate(st *State, account string, now time.Time) (string, error) {
 	}
 	devices := st.DevicesOf(a.ID)
 	for _, d := range devices {
-		st.revoke(d, now)
+		st.revoke(d, now, ID{})
 	}
 	st.Invites = slices.DeleteFunc(st.Invites, func(i *Invite) bool { return i.Account == a.ID })
 	return fmt.Sprintf("rotated account %s: revoked its %d devices and cancelled its invites\n", account, len(devices)), nil
@@ -143,7 +143,11 @@ func (st *State) device(account ID, name string) *Device {
 }
 
 func (st *State) tombstone(d *Device, now time.Time, by ID) {
-	st.Revoked = append(st.Revoked, &Tombstone{ID: d.ID, Until: now.Add(TombstoneLife).UTC().Truncate(time.Second), By: by})
+	t := &Tombstone{ID: d.ID, Until: now.Add(TombstoneLife).UTC().Truncate(time.Second), By: by}
+	if !by.IsZero() {
+		t.Rest = d.record()
+	}
+	st.Revoked = append(st.Revoked, t)
 }
 
 // List describes every account and its devices, each device under the
@@ -185,6 +189,17 @@ func List(st *State) string {
 				state += ", minted by " + by
 			}
 			fmt.Fprintf(tw, "  invite %v\t\t%s\n", i.ID, state)
+		}
+		for _, t := range st.Revoked {
+			d, err := parseDevice(t.Rest)
+			if t.By.IsZero() || err != nil || d.Account != a.ID {
+				continue
+			}
+			by := t.By.String()
+			if x := st.DeviceByID(t.By); x != nil {
+				by = x.Name
+			}
+			fmt.Fprintf(tw, "  revoked %s\t%v\tby %s; restore until %s\n", d.Name, d.ID, by, stamp(t.Until))
 		}
 	}
 	tw.Flush()
