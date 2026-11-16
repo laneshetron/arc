@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"net"
@@ -17,7 +18,7 @@ import (
 )
 
 // RelayConfig configures a relay engine. Session.Authorize is set to
-// Gateway.Authorize.
+// Gateway.AuthorizeSession.
 type RelayConfig struct {
 	Session session.RelayConfig
 	Conn    DatagramConn
@@ -96,7 +97,7 @@ func RunRelay(ctx context.Context, cfg RelayConfig) error {
 	if attempts == nil {
 		attempts = NewAttemptLog(log)
 	}
-	cfg.Session.Authorize = cfg.Gateway.Authorize
+	cfg.Session.Authorize = cfg.Gateway.AuthorizeSession
 	cfg.Session.Diagnostics = cfg.Diagnostics != nil
 	r := session.NewRelay(cfg.Session, time.Now())
 	timer := time.NewTimer(time.Hour)
@@ -174,6 +175,10 @@ func RunRelay(ctx context.Context, cfg RelayConfig) error {
 				}
 				attempts.established(e.Session, time.Now(), "address", addr, "account", cfg.Gateway.AccountName(addr),
 					"device", cfg.Gateway.DeviceName(addr))
+				if d := e.Session.Enrolled(); d != nil {
+					log.Info("device enrolled", "account", cfg.Gateway.AccountName(addr), "device", d.Name,
+						"id", hex.EncodeToString(d.DeviceID[:]))
+				}
 			case session.HandshakeFailed:
 				attempts.failed(e)
 			case session.SessionClosed:

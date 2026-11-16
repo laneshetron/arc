@@ -7,20 +7,66 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
 	"syscall"
 	"time"
+
+	"github.com/laneshetron/arc/internal/invite"
 )
 
 // A Request is one operator command (self-service-accounts.md §3.2).
 type Request struct {
-	Op   string   `json:"op"` // add, remove, add-token, revoke, list, takeover
+	Op   string   `json:"op"` // add, remove, add-token, invite, revoke, list, takeover
 	Args []string `json:"args"`
 	// Flags for add: relay access and a device cap.
 	Relay      bool `json:"relay,omitempty"`
 	MaxDevices int  `json:"max_devices,omitempty"`
+	// For invite: how to reach the relay, and how long the invite lasts.
+	Invite *InviteRequest `json:"invite,omitempty"`
+	// RelayKey is the relay's static public key, which an invite pins.
+	// Control.Serve sets it to the running relay's.
+	RelayKey []byte `json:"relay_key,omitempty"`
+}
+
+// An InviteRequest says how an invite's holder reaches the relay
+// (self-service-accounts.md §3.3).
+type InviteRequest struct {
+	Address     string        `json:"address"`
+	UDPPort     uint16        `json:"udp_port,omitempty"`
+	TLSPort     uint16        `json:"tls_port,omitempty"`
+	ServerName  string        `json:"server_name,omitempty"` // the TLS cover host
+	Fingerprint string        `json:"fingerprint,omitempty"`
+	TTL         time.Duration `json:"ttl,omitempty"`
+}
+
+// template checks r and returns the invite it describes, without its ID
+// and secret.
+func (r *InviteRequest) template(relayKey []byte) (*invite.Invite, error) {
+	if r == nil {
+		return nil, errors.New("invite: no relay address given")
+	}
+	if len(relayKey) != 32 {
+		return nil, errors.New("invite: the relay's public key is unknown (pass -relay-key, or run it on the relay's host)")
+	}
+	addr, err := netip.ParseAddr(r.Address)
+	if err != nil {
+		return nil, fmt.Errorf("invite: relay address: %w", err)
+	}
+	if addr = addr.Unmap(); !addr.Is4() {
+		return nil, errors.New("invite: the relay address must be IPv4 (clients reach relays over IPv4 only)")
+	}
+	v := &invite.Invite{Addr: addr, UDPPort: r.UDPPort, TLSPort: r.TLSPort, Fingerprint: r.Fingerprint, ServerName: r.ServerName,
+		RelayKey: [32]byte(relayKey)}
+	if r.UDPPort != 0 {
+		v.Carriers |= invite.CarrierUDP
+	}
+	if r.TLSPort != 0 {
+		v.Carriers |= invite.CarrierTLS
+	}
+	return v, v.Validate()
 }
 
 // A Response answers a Request. Token is set by add-token. An Error
@@ -29,6 +75,7 @@ type Request struct {
 type Response struct {
 	Output string `json:"output,omitempty"`
 	Token  string `json:"token,omitempty"`
+	Invite string `json:"invite,omitempty"`
 	Error  string `json:"error,omitempty"`
 }
 
@@ -61,13 +108,21 @@ func Do(ctx context.Context, w *Writer, req Request, now time.Time) Response {
 		}
 		return ""
 	}
-	want := map[string]int{"add": 1, "remove": 1, "add-token": 1, "revoke": 1}
+	want := map[string]int{"add": 1, "remove": 1, "add-token": 1, "invite": 1, "revoke": 1}
 	n, ok := want[req.Op]
 	if !ok {
 		return Response{Error: fmt.Sprintf("unknown operation %q", req.Op)}
 	}
 	if len(req.Args) < n || len(req.Args) > n+1 || (req.Op != "add-token" && len(req.Args) != n) {
 		return Response{Error: fmt.Sprintf("%s: wrong number of arguments", req.Op)}
+	}
+	var inv *invite.Invite // the invite string, once its ID and secret are set
+	var tmpl *invite.Invite
+	if req.Op == "invite" {
+		var err error
+		if tmpl, err = req.Invite.template(req.RelayKey); err != nil {
+			return Response{Error: err.Error()}
+		}
 	}
 	err := w.Commit(ctx, func(st *State) (err error) {
 		switch req.Op {
@@ -77,6 +132,14 @@ func Do(ctx context.Context, w *Writer, req Request, now time.Time) Response {
 			out, err = RemoveAccount(st, arg(0), now)
 		case "add-token":
 			out, token, err = AddToken(st, arg(0), arg(1), now)
+		case "invite":
+			var i *Invite
+			var secret [16]byte
+			if i, secret, err = AddInvite(st, arg(0), req.Invite.TTL, now); err == nil {
+				inv = tmpl
+				inv.ID, inv.Secret = i.ID, secret
+				out = fmt.Sprintf("invite %v for account %s, single use, expires %s\n", i.ID, arg(0), stamp(i.Expires))
+			}
 		case "revoke":
 			out, err = Revoke(st, arg(0), now)
 		}
@@ -89,20 +152,28 @@ func Do(ctx context.Context, w *Writer, req Request, now time.Time) Response {
 		if token != nil {
 			msg += ", and if the device is there, this is its token: it is not shown again"
 		}
-		return Response{Output: out, Token: string(token), Error: msg}
+		if inv != nil {
+			msg += ", and if the invite is there, this is it: it is not shown again"
+		}
+		return Response{Output: out, Token: string(token), Invite: inviteString(inv), Error: msg}
 	case errors.Is(err, ErrUnavailable):
 		return Response{Error: err.Error() + "; nothing changed"}
 	case err != nil:
 		return Response{Error: err.Error()}
 	}
-	return Response{Output: out, Token: string(token)}
+	return Response{Output: out, Token: string(token), Invite: inviteString(inv)}
 }
 
 // Control is the relay's control socket and writer lock, in one
 // directory: the lock excludes a second writer on the host, a running
 // relay or an offline command, and the socket takes commands while a
 // relay runs.
-type Control struct{ Dir string }
+type Control struct {
+	Dir string
+	// RelayKey is the running relay's static public key, which invites
+	// it hands out pin.
+	RelayKey []byte
+}
 
 func (c Control) socket() string { return filepath.Join(c.Dir, "control.sock") }
 func (c Control) lock() string   { return filepath.Join(c.Dir, "accounts.lock") }
@@ -168,6 +239,7 @@ func (c Control) Serve(ctx context.Context, w *Writer) error {
 				json.NewEncoder(conn).Encode(Response{Error: "bad request: " + err.Error()})
 				return
 			}
+			req.RelayKey = c.RelayKey
 			json.NewEncoder(conn).Encode(Do(ctx, w, req, time.Now()))
 		}()
 	}
@@ -195,4 +267,11 @@ func (c Control) Send(req Request) (Response, error) {
 		return Response{}, err
 	}
 	return resp, nil
+}
+
+func inviteString(v *invite.Invite) string {
+	if v == nil {
+		return ""
+	}
+	return v.String()
 }

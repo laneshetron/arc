@@ -269,6 +269,10 @@ func checkFrameFields(t *testing.T, fr Frame, fields map[string]any) {
 		if v.ID != uint32(num("stream_id")) {
 			t.Errorf("DIAGNOSTICS_OPEN = %+v", v)
 		}
+	case Enrolled:
+		if hex.EncodeToString(v.DeviceID[:]) != fields["device_id_hex"] || v.Name != fields["name"] {
+			t.Errorf("ENROLLED = %+v", v)
+		}
 	case NewPath:
 		if v.PathID != uint32(num("path_id")) || hex.EncodeToString(v.CID[:]) != fields["cid_hex"] ||
 			hex.EncodeToString(v.ResetToken[:]) != fields["reset_token_hex"] {

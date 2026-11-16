@@ -7,6 +7,7 @@ package session
 
 import (
 	"errors"
+	"fmt"
 	"net/netip"
 	"slices"
 	"time"
@@ -57,6 +58,10 @@ var (
 	ErrNoPath         = errors.New("session: no usable path")
 	ErrNoPathSlots    = errors.New("session: relay has not issued a path slot")
 	ErrAuthFailed     = errors.New("session: authentication failed")
+	// ErrInviteUsed and ErrInviteExpired refuse an enrollment (§9.2).
+	// They wrap ErrAuthFailed.
+	ErrInviteUsed    = fmt.Errorf("%w: invite already redeemed by another device", ErrAuthFailed)
+	ErrInviteExpired = fmt.Errorf("%w: invite expired", ErrAuthFailed)
 	// ErrHandshakeTimeout ends a relay session the client never
 	// authenticated, such as one of the extra handshakes a client with
 	// several carriers starts (§9.2).

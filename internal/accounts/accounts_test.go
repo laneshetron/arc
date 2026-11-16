@@ -1,6 +1,7 @@
 package accounts
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"path/filepath"
@@ -724,4 +725,67 @@ func mustGet(t *testing.T, s Store) []byte {
 		t.Fatal(err)
 	}
 	return data
+}
+
+func TestRedeem(t *testing.T) {
+	st := &State{}
+	if _, err := AddAccount(st, "alexei", false, 2); err != nil {
+		t.Fatal(err)
+	}
+	i, secret, err := AddInvite(st, "alexei", time.Hour, t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, key := []byte(strings.Repeat("t", 43)), bytes.Repeat([]byte{1}, 32)
+	if _, err := Redeem(st, i.ID, []byte("wrong secret...."), token, key, "laptop", t0); !errors.Is(err, ErrInviteUnknown) {
+		t.Errorf("wrong secret: %v", err)
+	}
+	d, err := Redeem(st, i.ID, secret[:], token, key, "laptop", t0)
+	if err != nil || d.Name != "laptop" || !bytes.Equal(d.Key, key) || d.Via != i.ID || st.InviteByID(i.ID).Redeemed != d.ID {
+		t.Fatalf("redeem: %+v %v", d, err)
+	}
+	// A repeat is the same device, even past the invite's expiry.
+	if again, err := Redeem(st, i.ID, secret[:], token, key, "laptop", t0.Add(2*time.Hour)); err != nil || again != d {
+		t.Errorf("repeat: %v %v", again, err)
+	}
+	if _, err := Redeem(st, i.ID, secret[:], []byte(strings.Repeat("u", 43)), key, "phone", t0); !errors.Is(err, ErrInviteUsed) {
+		t.Errorf("second device: %v", err)
+	}
+	// The record survives the file, key and all.
+	back, err := Parse(st.Marshal(), t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bd := back.RedeemedBy(back.InviteByID(i.ID), token, key); bd == nil || bd.ID != d.ID {
+		t.Error("redemption lost in the file")
+	}
+
+	i2, s2, _ := AddInvite(st, "alexei", time.Hour, t0)
+	if _, err := Redeem(st, i2.ID, s2[:], []byte(strings.Repeat("v", 43)), key, "laptop", t0.Add(time.Hour)); !errors.Is(err, ErrInviteExpired) {
+		t.Errorf("expired: %v", err)
+	}
+	// A clashing name gets a suffix.
+	d2, err := Redeem(st, i2.ID, s2[:], []byte(strings.Repeat("v", 43)), key, "laptop", t0)
+	if err != nil || d2.Name != "laptop-2" {
+		t.Fatalf("clashing name: %+v %v", d2, err)
+	}
+	i3, s3, _ := AddInvite(st, "alexei", time.Hour, t0)
+	if _, err := Redeem(st, i3.ID, s3[:], []byte(strings.Repeat("w", 43)), key, "", t0); !errors.Is(err, ErrDeviceCap) {
+		t.Errorf("past the cap: %v", err)
+	}
+}
+
+// TestInviteTemplate: invites are minted only for addresses clients can
+// reach, IPv4.
+func TestInviteTemplate(t *testing.T) {
+	key := bytes.Repeat([]byte{1}, 32)
+	for addr, ok := range map[string]bool{"203.0.113.7": true, "::ffff:203.0.113.7": true, "2001:db8::1": false} {
+		v, err := (&InviteRequest{Address: addr, UDPPort: 4433}).template(key)
+		if (err == nil) != ok {
+			t.Errorf("%s: %v", addr, err)
+		}
+		if ok && err == nil && !v.Addr.Is4() {
+			t.Errorf("%s: invite address %v", addr, v.Addr)
+		}
+	}
 }

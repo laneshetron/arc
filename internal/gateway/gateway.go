@@ -6,6 +6,7 @@ package gateway
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"net/netip"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/laneshetron/arc/internal/accounts"
+	"github.com/laneshetron/arc/internal/invite"
 	"github.com/laneshetron/arc/internal/session"
 	"github.com/laneshetron/arc/internal/wire"
 )
@@ -28,7 +30,19 @@ var (
 	// cannot prove its accounts are current. It wraps session.ErrCapacity,
 	// so the client is told the relay is full and retries.
 	ErrNotServing = fmt.Errorf("gateway: not serving accounts: %w", session.ErrCapacity)
+
+	// Enrollment refusals (self-service-accounts.md §3.4). An unknown
+	// invite, or a wrong secret, is refused like a wrong token.
+	ErrUnknownInvite = fmt.Errorf("%w: unknown invite", ErrBadCredential)
+	ErrInviteUsed    = errors.New("gateway: invite already redeemed by another device")
+	ErrInviteExpired = errors.New("gateway: invite expired")
+	ErrDeviceCap     = fmt.Errorf("gateway: account at its device cap: %w", session.ErrCapacity)
 )
+
+// maxEnrolling bounds the enrollments waiting for their commits, or for
+// their clients to hear the outcome. Each invite has at most one commit
+// in flight.
+const maxEnrolling = 64
 
 // Config describes the tunnel network.
 type Config struct {
@@ -52,6 +66,13 @@ type Config struct {
 	// It is called with the gateway locked, so it must not block or call
 	// into the Gateway.
 	Gate func() bool
+	// Commit, if set, commits a change to the accounts store, which the
+	// gateway applies (Apply) before Commit returns: a relay
+	// authenticating from a store passes its writer's Commit. Without
+	// it, the gateway refuses enrollment credentials.
+	Commit func(ctx context.Context, change func(*accounts.State) error) error
+	// Now is the clock for invite expiry; nil uses time.Now.
+	Now func() time.Time
 
 	// HostAddrs are the relay host's own addresses outside the tunnel
 	// network (its LAN or VPC address, say). Like the relay's tunnel
@@ -108,6 +129,23 @@ type Gateway struct {
 	free     []netip.Addr
 	revoke   []Revocation
 	kick     chan struct{}
+
+	st        *accounts.State // the last applied, for enrollments; nil with static accounts
+	enrolling map[enrollKey]*enrollment
+}
+
+// An enrollment is a redemption waiting for its commit, keyed by what
+// makes a repeat of it the same redemption.
+type enrollKey struct {
+	invite accounts.ID
+	token  [32]byte // hash
+	key    [32]byte // the client's Noise static key
+}
+
+type enrollment struct {
+	started time.Time
+	done    bool
+	err     error
 }
 
 func New(cfg Config) (*Gateway, error) {
@@ -130,7 +168,7 @@ func New(cfg Config) (*Gateway, error) {
 			return nil, fmt.Errorf("gateway: deny prefix %v is not IPv4", p)
 		}
 	}
-	g := &Gateway{cfg: cfg, accounts: map[accounts.ID]*Account{}, creds: map[[32]byte]credential{},
+	g := &Gateway{cfg: cfg, accounts: map[accounts.ID]*Account{}, creds: map[[32]byte]credential{}, enrolling: map[enrollKey]*enrollment{},
 		next: cfg.Network.Masked().Addr().Next(), leased: map[netip.Addr]lease{}, kick: make(chan struct{}, 1)}
 	for i := range accts {
 		a := &accts[i]
@@ -184,7 +222,7 @@ func (g *Gateway) Apply(st *accounts.State) {
 		creds[d.TokenHash] = credential{account: g.accounts[d.Account], device: d.ID, name: d.Name, key: d.Key}
 		devices[d.ID] = true
 	}
-	g.creds, g.static = creds, nil
+	g.creds, g.static, g.st = creds, nil, st
 	for addr, l := range g.leased {
 		if !l.revoked && !devices[l.device] {
 			g.revokeLocked(addr, l, wire.CodeAuthFailed, ErrRevoked)
@@ -238,16 +276,35 @@ func (g *Gateway) TakeRevocations() []Revocation {
 //
 // A credential bound to a device key admits only a client with that key
 // (self-service-accounts.md §3.4).
-func (g *Gateway) Authorize(token, clientStatic []byte, prior *wire.AuthResult) (wire.AuthResult, error) {
-	hash := accounts.TokenHash(token)
+func (g *Gateway) Authorize(credential, clientStatic []byte, prior *wire.AuthResult) (wire.AuthResult, error) {
+	a, err := g.AuthorizeSession(credential, clientStatic, prior)
+	return a.Result, err
+}
+
+// AuthorizeSession is the session.Authorizer: Authorize, and for an
+// enrollment credential (self-service-accounts.md §3.4) the device it
+// enrolled, for ENROLLED. An enrollment's commit runs apart from the
+// caller, the relay's session loop: until it is done, the AUTH is left
+// unanswered (session.ErrAuthPending), and the client's repeat of it
+// gets the answer.
+func (g *Gateway) AuthorizeSession(credential, clientStatic []byte, prior *wire.AuthResult) (session.Authorization, error) {
 	// One lock from the gate to the lease, so that an Apply or Suspend
 	// either comes first, and refuses, or comes after, and revokes the
 	// lease this grants.
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.cfg.Gate != nil && !g.cfg.Gate() {
-		return wire.AuthResult{}, ErrNotServing
+		return session.Authorization{}, ErrNotServing
 	}
+	if invite.IsEnrollment(credential) {
+		return g.enrollLocked(credential, clientStatic, prior)
+	}
+	r, err := g.authorizeLocked(credential, clientStatic, prior)
+	return session.Authorization{Result: r}, err
+}
+
+func (g *Gateway) authorizeLocked(token, clientStatic []byte, prior *wire.AuthResult) (wire.AuthResult, error) {
+	hash := accounts.TokenHash(token)
 	c, ok := g.creds[hash]
 	if testHookAuthorize != nil {
 		testHookAuthorize()
@@ -470,4 +527,116 @@ func (g *Gateway) allowTunnel(src, dst netip.Addr) bool {
 	}
 	to, ok := g.leased[dst]
 	return ok && to.account == from.account
+}
+
+func (g *Gateway) now() time.Time {
+	if g.cfg.Now != nil {
+		return g.cfg.Now()
+	}
+	return time.Now()
+}
+
+// enrollLocked authorizes an enrollment credential: a repeat of a
+// redemption already made is authorized as the device's token; a new one
+// starts its commit and is pending.
+func (g *Gateway) enrollLocked(credential, clientStatic []byte, prior *wire.AuthResult) (session.Authorization, error) {
+	e, err := invite.ParseEnrollment(credential)
+	if err != nil || g.st == nil || g.cfg.Commit == nil || len(clientStatic) != 32 {
+		return session.Authorization{}, ErrUnknownInvite
+	}
+	now := g.now()
+	g.sweepEnrolling(now)
+	i, err := g.st.CheckInvite(accounts.ID(e.ID), e.Secret[:])
+	if err != nil {
+		return session.Authorization{}, ErrUnknownInvite
+	}
+	key := enrollKey{invite: i.ID, token: accounts.TokenHash(e.Token), key: [32]byte(clientStatic)}
+	if d := g.st.RedeemedBy(i, e.Token, clientStatic); d != nil {
+		// Made: the client authenticates as the device, and hears which.
+		delete(g.enrolling, key)
+		r, err := g.authorizeLocked(e.Token, clientStatic, prior)
+		if err != nil {
+			return session.Authorization{}, err
+		}
+		return session.Authorization{Result: r, Enrolled: &wire.Enrolled{DeviceID: d.ID, Name: d.Name}}, nil
+	}
+	if p := g.enrolling[key]; p != nil {
+		if !p.done {
+			return session.Authorization{}, session.ErrAuthPending
+		}
+		delete(g.enrolling, key)
+		if p.err != nil {
+			return session.Authorization{}, g.enrollError(p.err, i)
+		}
+	}
+	switch {
+	case !i.Redeemed.IsZero():
+		return session.Authorization{}, g.enrollError(accounts.ErrInviteUsed, i)
+	case !now.Before(i.Expires):
+		return session.Authorization{}, g.enrollError(accounts.ErrInviteExpired, i)
+	case prior != nil:
+		return session.Authorization{}, ErrWrongAccount
+	}
+	// One commit per invite at a time: only one redemption can succeed,
+	// so another device's waits for the outcome instead of taking a slot
+	// (someone holding an invite can't fill the slots with new keys).
+	// Finished ones for the invite are dropped; repeated, they are
+	// decided afresh, against the invite as the store now has it.
+	for k, o := range g.enrolling {
+		if k.invite != i.ID {
+			continue
+		}
+		if !o.done {
+			return session.Authorization{}, session.ErrAuthPending
+		}
+		delete(g.enrolling, k)
+	}
+	if len(g.enrolling) >= maxEnrolling {
+		return session.Authorization{}, fmt.Errorf("gateway: too many enrollments in progress: %w", session.ErrCapacity)
+	}
+	p := &enrollment{started: now}
+	g.enrolling[key] = p
+	token, static := e.Token, [32]byte(clientStatic)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		err := g.cfg.Commit(ctx, func(st *accounts.State) error {
+			_, err := accounts.Redeem(st, accounts.ID(e.ID), e.Secret[:], token, static[:], e.Name, now)
+			return err
+		})
+		g.mu.Lock()
+		p.done, p.err = true, err
+		g.mu.Unlock()
+	}()
+	return session.Authorization{}, session.ErrAuthPending
+}
+
+// enrollError is how the client hears a redemption refused.
+func (g *Gateway) enrollError(err error, i *accounts.Invite) error {
+	account := ""
+	if a := g.st.AccountByID(i.Account); a != nil {
+		account = a.Name
+	}
+	switch {
+	case errors.Is(err, accounts.ErrInviteUsed):
+		return &session.AuthError{Code: wire.CodeInviteUsed, Err: fmt.Errorf("%w (invite %v, account %s)", ErrInviteUsed, i.ID, account)}
+	case errors.Is(err, accounts.ErrInviteExpired):
+		return &session.AuthError{Code: wire.CodeInviteExpired, Err: fmt.Errorf("%w (invite %v, account %s)", ErrInviteExpired, i.ID, account)}
+	case errors.Is(err, accounts.ErrInviteUnknown):
+		return ErrUnknownInvite
+	case errors.Is(err, accounts.ErrDeviceCap):
+		return fmt.Errorf("%w (account %s)", ErrDeviceCap, account)
+	}
+	// Not committed (the store is unreachable, say): the client retries.
+	return fmt.Errorf("gateway: enrollment not committed: %v: %w", err, session.ErrCapacity)
+}
+
+// sweepEnrolling forgets finished enrollments whose clients never came
+// back for the answer.
+func (g *Gateway) sweepEnrolling(now time.Time) {
+	for k, p := range g.enrolling {
+		if p.done && now.Sub(p.started) > 5*time.Minute {
+			delete(g.enrolling, k)
+		}
+	}
 }

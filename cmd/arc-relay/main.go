@@ -258,7 +258,7 @@ func run(args []string) error {
 		Accounts: staticAccounts, Deny: deny,
 	}
 	if writer != nil {
-		gwCfg.Gate = writer.Serving
+		gwCfg.Gate, gwCfg.Commit = writer.Serving, writer.Commit
 	}
 	if gwCfg.HostAddrs, err = hostAddrs(); err != nil {
 		return err
@@ -275,7 +275,7 @@ func run(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if writer != nil {
-		ctl := accounts.Control{Dir: *controlDir}
+		ctl := accounts.Control{Dir: *controlDir, RelayKey: static.Public}
 		unlock, err := ctl.Lock()
 		if err != nil {
 			return fmt.Errorf("-accounts-control %s: %w", *controlDir, err)

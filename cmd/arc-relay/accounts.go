@@ -11,6 +11,7 @@ import (
 
 	"github.com/laneshetron/arc/internal/accounts"
 	"github.com/laneshetron/arc/internal/accounts/s3store"
+	"github.com/laneshetron/arc/internal/keyfile"
 )
 
 const defaultControlDir = "/run/arc-relay"
@@ -56,6 +57,13 @@ func accountsCmd(args []string) error {
 	storeURL := fs.String("store", "", "accounts store, as the relay's -accounts-store (used when no relay is running)")
 	controlDir := fs.String("control", defaultControlDir, "the relay's control directory (-accounts-control)")
 	relay := fs.Bool("relay", false, "add: the account's clients may reach the relay host")
+	inviteAddr := fs.String("address", "", "invite: the relay's public address, which the invite's holder connects to")
+	inviteUDP := fs.Uint("udp-port", 4433, "invite: the relay's UDP port (0: no UDP carrier)")
+	inviteTLS := fs.Uint("tls-port", 0, "invite: the relay's TLS port (0: no TLS carrier); the relay must run with -tls-camouflage, since enrolled devices pose as browsers")
+	inviteCover := fs.String("tls-cover", "", "invite: the host name the TLS carrier poses as (required with -tls-port)")
+	inviteFP := fs.String("tls-fingerprint", "", "invite: shape the TLS ClientHello as this browser's: chrome, edge, safari, ios, or firefox")
+	inviteTTL := fs.Duration("ttl", accounts.DefaultInviteTTL, "invite: how long the invite lasts")
+	relayKey := fs.String("relay-key", "", "invite, with no relay running: the relay's static public key (base64)")
 	maxDevices := fs.Int("max-devices", 0, fmt.Sprintf("add: the account's device cap (default %d, at most %d)", accounts.DefaultMaxDevices, accounts.MaxDevicesLimit))
 	fs.Usage = func() {
 		fmt.Fprintln(fs.Output(), `usage: arc-relay accounts [flags] COMMAND
@@ -64,6 +72,8 @@ commands:
   add NAME                   create an account (-relay, -max-devices)
   remove NAME                delete an account and its devices
   add-token ACCOUNT [DEVICE] add a device with a new token, printed once
+  invite ACCOUNT             print a single-use invite that enrolls a device
+                             (-address, -udp-port, -tls-port, -tls-cover, -ttl)
   revoke ACCOUNT/DEVICE      revoke one device
   takeover                   break the lease of a writer known to be dead
                              (a running relay here takes it at once)
@@ -86,6 +96,20 @@ flags:`)
 	}
 	ctl := accounts.Control{Dir: *controlDir}
 	req := accounts.Request{Op: rest[0], Args: rest[1:], Relay: *relay, MaxDevices: *maxDevices}
+	if req.Op == "invite" {
+		if *inviteUDP > 65535 || *inviteTLS > 65535 {
+			return errors.New("ports are at most 65535")
+		}
+		req.Invite = &accounts.InviteRequest{Address: *inviteAddr, UDPPort: uint16(*inviteUDP), TLSPort: uint16(*inviteTLS),
+			ServerName: *inviteCover, Fingerprint: *inviteFP, TTL: *inviteTTL}
+		if *relayKey != "" {
+			k, err := keyfile.Decode32(*relayKey)
+			if err != nil {
+				return fmt.Errorf("-relay-key: %w", err)
+			}
+			req.RelayKey = k[:]
+		}
+	}
 
 	resp, err := ctl.Send(req)
 	if err == nil {
@@ -138,6 +162,9 @@ func printResponse(r accounts.Response) error {
 	fmt.Print(r.Output)
 	if r.Token != "" {
 		fmt.Println(r.Token)
+	}
+	if r.Invite != "" {
+		fmt.Println(r.Invite)
 	}
 	if r.Error != "" {
 		return errors.New(r.Error)

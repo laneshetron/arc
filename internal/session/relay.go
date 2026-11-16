@@ -22,8 +22,32 @@ import (
 // another, and should reject a credential of a different principal than
 // the one prior's lease belongs to. A non-nil error or a nonzero Status
 // rejects the client; an error wrapping ErrCapacity rejects it as the
-// relay being full, which the client retries.
-type Authorizer func(credential, clientStatic []byte, prior *wire.AuthResult) (wire.AuthResult, error)
+// relay being full, which the client retries; an *AuthError rejects it
+// with its own code. ErrAuthPending leaves the AUTH unanswered, for an
+// Authorizer that is still deciding: the client repeats AUTH (§9.2), and
+// the Authorizer answers a repeat once it can.
+type Authorizer func(credential, clientStatic []byte, prior *wire.AuthResult) (Authorization, error)
+
+// An Authorization is an Authorizer's verdict on a credential the client
+// may use: the session configuration for AUTH_RESULT and, for an
+// enrollment credential, the device it enrolled, for ENROLLED.
+type Authorization struct {
+	Result   wire.AuthResult
+	Enrolled *wire.Enrolled
+}
+
+// ErrAuthPending: the Authorizer cannot decide yet. See Authorizer.
+var ErrAuthPending = errors.New("session: authorization pending")
+
+// An AuthError refuses a credential with a code of its own, in
+// AUTH_RESULT.status and CLOSE, such as CodeInviteUsed. It wraps Err.
+type AuthError struct {
+	Code wire.ErrorCode
+	Err  error
+}
+
+func (e *AuthError) Error() string { return e.Err.Error() }
+func (e *AuthError) Unwrap() error { return e.Err }
 
 // RelayConfig configures a relay endpoint.
 type RelayConfig struct {
@@ -175,6 +199,7 @@ type RelaySession struct {
 	clientStatic  []byte
 	credential    []byte
 	result        wire.AuthResult
+	enrolled      *wire.Enrolled // what ENROLLED said, for a duplicate AUTH
 	created       time.Time
 	established   time.Time // when the client authenticated; zero until then
 	initResends   int       // retransmitted HANDSHAKE_INITs: the client had not heard the response
@@ -672,6 +697,9 @@ func (s *RelaySession) onAuth(now time.Time, credential []byte) bool {
 	r := s.relay
 	if s.state == StateActive && bytes.Equal(credential, s.credential) {
 		s.conn.queue(s.result) // duplicate AUTH: repeat the answer
+		if s.enrolled != nil {
+			s.conn.queue(*s.enrolled)
+		}
 		return true
 	}
 	// Several pending handshakes may race for the last active slot.
@@ -685,7 +713,17 @@ func (s *RelaySession) onAuth(now time.Time, credential []byte) bool {
 	if s.state == StateActive {
 		prior = &s.result
 	}
-	result, err := r.cfg.Authorize(credential, s.clientStatic, prior)
+	auth, err := r.cfg.Authorize(credential, s.clientStatic, prior)
+	result := auth.Result
+	if errors.Is(err, ErrAuthPending) {
+		return true // the client repeats AUTH
+	}
+	var authErr *AuthError
+	if errors.As(err, &authErr) {
+		s.conn.transmit(now, s.conn.path(0), []wire.Frame{wire.AuthResult{Status: uint8(authErr.Code)}, wire.CloseFrame{Code: authErr.Code}})
+		r.closeSession(now, s, authFailure(err, 0), false)
+		return false
+	}
 	if errors.Is(err, ErrCapacity) {
 		// The Authorizer cannot decide now (for instance, its relay is
 		// not serving accounts): the client may retry, as when full.
@@ -704,6 +742,7 @@ func (s *RelaySession) onAuth(now time.Time, credential []byte) bool {
 		s.conn.queue(s.result) // refresh: the lease is unchanged
 		return true
 	}
+	s.enrolled = auth.Enrolled
 	if !r.cfg.NoRedundancy {
 		result.Features |= wire.FeatureRedundancy
 	}
@@ -725,6 +764,9 @@ func (s *RelaySession) onAuth(now time.Time, credential []byte) bool {
 	s.established = now
 	r.leavePending(s)
 	s.conn.queue(result)
+	if s.enrolled != nil {
+		s.conn.queue(*s.enrolled) // reliable: retransmitted until acknowledged
+	}
 	s.conn.setProbeSizes(result.TunMTU, result.Features&(wire.FeatureRedundancy|wire.FeatureFEC) != 0)
 	if result.KeepaliveMS > 0 {
 		s.conn.keepalive = time.Duration(result.KeepaliveMS) * time.Millisecond
@@ -826,8 +868,12 @@ func (s *RelaySession) emit(p *path, b []byte, toCandidate bool) {
 
 func (s *RelaySession) State() State            { return s.state }
 func (s *RelaySession) Config() wire.AuthResult { return s.result }
-func (s *RelaySession) ClientStatic() []byte    { return s.clientStatic }
-func (s *RelaySession) Stats() Stats            { return s.conn.stats }
+
+// Enrolled returns the device the session's enrollment credential
+// enrolled (or re-enrolled, for a repeat), or nil for a token's session.
+func (s *RelaySession) Enrolled() *wire.Enrolled { return s.enrolled }
+func (s *RelaySession) ClientStatic() []byte     { return s.clientStatic }
+func (s *RelaySession) Stats() Stats             { return s.conn.stats }
 
 // Handshake describes how the session began: the address its
 // HANDSHAKE_INIT came from, when it arrived, how many times the client

@@ -304,6 +304,15 @@
       }
     },
     {
+      "name": "ENROLLED",
+      "type": 24,
+      "frame_hex": "18000fd1d2d3d4d5d6d7d8066c6170746f70",
+      "fields": {
+        "device_id_hex": "d1d2d3d4d5d6d7d8",
+        "name": "laptop"
+      }
+    },
+    {
       "name": "UNKNOWN_EXTENSION",
       "type": 159,
       "frame_hex": "9f0002aabb",
@@ -544,6 +553,22 @@
     {
       "name": "diagnostics_open wrong size",
       "hex": "170006000000010000"
+    },
+    {
+      "name": "enrolled empty name",
+      "hex": "180009000000000000000000"
+    },
+    {
+      "name": "enrolled name length mismatch",
+      "hex": "18000c000000000000000005616263"
+    },
+    {
+      "name": "enrolled name too long",
+      "hex": "18002a000000000000000021616161616161616161616161616161616161616161616161616161616161616161"
+    },
+    {
+      "name": "enrolled name invalid",
+      "hex": "18000c000000000000000003612062"
     },
     {
       "name": "redundancy unknown mode",
