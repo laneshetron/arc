@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/netip"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -246,5 +247,103 @@ func TestStaleCredentialDuringAcquisition(t *testing.T) {
 	}
 	if _, err := g.Authorize(ta, nil, nil); !errors.Is(err, ErrBadCredential) {
 		t.Errorf("revoked credential after acquiring: %v", err)
+	}
+}
+
+// lossyStore's writes land but, while lossy, report failure; while
+// blind, reads fail.
+type lossyStore struct {
+	accounts.Store
+	lossy, blind bool
+}
+
+func (s *lossyStore) Put(ctx context.Context, data []byte, ifMatch string) (string, error) {
+	v, err := s.Store.Put(ctx, data, ifMatch)
+	if err == nil && s.lossy {
+		return "", errors.New("connection reset")
+	}
+	return v, err
+}
+
+func (s *lossyStore) Get(ctx context.Context) ([]byte, string, error) {
+	if s.blind {
+		return nil, "", errors.New("store unreachable")
+	}
+	return s.Store.Get(ctx)
+}
+
+// TestUnresolvedRevocation: a revocation the store took without
+// confirming, and that cannot be read back, leaves the relay admitting
+// no one, the revoked device included, until it is resolved.
+func TestUnresolvedRevocation(t *testing.T) {
+	ctx := context.Background()
+	store := &lossyStore{Store: accounts.FileStore{Path: filepath.Join(t.TempDir(), "accounts")}}
+	st, ta, tb := twoAccounts(t)
+	w := &accounts.Writer{Store: store, Holder: "a", Seed: func() (*accounts.State, error) { return st, nil }}
+	if err := w.Acquire(ctx); err != nil {
+		t.Fatal(err)
+	}
+	g := storeGateway(t, w.State(), w.Serving)
+	w.OnState = g.Apply
+	store.lossy, store.blind = true, true
+	err := w.Commit(ctx, func(s *accounts.State) error { _, err := accounts.Revoke(s, "a/laptop", time.Now()); return err })
+	if !errors.Is(err, accounts.ErrIndeterminate) {
+		t.Fatalf("revocation: %v", err)
+	}
+	if _, err := g.Authorize(ta, nil, nil); !errors.Is(err, ErrNotServing) {
+		t.Errorf("revoked device during an unresolved revocation: %v", err)
+	}
+	if _, err := g.Authorize(tb, nil, nil); !errors.Is(err, ErrNotServing) {
+		t.Errorf("another device during an unresolved revocation: %v", err)
+	}
+	// Resolved by the next write, the revocation is found made.
+	store.lossy, store.blind = false, false
+	if err := w.Commit(ctx, func(*accounts.State) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.Authorize(ta, nil, nil); !errors.Is(err, ErrBadCredential) {
+		t.Errorf("revoked device after resolution: %v", err)
+	}
+	if _, err := g.Authorize(tb, nil, nil); err != nil {
+		t.Errorf("other device after resolution: %v", err)
+	}
+}
+
+// TestResolutionAppliesBeforeAdmitting: once an unresolved revocation is
+// found made, the relay keeps admitting no one until the gateway has the
+// new credentials.
+func TestResolutionAppliesBeforeAdmitting(t *testing.T) {
+	ctx := context.Background()
+	store := &lossyStore{Store: accounts.FileStore{Path: filepath.Join(t.TempDir(), "accounts")}}
+	st, ta, _ := twoAccounts(t)
+	w := &accounts.Writer{Store: store, Holder: "a", Seed: func() (*accounts.State, error) { return st, nil }}
+	if err := w.Acquire(ctx); err != nil {
+		t.Fatal(err)
+	}
+	g := storeGateway(t, w.State(), w.Serving)
+	w.OnState = g.Apply
+	store.lossy, store.blind = true, true
+	if err := w.Commit(ctx, func(s *accounts.State) error { _, err := accounts.Revoke(s, "a/laptop", time.Now()); return err }); !errors.Is(err, accounts.ErrIndeterminate) {
+		t.Fatalf("revocation: %v", err)
+	}
+	store.lossy, store.blind = false, false
+	applying, apply := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	w.OnState = func(s *accounts.State) {
+		once.Do(func() { close(applying); <-apply })
+		g.Apply(s)
+	}
+	done := make(chan error)
+	go func() { done <- w.Commit(ctx, func(*accounts.State) error { return nil }) }()
+	<-applying
+	if _, err := g.Authorize(ta, nil, nil); !errors.Is(err, ErrNotServing) {
+		t.Errorf("revoked device while its revocation is being applied: %v", err)
+	}
+	close(apply)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.Authorize(ta, nil, nil); !errors.Is(err, ErrBadCredential) {
+		t.Errorf("revoked device once applied: %v", err)
 	}
 }

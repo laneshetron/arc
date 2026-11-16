@@ -417,8 +417,10 @@ func TestUnconfirmedWrite(t *testing.T) {
 	if !strings.Contains(resp.Error, "may or may not") || !ValidToken([]byte(resp.Token)) {
 		t.Fatalf("unconfirmed add-token: %+v", resp)
 	}
-	if !w.Serving() {
-		t.Fatal("an unconfirmed write ended serving")
+	// Its credentials may be stale, so it admits no one, but keeps the
+	// lease.
+	if w.Serving() || !w.live() {
+		t.Fatalf("after an unconfirmed write: serving %v, live %v", w.Serving(), w.live())
 	}
 	if err := add("y"); !errors.Is(err, ErrIndeterminate) {
 		t.Fatalf("commit over an unresolved write: %v", err)
@@ -430,6 +432,9 @@ func TestUnconfirmedWrite(t *testing.T) {
 	resp = Do(ctx, w, Request{Op: "add-token", Args: []string{"x", "laptop"}}, t0)
 	if !strings.Contains(resp.Error, "already has a device laptop") {
 		t.Fatalf("retried add-token: %+v", resp)
+	}
+	if !w.Serving() {
+		t.Fatal("not serving once the write was resolved")
 	}
 	if d := w.State().device(w.State().AccountByName("x").ID, "laptop"); d == nil || d.TokenHash != TokenHash([]byte(token)) {
 		t.Fatal("the device found is not the one whose token was handed out")
@@ -612,4 +617,111 @@ func TestReleaseResponseLost(t *testing.T) {
 	if w.Serving() {
 		t.Fatal("serving alongside the successor")
 	}
+}
+
+// retriedStore applies a write and then, once, reports a conflict, as a
+// client retrying a write it already made sees its condition fail.
+type retriedStore struct {
+	Store
+	once bool
+}
+
+func (s *retriedStore) Put(ctx context.Context, data []byte, ifMatch string) (string, error) {
+	v, err := s.Store.Put(ctx, data, ifMatch)
+	if err == nil && s.once {
+		s.once = false
+		return "", ErrConflict
+	}
+	return v, err
+}
+
+// TestRetriedWriteConflict: a conflict caused by this writer's own write,
+// retried, is confirmed by reading the store back, not taken for losing
+// the lease.
+func TestRetriedWriteConflict(t *testing.T) {
+	ctx := context.Background()
+	store := &retriedStore{Store: FileStore{Path: filepath.Join(t.TempDir(), "accounts")}}
+	c := &clock{t: t0}
+	w := newWriter(t, store, "a", c)
+	lost := 0
+	w.OnLost = func(error) { lost++ }
+	if err := w.Acquire(ctx); err != nil {
+		t.Fatal(err)
+	}
+	store.once = true
+	if err := w.Commit(ctx, func(s *State) error { _, err := AddAccount(s, "x", false, 0); return err }); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if lost != 0 || !w.Serving() || w.State().AccountByName("x") == nil {
+		t.Fatalf("after a retried write: lost %d, serving %v", lost, w.Serving())
+	}
+	// A real conflict still loses the lease.
+	if err := newWriter(t, store, "b", c).Takeover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Commit(ctx, func(*State) error { return nil }); !errors.Is(err, ErrNotWriter) || lost != 1 {
+		t.Fatalf("after a takeover: %v, lost %d", err, lost)
+	}
+}
+
+// TestTakeoverThroughDo: a waiting writer, told to take over, breaks the
+// live lease and serves.
+func TestTakeoverThroughDo(t *testing.T) {
+	ctx := context.Background()
+	store := FileStore{Path: filepath.Join(t.TempDir(), "accounts")}
+	c := &clock{t: t0}
+	if err := newWriter(t, store, "dead", c).Acquire(ctx); err != nil {
+		t.Fatal(err)
+	}
+	w := newWriter(t, store, "b", c)
+	if resp := Do(ctx, w, Request{Op: "takeover"}, t0); resp.Error != "" || !w.Serving() {
+		t.Fatalf("takeover: %+v, serving %v", resp, w.Serving())
+	}
+}
+
+// TestStateSizeLimit: a commit that would make the accounts larger than
+// the limit is refused before it reaches the store; one at the limit
+// commits and reads back.
+func TestStateSizeLimit(t *testing.T) {
+	ctx := context.Background()
+	store := FileStore{Path: filepath.Join(t.TempDir(), "accounts")}
+	c := &clock{t: t0}
+	w := newWriter(t, store, "a", c)
+	if err := w.Acquire(ctx); err != nil {
+		t.Fatal(err)
+	}
+	add := func(name string) error {
+		return w.Commit(ctx, func(s *State) error { _, err := AddAccount(s, name, false, 0); return err })
+	}
+	if err := add("x"); err != nil {
+		t.Fatal(err)
+	}
+	defer func(old int) { maxStateSize = old }(maxStateSize)
+	// The limit: what adding y makes, with a little room for the lease's
+	// expiry to serialize differently.
+	next := w.State().Clone()
+	AddAccount(next, "y", false, 0)
+	next.Generation++
+	maxStateSize = len(next.Marshal()) + 16
+	if err := add("y"); err != nil {
+		t.Fatalf("at the limit: %v", err)
+	}
+	if _, err := Parse(mustGet(t, store), t0); err != nil {
+		t.Fatalf("reading back: %v", err)
+	}
+	if err := add("a-much-longer-account-name"); err == nil || !strings.Contains(err.Error(), "limit") {
+		t.Fatalf("over the limit: %v", err)
+	}
+	if strings.Contains(string(mustGet(t, store)), "a-much-longer") || w.State().AccountByName("a-much-longer-account-name") != nil {
+		t.Fatal("the oversized change was committed")
+	}
+}
+
+func mustGet(t *testing.T, s Store) []byte {
+	t.Helper()
+	data, _, err := s.Get(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
 }

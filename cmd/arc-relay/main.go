@@ -152,7 +152,7 @@ func run(args []string) error {
 	listen := fs.String("listen", "0.0.0.0:4433", "UDP address to listen on")
 	keyFile := fs.String("key-file", "relay.key", "relay static private key (from genkey)")
 	resetFile := fs.String("reset-secret-file", "reset.secret", "stateless reset secret; created if missing, keep it across restarts")
-	storeURL := fs.String("accounts-store", "", "keep accounts in this store instead of reading -tokens-file once: file:PATH. The relay then changes accounts while it runs (arc-relay accounts), and authenticates only while it holds the store's writer lease; an empty store is seeded from -tokens-file, if it exists")
+	storeURL := fs.String("accounts-store", "", "keep accounts in this store instead of reading -tokens-file once: s3://BUCKET/KEY (credentials and AWS_REGION from the environment or instance role) or file:PATH. The relay then changes accounts while it runs (arc-relay accounts), and authenticates only while it holds the store's writer lease; an empty store is seeded from -tokens-file, if it exists")
 	controlDir := fs.String("accounts-control", defaultControlDir, "with -accounts-store: directory for the control socket and the writer lock")
 	holder := fs.String("accounts-holder", defaultHolder(), "with -accounts-store: this relay's name in the writer lease, for operators")
 	accountsLease := fs.Duration("accounts-lease", accounts.DefaultLease, "with -accounts-store: writer lease length, the longest a store outage goes unnoticed by clients, and the longest a revocation takes to reach a relay that lost the store")
