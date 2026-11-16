@@ -49,6 +49,9 @@ jobs:
       - name: account isolation end to end in network namespaces
         if: success() || failure()
         run: sudo ./test/netns/accounts.sh bin
+      - name: accounts store end to end in network namespaces
+        if: success() || failure()
+        run: sudo ./test/netns/store.sh bin
 
   degraded:
     runs-on: ubuntu-latest

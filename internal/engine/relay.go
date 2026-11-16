@@ -166,9 +166,14 @@ func RunRelay(ctx context.Context, cfg RelayConfig) error {
 		for e, ok := r.PollEvent(); ok; e, ok = r.PollEvent() {
 			switch e := e.(type) {
 			case session.SessionEstablished:
-				cfg.Gateway.Bind(e.Session)
 				addr := netip.AddrFrom4(e.Session.Config().IPv4)
-				attempts.established(e.Session, time.Now(), "address", addr, "account", cfg.Gateway.AccountName(addr))
+				if !cfg.Gateway.Bind(e.Session) {
+					// Revoked between AUTH and now.
+					r.Revoke(time.Now(), e.Session, wire.CodeAuthFailed, gateway.ErrRevoked)
+					continue
+				}
+				attempts.established(e.Session, time.Now(), "address", addr, "account", cfg.Gateway.AccountName(addr),
+					"device", cfg.Gateway.DeviceName(addr))
 			case session.HandshakeFailed:
 				attempts.failed(e)
 			case session.SessionClosed:
@@ -176,7 +181,8 @@ func RunRelay(ctx context.Context, cfg RelayConfig) error {
 					attempts.unestablished(e.Session, e.Err)
 				} else {
 					addr := netip.AddrFrom4(e.Session.Config().IPv4)
-					log.Info("session closed", "address", addr, "account", cfg.Gateway.AccountName(addr), "reason", e.Err)
+					log.Info("session closed", "address", addr, "account", cfg.Gateway.AccountName(addr),
+						"device", cfg.Gateway.DeviceName(addr), "reason", e.Err)
 				}
 				cfg.Gateway.Release(e.Session)
 				for k, b := range bridges {
@@ -273,6 +279,14 @@ func RunRelay(ctx context.Context, cfg RelayConfig) error {
 			}
 		case e := <-bridgeEvents:
 			e.b.handle(time.Now(), e)
+		case <-cfg.Gateway.Revocations():
+			now := time.Now()
+			for _, rv := range cfg.Gateway.TakeRevocations() {
+				addr := netip.AddrFrom4(rv.Session.Config().IPv4)
+				log.Warn("session revoked", "address", addr, "account", cfg.Gateway.AccountName(addr),
+					"device", cfg.Gateway.DeviceName(addr), "reason", rv.Err)
+				r.Revoke(now, rv.Session, rv.Code, rv.Err)
+			}
 		case <-refusalTicker.C:
 			var tls stream.Refusals
 			if refusers != nil {
