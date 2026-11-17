@@ -62,13 +62,14 @@ func (r *registry) addr() netip.AddrPort {
 // or the registry closes, and forgets it. The caller has finished any
 // transport-level handshake it required. opened, if set, learns the
 // carrier's address once registered; serve returns that address
-// (invalid if conn was refused) and the transport error that ended it.
-func (r *registry) serve(conn net.Conn, opened func(netip.AddrPort)) (netip.AddrPort, error) {
+// (invalid if conn was refused), how many packets were still queued for
+// it when it ended, and the transport error that ended it.
+func (r *registry) serve(conn net.Conn, opened func(netip.AddrPort)) (netip.AddrPort, int, error) {
 	r.mu.Lock()
 	if len(r.links) >= r.maxConns || r.ctx.Err() != nil {
 		r.mu.Unlock()
 		conn.Close()
-		return netip.AddrPort{}, errRegistryFull
+		return netip.AddrPort{}, 0, errRegistryFull
 	}
 	k := newLink(conn, r.addr(), r.queue, r.idle)
 	r.links[k.addr] = k
@@ -82,7 +83,7 @@ func (r *registry) serve(conn net.Conn, opened func(netip.AddrPort)) (netip.Addr
 	r.mu.Lock()
 	delete(r.links, k.addr)
 	r.mu.Unlock()
-	return k.addr, err
+	return k.addr, k.drain(), err
 }
 
 var errRegistryFull = errors.New("stream: carrier limit reached or endpoint closed")

@@ -109,6 +109,7 @@ type Client struct {
 	spare     *dialed
 	spareBusy bool // a spare dial is running and will send on spareCh
 	spareCh   chan dialed
+	moved     chan struct{} // see Moved
 
 	endpoints    []netip.AddrPort
 	nextEndpoint int
@@ -129,7 +130,7 @@ func Dial(opts ClientOptions) *Client {
 	}
 	ctx, stop := context.WithCancel(context.Background())
 	c := &Client{opts: opts, in: make(chan inbound, opts.Queue), ctx: ctx, stop: stop,
-		budget: max(opts.RotateBytes, 0), spareCh: make(chan dialed, 1)}
+		budget: max(opts.RotateBytes, 0), spareCh: make(chan dialed, 1), moved: make(chan struct{}, 1)}
 	go c.connectLoop()
 	return c
 }
@@ -167,6 +168,10 @@ func (c *Client) connectLoop() {
 			l.track, l.rotateAt = track, c.budget
 		}
 		c.setLink(l) // before OnState, so a write it prompts is not dropped
+		select {
+		case c.moved <- struct{}{}:
+		default:
+		}
 		if c.opts.OnState != nil {
 			c.opts.OnState(nil)
 		}
@@ -461,6 +466,13 @@ func (c *Client) setLink(l *link) {
 	c.cur = l
 	c.mu.Unlock()
 }
+
+// Moved receives a value each time the carrier starts writing on a new
+// connection (after a redial or a rotation). The relay sends to the old
+// one until a packet reaches it on the new one, so the session should
+// send one at once (session.Client.Probe) rather than wait to have
+// something to say: a client that is only receiving has nothing.
+func (c *Client) Moved() <-chan struct{} { return c.moved }
 
 // Connected reports whether the carrier has a connection now.
 func (c *Client) Connected() bool {

@@ -103,6 +103,9 @@ func (a *AttemptLog) TLS(r stream.ConnReport) {
 		args = append(args, "err", r.Err)
 	}
 	if r.Addr.IsValid() {
+		if r.Unsent > 0 {
+			args = append(args, "unsent_packets", r.Unsent)
+		}
 		a.line(slog.LevelInfo, "tls carrier closed", append(args, "carrier", r.Addr)...)
 		return
 	}

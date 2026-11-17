@@ -191,11 +191,11 @@ func (f *Front) handle(w http.ResponseWriter, r *http.Request) {
 		go func() {
 			var opened func(netip.AddrPort)
 			if report != nil {
-				opened = func(a netip.AddrPort) { report(raw.report(true, a, nil)) }
+				opened = func(a netip.AddrPort) { report(raw.report(true, a, 0, nil)) }
 			}
-			addr, err := f.reg.serve(pc, opened)
+			addr, unsent, err := f.reg.serve(pc, opened)
 			if report != nil && f.reg.ctx.Err() == nil {
-				report(raw.report(false, addr, err))
+				report(raw.report(false, addr, unsent, err))
 			}
 		}()
 		return

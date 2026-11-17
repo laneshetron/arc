@@ -225,6 +225,14 @@ func RunClient(ctx context.Context, cfg ClientConfig) error {
 		go readDatagrams(ctx, i, cr.Conn, udpCh, errc)
 	}
 	go readPackets(ctx, cfg.TUN, tunCh, errc)
+	// Carriers that move between connections (stream carriers) report
+	// each move, so the session can announce itself on the new one.
+	movedCh := make(chan int, len(cfg.Carriers))
+	for i, cr := range cfg.Carriers {
+		if m, ok := cr.Conn.(interface{ Moved() <-chan struct{} }); ok {
+			go forwardMoves(ctx, i, m.Moved(), movedCh)
+		}
+	}
 
 	// hs tracks where handshake packets go: every carrier, or only the one
 	// a COOKIE_REPLY arrived on, since the cookie is valid only for that
@@ -507,6 +515,10 @@ func RunClient(ctx context.Context, cfg ClientConfig) error {
 			b.service(now)
 		case e := <-bridgeEvents:
 			e.b.handle(time.Now(), e)
+		case i := <-movedCh:
+			if cs := carriers[i]; cs.bound {
+				c.Probe(time.Now(), cs.path)
+			}
 		case <-status:
 			logPaths(log, slog.LevelInfo, c, carriers, time.Now())
 		case <-snapshots:
@@ -532,6 +544,22 @@ func RunClient(ctx context.Context, cfg ClientConfig) error {
 				continue
 			}
 			c.Tick(now)
+		}
+	}
+}
+
+// forwardMoves passes carrier i's connection moves to out until ctx ends.
+func forwardMoves(ctx context.Context, i int, moved <-chan struct{}, out chan<- int) {
+	for {
+		select {
+		case <-moved:
+		case <-ctx.Done():
+			return
+		}
+		select {
+		case out <- i:
+		case <-ctx.Done():
+			return
 		}
 	}
 }

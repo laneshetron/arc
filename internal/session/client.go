@@ -260,6 +260,21 @@ func (c *Client) SetFallback(id uint32, fallback bool) {
 	}
 }
 
+// Probe sends a PING on a validated path now. The engine calls it when
+// the transport under the path has moved to a new connection (a stream
+// carrier's redial or rotation): the relay keeps sending on the old one
+// until it hears from the new one, and a client with nothing to say
+// would otherwise stay silent until its next keepalive.
+func (c *Client) Probe(now time.Time, id uint32) {
+	c.observe(now)
+	if c.state != StateActive {
+		return
+	}
+	if p := c.conn.path(id); p != nil && p.validated {
+		c.conn.transmit(now, p, []wire.Frame{wire.Ping{}})
+	}
+}
+
 // HandshakeAttempt numbers the current handshake attempt. It changes when
 // the client starts over with a new ephemeral key, which invalidates any
 // cookie the previous attempt held.

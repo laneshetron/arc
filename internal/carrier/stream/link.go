@@ -117,6 +117,20 @@ func (l *link) send(pkt []byte) bool {
 	}
 }
 
+// drain empties a closed link's queue, returning how many packets it held.
+func (l *link) drain() int {
+	n := 0
+	for {
+		select {
+		case p := <-l.out:
+			bufpool.Put(p)
+			n++
+		default:
+			return n
+		}
+	}
+}
+
 func (l *link) close() {
 	l.once.Do(func() {
 		close(l.done)

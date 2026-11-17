@@ -33,6 +33,9 @@ type ConnReport struct {
 	// BytesIn and BytesOut count bytes on the TCP connection, TLS records
 	// included (and, on the front, the HTTP upgrade).
 	BytesIn, BytesOut int64
+	// Unsent counts packets still queued for the carrier when it ended:
+	// dropped, as a congested link would drop them.
+	Unsent int
 	// Err ends the connection, if it ended with one: a failed TLS
 	// handshake, ErrALPN, or the carrier's transport error.
 	Err error
@@ -86,10 +89,10 @@ func noteHello(cfg *tls.Config) {
 
 // report describes c for a ConnReport, with the carrier's address and
 // the error that ended it.
-func (c *countedConn) report(open bool, addr netip.AddrPort, err error) ConnReport {
+func (c *countedConn) report(open bool, addr netip.AddrPort, unsent int, err error) ConnReport {
 	return ConnReport{
 		Open: open, Peer: peerOf(c), Addr: addr, Hello: c.hello, ServerName: c.serverName, ALPN: c.alpn,
-		Duration: time.Since(c.accepted), BytesIn: c.in.Load(), BytesOut: c.out.Load(), Err: err,
+		Duration: time.Since(c.accepted), BytesIn: c.in.Load(), BytesOut: c.out.Load(), Unsent: unsent, Err: err,
 	}
 }
 

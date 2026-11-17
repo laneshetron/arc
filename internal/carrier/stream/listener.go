@@ -155,9 +155,10 @@ func (l *Listener) serve(raw *countedConn, p *permit) {
 	conn := tls.Server(raw, l.tls)
 	var addr netip.AddrPort
 	var err error
+	var unsent int
 	report := func(open bool) {
 		if l.opts.Report != nil {
-			l.opts.Report(raw.report(open, addr, err))
+			l.opts.Report(raw.report(open, addr, unsent, err))
 		}
 	}
 	defer func() {
@@ -188,7 +189,7 @@ func (l *Listener) serve(raw *countedConn, p *permit) {
 		return
 	}
 	p.established()
-	addr, err = l.reg.serve(conn, func(a netip.AddrPort) {
+	addr, unsent, err = l.reg.serve(conn, func(a netip.AddrPort) {
 		addr = a
 		report(true)
 	})

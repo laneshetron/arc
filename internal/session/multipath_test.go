@@ -518,3 +518,25 @@ func TestCapacityForgottenAfterOutage(t *testing.T) {
 		}
 	}
 }
+
+// TestProbeMovesDownlink: a client that is only receiving has nothing to
+// send when its transport moves to a new connection, so the relay keeps
+// sending to the old one (frozen, for a stream carrier under the TSPU
+// freeze) until the next keepalive. Probe announces the new address at
+// once, and the relay migrates within a few round trips.
+func TestProbeMovesDownlink(t *testing.T) {
+	for _, probe := range []bool{false, true} {
+		n := newNetwork(t, 34, defaultRelayConfig(), ClientConfig{})
+		s := n.establish()
+		n.runFor(time.Second) // quiet: nothing outstanding either way
+		n.rebind(0, "192.0.2.10:41000")
+		if probe {
+			n.client.Probe(n.now, 0)
+		}
+		n.runFor(200 * time.Millisecond)
+		moved := s.Addr(n.now) == netip.MustParseAddrPort("192.0.2.10:41000")
+		if moved != probe {
+			t.Errorf("probe %v: downlink moved within 200 ms: %v", probe, moved)
+		}
+	}
+}
