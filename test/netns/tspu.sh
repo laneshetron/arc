@@ -74,6 +74,14 @@ for nsdev in tspu-c:c0 tspu-t:t0 tspu-t:t1 tspu-s:s0 tspu-s:s1 tspu-i:i0; do
   ip netns exec "$ns" ethtool -K "$dev" tx off tso off gso off gro off >/dev/null 2>&1 || true
   ip -n "$ns" link set "$dev" up
 done
+# DELAY (e.g. 25ms) delays each direction of the censored link, for
+# round trips like a real path's: a fresh TCP connection's first flight
+# is then limited by its initial window, as it is in the field, rather
+# than by a sub-millisecond RTT.
+if [[ -n ${DELAY:-} ]]; then
+  $C tc qdisc add dev c0 root netem delay "$DELAY" limit 10000
+  $S tc qdisc add dev s0 root netem delay "$DELAY" limit 10000
+fi
 $S sysctl -qw net.ipv4.ip_forward=1
 $S iptables -t nat -A POSTROUTING -s 10.77.0.0/16 -o s1 -j MASQUERADE
 
