@@ -249,7 +249,7 @@ type conn struct {
 	// the path for each IP packet (the primary when nil); see sched.go.
 	primary func(now time.Time) *path
 	pathFor func(now time.Time, pkt []byte) *path
-	emit    func(p *path, b []byte, toCandidate bool)
+	emit    func(p *path, b []byte, toCandidate, ackEliciting bool)
 
 	ackedThisEpoch bool
 	keepalive      time.Duration
@@ -805,7 +805,7 @@ func (c *conn) sealPacket(now time.Time, p *path, pt []byte, retx []wire.Frame, 
 	}
 	p.lastSend = now
 	c.stats.PacketsSent++
-	c.emit(p, pkt, toCandidate)
+	c.emit(p, pkt, toCandidate, ackEliciting)
 	c.maybeRekey(now)
 }
 

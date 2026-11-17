@@ -319,7 +319,23 @@ func (c *Client) WriteBatch(pkts [][]byte, _ []netip.AddrPort) error {
 		return nil
 	}
 	for _, p := range pkts {
-		l.send(p)
+		l.send(p, false)
+	}
+	return nil
+}
+
+// WriteBatchEliciting is WriteBatch, told which packets the relay owes a
+// reply (an acknowledgement within its maximum ACK delay). Only those arm
+// stall detection (StallTimeout); WriteBatch arms it for none.
+func (c *Client) WriteBatchEliciting(pkts [][]byte, _ []netip.AddrPort, eliciting []bool) error {
+	c.mu.Lock()
+	l := c.cur
+	c.mu.Unlock()
+	if l == nil {
+		return nil
+	}
+	for i, p := range pkts {
+		l.send(p, eliciting[i])
 	}
 	return nil
 }
