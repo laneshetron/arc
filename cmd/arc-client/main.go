@@ -118,8 +118,8 @@ func run(args []string) error {
 	tlsFragment := fs.Int("tls-fragment", 0, "send the TLS ClientHello in TCP segments of at most this many bytes (optional; the relay certificate is still verified unless -tls-cover is set)")
 	frontAddr := fs.String("front", "", "relay HTTPS front endpoint, host:port: like -tls, but the carrier rides an authenticated HTTP upgrade inside an ordinary HTTPS session; the relay's front serves cover content to everyone else. The admission token is the session's -token-file token. -tls-cover, -tls-fingerprint, and -tls-fragment shape the outer handshake as for -tls")
 	noOffload := fs.Bool("no-offload", false, "send and receive without UDP GSO/GRO, for comparison")
-	censorship := fs.Bool("censorship", false, "censorship posture: presume the relay sits on foreign hosting behind a censor that bans an address for minutes after UDP to it (TSPU), so open no UDP carrier to an address a -tls or -front carrier uses (spec/freeze-and-udp-ban.md §4)")
 	noUDP := fs.Bool("no-udp", false, "open no UDP carriers: reach the relay only through -tls or -front (-relay is then the session's address, the -tls endpoint, say)")
+	censorship := fs.Bool("censorship", false, "censorship posture: presume the relay sits on foreign hosting behind a censor that bans an address for minutes after UDP to it (TSPU), so open no UDP carrier to an address a -tls or -front carrier uses (spec/freeze-and-udp-ban.md §4)")
 	fecMode := wire.FECAuto
 	fs.Func("fec", "forward error correction: auto (default; while loss is at least 0.5%), off, or always", func(v string) error {
 		switch v {
