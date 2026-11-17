@@ -51,7 +51,7 @@ redials.
   from `TCP_INFO`, so it works the same on every OS and through every
   TLS profile. A read of any frame is progress. An idle connection
   (nothing written) never stalls, so keepalive spacing is irrelevant.
-- **Stall timeout:** 2 s by default, at most once per connection. The
+- **Stall timeout:** 2 s by default. The
   session already sends a PING at least every PTO on a suspect path
   (§14.1), so a frozen connection has writes outstanding within one PTO
   of freezing, and the relay answers any ack-eliciting packet within a
@@ -88,18 +88,29 @@ smaller received count. That's `bulk_throttle = after-N-bytes` in the
 profile (§6.1). A configured budget (`-stream-rotate-bytes`) skips the
 learning, for a profile that already knows the regime.
 
-**Make before break.** When the current connection has received half
-its budget, the carrier dials a successor in the background. Once the
-successor is up, the carrier *writes* only on it and keeps *reading*
-both. The relay sees authenticated packets from a new synthetic address
-and migrates the path's downlink there after one validation round trip
-(§14.5); until then it keeps sending on the old connection, which still
-has the other half of its budget. The old connection is closed once it
-has been quiet for the stall timeout or has received its full budget.
+**Make before break.** Once a budget is known, the carrier keeps one
+spare connection dialed ahead (TLS and any front upgrade done, nothing
+sent on it yet). When the current connection has received its budget,
+the carrier *writes* only on the spare and keeps *reading* both, then
+dials the next spare. The relay sees authenticated packets from a new
+synthetic address and migrates the path's downlink there (§14.5); until
+then it keeps sending on the old connection, which still has the other
+half of the cap. The old connection is closed one stall timeout after
+the switch. A spare older than a minute is replaced before use.
+
+The relay's downlink lag is the weak point: whatever the relay has
+queued or sent on the old connection past the cap is lost (the inner
+connections recover it), and §14.5 holds the downlink there for a
+validation round trip. Moving it at once for stream-to-stream changes
+is safe (a stream address is a TCP connection that completed TLS with
+the relay, and its packets cannot be captured for replay), but the
+measured gain decides whether it is worth the special case.
 
 **Cost and limits.** Throughput is bounded by budget per connection
-setup: one TCP+TLS(+front upgrade) handshake, 3–4 RTTs, per ~8 KB of
-downlink. At a 50 ms RTT that is ~40–60 KB/s. This is a survival mode,
+setup: with a warm spare, the switch itself costs about one round trip,
+but each connection still costs a TCP+TLS(+front upgrade) handshake,
+3–4 RTTs, per ~8 KB of downlink, so the dial rate bounds it: at a 50 ms
+RTT, ~40–60 KB/s. This is a survival mode,
 not a data plane: enough for messaging and a usable web, not for video.
 Pre-dialing several successors would multiply it, at the price of many
 short, same-sized TLS connections to one address, a shape a classifier
