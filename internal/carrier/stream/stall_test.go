@@ -514,3 +514,29 @@ func TestLearnedBudgetPerDestination(t *testing.T) {
 		t.Errorf("%v got budget %d from %v's stalls", b, c.budget(b), a)
 	}
 }
+
+// TestRefusedPacketDoesNotArmStall: a reply-eliciting packet the full
+// queue refuses was never sent, so no reply is owed and the healthy
+// link must not stall waiting for one.
+func TestRefusedPacketDoesNotArmStall(t *testing.T) {
+	near, far := net.Pipe()
+	t.Cleanup(func() { near.Close(); far.Close() })
+	l := newLink(near, netip.AddrPort{}, 1, 0)
+	l.stall = 100 * time.Millisecond
+	if !l.send(bytes.Repeat([]byte{1}, 100), false) { // fills the queue
+		t.Fatal("first packet refused")
+	}
+	if l.send(bytes.Repeat([]byte{2}, 100), true) {
+		t.Fatal("second packet accepted by a full queue")
+	}
+	go func() { io.Copy(io.Discard, far) }() // the peer drains, owes nothing
+	in := make(chan inbound, 1)
+	ran := make(chan error, 1)
+	go func() { ran <- l.run(in) }()
+	select {
+	case err := <-ran:
+		t.Fatalf("healthy link closed: %v", err)
+	case <-time.After(500 * time.Millisecond):
+	}
+	l.close()
+}
