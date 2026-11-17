@@ -18,10 +18,14 @@ import (
 
 // carrierOptions are the flags that choose a client's carriers.
 type carrierOptions struct {
-	Relay      netip.AddrPort
-	Binds      []string
-	NoOffload  bool
-	NoUDP      bool // only the TLS and front carriers
+	Relay     netip.AddrPort
+	Binds     []string
+	NoOffload bool
+	NoUDP     bool // only the TLS and front carriers
+	// Censorship holds UDP back from any relay address a stream carrier
+	// uses: under TSPU, UDP to foreign hosting gets the whole address
+	// banned for minutes, stream carriers included.
+	Censorship bool
 	FullTunnel bool
 	Mark       uint32
 
@@ -50,6 +54,11 @@ func openCarriers(log *slog.Logger, o carrierOptions) ([]engine.Carrier, func(),
 	}
 	if !o.Relay.Addr().Unmap().Is4() {
 		return fail(fmt.Errorf("relay %v: only IPv4 relays are supported", o.Relay.Addr()))
+	}
+	if o.Censorship && !o.NoUDP && sharesStreamAddr(log, o) {
+		log.Info("censorship posture: no UDP to the relay; a UDP ban on its address would take the TLS carriers down too",
+			"relay", o.Relay.Addr())
+		o.NoUDP = true
 	}
 	binds := append([]string(nil), o.Binds...)
 	// Each carrier talks only to the relay, so its socket is connected.
@@ -148,4 +157,30 @@ func openCarriers(log *slog.Logger, o carrierOptions) ([]engine.Carrier, func(),
 		}
 	}
 	return carriers, closeAll, nil
+}
+
+// sharesStreamAddr reports whether a stream carrier (-tls or -front)
+// reaches the relay at the UDP carriers' address. A stream endpoint that
+// cannot be resolved yet counts as shared: the answer that risks a ban
+// is the one to avoid.
+func sharesStreamAddr(log *slog.Logger, o carrierOptions) bool {
+	relay := o.Relay.Addr().Unmap()
+	for _, addr := range []string{o.TLS, o.Front} {
+		if addr == "" {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		eps, err := stream.ResolveEndpoints(ctx, addr)
+		cancel()
+		if err != nil {
+			log.Warn("censorship posture: cannot resolve the stream endpoint; presuming it shares the relay's address", "endpoint", addr, "err", err)
+			return true
+		}
+		for _, ep := range eps {
+			if ep.Addr().Unmap() == relay {
+				return true
+			}
+		}
+	}
+	return false
 }
