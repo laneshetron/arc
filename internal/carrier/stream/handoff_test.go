@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"crypto/tls"
 	"crypto/x509"
+	"io"
 	"net"
 	"net/netip"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -102,5 +104,43 @@ func TestDrainCountsFramesInAFailedFlush(t *testing.T) {
 	}
 	if n := l.drain(); n != 2 {
 		t.Errorf("drain = %d, want 2: one in the failed flush, one queued", n)
+	}
+}
+
+// TestWriterBookkeepingBounded: the writer tracks only the frames it
+// still holds, however long the queue stays nonempty, not every frame
+// since the queue last emptied.
+func TestWriterBookkeepingBounded(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		c, err := ln.Accept()
+		if err == nil {
+			io.Copy(io.Discard, c)
+		}
+	}()
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := newLink(conn, netip.MustParseAddrPort("192.0.2.1:1"), 128, 0)
+	go l.run(make(chan inbound, 1))
+	pkt := bytes.Repeat([]byte{1}, 100)
+	const frames = 50000
+	for sent := 0; sent < frames; {
+		if l.send(pkt, false) {
+			sent++
+		} else {
+			runtime.Gosched() // the queue is full: it stays nonempty throughout
+		}
+	}
+	l.close()
+	<-l.writerDone
+	// bufio's 64 KB holds at most ~640 such frames, plus one in hand.
+	if peak := l.heldPeak.Load(); peak > 700 {
+		t.Errorf("writer held %d frame offsets at once, want ≤ 700 (bufio's buffer)", peak)
 	}
 }

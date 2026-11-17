@@ -2,6 +2,7 @@ package stream
 
 import (
 	"bufio"
+	"io"
 	"net"
 	"net/netip"
 	"sync"
@@ -52,6 +53,7 @@ type link struct {
 	// writer stops the link, read after it exits (writerDone).
 	unwritten  atomic.Int64
 	writerDone chan struct{}
+	heldPeak   atomic.Int64 // most frames the writer held at once (tests)
 
 	// rotateAt, when positive, signals rotate once track has read this
 	// many bytes. Client links only; both are set before run.
@@ -221,21 +223,26 @@ func (l *link) read(in chan<- inbound) {
 // write sends queued packets, coalescing whatever is queued into one
 // flush.
 func (l *link) write() {
-	w := bufio.NewWriterSize(l.conn, 64<<10)
+	cw := &countingWriter{w: l.conn}
+	w := bufio.NewWriterSize(cw, 64<<10)
 	var frame []byte
-	var ends []int // where each frame of the batch ends, in bytes appended to w
-	// fail records the frames of the batch TCP did not take whole, then
-	// stops the link. bufio keeps what a failed flush did not write, so
-	// what reached TCP is everything given to w but its Buffered tail.
-	fail := func(given int, err error) {
-		written := given - w.Buffered()
-		lost := 0
-		for _, end := range ends {
-			if end > written {
-				lost++
-			}
+	// held lists where each frame the writer still holds ends, in bytes
+	// given to w since the link started: those not yet handed to TCP
+	// whole. Frames leave it as bufio's writes to the connection succeed,
+	// so it never holds more than bufio's buffer plus one frame.
+	var held []int64
+	var given int64
+	retire := func() {
+		i := 0
+		for i < len(held) && held[i] <= cw.n {
+			i++
 		}
-		l.unwritten.Add(int64(lost))
+		held = held[:copy(held, held[i:])]
+	}
+	// fail counts the frames TCP did not take whole, then stops the link.
+	fail := func(err error) {
+		retire()
+		l.unwritten.Add(int64(len(held)))
 		l.stopWith(err)
 	}
 	for {
@@ -245,18 +252,19 @@ func (l *link) write() {
 		case <-l.done:
 			return
 		}
-		ends = ends[:0]
-		given := 0
 		for {
 			frame = appendFrame(frame[:0], pkt)
 			bufpool.Put(pkt)
-			ends = append(ends, given+len(frame))
-			n, err := w.Write(frame)
-			given += n
-			if err != nil {
-				fail(given, err)
+			held = append(held, given+int64(len(frame)))
+			if n := int64(len(held)); n > l.heldPeak.Load() {
+				l.heldPeak.Store(n)
+			}
+			given += int64(len(frame))
+			if _, err := w.Write(frame); err != nil {
+				fail(err)
 				return
 			}
+			retire()
 			select {
 			case pkt = <-l.out:
 				continue
@@ -265,10 +273,23 @@ func (l *link) write() {
 			break
 		}
 		if err := w.Flush(); err != nil {
-			fail(given, err)
+			fail(err)
 			return
 		}
+		retire()
 	}
+}
+
+// countingWriter counts the bytes its writer accepted.
+type countingWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (c *countingWriter) Write(b []byte) (int, error) {
+	n, err := c.w.Write(b)
+	c.n += int64(n)
+	return n, err
 }
 
 // readBatch fills bufs from in, blocking until at least one packet is
