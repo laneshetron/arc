@@ -47,14 +47,21 @@ func startFront(t *testing.T, mods ...func(*FrontOptions)) (*Front, []byte) {
 // frontPair starts a front and a client carrier riding its upgrade.
 func frontPair(t *testing.T, mods ...func(*FrontOptions)) (*Front, *Client, chan error) {
 	t.Helper()
+	return frontPairCamouflaged(t, nil, mods...)
+}
+
+// frontPairCamouflaged is frontPair with the client's outer TLS under a
+// camouflage profile (nil for none), as -front with -tls-fingerprint.
+func frontPairCamouflaged(t *testing.T, cam *Camouflage, mods ...func(*FrontOptions)) (*Front, *Client, chan error) {
+	t.Helper()
 	f, certPEM := startFront(t, mods...)
 	roots := x509.NewCertPool()
 	roots.AppendCertsFromPEM(certPEM)
 	states := make(chan error, 16)
 	c := Dial(ClientOptions{
 		Addr: f.Addr().String(), TLS: &tls.Config{RootCAs: roots, ServerName: "cdn.example"},
-		Front: &FrontDialOptions{Token: frontToken},
-		Peer:  netip.MustParseAddrPort("192.0.2.1:4433"), OnState: func(err error) { states <- err },
+		Front: &FrontDialOptions{Token: frontToken}, Camouflage: cam,
+		Peer: netip.MustParseAddrPort("192.0.2.1:4433"), OnState: func(err error) { states <- err },
 	})
 	t.Cleanup(func() { c.Close() })
 	select {
@@ -70,6 +77,24 @@ func frontPair(t *testing.T, mods ...func(*FrontOptions)) (*Front, *Client, chan
 
 func TestFrontCarrierExchange(t *testing.T) {
 	f, c, _ := frontPair(t)
+	exchangeFront(t, f, c)
+}
+
+// A browser fingerprint on the front (-front with -tls-fingerprint) must
+// still negotiate HTTP/1.1: the browser presets offer h2 first, the
+// front's cover site accepts it, and the upgrade then reaches an HTTP/2
+// server as a bogus preface.
+func TestFrontCarrierExchangeFingerprinted(t *testing.T) {
+	for _, fp := range []string{"chrome", "edge", "safari", "ios", "firefox"} {
+		t.Run(fp, func(t *testing.T) {
+			f, c, _ := frontPairCamouflaged(t, &Camouflage{Fingerprint: fp, Fragment: 64})
+			exchangeFront(t, f, c)
+		})
+	}
+}
+
+func exchangeFront(t *testing.T, f *Front, c *Client) {
+	t.Helper()
 	up := bytes.Repeat([]byte{7}, 1200)
 	c.WriteBatch([][]byte{up}, nil)
 	got, from := readOne(t, f)

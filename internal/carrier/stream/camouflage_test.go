@@ -2,12 +2,14 @@ package stream
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
 	"io"
 	"net"
 	"net/netip"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -278,5 +280,128 @@ func TestUTLSConfigRefusesVerifyConnection(t *testing.T) {
 	u.VerifyPeerCertificate(nil, nil)
 	if !called {
 		t.Fatal("wrong VerifyPeerCertificate carried")
+	}
+}
+
+// captureHello runs cam's handshake against a listener that records the
+// first TLS record (the ClientHello) and hangs up.
+func captureHello(t *testing.T, cam *Camouflage) []byte {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	got := make(chan []byte, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			got <- nil
+			return
+		}
+		defer conn.Close()
+		hdr := make([]byte, 5)
+		if _, err := io.ReadFull(conn, hdr); err != nil {
+			got <- nil
+			return
+		}
+		body := make([]byte, int(hdr[3])<<8|int(hdr[4]))
+		if _, err := io.ReadFull(conn, body); err != nil {
+			got <- nil
+			return
+		}
+		got <- append(hdr, body...)
+	}()
+	raw, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cam.Handshake(ctx, raw, ln.Addr().String(), &tls.Config{}) // fails: the listener hangs up
+	hello := <-got
+	if hello == nil {
+		t.Fatal("no ClientHello captured")
+	}
+	return hello
+}
+
+// helloExtensions parses a ClientHello record into its extensions, by
+// type, GREASE values left out (they are random by design).
+func helloExtensions(t *testing.T, rec []byte) map[uint16][]byte {
+	t.Helper()
+	b := rec[5+4+2+32:] // record header, handshake header, version, random
+	skip := func(lenBytes int) {
+		n := 0
+		for i := range lenBytes {
+			n = n<<8 | int(b[i])
+		}
+		b = b[lenBytes+n:]
+	}
+	skip(1) // session ID
+	skip(2) // cipher suites
+	skip(1) // compression methods
+	b = b[2:]
+	exts := map[uint16][]byte{}
+	for len(b) >= 4 {
+		typ, n := uint16(b[0])<<8|uint16(b[1]), int(b[2])<<8|int(b[3])
+		if typ&0x0f0f != 0x0a0a {
+			exts[typ] = b[4 : 4+n]
+		}
+		b = b[4+n:]
+	}
+	return exts
+}
+
+func alpnOffer(data []byte) []string {
+	var ps []string
+	for b := data[2:]; len(b) > 0; b = b[1+int(b[0]):] {
+		ps = append(ps, string(b[1:1+int(b[0])]))
+	}
+	return ps
+}
+
+const (
+	extALPN    = 16
+	extALPS    = 17513 // application_settings, as Chrome sent it until 2025
+	extALPSNew = 17613 // its successor codepoint, in the current Chrome preset
+)
+
+// The front's ALPN override is written into the browser preset (which
+// otherwise replaces it with h2, http/1.1); the rest of the hello keeps
+// the preset's extensions, less ALPS for the h2 no longer offered.
+func TestFingerprintHonorsALPNOverride(t *testing.T) {
+	for _, fp := range []string{"chrome", "edge", "safari", "ios", "firefox"} {
+		t.Run(fp, func(t *testing.T) {
+			browser := helloExtensions(t, captureHello(t, &Camouflage{Name: "cover.example", Fingerprint: fp}))
+			front := helloExtensions(t, captureHello(t, &Camouflage{Name: "cover.example", Fingerprint: fp, ALPN: []string{"http/1.1"}}))
+			if got := alpnOffer(browser[extALPN]); !slices.Contains(got, "h2") {
+				t.Errorf("browser profile offers %q, want the preset's h2 offer", got)
+			}
+			if got := alpnOffer(front[extALPN]); !slices.Equal(got, []string{"http/1.1"}) {
+				t.Errorf("front profile offers %q, want only http/1.1", got)
+			}
+			if _, alps := browser[extALPSNew]; fp == "chrome" && !alps {
+				t.Fatal("chrome preset sent no ALPS; the test no longer covers dropping it")
+			}
+			for typ := range browser {
+				_, kept := front[typ]
+				if alps := typ == extALPS || typ == extALPSNew; kept == alps {
+					t.Errorf("extension %d: in the front hello %v, want %v", typ, kept, !alps)
+				}
+			}
+			if len(front) > len(browser) {
+				t.Errorf("front hello has extensions the preset lacks: %d vs %d", len(front), len(browser))
+			}
+		})
+	}
+}
+
+func TestCheckFrontALPN(t *testing.T) {
+	for alpn, ok := range map[string]bool{"http/1.1": true, "": true, "h2": false, "arc/1": false} {
+		if err := checkFrontALPN(alpn); (err == nil) != ok {
+			t.Errorf("checkFrontALPN(%q) = %v, want ok=%v", alpn, err, ok)
+		}
 	}
 }

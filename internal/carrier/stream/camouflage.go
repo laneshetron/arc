@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"slices"
 
 	utls "github.com/refraction-networking/utls"
 )
@@ -37,7 +38,9 @@ type Camouflage struct {
 	// server name out of the first segment.
 	Fragment int
 	// ALPN overrides the browser offer. The front client needs HTTP/1.1
-	// negotiated, for its upgrade; nil offers the browser set.
+	// negotiated, for its upgrade; nil offers the browser set. Under a
+	// Fingerprint the override is written into the browser's own ALPN
+	// extension (see fingerprintSpec), which otherwise wins.
 	ALPN []string
 }
 
@@ -140,7 +143,22 @@ func (cam *Camouflage) Handshake(ctx context.Context, raw net.Conn, addr string,
 		if err != nil {
 			return nil, "", err
 		}
-		uconn := utls.UClient(hconn, ucfg, id)
+		var uconn *utls.UConn
+		if cam.ALPN == nil {
+			uconn = utls.UClient(hconn, ucfg, id)
+		} else {
+			// A preset's ALPN extension replaces the configuration's
+			// NextProtos, so an override must be written into the
+			// preset's own extension.
+			spec, err := fingerprintSpec(id, protos)
+			if err != nil {
+				return nil, "", err
+			}
+			uconn = utls.UClient(hconn, ucfg, utls.HelloCustom)
+			if err := uconn.ApplyPreset(&spec); err != nil {
+				return nil, "", err
+			}
+		}
 		conn, alpn = uconn, func() string { return uconn.ConnectionState().NegotiatedProtocol }
 	} else {
 		tconn := tls.Client(hconn, cfg)
@@ -153,6 +171,50 @@ func (cam *Camouflage) Handshake(ctx context.Context, raw net.Conn, addr string,
 		frag.clear = true // post-handshake writes pass whole
 	}
 	return conn, alpn(), nil
+}
+
+// fingerprintSpec returns the ClientHello of browser id offering protos
+// as its ALPN. The rest of the hello keeps the browser's shape, except
+// that ALPS (application settings) is dropped for protocols no longer
+// offered: Chromium sends ALPS only for offered protocols, so a
+// Chrome-shaped hello with HTTP/1.1-only ALPN carries none (as Chrome's
+// own HTTP/1.1-only connections, such as a WebSocket's, do).
+func fingerprintSpec(id utls.ClientHelloID, protos []string) (utls.ClientHelloSpec, error) {
+	spec, err := utls.UTLSIdToSpec(id)
+	if err != nil {
+		return spec, err
+	}
+	offered := func(ps []string) bool {
+		for _, p := range ps {
+			if !slices.Contains(protos, p) {
+				return false
+			}
+		}
+		return true
+	}
+	found := false
+	exts := spec.Extensions[:0]
+	for _, ext := range spec.Extensions {
+		switch e := ext.(type) {
+		case *utls.ALPNExtension:
+			e.AlpnProtocols = slices.Clone(protos)
+			found = true
+		case *utls.ApplicationSettingsExtension:
+			if !offered(e.SupportedProtocols) {
+				continue
+			}
+		case *utls.ApplicationSettingsExtensionNew:
+			if !offered(e.SupportedProtocols) {
+				continue
+			}
+		}
+		exts = append(exts, ext)
+	}
+	if !found {
+		return spec, fmt.Errorf("stream: TLS fingerprint %s offers no ALPN to override", id.Str())
+	}
+	spec.Extensions = exts
+	return spec, nil
 }
 
 // utlsConfig carries cfg over to uTLS, whose configuration is a separate

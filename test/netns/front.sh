@@ -80,7 +80,8 @@ block_udp A
 CLIENT_ARGS=(-relay 192.168.10.2:4433 -relay-key "$RELAY_PUB" -token-file "$WORK/token"
   -route 192.168.20.0/24 -bind c0 -bind c1 -front "$FRONT" -tls-ca "$WORK/relay.crt")
 $C "$BIN/arc-client" run "${CLIENT_ARGS[@]}" >"$WORK/client.log" 2>&1 &
-PIDS+=("$!")
+CLIENT_PID=$!
+PIDS+=("$CLIENT_PID")
 if wait_for 20 "session over the front" grep -q "session established" "$WORK/client.log" &&
   $C timeout 60 ping -c3 -i0.2 -W2 192.168.20.2 >/dev/null 2>&1; then
   pass "connected with UDP blocked, through the front"
@@ -121,6 +122,28 @@ if [[ $(grep -c 'session established' "$WORK/client.log") -eq $sessions ]]; then
   pass "failover to the front kept the session"
 else
   fail "failover to the front started a new session"
+fi
+block_udp D
+
+# --- a browser fingerprint on the front -------------------------------------
+# The browser presets offer h2 first; the front must still negotiate
+# HTTP/1.1, or the relay reads the upgrade as a bogus HTTP/2 preface.
+kill "$CLIENT_PID"; wait "$CLIENT_PID" 2>/dev/null || true
+block_udp A
+bogus_before=$(grep -c 'bogus greeting' "$WORK/relay.log" || true)
+$C "$BIN/arc-client" run "${CLIENT_ARGS[@]}" -tls-fingerprint chrome >"$WORK/client-fp.log" 2>&1 &
+CLIENT_PID=$!
+PIDS+=("$CLIENT_PID")
+if wait_for 20 "session over the fingerprinted front" grep -q "session established" "$WORK/client-fp.log" &&
+  $C timeout 60 ping -c3 -i0.2 -W2 192.168.20.2 >/dev/null 2>&1; then
+  pass "connected through the front with -tls-fingerprint chrome"
+else
+  fail "could not connect through the front with -tls-fingerprint chrome"
+fi
+if [[ $(grep -c 'bogus greeting' "$WORK/relay.log" || true) -eq $bogus_before ]]; then
+  pass "fingerprinted front negotiated HTTP/1.1 (no bogus h2 preface at the relay)"
+else
+  fail "relay read the fingerprinted upgrade as an h2 preface"
 fi
 block_udp D
 
