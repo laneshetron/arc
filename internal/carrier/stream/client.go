@@ -63,10 +63,23 @@ type ClientOptions struct {
 	// MaxBackoff caps the delay between reconnection attempts (default
 	// 30 s; attempts start 500 ms apart and double).
 	MaxBackoff time.Duration
+	// StallTimeout closes a connection that has had a frame in flight
+	// this long without receiving anything, reporting it as
+	// ModeTimeoutAtNBytes, and redials: a censor that silently stops
+	// delivering a connection's data (the TSPU freeze) otherwise leaves
+	// the carrier on it until TCP gives up, many minutes later. Default
+	// DefaultStallTimeout; negative disables.
+	StallTimeout time.Duration
 	// OnState, if set, is called when the connection comes up (err nil)
 	// or a dial attempt or connection fails.
 	OnState func(err error)
 }
+
+// DefaultStallTimeout is ClientOptions.StallTimeout's default: above the
+// round trip plus queueing of any link worth keeping, and short enough
+// that a frozen connection costs the session seconds, not its path
+// (spec/freeze-and-udp-ban.md §2).
+const DefaultStallTimeout = 2 * time.Second
 
 // Client is a TLS/TCP carrier to one relay. It connects in the background
 // and reconnects after failures; while disconnected, writes are dropped,
@@ -95,6 +108,9 @@ func Dial(opts ClientOptions) *Client {
 	if opts.MaxBackoff == 0 {
 		opts.MaxBackoff = 30 * time.Second
 	}
+	if opts.StallTimeout == 0 {
+		opts.StallTimeout = DefaultStallTimeout
+	}
 	ctx, stop := context.WithCancel(context.Background())
 	c := &Client{opts: opts, in: make(chan inbound, opts.Queue), ctx: ctx, stop: stop}
 	go c.connectLoop()
@@ -102,8 +118,10 @@ func Dial(opts ClientOptions) *Client {
 }
 
 func (c *Client) connectLoop() {
-	backoff := 500 * time.Millisecond
+	const initialBackoff = 500 * time.Millisecond
+	backoff := initialBackoff
 	for c.ctx.Err() == nil {
+		redial := false // dial again without waiting
 		l, track, err := c.connect()
 		if c.ctx.Err() != nil { // closed mid-dial: nothing to report
 			if l != nil {
@@ -138,12 +156,21 @@ func (c *Client) connectLoop() {
 					c.opts.OnState(errors.New("stream: connection closed"))
 				}
 			}
-			if time.Since(start) > 10*time.Second {
-				backoff = 500 * time.Millisecond // it worked for a while
+			switch {
+			case errors.Is(derr, errStalled) && l.frames.Load() > 0:
+				// It carried data until a censor froze it: redial at once.
+				// Stalls pace these dials to one per StallTimeout.
+				backoff, redial = initialBackoff, true
+			case time.Since(start) > 10*time.Second:
+				backoff = initialBackoff // it worked for a while
 			}
 		}
+		wait := backoff
+		if redial {
+			wait = 0
+		}
 		select {
-		case <-time.After(backoff):
+		case <-time.After(wait):
 		case <-c.ctx.Done():
 			return
 		}
@@ -178,7 +205,9 @@ func (c *Client) connect() (*link, *trackingConn, error) {
 		}
 		conn = uconn
 	}
-	return newLink(conn, c.opts.Peer, c.opts.Queue, 0), raw, nil
+	l := newLink(conn, c.opts.Peer, c.opts.Queue, 0)
+	l.stall = max(c.opts.StallTimeout, 0)
+	return l, raw, nil
 }
 
 // checkFrontALPN refuses a front handshake that negotiated anything but
@@ -306,7 +335,23 @@ func (c *Client) WriteBatch(pkts [][]byte, _ []netip.AddrPort) error {
 		return nil
 	}
 	for _, p := range pkts {
-		l.send(p)
+		l.send(p, false)
+	}
+	return nil
+}
+
+// WriteBatchEliciting is WriteBatch, told which packets the relay owes a
+// reply (an acknowledgement within its maximum ACK delay). Only those arm
+// stall detection (StallTimeout); WriteBatch arms it for none.
+func (c *Client) WriteBatchEliciting(pkts [][]byte, _ []netip.AddrPort, eliciting []bool) error {
+	c.mu.Lock()
+	l := c.cur
+	c.mu.Unlock()
+	if l == nil {
+		return nil
+	}
+	for i, p := range pkts {
+		l.send(p, eliciting[i])
 	}
 	return nil
 }

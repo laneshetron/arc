@@ -62,6 +62,42 @@ jobs:
         if: success() || failure()
         run: sudo ./test/netns/devices.sh bin
 
+  # arc through mini-tspu, a private model of Russia's TSPU
+  # (spec/freeze-and-udp-ban.md). Checking it out needs a read-only token
+  # for laneshetron/mini-tspu in the MINI_TSPU_TOKEN secret; without one
+  # (forks, or before it is set) the job reports a skip and passes.
+  tspu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      MINI_TSPU_TOKEN: ${{ secrets.MINI_TSPU_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: mini-tspu available
+        id: tspu
+        run: |
+          if [[ -n $MINI_TSPU_TOKEN ]]; then echo "ok=1" >>"$GITHUB_OUTPUT"
+          else echo "::notice::MINI_TSPU_TOKEN not set; skipping the mini-tspu tests"; fi
+      - uses: actions/checkout@v4
+        if: steps.tspu.outputs.ok
+        with:
+          repository: laneshetron/mini-tspu
+          token: ${{ secrets.MINI_TSPU_TOKEN }}
+          path: mini-tspu
+      - uses: actions/setup-go@v5
+        if: steps.tspu.outputs.ok
+        with:
+          go-version-file: go.mod
+      - if: steps.tspu.outputs.ok
+        run: sudo apt-get update && sudo apt-get install -y iperf3
+      - if: steps.tspu.outputs.ok
+        run: |
+          go build -o bin/ ./cmd/arc-client ./cmd/arc-relay
+          (cd mini-tspu && go build -o ../bin/ ./cmd/mini-tspu)
+      - name: arc through mini-tspu in network namespaces
+        if: steps.tspu.outputs.ok
+        run: sudo ./test/netns/tspu.sh bin
+
   degraded:
     runs-on: ubuntu-latest
     timeout-minutes: 45

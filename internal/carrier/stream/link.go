@@ -34,10 +34,50 @@ type link struct {
 	death atomic.Pointer[error] // first fatal transport error, for classification
 
 	idle time.Duration // close after this long without a received packet; 0: never
+
+	// stall, when positive, closes the link with errStalled once a packet
+	// the peer owes a reply has gone this long with no frame read since:
+	// an exchange in flight, no progress (a censor's silent freeze,
+	// spec/freeze-and-udp-ban.md §2). Client links only.
+	stall time.Duration
+	// unanswered is when the oldest reply-eliciting packet queued since
+	// the last frame read was queued (UnixNano), or 0 if none has been.
+	// It is set before the packet is queued, so a reply that arrives
+	// before the write returns clears it rather than racing it.
+	unanswered atomic.Int64
+	// frames counts frames read.
+	frames atomic.Int64
 }
 
 func newLink(conn net.Conn, addr netip.AddrPort, queue int, idle time.Duration) *link {
 	return &link{conn: conn, addr: addr, out: make(chan []byte, queue), done: make(chan struct{}), idle: idle}
+}
+
+// errStalled ends a link that stopped receiving while it had frames in
+// flight. It is a timeout, so classifyDeath reports ModeTimeoutAtNBytes.
+var errStalled error = stallError{}
+
+type stallError struct{}
+
+func (stallError) Error() string   { return "stream: no data received while frames were in flight" }
+func (stallError) Timeout() bool   { return true }
+func (stallError) Temporary() bool { return false }
+
+// watchStall closes the link with errStalled when it stalls (see stall).
+func (l *link) watchStall() {
+	t := time.NewTicker(l.stall / 8)
+	defer t.Stop()
+	for {
+		select {
+		case <-l.done:
+			return
+		case now := <-t.C:
+			if since := l.unanswered.Load(); since != 0 && now.UnixNano()-since > int64(l.stall) {
+				l.stopWith(errStalled)
+				return
+			}
+		}
+	}
 }
 
 // stopWith records the link's first fatal error, if any, and closes it.
@@ -50,8 +90,9 @@ func (l *link) stopWith(err error) {
 }
 
 // send queues a copy of pkt, reporting false if the queue is full or the
-// link closed.
-func (l *link) send(pkt []byte) bool {
+// link closed. elicits marks a packet the peer owes a reply, which arms
+// stall detection.
+func (l *link) send(pkt []byte, elicits bool) bool {
 	select {
 	case <-l.done:
 		return false
@@ -63,11 +104,23 @@ func (l *link) send(pkt []byte) bool {
 	} else {
 		b = append([]byte(nil), pkt...)
 	}
+	// Arm stall detection before queueing, so a reply that arrives
+	// before the writer has even returned clears it, and disarm it if
+	// the queue refuses the packet: nothing was sent, so no reply is owed.
+	var armed int64
+	if elicits && l.stall > 0 {
+		if now := time.Now().UnixNano(); l.unanswered.CompareAndSwap(0, now) {
+			armed = now
+		}
+	}
 	select {
 	case l.out <- b:
 		return true
 	default:
 		bufpool.Put(b)
+		if armed != 0 {
+			l.unanswered.CompareAndSwap(armed, 0)
+		}
 		return false
 	}
 }
@@ -84,6 +137,9 @@ func (l *link) close() {
 // Received packets go to in.
 func (l *link) run(in chan<- inbound) error {
 	go l.write()
+	if l.stall > 0 {
+		go l.watchStall()
+	}
 	l.read(in)
 	l.close()
 	if p := l.death.Load(); p != nil {
@@ -104,6 +160,8 @@ func (l *link) read(in chan<- inbound) {
 			l.stopWith(err)
 			return
 		}
+		l.frames.Add(1)
+		l.unanswered.Store(0)
 		var pkt []byte
 		if n <= bufpool.Packet {
 			pkt = append(bufpool.Get(), buf[:n]...)
