@@ -316,13 +316,14 @@ func captureHello(t *testing.T, cam *Camouflage) []byte {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer raw.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	cam.Handshake(ctx, raw, ln.Addr().String(), &tls.Config{}) // fails: the listener hangs up
+	_, _, err = cam.Handshake(ctx, raw, ln.Addr().String(), &tls.Config{}) // fails: the listener hangs up
+	// Closing ends the capture's read if no ClientHello was ever written.
+	raw.Close()
 	hello := <-got
 	if hello == nil {
-		t.Fatal("no ClientHello captured")
+		t.Fatalf("no ClientHello captured (handshake: %v)", err)
 	}
 	return hello
 }
@@ -395,6 +396,18 @@ func TestFingerprintHonorsALPNOverride(t *testing.T) {
 				t.Errorf("front hello has extensions the preset lacks: %d vs %d", len(front), len(browser))
 			}
 		})
+	}
+}
+
+// An explicitly empty override offers no ALPN, as Go TLS does: RFC 7301
+// §3.1 forbids an ALPN extension with an empty protocol list.
+func TestFingerprintEmptyALPNOmitsExtension(t *testing.T) {
+	ext := helloExtensions(t, captureHello(t, &Camouflage{Name: "cover.example", Fingerprint: "chrome", ALPN: []string{}}))
+	if _, ok := ext[extALPN]; ok {
+		t.Errorf("empty override sent an ALPN extension: %x", ext[extALPN])
+	}
+	if _, ok := ext[extALPSNew]; ok {
+		t.Error("empty override kept ALPS for a protocol it does not offer")
 	}
 }
 

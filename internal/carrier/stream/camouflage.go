@@ -38,7 +38,8 @@ type Camouflage struct {
 	// server name out of the first segment.
 	Fragment int
 	// ALPN overrides the browser offer. The front client needs HTTP/1.1
-	// negotiated, for its upgrade; nil offers the browser set. Under a
+	// negotiated, for its upgrade; nil offers the browser set, and an
+	// empty, non-nil list offers no ALPN at all. Under a
 	// Fingerprint the override is written into the browser's own ALPN
 	// extension (see fingerprintSpec), which otherwise wins.
 	ALPN []string
@@ -197,8 +198,11 @@ func fingerprintSpec(id utls.ClientHelloID, protos []string) (utls.ClientHelloSp
 	for _, ext := range spec.Extensions {
 		switch e := ext.(type) {
 		case *utls.ALPNExtension:
-			e.AlpnProtocols = slices.Clone(protos)
 			found = true
+			if len(protos) == 0 {
+				continue // RFC 7301 §3.1: an empty list is omitted, as Go TLS does
+			}
+			e.AlpnProtocols = slices.Clone(protos)
 		case *utls.ApplicationSettingsExtension:
 			if !offered(e.SupportedProtocols) {
 				continue
