@@ -99,7 +99,9 @@ func TestStoreRevokesLiveSession(t *testing.T) {
 	}
 	up, done := storeClient(t, ctx, relay, relayKey, token)
 	wait(t, up, "the session")
-	if r := lines.find(t, "session established"); r == nil || r["device"] != "laptop" {
+	// The client can hear the relay's answer before the relay's loop has
+	// logged the session it established.
+	if r := lines.await(t, "session established"); r == nil || r["device"] != "laptop" {
 		t.Errorf("established line %v", r)
 	}
 	if err := w.Commit(ctx, func(st *accounts.State) error {

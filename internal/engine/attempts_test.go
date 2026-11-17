@@ -60,6 +60,17 @@ func (l *logLines) find(t *testing.T, msg string) map[string]any {
 	return nil
 }
 
+// await is find for a line another goroutine may still be about to
+// write: it polls for up to 5 s.
+func (l *logLines) await(t *testing.T, msg string) map[string]any {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		if r := l.find(t, msg); r != nil || time.Now().After(deadline) {
+			return r
+		}
+	}
+}
+
 func newTestAttemptLog() (*AttemptLog, *logLines) {
 	lines := &logLines{}
 	return NewAttemptLog(slog.New(slog.NewJSONHandler(lines, nil))), lines
