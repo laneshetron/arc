@@ -118,6 +118,7 @@ func run(args []string) error {
 	tlsFragment := fs.Int("tls-fragment", 0, "send the TLS ClientHello in TCP segments of at most this many bytes (optional; the relay certificate is still verified unless -tls-cover is set)")
 	frontAddr := fs.String("front", "", "relay HTTPS front endpoint, host:port: like -tls, but the carrier rides an authenticated HTTP upgrade inside an ordinary HTTPS session; the relay's front serves cover content to everyone else. The admission token is the session's -token-file token. -tls-cover, -tls-fingerprint, and -tls-fragment shape the outer handshake as for -tls")
 	noOffload := fs.Bool("no-offload", false, "send and receive without UDP GSO/GRO, for comparison")
+	rotateBytes := fs.Int64("stream-rotate-bytes", 0, "move each -tls or -front carrier to a fresh TCP connection after it has received this many bytes, dialed ahead of time, to stay under a censor's per-connection cap (the TSPU freeze to foreign hosting); 0: learn the cap from stalled connections")
 	noUDP := fs.Bool("no-udp", false, "open no UDP carriers: reach the relay only through -tls or -front (-relay is then the session's address, the -tls endpoint, say)")
 	fecMode := wire.FECAuto
 	fs.Func("fec", "forward error correction: auto (default; while loss is at least 0.5%), off, or always", func(v string) error {
@@ -261,7 +262,7 @@ func run(args []string) error {
 	carriers, closeCarriers, err := openCarriers(log, carrierOptions{
 		Relay: relayAddr, Binds: binds, NoOffload: *noOffload, NoUDP: *noUDP, FullTunnel: *fullTunnel, Mark: uint32(*mark),
 		TLS: *tlsAddr, TLSCA: *tlsCA, TLSName: *tlsName, TLSCover: *tlsCover, TLSFingerprint: *tlsFingerprint,
-		TLSFragment: *tlsFragment, Front: *frontAddr, FrontToken: tokens[0],
+		TLSFragment: *tlsFragment, Front: *frontAddr, FrontToken: tokens[0], RotateBytes: *rotateBytes,
 	})
 	if err != nil {
 		return err

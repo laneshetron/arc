@@ -169,12 +169,12 @@ scenario_freeze() {
   fi
   pcap freeze
   local got
-  got=$(download 5201 20)
-  echo "freeze: received $got bytes in 20 s; kbit/s per second: $(intervals 5201)"
+  got=$(download 5201 "${DURATION:-20}")
+  echo "freeze: received $got bytes in ${DURATION:-20} s; kbit/s per second: $(intervals 5201)"
   echo "freeze: censor events: $(censor_events)"
-  # More than two connections' worth: the carrier redialed and the
-  # downlink resumed. Stall-and-redial alone gets ~55–100 KB in 20 s.
-  local want=$((${FREEZE_FLOOR:-2} * FREEZE_BYTES))
+  # More than six connections' worth: stall-and-redial alone gets
+  # ~55–100 KB in 20 s; rotating ahead of the cap, ~0.3–1.4 MB.
+  local want=$((${FREEZE_FLOOR:-6} * FREEZE_BYTES))
   if ((got > want)); then
     pass "freeze: downlink kept flowing past the freeze ($got bytes, > $want)"
   else
@@ -184,6 +184,11 @@ scenario_freeze() {
     pass "freeze: stalls reported as timeout-at-N-bytes"
   else
     fail "freeze: no timeout-at-N-bytes stall reported"
+  fi
+  if grep -q 'rotating them ahead of it' "$WORK/freeze.log"; then
+    pass "freeze: learned the cap and rotated connections ahead of it"
+  else
+    fail "freeze: no byte cap learned"
   fi
   # Still alive after the transfer: a ping through the tunnel.
   if $C ping -c 3 -W 5 -i 0.5 $SERVER >/dev/null 2>&1 || $C ping -c 3 -W 5 -i 0.5 $SERVER >/dev/null 2>&1; then

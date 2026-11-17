@@ -70,6 +70,16 @@ type ClientOptions struct {
 	// the carrier on it until TCP gives up, many minutes later. Default
 	// DefaultStallTimeout; negative disables.
 	StallTimeout time.Duration
+	// RotateBytes, when positive, moves the carrier to a fresh connection
+	// each time the current one has received this many bytes, dialing
+	// the next one ahead of time: a censor that caps each connection's
+	// downlink (the TSPU freeze) then never freezes one in use. Without
+	// it, the carrier learns a budget from its stalls (see learn), per
+	// dial destination.
+	RotateBytes int64
+	// OnLearn, if set, is called when the carrier learns a rotation
+	// budget for a destination from its stalls.
+	OnLearn func(dest netip.AddrPort, budget int64)
 	// OnState, if set, is called when the connection comes up (err nil)
 	// or a dial attempt or connection fails.
 	OnState func(err error)
@@ -93,7 +103,16 @@ type Client struct {
 	mu  sync.Mutex
 	cur *link
 
-	// Used by the connecting goroutine only.
+	// Used by the connecting goroutine only (and by one spare dial at a
+	// time, which it hands over through spareCh).
+	// Learned per dial destination: a cap observed on one relay address
+	// says nothing about another (a hosting address and a domestic one).
+	budgets   map[netip.AddrPort]int64 // rotate after receiving this much
+	lastStall map[netip.AddrPort]int64 // bytes the last stalled connection received
+	spare     *dialed
+	spareBusy bool // a spare dial is running and will send on spareCh
+	spareCh   chan dialed
+
 	endpoints    []netip.AddrPort
 	nextEndpoint int
 	lookup       func(context.Context, string, string) ([]netip.Addr, error) // nil: the system resolver
@@ -112,102 +131,331 @@ func Dial(opts ClientOptions) *Client {
 		opts.StallTimeout = DefaultStallTimeout
 	}
 	ctx, stop := context.WithCancel(context.Background())
-	c := &Client{opts: opts, in: make(chan inbound, opts.Queue), ctx: ctx, stop: stop}
+	c := &Client{opts: opts, in: make(chan inbound, opts.Queue), ctx: ctx, stop: stop,
+		budgets: map[netip.AddrPort]int64{}, lastStall: map[netip.AddrPort]int64{}, spareCh: make(chan dialed, 1)}
 	go c.connectLoop()
 	return c
 }
 
+// dialed is the outcome of one connection attempt.
+type dialed struct {
+	l     *link
+	track *trackingConn
+	dest  netip.AddrPort // the endpoint dialed; invalid if none was
+	err   error
+	at    time.Time
+}
+
+// maxSpareAge bounds how long a pre-dialed spare connection waits unused
+// before it is replaced: the relay or a middlebox may have dropped it.
+const maxSpareAge = time.Minute
+
 func (c *Client) connectLoop() {
 	const initialBackoff = 500 * time.Millisecond
 	backoff := initialBackoff
+	d := c.take()
 	for c.ctx.Err() == nil {
-		redial := false // dial again without waiting
-		l, track, err := c.connect()
-		if c.ctx.Err() != nil { // closed mid-dial: nothing to report
-			if l != nil {
-				l.close()
+		if d.err != nil {
+			if c.opts.OnState != nil {
+				c.opts.OnState(d.err)
 			}
-			return
-		}
-		if err == nil {
-			c.setLink(l) // before OnState, so a write it prompts is not dropped
-		}
-		if c.opts.OnState != nil {
-			c.opts.OnState(err)
-		}
-		if err == nil {
-			start := time.Now()
-			go func() { // Close may have missed a link that was still dialing
-				select {
-				case <-c.ctx.Done():
-					l.close()
-				case <-l.done:
-				}
-			}()
-			derr := l.run(c.in)
-			c.setLink(nil)
-			if c.ctx.Err() != nil {
+			if !c.sleep(backoff) {
 				return
 			}
-			if c.opts.OnState != nil {
-				if derr != nil {
-					c.opts.OnState(classifyDeath(track, derr))
-				} else {
-					c.opts.OnState(errors.New("stream: connection closed"))
-				}
+			backoff = min(2*backoff, c.opts.MaxBackoff)
+			d = c.take()
+			continue
+		}
+		l, track, dest := d.l, d.track, d.dest
+		budget := c.budget(dest)
+		if budget > 0 {
+			l.track, l.rotateAt = track, budget
+		}
+		c.setLink(l) // before OnState, so a write it prompts is not dropped
+		if c.opts.OnState != nil {
+			c.opts.OnState(nil)
+		}
+		if budget > 0 {
+			c.startSpare()
+		}
+		start := time.Now()
+		ran := make(chan error, 1)
+		go func() { ran <- l.run(c.in) }()
+
+		// Wait for the link to end or to reach its budget. A spare
+		// still dialing never blocks this loop: the active link's death
+		// and Close are handled while it dials, and the switch happens
+		// when both the budget is reached and the spare is ready.
+		var derr error
+		rotated, rotate, due := false, l.rotate, false
+		// A spare dial that fails is retried in the background, backing
+		// off, for as long as this link carries traffic: the endpoint may
+		// come back before the link reaches its cap.
+		spareBackoff := initialBackoff
+		var retry *time.Timer
+		var retryC <-chan time.Time
+	wait:
+		for {
+			var spareDone chan dialed
+			if c.spareBusy {
+				spareDone = c.spareCh
 			}
-			switch {
-			case errors.Is(derr, errStalled) && l.frames.Load() > 0:
-				// It carried data until a censor froze it: redial at once.
-				// Stalls pace these dials to one per StallTimeout.
-				backoff, redial = initialBackoff, true
-			case time.Since(start) > 10*time.Second:
-				backoff = initialBackoff // it worked for a while
+			select {
+			case derr = <-ran:
+				break wait
+			case <-rotate:
+				due = true
+			case sp := <-spareDone:
+				c.spareBusy = false
+				if sp.err != nil {
+					if c.opts.OnState != nil {
+						c.opts.OnState(sp.err)
+					}
+					retry = time.NewTimer(spareBackoff)
+					retryC = retry.C
+					spareBackoff = min(2*spareBackoff, c.opts.MaxBackoff)
+				} else {
+					c.spare, spareBackoff = &sp, initialBackoff
+				}
+			case <-retryC:
+				retryC = nil
+				c.startSpare()
+			case <-c.ctx.Done():
+				l.close()
+				c.dropSpare()
+				if retry != nil {
+					retry.Stop()
+				}
+				return
+			}
+			if !due || c.spareBusy {
+				continue
+			}
+			next, ok := c.freshSpare()
+			if !ok {
+				// No usable spare (none yet, or it went stale): keep
+				// this connection and dial one, unless a retry after a
+				// failed dial is already scheduled.
+				if retryC == nil {
+					c.startSpare()
+				}
+				continue
+			}
+			// The connection nears the censor's cap: move to the spare
+			// (make before break, spec/freeze-and-udp-ban.md §3).
+			go c.retire(l, ran)
+			d, rotated = next, true
+			break wait
+		}
+		if retry != nil {
+			retry.Stop()
+		}
+		if rotated {
+			continue
+		}
+		c.setLink(nil)
+		if c.ctx.Err() != nil {
+			return
+		}
+		if c.opts.OnState != nil {
+			if derr != nil {
+				c.opts.OnState(classifyDeath(track, derr))
+			} else {
+				c.opts.OnState(errors.New("stream: connection closed"))
 			}
 		}
 		wait := backoff
-		if redial {
-			wait = 0
+		switch {
+		case errors.Is(derr, errStalled) && l.frames.Load() > 0:
+			// It carried data until a censor froze it: redial at once.
+			// Stalls pace these dials to one per StallTimeout.
+			c.learn(dest, track.read.Load())
+			backoff, wait = initialBackoff, 0
+		case time.Since(start) > 10*time.Second:
+			backoff = initialBackoff // it worked for a while
+			wait = backoff
 		}
-		select {
-		case <-time.After(wait):
-		case <-c.ctx.Done():
+		if wait > 0 && !c.sleep(wait) {
 			return
 		}
-		backoff = min(2*backoff, c.opts.MaxBackoff)
+		if wait > 0 {
+			backoff = min(2*backoff, c.opts.MaxBackoff)
+		}
+		d = c.take()
+	}
+	c.dropSpare()
+}
+
+// sleep waits d, reporting false if the carrier closed meanwhile.
+func (c *Client) sleep(d time.Duration) bool {
+	select {
+	case <-time.After(d):
+		return true
+	case <-c.ctx.Done():
+		return false
 	}
 }
 
-func (c *Client) connect() (*link, *trackingConn, error) {
-	ctx, cancel := context.WithTimeout(c.ctx, 10*time.Second)
+// take returns the next connection: the spare, if one is ready or being
+// dialed and fresh, otherwise a new dial. Only one dial runs at a time.
+func (c *Client) take() dialed {
+	if c.spareBusy {
+		select {
+		case sp := <-c.spareCh:
+			c.spare = &sp
+		case <-c.ctx.Done():
+			return dialed{err: context.Canceled}
+		}
+		c.spareBusy = false
+	}
+	if sp, ok := c.freshSpare(); ok {
+		return sp
+	}
+	return c.connect()
+}
+
+// freshSpare takes the spare connection if it is up and not stale,
+// closing it otherwise.
+func (c *Client) freshSpare() (dialed, bool) {
+	sp := c.spare
+	c.spare = nil
+	switch {
+	case sp == nil:
+		return dialed{}, false
+	case sp.err == nil && time.Since(sp.at) < maxSpareAge:
+		return *sp, true
+	case sp.l != nil:
+		sp.l.close()
+	}
+	return dialed{}, false
+}
+
+// budget is the rotation budget for connections to dest: RotateBytes if
+// set, else what stalls on dest taught; 0 for none.
+func (c *Client) budget(dest netip.AddrPort) int64 {
+	if c.opts.RotateBytes > 0 {
+		return c.opts.RotateBytes
+	}
+	return c.budgets[dest]
+}
+
+// startSpare dials a spare connection in the background, unless one is
+// ready or being dialed.
+func (c *Client) startSpare() {
+	if c.spareBusy || c.spare != nil {
+		return
+	}
+	c.spareBusy = true
+	go func() { c.spareCh <- c.connect() }()
+}
+
+// dropSpare closes the spare connection, waiting for one being dialed.
+func (c *Client) dropSpare() {
+	if c.spareBusy {
+		sp := <-c.spareCh
+		c.spareBusy, c.spare = false, &sp
+	}
+	if c.spare != nil && c.spare.l != nil {
+		c.spare.l.close()
+	}
+	c.spare = nil
+}
+
+// retire closes a link the carrier rotated away from, once the relay has
+// had StallTimeout to move its downlink to the successor. Until then it
+// keeps delivering what the relay still sends on it.
+func (c *Client) retire(l *link, ran <-chan error) {
+	grace := c.opts.StallTimeout
+	if grace <= 0 {
+		grace = DefaultStallTimeout
+	}
+	select {
+	case <-time.After(grace):
+	case <-ran:
+	case <-c.ctx.Done():
+	}
+	l.close()
+}
+
+// minCap is the least a stalled connection must have received for its
+// stall to count as a byte cap rather than a dead link.
+const minCap = 4 << 10
+
+// learn records how much a stalled connection to dest received. Two
+// consecutive stalls on dest within 25% of each other, both above minCap,
+// are a byte cap (spec/freeze-and-udp-ban.md §3): later connections to
+// dest rotate at half the smaller count. Other destinations are not
+// affected, and a configured budget is never changed.
+func (c *Client) learn(dest netip.AddrPort, read int64) {
+	prev := c.lastStall[dest]
+	c.lastStall[dest] = read
+	if c.opts.RotateBytes > 0 || !dest.IsValid() || prev < minCap || read < minCap {
+		return
+	}
+	lo, hi := min(prev, read), max(prev, read)
+	if 4*(hi-lo) > hi {
+		return
+	}
+	if budget := lo / 2; c.budgets[dest] == 0 || budget < c.budgets[dest] {
+		c.budgets[dest] = budget
+		if c.opts.OnLearn != nil {
+			c.opts.OnLearn(dest, budget)
+		}
+	}
+}
+
+// connectTimeout bounds a whole connection attempt: TCP, TLS, and the
+// front's HTTP upgrade.
+var connectTimeout = 10 * time.Second
+
+// connect makes one connection attempt, bounded by connectTimeout and
+// abandoned when the carrier closes.
+func (c *Client) connect() dialed {
+	ctx, cancel := context.WithTimeout(c.ctx, connectTimeout)
 	defer cancel()
-	conn, raw, alpn, err := c.dialTLS(ctx)
+	conn, raw, dest, alpn, err := c.dialTLS(ctx)
+	fail := func(err error) dialed { return dialed{dest: dest, err: err, at: time.Now()} }
 	if err != nil {
-		return nil, nil, err
+		return fail(err)
 	}
 	// The camouflage and front profiles offer web ALPN, so the
 	// negotiated label is not the carrier's; the ARC session
 	// authenticates the peer.
 	if c.opts.Camouflage == nil && c.opts.Front == nil && alpn != ALPN {
 		conn.Close()
-		return nil, nil, &Failure{Mode: ModeDied, At: raw.total(),
-			Err: errors.New("stream: relay did not negotiate ALPN " + ALPN)}
+		return fail(&Failure{Mode: ModeDied, At: raw.total(),
+			Err: errors.New("stream: relay did not negotiate ALPN " + ALPN)})
 	}
 	if c.opts.Front != nil {
+		// Refuse anything but HTTP/1.1 before sending the upgrade
+		// request (#58).
 		if err := checkFrontALPN(alpn); err != nil {
 			conn.Close()
-			return nil, nil, &Failure{Mode: ModeDied, At: raw.total(), Err: err}
+			return fail(&Failure{Mode: ModeDied, At: raw.total(), Err: err})
 		}
+		// The upgrade is plain reads and writes: bound it by the same
+		// deadline, and by Close.
+		dl, _ := ctx.Deadline()
+		conn.SetDeadline(dl)
+		stop := context.AfterFunc(ctx, func() { conn.SetDeadline(time.Now()) })
 		uconn, err := upgradeFront(conn, c.opts.Addr, c.opts.Front)
-		if err != nil {
+		if !stop() || err != nil {
 			conn.Close()
-			return nil, nil, &Failure{Mode: ModeFrontRefused, At: raw.total(), Err: err}
+			if err == nil {
+				err = ctx.Err()
+			}
+			mode := ModeFrontRefused
+			if isTimeout(err) { // no answer to the upgrade, not a refusal
+				mode = ModeTimeoutAtNBytes
+			}
+			return fail(&Failure{Mode: mode, At: raw.total(), Err: err})
 		}
+		conn.SetDeadline(time.Time{})
 		conn = uconn
 	}
 	l := newLink(conn, c.opts.Peer, c.opts.Queue, 0)
 	l.stall = max(c.opts.StallTimeout, 0)
-	return l, raw, nil
+	return dialed{l: l, track: raw, dest: dest, at: time.Now()}
 }
 
 // checkFrontALPN refuses a front handshake that negotiated anything but
@@ -228,7 +476,7 @@ func checkFrontALPN(alpn string) error {
 // classified (§8 taxonomy): OnState receives a *Failure, not a bare
 // error. SetNoDelay runs before the handshake: the camouflage profile
 // needs its ClientHello fragments to leave as TCP segments at once.
-func (c *Client) dialTLS(ctx context.Context) (net.Conn, *trackingConn, string, error) {
+func (c *Client) dialTLS(ctx context.Context) (net.Conn, *trackingConn, netip.AddrPort, string, error) {
 	if len(c.endpoints) == 0 {
 		c.endpoints = c.opts.Endpoints
 	}
@@ -239,19 +487,20 @@ func (c *Client) dialTLS(ctx context.Context) (net.Conn, *trackingConn, string, 
 		}
 		eps, err := resolveEndpoints(ctx, c.opts.Addr, lookup)
 		if err != nil {
-			return nil, nil, "", classifyConnect(err)
+			return nil, nil, netip.AddrPort{}, "", classifyConnect(err)
 		}
 		c.endpoints = eps
 	}
 	// The TLS server name still comes from Addr (see handshakeTLS).
-	addr := c.endpoints[c.nextEndpoint%len(c.endpoints)].String()
+	dest := c.endpoints[c.nextEndpoint%len(c.endpoints)]
+	addr := dest.String()
 	c.nextEndpoint = (c.nextEndpoint + 1) % len(c.endpoints)
 	tcp, err := (&net.Dialer{
 		Control:   sockopt.Control(c.opts.Sockopt),
 		KeepAlive: 15 * time.Second,
 	}).DialContext(ctx, "tcp", addr)
 	if err != nil {
-		return nil, nil, "", classifyConnect(err)
+		return nil, nil, dest, "", classifyConnect(err)
 	}
 	raw := &trackingConn{Conn: tcp}
 	if t, ok := tcp.(*net.TCPConn); ok {
@@ -260,9 +509,9 @@ func (c *Client) dialTLS(ctx context.Context) (net.Conn, *trackingConn, string, 
 	conn, alpn, err := c.handshakeTLS(ctx, raw)
 	if err != nil {
 		raw.Close()
-		return nil, nil, "", classifyHandshake(raw, err)
+		return nil, nil, dest, "", classifyHandshake(raw, err)
 	}
-	return conn, raw, alpn, nil
+	return conn, raw, dest, alpn, nil
 }
 
 // handshakeTLS runs the carrier's TLS handshake over raw: the plain
