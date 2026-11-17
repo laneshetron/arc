@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/netip"
 	"slices"
 	"sync"
@@ -73,6 +74,13 @@ type Config struct {
 	Commit func(ctx context.Context, change func(*accounts.State) error) error
 	// Now is the clock for invite expiry; nil uses time.Now.
 	Now func() time.Time
+	// InviteKey, with Commit, lets key-bound devices of accounts that
+	// allow it mint invites (self-service-accounts.md §3.6): the relay
+	// secret their IDs and secrets are derived from. Without it, no
+	// device is offered invites.
+	InviteKey []byte
+	// Log, if set, records each invite a device mints.
+	Log *slog.Logger
 
 	// HostAddrs are the relay host's own addresses outside the tunnel
 	// network (its LAN or VPC address, say). Like the relay's tunnel
@@ -105,6 +113,7 @@ type credential struct {
 	device  accounts.ID
 	name    string
 	key     []byte // the Noise static key it is bound to, if any
+	mint    bool   // the device may mint invites
 }
 
 // A Revocation is a session the relay must close: its device was
@@ -130,9 +139,22 @@ type Gateway struct {
 	revoke   []Revocation
 	kick     chan struct{}
 
-	st        *accounts.State // the last applied, for enrollments; nil with static accounts
-	enrolling map[enrollKey]*enrollment
+	st         *accounts.State // the last applied, for enrollments; nil with static accounts
+	enrolling  map[enrollKey]*enrollment
+	minting    map[accounts.ID]*minting // by device: at most one commit in flight each
+	committing int                      // minting commits not yet done
 }
+
+// A minting is a device's invite request waiting for its commit.
+type minting struct {
+	request accounts.ID
+	started time.Time
+	done    bool
+	err     error
+}
+
+// maxMinting bounds the minting commits in flight.
+const maxMinting = 64
 
 // An enrollment is a redemption waiting for its commit, keyed by what
 // makes a repeat of it the same redemption.
@@ -168,7 +190,7 @@ func New(cfg Config) (*Gateway, error) {
 			return nil, fmt.Errorf("gateway: deny prefix %v is not IPv4", p)
 		}
 	}
-	g := &Gateway{cfg: cfg, accounts: map[accounts.ID]*Account{}, creds: map[[32]byte]credential{}, enrolling: map[enrollKey]*enrollment{},
+	g := &Gateway{cfg: cfg, accounts: map[accounts.ID]*Account{}, creds: map[[32]byte]credential{}, enrolling: map[enrollKey]*enrollment{}, minting: map[accounts.ID]*minting{},
 		next: cfg.Network.Masked().Addr().Next(), leased: map[netip.Addr]lease{}, kick: make(chan struct{}, 1)}
 	for i := range accts {
 		a := &accts[i]
@@ -219,14 +241,40 @@ func (g *Gateway) Apply(st *accounts.State) {
 	creds := map[[32]byte]credential{}
 	devices := map[accounts.ID]bool{}
 	for _, d := range st.Devices {
-		creds[d.TokenHash] = credential{account: g.accounts[d.Account], device: d.ID, name: d.Name, key: d.Key}
+		creds[d.TokenHash] = credential{account: g.accounts[d.Account], device: d.ID, name: d.Name, key: d.Key,
+			mint: len(g.cfg.InviteKey) == accounts.InviteKeySize && g.cfg.Commit != nil && st.MayMint(d)}
 		devices[d.ID] = true
 	}
+	g.logMintedLocked(st)
 	g.creds, g.static, g.st = creds, nil, st
 	for addr, l := range g.leased {
 		if !l.revoked && !devices[l.device] {
 			g.revokeLocked(addr, l, wire.CodeAuthFailed, ErrRevoked)
 		}
+	}
+}
+
+// logMintedLocked logs the invites devices minted that st has and the
+// last applied state lacks: the audit of minting follows the state the
+// relay adopts, so a mint whose write was confirmed only later (say, by
+// resolving an indeterminate write) is logged too, as are mints by
+// another relay before this one took over.
+func (g *Gateway) logMintedLocked(st *accounts.State) {
+	if g.st == nil || g.cfg.Log == nil {
+		return
+	}
+	for _, i := range st.Invites {
+		if i.By.IsZero() || g.st.InviteByID(i.ID) != nil {
+			continue
+		}
+		account, device := "", ""
+		if a := st.AccountByID(i.Account); a != nil {
+			account = a.Name
+		}
+		if d := st.DeviceByID(i.By); d != nil {
+			device = d.Name
+		}
+		g.cfg.Log.Info("invite minted", "account", account, "device", device, "invite", i.ID.String(), "expires", i.Expires)
 	}
 }
 
@@ -335,6 +383,9 @@ func (g *Gateway) authorizeLocked(token, clientStatic []byte, prior *wire.AuthRe
 	}
 	if g.cfg.DNS.Is4() {
 		r.DNSv4 = g.cfg.DNS.As4()
+	}
+	if c.mint {
+		r.Features |= wire.FeatureInvites
 	}
 	return r, nil
 }
@@ -637,6 +688,106 @@ func (g *Gateway) sweepEnrolling(now time.Time) {
 	for k, p := range g.enrolling {
 		if p.done && now.Sub(p.started) > 5*time.Minute {
 			delete(g.enrolling, k)
+		}
+	}
+}
+
+// MintInvite answers a session's INVITE_REQUEST (self-service-accounts.md
+// §3.6), as session.RelayConfig.Invites: an invite to the session's
+// account, minted by a commit that runs apart from the caller, the
+// relay's session loop. Until the commit is done, and while the relay is
+// not serving, the request is left unanswered (false), and the client's
+// repeat of it gets the answer. A repeat of a request already minted is
+// answered with the same invite, from the store's record.
+func (g *Gateway) MintInvite(s *session.RelaySession, req wire.InviteRequest) (wire.Invite, bool) {
+	return g.mint(netip.AddrFrom4(s.Config().IPv4), s, req)
+}
+
+// mint is MintInvite for the session s leasing addr.
+func (g *Gateway) mint(addr netip.Addr, s *session.RelaySession, req wire.InviteRequest) (wire.Invite, bool) {
+	refuse := func(code wire.ErrorCode) (wire.Invite, bool) { return wire.Invite{Status: code}, true }
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	l, ok := g.leased[addr]
+	if !ok || l.session != s || l.revoked || g.st == nil || g.cfg.Commit == nil {
+		return refuse(wire.CodeUnauthorized)
+	}
+	if g.cfg.Gate != nil && !g.cfg.Gate() {
+		return wire.Invite{}, false
+	}
+	now := g.now()
+	g.sweepMinting(now)
+	device, request := l.device, accounts.ID(req.RequestID)
+	if p := g.minting[device]; p != nil {
+		if !p.done {
+			return wire.Invite{}, false // this request's commit, or another of the device's
+		}
+		delete(g.minting, device)
+		if p.request == request && p.err != nil && mintRefusal(p.err) != 0 {
+			return refuse(mintRefusal(p.err))
+		}
+	}
+	// The committed state decides: a repeat is answered from its
+	// record, a refusal at once; anything else is minted.
+	i, secret, minted, err := accounts.MintInvite(g.st.Clone(), g.cfg.InviteKey, device, request, now)
+	switch {
+	case err != nil && mintRefusal(err) != 0:
+		return refuse(mintRefusal(err))
+	case err != nil:
+		return wire.Invite{}, false
+	case !minted:
+		return wire.Invite{ID: i.ID, Secret: secret, Expires: uint32(i.Expires.Unix())}, true
+	case g.committing >= maxMinting:
+		return wire.Invite{}, false
+	}
+	p := &minting{request: request, started: now}
+	g.minting[device] = p
+	g.committing++
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		err := g.cfg.Commit(ctx, func(st *accounts.State) error {
+			_, _, minted, err := accounts.MintInvite(st, g.cfg.InviteKey, device, request, now)
+			if err == nil && !minted {
+				return errNoChange
+			}
+			return err
+		})
+		if errors.Is(err, errNoChange) {
+			err = nil
+		}
+		// Apply, given the committed state, logs the mint.
+		g.mu.Lock()
+		p.done, p.err = true, err
+		g.committing--
+		g.mu.Unlock()
+	}()
+	return wire.Invite{}, false
+}
+
+// errNoChange ends a commit with nothing to write.
+var errNoChange = errors.New("gateway: nothing to commit")
+
+// mintRefusal is the INVITE status for a minting error, or 0 for one the
+// client should retry (the store unreachable, say).
+func mintRefusal(err error) wire.ErrorCode {
+	switch {
+	case errors.Is(err, accounts.ErrNotPermitted):
+		return wire.CodeUnauthorized
+	case errors.Is(err, accounts.ErrInviteExpired), errors.Is(err, accounts.ErrInviteKeyChanged):
+		return wire.CodeInviteExpired
+	case errors.Is(err, accounts.ErrDeviceCap), errors.Is(err, accounts.ErrInviteCap), errors.Is(err, accounts.ErrLineageFull):
+		return wire.CodeCapacity
+	}
+	return 0
+}
+
+// sweepMinting forgets finished requests whose clients never came back
+// for the answer.
+func (g *Gateway) sweepMinting(now time.Time) {
+	for k, p := range g.minting {
+		if p.done && now.Sub(p.started) > 5*time.Minute {
+			delete(g.minting, k)
 		}
 	}
 }

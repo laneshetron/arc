@@ -45,6 +45,15 @@ type ClientConfig struct {
 	// OnEstablished, for a session that enrolled with an invite. An
 	// error closes the session and RunClient returns it.
 	OnEnrolled func(session.Enrolled) error
+	// InviteRequest, if set, asks the relay for an invite with this
+	// request ID once each session is active, repeating it every
+	// InviteRepeat until answered (self-service-accounts.md §3.6); the
+	// answer goes to OnInvite, whose error closes the session and
+	// RunClient returns it. A relay that offers this device no invites
+	// ends RunClient with session.ErrNoInvites.
+	InviteRequest *[8]byte
+	OnInvite      func(session.InviteAnswer) error
+	InviteRepeat  time.Duration // default 2 s
 
 	// ReconnectDelay is the pause before replacing a session that ended
 	// for a reason other than authentication failure. Default 1 s.
@@ -214,6 +223,21 @@ func RunClient(ctx context.Context, cfg ClientConfig) error {
 	}
 	var reconnectAt time.Time
 	var toTUN [][]byte
+	var inviteAt time.Time // the next INVITE_REQUEST; zero for none
+	if cfg.InviteRepeat <= 0 {
+		cfg.InviteRepeat = 2 * time.Second
+	}
+	requestInvite := func(now time.Time) error {
+		inviteAt = now.Add(cfg.InviteRepeat)
+		err := c.RequestInvite(*cfg.InviteRequest)
+		if errors.Is(err, session.ErrNoInvites) {
+			c.Close(now)
+			flushTransmits(c, carriers, hs.pinned, log)
+			return err
+		}
+		c.Tick(now)
+		return nil
+	}
 
 	// Diagnostics: the next upload, and the one in flight.
 	var uploadAt time.Time
@@ -276,6 +300,11 @@ func RunClient(ctx context.Context, cfg ClientConfig) error {
 						return err
 					}
 				}
+				if cfg.InviteRequest != nil {
+					if err := requestInvite(time.Now()); err != nil {
+						return err
+					}
+				}
 				if cfg.SplitTCP != SplitOff && split == nil {
 					if split, err = splittcp.New(uint32(e.Config.TunMTU)); err != nil {
 						return err
@@ -304,6 +333,18 @@ func RunClient(ctx context.Context, cfg ClientConfig) error {
 						return err
 					}
 				}
+			case session.InviteAnswer:
+				if cfg.InviteRequest == nil || e.RequestID != *cfg.InviteRequest {
+					break
+				}
+				inviteAt = time.Time{}
+				if cfg.OnInvite != nil {
+					if err := cfg.OnInvite(e); err != nil {
+						c.Close(time.Now())
+						flushTransmits(c, carriers, hs.pinned, log)
+						return err
+					}
+				}
 			case session.PathValidated:
 				log.Info("path validated", "path", e.ID)
 			case session.RedundancyChanged:
@@ -325,7 +366,7 @@ func RunClient(ctx context.Context, cfg ClientConfig) error {
 				for _, b := range bridges {
 					b.finish(true) // the session's streams are gone
 				}
-				uploadAt, upload = time.Time{}, nil
+				uploadAt, upload, inviteAt = time.Time{}, nil, time.Time{}
 				if errors.Is(e.Err, session.ErrAuthFailed) {
 					return e.Err
 				}
@@ -362,6 +403,9 @@ func RunClient(ctx context.Context, cfg ClientConfig) error {
 		}
 		if !uploadAt.IsZero() && (deadline.IsZero() || uploadAt.Before(deadline)) {
 			deadline = uploadAt
+		}
+		if !inviteAt.IsZero() && (deadline.IsZero() || inviteAt.Before(deadline)) {
+			deadline = inviteAt
 		}
 		if !reconnectAt.IsZero() {
 			deadline = reconnectAt
@@ -437,6 +481,11 @@ func RunClient(ctx context.Context, cfg ClientConfig) error {
 				uploadAt = now.Add(cfg.DiagnosticsInterval)
 				if upload == nil || upload.finished {
 					upload = startUpload(ctx, c, cfg.Diagnostics, bridges, bridgeEvents, log, now)
+				}
+			}
+			if !inviteAt.IsZero() && !now.Before(inviteAt) && c.State() == session.StateActive {
+				if err := requestInvite(now); err != nil {
+					return err
 				}
 			}
 			if !reconnectAt.IsZero() && !now.Before(reconnectAt) {

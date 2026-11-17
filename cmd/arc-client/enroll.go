@@ -85,9 +85,11 @@ func enroll(args []string) error {
 
 	e := &invite.Enrollment{ID: inv.ID, Secret: inv.Secret, Token: token, Name: *device}
 	var enrolled *session.Enrolled
-	err = connectOnce(ctx, log, p, binds, static, e.Credential(), func(ev session.Enrolled) error {
-		enrolled = &ev
-		return errEnrolled
+	err = connectOnce(ctx, log, p, binds, static, e.Credential(), func(cfg *engine.ClientConfig) {
+		cfg.OnEnrolled = func(ev session.Enrolled) error {
+			enrolled = &ev
+			return errEnrolled
+		}
 	})
 	switch {
 	case errors.Is(err, errEnrolled):
@@ -172,11 +174,11 @@ func prepareProfile(dir string, inv *invite.Invite) (*profile, crypto.StaticKey,
 	return p, static, token, p.save()
 }
 
-// connectOnce runs a session with credential until it is established
-// (errTokenOK) or, with onEnrolled, until ENROLLED, and returns why it
-// ended.
+// connectOnce runs a session with credential and returns why it ended:
+// with no hook, it ends once established (errTokenOK); a hook sets the
+// callbacks that end it instead.
 func connectOnce(ctx context.Context, log *slog.Logger, p *profile, binds []string, static crypto.StaticKey,
-	credential []byte, onEnrolled func(session.Enrolled) error) error {
+	credential []byte, hook func(*engine.ClientConfig)) error {
 	relay, err := netip.ParseAddrPort(p.settings["relay"])
 	if err != nil {
 		return fmt.Errorf("profile relay: %w", err)
@@ -198,13 +200,14 @@ func connectOnce(ctx context.Context, log *slog.Logger, p *profile, binds []stri
 	cfg := engine.ClientConfig{
 		Session: session.ClientConfig{Static: static, RelayPublic: pin[:], Credential: credential},
 		Relay:   relay, Carriers: carriers, TUN: dev, Logger: log,
-		OnEnrolled: onEnrolled,
 	}
-	if onEnrolled == nil {
+	if hook != nil {
+		hook(&cfg)
+	} else {
 		cfg.OnEstablished = func(wire.AuthResult) error { return errTokenOK }
 	}
 	err = engine.RunClient(ctx, cfg)
-	if err != nil && !errors.Is(err, errEnrolled) && !errors.Is(err, errTokenOK) && ctx.Err() != nil {
+	if err != nil && !errors.Is(err, errEnrolled) && !errors.Is(err, errTokenOK) && !errors.Is(err, errAnswered) && ctx.Err() != nil {
 		return ctx.Err()
 	}
 	return err

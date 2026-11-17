@@ -80,7 +80,7 @@ func TestApplyRevokes(t *testing.T) {
 	b := authorize(t, g, string(tb))
 
 	next := st.Clone()
-	if _, err := accounts.Revoke(next, "a/laptop", time.Now()); err != nil {
+	if _, err := accounts.Revoke(next, "a/laptop", time.Now(), false); err != nil {
 		t.Fatal(err)
 	}
 	g.Apply(next)
@@ -132,7 +132,7 @@ func TestRevokeDuringAuthorize(t *testing.T) {
 	st, ta, _ := twoAccounts(t)
 	g := storeGateway(t, st, nil)
 	next := st.Clone()
-	if _, err := accounts.Revoke(next, "a/laptop", time.Now()); err != nil {
+	if _, err := accounts.Revoke(next, "a/laptop", time.Now(), false); err != nil {
 		t.Fatal(err)
 	}
 	applied := make(chan struct{})
@@ -226,7 +226,7 @@ func TestStaleCredentialDuringAcquisition(t *testing.T) {
 	if err := other.Takeover(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := other.Commit(ctx, func(s *accounts.State) error { _, err := accounts.Revoke(s, "a/laptop", time.Now()); return err }); err != nil {
+	if err := other.Commit(ctx, func(s *accounts.State) error { _, err := accounts.Revoke(s, "a/laptop", time.Now(), false); return err }); err != nil {
 		t.Fatal(err)
 	}
 	if err := other.Release(ctx); err != nil {
@@ -286,7 +286,7 @@ func TestUnresolvedRevocation(t *testing.T) {
 	g := storeGateway(t, w.State(), w.Serving)
 	w.OnState = g.Apply
 	store.lossy, store.blind = true, true
-	err := w.Commit(ctx, func(s *accounts.State) error { _, err := accounts.Revoke(s, "a/laptop", time.Now()); return err })
+	err := w.Commit(ctx, func(s *accounts.State) error { _, err := accounts.Revoke(s, "a/laptop", time.Now(), false); return err })
 	if !errors.Is(err, accounts.ErrIndeterminate) {
 		t.Fatalf("revocation: %v", err)
 	}
@@ -323,7 +323,7 @@ func TestResolutionAppliesBeforeAdmitting(t *testing.T) {
 	g := storeGateway(t, w.State(), w.Serving)
 	w.OnState = g.Apply
 	store.lossy, store.blind = true, true
-	if err := w.Commit(ctx, func(s *accounts.State) error { _, err := accounts.Revoke(s, "a/laptop", time.Now()); return err }); !errors.Is(err, accounts.ErrIndeterminate) {
+	if err := w.Commit(ctx, func(s *accounts.State) error { _, err := accounts.Revoke(s, "a/laptop", time.Now(), false); return err }); !errors.Is(err, accounts.ErrIndeterminate) {
 		t.Fatalf("revocation: %v", err)
 	}
 	store.lossy, store.blind = false, false

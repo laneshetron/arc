@@ -297,6 +297,10 @@ func (s *State) Validate() error {
 		if s.AccountByID(i.Account) == nil {
 			return fmt.Errorf("invite %v: no account %v", i.ID, i.Account)
 		}
+		// Marshal writes by= and req= together, and Parse refuses a zero ID.
+		if i.By.IsZero() != i.Request.IsZero() {
+			return fmt.Errorf("invite %v: minting device and request not both set", i.ID)
+		}
 	}
 	return nil
 }

@@ -152,6 +152,7 @@ func run(args []string) error {
 	listen := fs.String("listen", "0.0.0.0:4433", "UDP address to listen on")
 	keyFile := fs.String("key-file", "relay.key", "relay static private key (from genkey)")
 	resetFile := fs.String("reset-secret-file", "reset.secret", "stateless reset secret; created if missing, keep it across restarts")
+	inviteKeyFile := fs.String("invite-key-file", "", "with -accounts-store: lets enrolled devices mint invites to their accounts, derived from this secret (created if missing). Keep it with the relay's key, across restarts and on every relay that serves the store: a relay with another key cannot answer a device's repeated request (default: off)")
 	storeURL := fs.String("accounts-store", "", "keep accounts in this store instead of reading -tokens-file once: s3://BUCKET/KEY (credentials and AWS_REGION from the environment or instance role) or file:PATH. The relay then changes accounts while it runs (arc-relay accounts), and authenticates only while it holds the store's writer lease; an empty store is seeded from -tokens-file, if it exists")
 	controlDir := fs.String("accounts-control", defaultControlDir, "with -accounts-store: directory for the control socket and the writer lock")
 	holder := fs.String("accounts-holder", defaultHolder(), "with -accounts-store: this relay's name in the writer lease, for operators")
@@ -258,7 +259,16 @@ func run(args []string) error {
 		Accounts: staticAccounts, Deny: deny,
 	}
 	if writer != nil {
-		gwCfg.Gate, gwCfg.Commit = writer.Serving, writer.Commit
+		gwCfg.Gate, gwCfg.Commit, gwCfg.Log = writer.Serving, writer.Commit, log
+		if *inviteKeyFile != "" {
+			k, err := keyfile.LoadOrCreateSecret(*inviteKeyFile)
+			if err != nil {
+				return fmt.Errorf("-invite-key-file: %w", err)
+			}
+			gwCfg.InviteKey = k[:]
+		}
+	} else if *inviteKeyFile != "" {
+		return errors.New("-invite-key-file needs -accounts-store")
 	}
 	if gwCfg.HostAddrs, err = hostAddrs(); err != nil {
 		return err

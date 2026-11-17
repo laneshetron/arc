@@ -82,6 +82,14 @@ type RelayConfig struct {
 	// StreamOpened, connecting or resetting the stream.
 	NoStreams bool
 
+	// Invites answers a session's INVITE_REQUEST, sent only to sessions
+	// whose AUTH_RESULT the Authorizer gave FeatureInvites: the answer,
+	// or false to leave the request unanswered for now (the client
+	// repeats it). It is called from the relay's loop, so it must not
+	// block. Without it, or without the feature, requests are refused
+	// UNAUTHORIZED.
+	Invites func(s *RelaySession, req wire.InviteRequest) (wire.Invite, bool)
+
 	// Diagnostics accepts clients' diagnostics uploads (§11.4): each
 	// arrives as a StreamOpened with Diagnostics set, which the caller
 	// answers by storing the stream's bytes or resetting it.
@@ -440,6 +448,8 @@ func (r *Relay) handleData(now time.Time, from netip.AddrPort, b []byte) {
 				s.violation(now)
 				return
 			}
+		case wire.InviteRequest:
+			s.onInviteRequest(f)
 		case wire.Redundancy:
 			s.onRedundancy(f)
 		case wire.IPFragment:
@@ -868,6 +878,22 @@ func (s *RelaySession) emit(p *path, b []byte, toCandidate bool) {
 
 func (s *RelaySession) State() State            { return s.state }
 func (s *RelaySession) Config() wire.AuthResult { return s.result }
+
+// onInviteRequest answers INVITE_REQUEST, or leaves it for the client's
+// repeat.
+func (s *RelaySession) onInviteRequest(f wire.InviteRequest) {
+	if s.state != StateActive {
+		return
+	}
+	if s.result.Features&wire.FeatureInvites == 0 || s.relay.cfg.Invites == nil {
+		s.conn.queue(wire.Invite{RequestID: f.RequestID, Status: wire.CodeUnauthorized})
+		return
+	}
+	if a, ok := s.relay.cfg.Invites(s, f); ok {
+		a.RequestID = f.RequestID
+		s.conn.queue(a)
+	}
+}
 
 // Enrolled returns the device the session's enrollment credential
 // enrolled (or re-enrolled, for a repeat), or nil for a token's session.

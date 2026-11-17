@@ -98,6 +98,7 @@ func RunRelay(ctx context.Context, cfg RelayConfig) error {
 		attempts = NewAttemptLog(log)
 	}
 	cfg.Session.Authorize = cfg.Gateway.AuthorizeSession
+	cfg.Session.Invites = cfg.Gateway.MintInvite
 	cfg.Session.Diagnostics = cfg.Diagnostics != nil
 	r := session.NewRelay(cfg.Session, time.Now())
 	timer := time.NewTimer(time.Hour)

@@ -313,6 +313,38 @@
       }
     },
     {
+      "name": "INVITE_REQUEST",
+      "type": 25,
+      "frame_hex": "190008e1e2e3e4e5e6e7e8",
+      "fields": {
+        "request_id_hex": "e1e2e3e4e5e6e7e8"
+      }
+    },
+    {
+      "name": "INVITE",
+      "type": 26,
+      "frame_hex": "1a0025e1e2e3e4e5e6e7e800f1f2f3f4f5f6f7f8101112131415161718191a1b1c1d1e1f6b49d200",
+      "fields": {
+        "request_id_hex": "e1e2e3e4e5e6e7e8",
+        "status": 0,
+        "invite_id_hex": "f1f2f3f4f5f6f7f8",
+        "secret_hex": "101112131415161718191a1b1c1d1e1f",
+        "expires": 1800000000
+      }
+    },
+    {
+      "name": "INVITE_REFUSED",
+      "type": 26,
+      "frame_hex": "1a0025e1e2e3e4e5e6e7e80500000000000000000000000000000000000000000000000000000000",
+      "fields": {
+        "request_id_hex": "e1e2e3e4e5e6e7e8",
+        "status": 5,
+        "invite_id_hex": "0000000000000000",
+        "secret_hex": "00000000000000000000000000000000",
+        "expires": 0
+      }
+    },
+    {
       "name": "UNKNOWN_EXTENSION",
       "type": 159,
       "frame_hex": "9f0002aabb",
@@ -569,6 +601,26 @@
     {
       "name": "enrolled name invalid",
       "hex": "18000c000000000000000003612062"
+    },
+    {
+      "name": "invite_request wrong size",
+      "hex": "19000700000000000000"
+    },
+    {
+      "name": "invite wrong size",
+      "hex": "1a0024000000000000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "name": "invite_request zero request_id",
+      "hex": "1900080000000000000000"
+    },
+    {
+      "name": "invite zero request_id",
+      "hex": "1a002500000000000000000500000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "name": "invite refusal with secret",
+      "hex": "1a002501000000000000000500000000000000000100000000000000000000000000000000000000"
     },
     {
       "name": "redundancy unknown mode",

@@ -64,6 +64,7 @@ func accountsCmd(args []string) error {
 	inviteFP := fs.String("tls-fingerprint", "", "invite: shape the TLS ClientHello as this browser's: chrome, edge, safari, ios, or firefox")
 	inviteTTL := fs.Duration("ttl", accounts.DefaultInviteTTL, "invite: how long the invite lasts")
 	relayKey := fs.String("relay-key", "", "invite, with no relay running: the relay's static public key (base64)")
+	descendants := fs.Bool("descendants", false, "revoke: also revoke every device enrolled through the device's invites, and theirs in turn")
 	maxDevices := fs.Int("max-devices", 0, fmt.Sprintf("add: the account's device cap (default %d, at most %d)", accounts.DefaultMaxDevices, accounts.MaxDevicesLimit))
 	fs.Usage = func() {
 		fmt.Fprintln(fs.Output(), `usage: arc-relay accounts [flags] COMMAND
@@ -74,7 +75,11 @@ commands:
   add-token ACCOUNT [DEVICE] add a device with a new token, printed once
   invite ACCOUNT             print a single-use invite that enrolls a device
                              (-address, -udp-port, -tls-port, -tls-cover, -ttl)
-  revoke ACCOUNT/DEVICE      revoke one device
+  revoke ACCOUNT/DEVICE      revoke one device (-descendants: and every device
+                             enrolled through its invites, and theirs)
+  rotate ACCOUNT             revoke every device and invite of the account,
+                             keep its policy, and print a fresh invite
+                             (the invite flags, as for invite)
   takeover                   break the lease of a writer known to be dead
                              (a running relay here takes it at once)
 flags:`)
@@ -95,8 +100,8 @@ flags:`)
 		os.Exit(2)
 	}
 	ctl := accounts.Control{Dir: *controlDir}
-	req := accounts.Request{Op: rest[0], Args: rest[1:], Relay: *relay, MaxDevices: *maxDevices}
-	if req.Op == "invite" {
+	req := accounts.Request{Op: rest[0], Args: rest[1:], Relay: *relay, MaxDevices: *maxDevices, Descendants: *descendants}
+	if req.Op == "invite" || req.Op == "rotate" {
 		if *inviteUDP > 65535 || *inviteTLS > 65535 {
 			return errors.New("ports are at most 65535")
 		}

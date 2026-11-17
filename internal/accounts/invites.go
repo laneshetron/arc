@@ -2,16 +2,28 @@ package accounts
 
 import (
 	"bytes"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 )
 
-// DefaultInviteTTL is how long an operator invite lasts (§3.6).
-const DefaultInviteTTL = 48 * time.Hour
+// Invite lifetimes and caps (§3.6).
+const (
+	DefaultInviteTTL = 48 * time.Hour // an operator invite's
+	MintedInviteTTL  = 24 * time.Hour // a device-minted invite's
+	// MaxOutstanding is how many unredeemed, unexpired invites an
+	// account may have before its devices are refused more.
+	MaxOutstanding = 2
+	// InviteKeySize is the length of the relay secret minted invites
+	// are derived from.
+	InviteKeySize = 32
+)
 
 // Redemption refusals (§3.4). ErrInviteUnknown is also a wrong secret.
 var (
@@ -20,6 +32,105 @@ var (
 	ErrInviteExpired = errors.New("accounts: invite expired")
 	ErrDeviceCap     = errors.New("accounts: account at its device cap")
 )
+
+// Minting refusals (§3.6). ErrInviteCap and ErrLineageFull are refused
+// as CAPACITY, like ErrDeviceCap; ErrNotPermitted as UNAUTHORIZED.
+var (
+	ErrNotPermitted = errors.New("accounts: this device may not mint invites")
+	ErrInviteCap    = fmt.Errorf("accounts: the account has %d unredeemed invites", MaxOutstanding)
+	ErrLineageFull  = fmt.Errorf("accounts: the device's lineage is full (%d entries)", MaxLineage)
+	// ErrInviteKeyChanged: the invite a repeated request minted was
+	// derived from another invite key, so it cannot be recomputed; the
+	// request is answered as expired, and the device asks afresh.
+	ErrInviteKeyChanged = errors.New("accounts: the invite was minted with another invite key")
+)
+
+// DeriveInvite is a minted invite's ID and secret (§3.6): derived from
+// the relay's invite key, so a repeat of the request that minted it is
+// answered with the same invite without the secret being stored, and a
+// fresh mint at a later generation never repeats an old one.
+func DeriveInvite(key []byte, device, request ID, gen uint64) (ID, [16]byte) {
+	derive := func(label string) []byte {
+		m := hmac.New(sha256.New, key)
+		m.Write([]byte(label))
+		m.Write(device[:])
+		m.Write(request[:])
+		m.Write(binary.BigEndian.AppendUint64(nil, gen))
+		return m.Sum(nil)
+	}
+	return ID(derive("ARC/1 invite id")[:8]), [16]byte(derive("ARC/1 invite secret")[:16])
+}
+
+// MintedBy returns the invite device minted for request, or nil.
+func (s *State) MintedBy(device, request ID) *Invite {
+	for _, i := range s.Invites {
+		if i.By == device && i.Request == request {
+			return i
+		}
+	}
+	return nil
+}
+
+// Outstanding counts an account's invites neither redeemed nor expired.
+func (s *State) Outstanding(account ID, now time.Time) int {
+	n := 0
+	for _, i := range s.Invites {
+		if i.Account == account && i.Redeemed.IsZero() && now.Before(i.Expires) {
+			n++
+		}
+	}
+	return n
+}
+
+// MayMint reports whether the device may mint invites at all: it is
+// bound to a key, and its account allows it (§3.1, §3.6).
+func (s *State) MayMint(d *Device) bool {
+	a := s.AccountByID(d.Account)
+	return a != nil && a.Invites && d.Bound()
+}
+
+// MintInvite answers a device's request for an invite to its account
+// (§3.6). A repeat of a request whose invite is kept returns that invite,
+// recomputed (minted reports false), or ErrInviteExpired once it has
+// expired; otherwise it mints one, at the generation of the transaction
+// that commits st, and adds its record. key is the relay's invite key.
+func MintInvite(st *State, key []byte, device, request ID, now time.Time) (i *Invite, secret [16]byte, minted bool, err error) {
+	if len(key) != InviteKeySize {
+		return nil, secret, false, errors.New("accounts: no invite key")
+	}
+	if request.IsZero() { // the store's records cannot hold it (Validate)
+		return nil, secret, false, fmt.Errorf("%w: zero request ID", ErrNotPermitted)
+	}
+	d := st.DeviceByID(device)
+	if d == nil || !st.MayMint(d) {
+		return nil, secret, false, ErrNotPermitted
+	}
+	if i := st.MintedBy(device, request); i != nil {
+		if !now.Before(i.Expires) {
+			return nil, secret, false, ErrInviteExpired
+		}
+		id, secret := DeriveInvite(key, device, request, i.Gen)
+		if h := sha256.Sum256(secret[:]); id != i.ID || h != i.SecretHash {
+			return nil, [16]byte{}, false, ErrInviteKeyChanged
+		}
+		return i, secret, false, nil
+	}
+	a := st.AccountByID(d.Account)
+	switch {
+	case len(d.Lineage) >= MaxLineage:
+		return nil, secret, false, ErrLineageFull
+	case len(st.DevicesOf(a.ID)) >= a.MaxDevices:
+		return nil, secret, false, ErrDeviceCap
+	case st.Outstanding(a.ID, now) >= MaxOutstanding:
+		return nil, secret, false, ErrInviteCap
+	}
+	gen := st.Generation + 1 // the transaction committing st (Writer.Commit)
+	id, secret := DeriveInvite(key, device, request, gen)
+	i = &Invite{ID: id, Account: a.ID, SecretHash: sha256.Sum256(secret[:]), Front: FrontVerifier(secret[:]),
+		Expires: now.Add(MintedInviteTTL).UTC().Truncate(time.Second), By: device, Request: request, Gen: gen}
+	st.Invites = append(st.Invites, i)
+	return i, secret, true, st.Validate()
+}
 
 // InviteByID returns the invite, or nil.
 func (s *State) InviteByID(id ID) *Invite {
@@ -119,7 +230,16 @@ func Redeem(st *State, id ID, secret, token, key []byte, name string, now time.T
 	d := &Device{ID: NewID(), Account: a.ID, Name: uniqueName(st, a.ID, name), TokenHash: h, Front: FrontVerifier(token),
 		Key: bytes.Clone(key), Via: i.ID, Created: now.UTC().Truncate(time.Second)}
 	if !i.By.IsZero() {
-		return nil, errors.New("accounts: device-minted invites are not supported yet")
+		// The minter's lineage, then the minter (§3.1). Its revocation
+		// cancelled its unredeemed invites, so it is here.
+		m := st.DeviceByID(i.By)
+		if m == nil {
+			return nil, ErrInviteUnknown
+		}
+		d.Lineage = append(slices.Clone(m.Lineage), m.ID)
+		if len(d.Lineage) > MaxLineage {
+			return nil, ErrLineageFull
+		}
 	}
 	st.Devices = append(st.Devices, d)
 	i.Redeemed = d.ID

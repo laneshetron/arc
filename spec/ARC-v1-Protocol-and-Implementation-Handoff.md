@@ -390,12 +390,14 @@ frame_value:  frame_length bytes
 | `16` | `STREAM_RESET` | 14 bytes: `stream_id:u32; code:u16; final:u64` (§11.3) | Both, if negotiated | Yes |
 | `17` | `DIAGNOSTICS_OPEN` | 4 bytes: `stream_id:u32` (§11.4) | Client → relay, if negotiated | Yes |
 | `18` | `ENROLLED` | `device_id:8B; len:u8; name` (name 1–32 bytes of letters, digits, `.`, `_`, `-`; §9.2) | Relay → client, only after an enrollment credential | Yes |
+| `19` | `INVITE_REQUEST` | 8 bytes: `request_id:8B` (below) | Client → relay, with features bit 4 | Yes |
+| `1A` | `INVITE` | 37 bytes: `request_id:8B; status:u8; invite_id:8B; secret:16B; expires:u32` (below) | Relay → client, answering `INVITE_REQUEST` | Yes |
 
 **`AUTH_RESULT`:**
 - `status=0` means success. Any other value is a failure, and all other fields MUST then be zero.
 - `tun_mtu` MUST be at least 1280 on success.
 - `dns_ipv4=0` means the relay supplied no resolver. Full-tunnel mode MUST then get an authenticated resolver setting from trusted, explicit client configuration.
-- `features` bit 0 (`REDUNDANCY`): the relay accepts `IP_DATAGRAM` and `REDUNDANCY` (§11.1). Bit 1 (`FEC`): the relay accepts `IP_DATAGRAM`, `FEC_REPAIR` and `FEC` (§11.2). Bit 2 (`STREAMS`): the relay accepts `STREAM_OPEN` and carries streams (§11.3). Bit 3 (`DIAGNOSTICS`): the relay accepts `DIAGNOSTICS_OPEN` (§11.4). A relay MUST send other bits as zero, and a client MUST ignore bits it does not know.
+- `features` bit 0 (`REDUNDANCY`): the relay accepts `IP_DATAGRAM` and `REDUNDANCY` (§11.1). Bit 1 (`FEC`): the relay accepts `IP_DATAGRAM`, `FEC_REPAIR` and `FEC` (§11.2). Bit 2 (`STREAMS`): the relay accepts `STREAM_OPEN` and carries streams (§11.3). Bit 3 (`DIAGNOSTICS`): the relay accepts `DIAGNOSTICS_OPEN` (§11.4). Bit 4 (`INVITES`): the session's device may ask for invites to its account (`INVITE_REQUEST`, below). A relay MUST send other bits as zero, and a client MUST ignore bits it does not know.
 - IPv6 configuration and pushed routes are deferred to an extension frame.
 - The relay controls address assignment by deployment policy. Receiving an address does not by itself authorize inbound Internet exposure.
 
@@ -405,6 +407,12 @@ frame_value:  frame_length bytes
 - 12-byte fixed prefix. Data length = `frame_length − 12`, and it MUST be greater than 0.
 - `offset + data_len <= total_len`, and `20 <= total_len <= 65535`.
 - Fragments whose byte ranges overlap with conflicting contents cause the whole datagram to be discarded.
+
+**`INVITE_REQUEST` and `INVITE`** (spec/self-service-accounts.md §3.6). A device asks for a single-use invite to its own account, for a new device to enroll with (§9.2):
+- The client picks a random, nonzero `request_id` (a frame with a zero one is malformed), keeps it (across sessions and restarts) until answered or for at most an hour, and sends `INVITE_REQUEST` reliably, repeating it every 2 s until `INVITE` arrives: the relay may leave a request unanswered while it writes the invite to its accounts store.
+- The relay answers a repeat of a request (the same device and `request_id`) with the same invite for as long as it keeps the invite's record, and with `INVITE_EXPIRED` once that invite has expired; it never mints a second invite for one request.
+- `status=0` carries the invite: its ID, its secret and its expiry (Unix seconds). Otherwise every field but `request_id` and `status` MUST be zero: `CAPACITY` (the account is at its device cap, has 2 unredeemed invites, or the device's lineage is full), `INVITE_EXPIRED`, or `UNAUTHORIZED` (the device may not mint invites).
+- The client builds the invite string from the relay settings it already has.
 
 **`ERROR` codes:** `1 MALFORMED`, `2 AUTH_FAILED`, `3 UNAUTHORIZED`, `4 PATH_UNAVAILABLE`, `5 CAPACITY`, `6 UNSUPPORTED`, `7 SESSION_EXPIRED`, `8 PROTOCOL_VIOLATION`, `9 CONNECT_FAILED`, `10 ABORTED` (these two for `STREAM_RESET`, §11.3), `11 INVITE_USED`, `12 INVITE_EXPIRED` (these two refuse an enrollment, §9.2). Unknown values are informational and MUST NOT crash an implementation. `CLOSE` and `PATH_ABANDON` use the same code space, plus `0 NO_ERROR`.
 

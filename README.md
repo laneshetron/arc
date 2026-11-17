@@ -279,6 +279,32 @@ logs a warning for the first. `run -profile` fills in `-relay`,
 `-relay-key`, `-token-file`, `-key-file` and the TLS settings; flags given
 on the command line win. The store keeps only the invite's hash.
 
+An enrolled device can invite another device to its own account, without
+the operator, when the relay runs with `-invite-key-file`
+([spec/self-service-accounts.md](spec/self-service-accounts.md) §3.6):
+
+```sh
+sudo arc-relay run ... -accounts-store s3://... -invite-key-file /etc/arc/invite.key
+arc-client invite -profile ~/.config/arc/relay        # prints arc1:..., valid 24 hours
+```
+
+Only devices that enrolled with a key may mint, and only while their
+account allows it (`invites=yes`, the default). An account may have 2
+unredeemed invites outstanding, and no more devices than its cap; a chain
+of devices inviting devices is at most 8 long. The invite's secret is
+derived from the invite key, which is kept apart from the accounts store
+(a copy of the store yields no secret): every relay serving the store
+needs the same key. `invite` keeps its request in the profile until it is
+answered, so a rerun after an interruption prints the same invite, never a
+second one. The relay logs each minted invite.
+
+Each device remembers the device that invited it. For a device known to
+be compromised, `arc-relay accounts revoke -descendants ACCOUNT/DEVICE`
+also revokes every device enrolled through its invites, and theirs in
+turn. When it is unclear which device was compromised, `arc-relay
+accounts rotate ACCOUNT` (with the invite flags) revokes all the account's
+devices and invites, keeps its policy, and prints a fresh operator invite.
+
 ### Diagnostics
 
 When someone else runs a client on a network that interferes with ARC,

@@ -84,6 +84,9 @@ type Enrolled struct {
 	Name     string
 }
 
+// InviteAnswer reports the relay's INVITE, answering RequestInvite.
+type InviteAnswer struct{ wire.Invite }
+
 // PathValidated reports that a path opened with OpenPath can carry traffic.
 type PathValidated struct{ ID uint32 }
 
@@ -108,6 +111,7 @@ type StreamUpdate struct{ ID uint32 }
 
 func (Established) clientEvent()       {}
 func (Enrolled) clientEvent()          {}
+func (InviteAnswer) clientEvent()      {}
 func (PathValidated) clientEvent()     {}
 func (PathClosed) clientEvent()        {}
 func (Closed) clientEvent()            {}
@@ -179,6 +183,25 @@ func NewClient(cfg ClientConfig, now time.Time) (*Client, error) {
 }
 
 func (c *Client) State() State { return c.state }
+
+// ErrNoInvites: the relay does not let this session's device mint
+// invites (AUTH_RESULT without FeatureInvites).
+var ErrNoInvites = errors.New("session: the relay does not offer invites to this device")
+
+// RequestInvite asks the relay for an invite to the session's account
+// (§10.1), reliably. The answer comes as an InviteAnswer; the relay may
+// hold a request it cannot answer yet, so the caller repeats it, with the
+// same id, until answered.
+func (c *Client) RequestInvite(id [8]byte) error {
+	if c.state != StateActive {
+		return ErrNotActive
+	}
+	if c.config.Features&wire.FeatureInvites == 0 {
+		return ErrNoInvites
+	}
+	c.conn.queue(wire.InviteRequest{RequestID: id})
+	return nil
+}
 
 // SetFallback marks a path to carry traffic only while no other path is
 // healthy, as for a TLS/TCP carrier (§16.3). It may be called before the
@@ -407,6 +430,8 @@ func (c *Client) handleData(now time.Time, b []byte) {
 			if c.state == StateClosed {
 				return
 			}
+		case wire.Invite:
+			c.events = append(c.events, InviteAnswer{f})
 		case wire.Ack:
 			c.conn.onAck(now, &f)
 		case wire.IPPacket:
