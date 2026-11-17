@@ -34,10 +34,48 @@ type link struct {
 	death atomic.Pointer[error] // first fatal transport error, for classification
 
 	idle time.Duration // close after this long without a received packet; 0: never
+
+	// stall, when positive, closes the link with errStalled once a frame
+	// written after the last one read has gone this long without any
+	// frame read since: bytes in flight, no progress (a censor's silent
+	// freeze, spec/freeze-and-udp-ban.md §2). Client links only.
+	stall time.Duration
+	// unanswered is when the oldest frame written since the last frame
+	// read was flushed (UnixNano), or 0 if none has been.
+	unanswered atomic.Int64
+	// frames counts frames read.
+	frames atomic.Int64
 }
 
 func newLink(conn net.Conn, addr netip.AddrPort, queue int, idle time.Duration) *link {
 	return &link{conn: conn, addr: addr, out: make(chan []byte, queue), done: make(chan struct{}), idle: idle}
+}
+
+// errStalled ends a link that stopped receiving while it had frames in
+// flight. It is a timeout, so classifyDeath reports ModeTimeoutAtNBytes.
+var errStalled error = stallError{}
+
+type stallError struct{}
+
+func (stallError) Error() string   { return "stream: no data received while frames were in flight" }
+func (stallError) Timeout() bool   { return true }
+func (stallError) Temporary() bool { return false }
+
+// watchStall closes the link with errStalled when it stalls (see stall).
+func (l *link) watchStall() {
+	t := time.NewTicker(l.stall / 8)
+	defer t.Stop()
+	for {
+		select {
+		case <-l.done:
+			return
+		case now := <-t.C:
+			if since := l.unanswered.Load(); since != 0 && now.UnixNano()-since > int64(l.stall) {
+				l.stopWith(errStalled)
+				return
+			}
+		}
+	}
 }
 
 // stopWith records the link's first fatal error, if any, and closes it.
@@ -84,6 +122,9 @@ func (l *link) close() {
 // Received packets go to in.
 func (l *link) run(in chan<- inbound) error {
 	go l.write()
+	if l.stall > 0 {
+		go l.watchStall()
+	}
 	l.read(in)
 	l.close()
 	if p := l.death.Load(); p != nil {
@@ -104,6 +145,8 @@ func (l *link) read(in chan<- inbound) {
 			l.stopWith(err)
 			return
 		}
+		l.frames.Add(1)
+		l.unanswered.Store(0)
 		var pkt []byte
 		if n <= bufpool.Packet {
 			pkt = append(bufpool.Get(), buf[:n]...)
@@ -148,6 +191,9 @@ func (l *link) write() {
 		if err := w.Flush(); err != nil {
 			l.stopWith(err)
 			return
+		}
+		if l.stall > 0 {
+			l.unanswered.CompareAndSwap(0, time.Now().UnixNano())
 		}
 	}
 }
