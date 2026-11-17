@@ -136,7 +136,7 @@ func TestClientRedialsFrozenConnection(t *testing.T) {
 			case <-stop:
 				return
 			case <-time.After(10 * time.Millisecond):
-				c.WriteBatch([][]byte{up}, nil)
+				c.WriteBatchEliciting([][]byte{up}, nil, []bool{true})
 			}
 		}
 	}()
@@ -175,8 +175,9 @@ func TestClientRedialsFrozenConnection(t *testing.T) {
 	}
 }
 
-// TestIdleConnectionDoesNotStall: with nothing written, silence is not a
-// stall, however long it lasts.
+// TestIdleConnectionDoesNotStall: once every reply-eliciting packet has
+// been answered, silence is not a stall, however long it lasts, and
+// packets the relay owes no reply (ACK-only) do not make it one.
 func TestIdleConnectionDoesNotStall(t *testing.T) {
 	certPEM, keyPEM, err := SelfSigned([]string{"127.0.0.1"}, time.Hour)
 	if err != nil {
@@ -203,11 +204,15 @@ func TestIdleConnectionDoesNotStall(t *testing.T) {
 	if err := <-states; err != nil {
 		t.Fatal(err)
 	}
-	// One exchange, answered, then silence.
-	c.WriteBatch([][]byte{bytes.Repeat([]byte{1}, 100)}, nil)
+	// One exchange, answered, then an ACK-only packet, then silence.
+	c.WriteBatchEliciting([][]byte{bytes.Repeat([]byte{1}, 100)}, nil, []bool{true})
 	_, from := readOne(t, ln)
 	ln.WriteBatch([][]byte{bytes.Repeat([]byte{2}, 100)}, []netip.AddrPort{from})
 	readOne(t, c)
+	c.WriteBatchEliciting([][]byte{bytes.Repeat([]byte{3}, 100)}, nil, []bool{false})
+	readOne(t, ln)
+	c.WriteBatch([][]byte{bytes.Repeat([]byte{4}, 100)}, nil) // no hint: elicits nothing
+	readOne(t, ln)
 	select {
 	case err := <-states:
 		t.Fatalf("idle connection ended: %v", err)
@@ -270,7 +275,7 @@ func pump(t *testing.T, c *Client) *atomic.Int64 {
 			case <-stop:
 				return
 			case <-time.After(5 * time.Millisecond):
-				c.WriteBatch([][]byte{up}, nil)
+				c.WriteBatchEliciting([][]byte{up}, nil, []bool{true})
 			}
 		}
 	}()
@@ -354,4 +359,44 @@ func TestClientRotatesConfiguredBudget(t *testing.T) {
 	if n := got.Load(); n < 200 {
 		t.Errorf("%d packets received in 2 s, want ≥ 200", n)
 	}
+}
+
+// TestFastReplyDoesNotRearmStall: a reply that arrives before the write
+// that elicited it has returned answers it. On a synchronous pipe the
+// reply is read while the writer is still inside Flush; a link that armed
+// stall detection after flushing would then wait for a reply already
+// received and close a healthy connection.
+func TestFastReplyDoesNotRearmStall(t *testing.T) {
+	near, far := net.Pipe()
+	t.Cleanup(func() { near.Close(); far.Close() })
+	go func() { // the peer: answer each frame at once
+		fr := newFrameReader(far)
+		buf := make([]byte, maxFrame)
+		for {
+			n, err := fr.next(buf)
+			if err != nil {
+				return
+			}
+			if _, err := far.Write(appendFrame(nil, buf[:n])); err != nil {
+				return
+			}
+		}
+	}()
+	l := newLink(near, netip.AddrPort{}, 16, 0)
+	l.stall = 100 * time.Millisecond
+	in := make(chan inbound, 16)
+	ran := make(chan error, 1)
+	go func() { ran <- l.run(in) }()
+	l.send(bytes.Repeat([]byte{5}, 100), true)
+	select {
+	case <-in:
+	case <-time.After(2 * time.Second):
+		t.Fatal("no reply")
+	}
+	select {
+	case err := <-ran:
+		t.Fatalf("answered link closed: %v", err)
+	case <-time.After(500 * time.Millisecond):
+	}
+	l.close()
 }

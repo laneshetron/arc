@@ -8,7 +8,7 @@
 #   docker build -f test/netns/tspu.Dockerfile --build-context mini-tspu=../mini-tspu -t arc-tspu .
 #   docker run --rm --privileged arc-tspu [SCENARIO...]
 #
-#   tspu-c (client)       tspu-t (censor)                tspu-s (relay)         tspu-i
+#   NS_C (client)         NS_T (censor)                  NS_S (relay)           NS_I
 #   c0 10.0.0.1/24 --- t0 [mini-tspu bridge] t1 --- s0 10.0.0.4/24 hosting
 #                                                    s1 192.168.20.1/24 ---- i0 192.168.20.2/24
 #
@@ -25,10 +25,16 @@ for b in arc-client arc-relay mini-tspu; do
   [[ -x $BIN/$b ]] || { echo "tspu.sh: $BIN/$b missing" >&2; exit 2; }
 done
 
-C="ip netns exec tspu-c"
-T="ip netns exec tspu-t"
-S="ip netns exec tspu-s"
-I="ip netns exec tspu-i"
+# Namespace names carry a per-run suffix (RUN_ID, default this shell's
+# PID), and cleanup deletes only the namespaces this run created, so a
+# concurrent run, or a leftover with the same name, is never torn down.
+RUN_ID=${RUN_ID:-$$}
+NS_C=tspu-c-$RUN_ID NS_T=tspu-t-$RUN_ID NS_S=tspu-s-$RUN_ID NS_I=tspu-i-$RUN_ID
+CREATED_NS=()
+C="ip netns exec $NS_C"
+T="ip netns exec $NS_T"
+S="ip netns exec $NS_S"
+I="ip netns exec $NS_I"
 HOSTING=10.0.0.4
 SERVER=192.168.20.2
 FREEZE_BYTES=16384
@@ -50,7 +56,8 @@ wait_until() { # wait_until SECONDS COMMAND...
 cleanup() {
   for pid in "${PIDS[@]}"; do kill "$pid" 2>/dev/null || true; done
   wait 2>/dev/null || true
-  for ns in tspu-c tspu-t tspu-s tspu-i; do ip netns del "$ns" 2>/dev/null || true; done
+  for f in "$WORK"/iperf3.*.pid; do [[ -f $f ]] && kill "$(cat "$f")" 2>/dev/null || true; done
+  for ns in "${CREATED_NS[@]}"; do ip netns del "$ns" 2>/dev/null || true; done
   if [[ $failures -ne 0 || -n "${KEEP_LOGS:-}" ]]; then
     for f in "$WORK"/*.log "$WORK"/censor.json; do [[ -f $f ]] && { echo "--- $f"; tail -n 30 "$f"; }; done
   fi
@@ -60,16 +67,20 @@ cleanup() {
 trap cleanup EXIT
 
 # --- topology ---------------------------------------------------------------
-for ns in tspu-c tspu-t tspu-s tspu-i; do ip netns add "$ns"; ip -n "$ns" link set lo up; done
-ip link add c0 netns tspu-c type veth peer name t0 netns tspu-t
-ip link add s0 netns tspu-s type veth peer name t1 netns tspu-t
-ip link add s1 netns tspu-s type veth peer name i0 netns tspu-i
-ip -n tspu-c addr add 10.0.0.1/24 dev c0
-ip -n tspu-s addr add $HOSTING/24 dev s0
-ip -n tspu-s addr add 192.168.20.1/24 dev s1
-ip -n tspu-i addr add $SERVER/24 dev i0
+for ns in "$NS_C" "$NS_T" "$NS_S" "$NS_I"; do
+  ip netns add "$ns" || { fail "create namespace $ns"; exit 1; }
+  CREATED_NS+=("$ns")
+  ip -n "$ns" link set lo up
+done
+ip link add c0 netns "$NS_C" type veth peer name t0 netns "$NS_T"
+ip link add s0 netns "$NS_S" type veth peer name t1 netns "$NS_T"
+ip link add s1 netns "$NS_S" type veth peer name i0 netns "$NS_I"
+ip -n "$NS_C" addr add 10.0.0.1/24 dev c0
+ip -n "$NS_S" addr add $HOSTING/24 dev s0
+ip -n "$NS_S" addr add 192.168.20.1/24 dev s1
+ip -n "$NS_I" addr add $SERVER/24 dev i0
 # The bridge sees real packets: no segmentation offloads on its path.
-for nsdev in tspu-c:c0 tspu-t:t0 tspu-t:t1 tspu-s:s0 tspu-s:s1 tspu-i:i0; do
+for nsdev in "$NS_C:c0" "$NS_T:t0" "$NS_T:t1" "$NS_S:s0" "$NS_S:s1" "$NS_I:i0"; do
   ns=${nsdev%%:*} dev=${nsdev##*:}
   ip netns exec "$ns" ethtool -K "$dev" tx off tso off gso off gro off >/dev/null 2>&1 || true
   ip -n "$ns" link set "$dev" up
@@ -96,8 +107,7 @@ $S "$BIN/arc-relay" run -listen $HOSTING:4433 -key-file "$WORK/relay.key" \
 PIDS+=("$!")
 wait_until 10 $S ip addr show arc0 || { fail "relay up"; exit 1; }
 
-$I iperf3 -s -D -p 5201
-$I iperf3 -s -D -p 5202
+for port in 5201 5202; do $I iperf3 -s -D -p $port -I "$WORK/iperf3.$port.pid"; done
 
 CLIENT_PID=
 # PCAP=1 captures the client's tunnel and link (for OUT=dir).
