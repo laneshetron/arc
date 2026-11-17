@@ -192,7 +192,9 @@ scenario_udp-ban() {
   else
     fail "udp-ban: no session"
   fi
-  sleep 3 # the ban fires within ~100 ms of UDP starting
+  # Traffic, so a UDP carrier (if any) carries well over the ban's
+  # 25 datagrams; the ban fires as soon as it does.
+  $C ping -c 60 -i 0.05 -W 1 $SERVER >/dev/null 2>&1 || true
   if grep -q '"rule":"udp-ban"' "$WORK/censor.json"; then
     fail "udp-ban: the censor banned the relay's address"
   else
