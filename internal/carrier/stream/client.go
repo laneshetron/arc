@@ -167,6 +167,10 @@ func (c *Client) connect() (*link, *trackingConn, error) {
 			Err: errors.New("stream: relay did not negotiate ALPN " + ALPN)}
 	}
 	if c.opts.Front != nil {
+		if err := checkFrontALPN(alpn); err != nil {
+			conn.Close()
+			return nil, nil, &Failure{Mode: ModeDied, At: raw.total(), Err: err}
+		}
 		uconn, err := upgradeFront(conn, c.opts.Addr, c.opts.Front)
 		if err != nil {
 			conn.Close()
@@ -175,6 +179,18 @@ func (c *Client) connect() (*link, *trackingConn, error) {
 		conn = uconn
 	}
 	return newLink(conn, c.opts.Peer, c.opts.Queue, 0), raw, nil
+}
+
+// checkFrontALPN refuses a front handshake that negotiated anything but
+// HTTP/1.1, before the upgrade request is sent: under h2 the relay reads
+// the request as a bogus HTTP/2 preface, and the dial would otherwise
+// fail as an unexplained refusal. No ALPN at all means HTTP/1.1 (RFC
+// 7301), which the upgrade can use.
+func checkFrontALPN(alpn string) error {
+	if alpn == "" || alpn == "http/1.1" {
+		return nil
+	}
+	return fmt.Errorf("stream: front negotiated ALPN %q, not http/1.1; the carrier upgrade needs HTTP/1.1", alpn)
 }
 
 // dialTLS connects to the relay endpoint and runs the TLS handshake,
