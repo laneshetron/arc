@@ -94,6 +94,9 @@ func TestInvalidInitWorkIsRateLimited(t *testing.T) {
 	if got := n.relay.Stats().HandshakeFailures; got != uint64(n.relay.cfg.HandshakesPerSource) {
 		t.Fatalf("per-source work = %d", got)
 	}
+	if got := n.relay.Stats().InitsRefusedLimited; got != uint64(100-n.relay.cfg.HandshakesPerSource) {
+		t.Fatalf("rate-limited INITs counted %d", got)
+	}
 	n.relay.HandlePacket(n.now.Add(time.Second), n.clientAddr, d.Data)
 	if got := n.relay.Stats().HandshakeFailures; got != uint64(n.relay.cfg.HandshakesPerSource+1) {
 		t.Fatalf("refill: %d", got)
@@ -135,6 +138,9 @@ func TestRelayTotalSessionLimit(t *testing.T) {
 	n.relay.HandlePacket(n.now, n.clientAddr, d.Data)
 	if n.relay.Sessions() != 1 {
 		t.Fatal("active session did not count toward total limit")
+	}
+	if got := n.relay.Stats().InitsRefusedFull; got != 1 {
+		t.Fatalf("refused INITs counted %d", got)
 	}
 }
 
@@ -212,7 +218,7 @@ func TestAuthChecksActiveCapacityBeforeLeasing(t *testing.T) {
 	calls := 0
 	cfg := defaultRelayConfig()
 	cfg.MaxSessions = 1
-	cfg.Authorize = func(c, k []byte, prior *wire.AuthResult) (wire.AuthResult, error) {
+	cfg.Authorize = func(c, k []byte, prior *wire.AuthResult) (Authorization, error) {
 		calls++
 		return testAuthorizer(c, k, prior)
 	}
@@ -353,10 +359,10 @@ func TestSkippedSlotsRefillAfterExpiry(t *testing.T) {
 func TestRefreshSeesTheSessionsLease(t *testing.T) {
 	cfg := defaultRelayConfig()
 	var priors []*wire.AuthResult
-	cfg.Authorize = func(c, k []byte, prior *wire.AuthResult) (wire.AuthResult, error) {
+	cfg.Authorize = func(c, k []byte, prior *wire.AuthResult) (Authorization, error) {
 		priors = append(priors, prior)
 		if prior != nil && string(c) != "good" {
-			return wire.AuthResult{Status: uint8(wire.CodeAuthFailed)}, nil // another principal's
+			return Authorization{Result: wire.AuthResult{Status: uint8(wire.CodeAuthFailed)}}, nil // another principal's
 		}
 		return testAuthorizer(c, k, prior)
 	}

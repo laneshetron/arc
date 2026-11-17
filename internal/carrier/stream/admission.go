@@ -4,6 +4,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"time"
 )
 
 // admissionLimits bound the TCP connections a relay endpoint holds,
@@ -28,6 +29,59 @@ type admission struct {
 	pending        int
 	sources        map[netip.Addr]int
 	pendingSources map[netip.Addr]int
+	refused        Refusals
+	refusedSources map[netip.Addr]int // since the last Refusals, bounded
+}
+
+// Refusals counts TCP connections an endpoint closed at once, before any
+// TLS work, because an admission limit was reached. Each reason is the
+// first limit the connection hit.
+type Refusals struct {
+	Full              int // every connection slot taken
+	Pending           int // every handshake (or visitor) slot taken
+	Source            int // the source's connections at its limit
+	SourcePending     int // the source's pending connections at its limit
+	Sources           int // distinct sources refused, up to refusedSourcesMax
+	TopSource         netip.Addr
+	TopSourceRefusals int
+}
+
+// Total is the number of connections refused.
+func (r Refusals) Total() int { return r.Full + r.Pending + r.Source + r.SourcePending }
+
+const refusedSourcesMax = 1024
+
+// refusal returns the counter of the first limit a new connection from
+// source would exceed, or nil if it may be admitted.
+func (a *admission) refusal(source netip.Addr) *int {
+	switch {
+	case len(a.permits) >= a.limits.maxConns:
+		return &a.refused.Full
+	case a.pending >= a.limits.maxPending:
+		return &a.refused.Pending
+	case a.sources[source] >= a.limits.maxConnsPerSource:
+		return &a.refused.Source
+	case a.pendingSources[source] >= a.limits.maxPendingPerSource:
+		return &a.refused.SourcePending
+	}
+	return nil
+}
+
+// takeRefusals returns the refusals since it was last called, and starts
+// counting afresh.
+func (a *admission) takeRefusals() Refusals {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	r := a.refused
+	r.Sources = len(a.refusedSources)
+	for src, n := range a.refusedSources {
+		if n > r.TopSourceRefusals || (n == r.TopSourceRefusals && src.Less(r.TopSource)) {
+			r.TopSource, r.TopSourceRefusals = src, n
+		}
+	}
+	a.refused = Refusals{}
+	clear(a.refusedSources)
+	return r
 }
 
 // permit is one admitted connection's share of the limits.
@@ -43,6 +97,7 @@ func newAdmission(limits admissionLimits) *admission {
 	return &admission{
 		limits:  limits,
 		permits: make(map[net.Conn]*permit), sources: make(map[netip.Addr]int), pendingSources: make(map[netip.Addr]int),
+		refusedSources: make(map[netip.Addr]int),
 	}
 }
 
@@ -57,8 +112,14 @@ func (a *admission) admit(conn net.Conn) *permit {
 	source := peer.Addr().Unmap()
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.closed || len(a.permits) >= a.limits.maxConns || a.pending >= a.limits.maxPending ||
-		a.sources[source] >= a.limits.maxConnsPerSource || a.pendingSources[source] >= a.limits.maxPendingPerSource {
+	if a.closed {
+		return nil
+	}
+	if r := a.refusal(source); r != nil {
+		*r++
+		if _, ok := a.refusedSources[source]; ok || len(a.refusedSources) < refusedSourcesMax {
+			a.refusedSources[source]++
+		}
 		return nil
 	}
 	p := &permit{a: a, conn: conn, source: source, pending: true}
@@ -146,7 +207,7 @@ func (l *admittedListener) Accept() (net.Conn, error) {
 			return nil, err
 		}
 		if p := l.adm.admit(c); p != nil {
-			return &admittedConn{Conn: c, permit: p}, nil
+			return &admittedConn{Conn: &countedConn{Conn: c, accepted: time.Now()}, permit: p}, nil
 		}
 		c.Close()
 	}

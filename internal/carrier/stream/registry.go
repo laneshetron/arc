@@ -3,6 +3,7 @@ package stream
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"net"
 	"net/netip"
 	"sync"
@@ -59,24 +60,32 @@ func (r *registry) addr() netip.AddrPort {
 
 // serve registers conn as one carrier connection, runs it until it fails
 // or the registry closes, and forgets it. The caller has finished any
-// transport-level handshake it required.
-func (r *registry) serve(conn net.Conn) {
+// transport-level handshake it required. opened, if set, learns the
+// carrier's address once registered; serve returns that address
+// (invalid if conn was refused) and the transport error that ended it.
+func (r *registry) serve(conn net.Conn, opened func(netip.AddrPort)) (netip.AddrPort, error) {
 	r.mu.Lock()
 	if len(r.links) >= r.maxConns || r.ctx.Err() != nil {
 		r.mu.Unlock()
 		conn.Close()
-		return
+		return netip.AddrPort{}, errRegistryFull
 	}
 	k := newLink(conn, r.addr(), r.queue, r.idle)
 	r.links[k.addr] = k
 	r.mu.Unlock()
+	if opened != nil {
+		opened(k.addr)
+	}
 
-	k.run(r.in) // classified deaths are the client side's concern here
+	err := k.run(r.in)
 
 	r.mu.Lock()
 	delete(r.links, k.addr)
 	r.mu.Unlock()
+	return k.addr, err
 }
+
+var errRegistryFull = errors.New("stream: carrier limit reached or endpoint closed")
 
 // writeBatch queues each packet for the connection its address names.
 // Packets for unknown addresses or full queues are dropped.

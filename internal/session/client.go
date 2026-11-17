@@ -77,6 +77,23 @@ type ClientEvent interface{ clientEvent() }
 // Established reports that the session is active.
 type Established struct{ Config wire.AuthResult }
 
+// Enrolled reports the relay's ENROLLED: the client's enrollment
+// credential made it the device DeviceID, named Name (§9.2).
+type Enrolled struct {
+	DeviceID [8]byte
+	Name     string
+}
+
+// InviteAnswer reports the relay's INVITE, answering RequestInvite.
+type InviteAnswer struct{ wire.Invite }
+
+// DevicesAnswer reports the relay's DEVICES, answering RequestDevices.
+type DevicesAnswer struct{ wire.Devices }
+
+// RevokeAnswer reports the relay's REVOKE_RESULT, answering
+// RequestRevoke.
+type RevokeAnswer struct{ wire.RevokeResult }
+
 // PathValidated reports that a path opened with OpenPath can carry traffic.
 type PathValidated struct{ ID uint32 }
 
@@ -100,6 +117,10 @@ type Closed struct{ Err error }
 type StreamUpdate struct{ ID uint32 }
 
 func (Established) clientEvent()       {}
+func (Enrolled) clientEvent()          {}
+func (InviteAnswer) clientEvent()      {}
+func (DevicesAnswer) clientEvent()     {}
+func (RevokeAnswer) clientEvent()      {}
 func (PathValidated) clientEvent()     {}
 func (PathClosed) clientEvent()        {}
 func (Closed) clientEvent()            {}
@@ -134,10 +155,11 @@ type Client struct {
 	nextInit      time.Time // next HANDSHAKE_INIT, or next AUTH while authenticating
 	authenticated time.Time
 
-	conn    *conn
-	config  wire.AuthResult
-	slots   []pathSlot
-	current *path // primary path
+	conn     *conn
+	config   wire.AuthResult
+	enrolled bool // ENROLLED reported
+	slots    []pathSlot
+	current  *path // primary path
 	// Loss-driven moves of the primary (loss.go): when the next check is
 	// due and the earliest the primary may move again.
 	lossCheckAt, lossMoveAt time.Time
@@ -170,6 +192,60 @@ func NewClient(cfg ClientConfig, now time.Time) (*Client, error) {
 }
 
 func (c *Client) State() State { return c.state }
+
+// ErrNoInvites: the relay does not let this session's device mint
+// invites (AUTH_RESULT without FeatureInvites).
+var ErrNoInvites = errors.New("session: the relay does not offer invites to this device")
+
+// ErrNoDevices: the relay does not let this session's device manage
+// devices (AUTH_RESULT without FeatureDevices).
+var ErrNoDevices = errors.New("session: the relay does not let this device manage devices")
+
+// RequestDevices asks the relay for the account's devices (§10.1),
+// reliably. The answer comes as a DevicesAnswer; the caller repeats the
+// request, with the same id, until answered.
+func (c *Client) RequestDevices(id [8]byte) error {
+	if c.state != StateActive {
+		return ErrNotActive
+	}
+	if c.config.Features&wire.FeatureDevices == 0 {
+		return ErrNoDevices
+	}
+	c.conn.queue(wire.DevicesRequest{RequestID: id})
+	return nil
+}
+
+// RequestRevoke asks the relay to revoke one of the account's devices,
+// and with descendants every device enrolled through its invites
+// (§10.1), reliably. The answer comes as a RevokeAnswer once the
+// revocation is committed; the caller repeats the request, with the same
+// id, until answered. Revoking this session's own device closes the
+// session with ErrRevoked instead.
+func (c *Client) RequestRevoke(id, device [8]byte, descendants bool) error {
+	if c.state != StateActive {
+		return ErrNotActive
+	}
+	if c.config.Features&wire.FeatureDevices == 0 {
+		return ErrNoDevices
+	}
+	c.conn.queue(wire.RevokeRequest{RequestID: id, DeviceID: device, Descendants: descendants})
+	return nil
+}
+
+// RequestInvite asks the relay for an invite to the session's account
+// (§10.1), reliably. The answer comes as an InviteAnswer; the relay may
+// hold a request it cannot answer yet, so the caller repeats it, with the
+// same id, until answered.
+func (c *Client) RequestInvite(id [8]byte) error {
+	if c.state != StateActive {
+		return ErrNotActive
+	}
+	if c.config.Features&wire.FeatureInvites == 0 {
+		return ErrNoInvites
+	}
+	c.conn.queue(wire.InviteRequest{RequestID: id})
+	return nil
+}
 
 // SetFallback marks a path to carry traffic only while no other path is
 // healthy, as for a TLS/TCP carrier (§16.3). It may be called before the
@@ -390,9 +466,20 @@ func (c *Client) handleData(now time.Time, b []byte) {
 		switch f := f.(type) {
 		case wire.AuthResult:
 			c.onAuthResult(now, f)
+		case wire.Enrolled:
+			if !c.enrolled {
+				c.enrolled = true
+				c.events = append(c.events, Enrolled{DeviceID: f.DeviceID, Name: f.Name})
+			}
 			if c.state == StateClosed {
 				return
 			}
+		case wire.Invite:
+			c.events = append(c.events, InviteAnswer{f})
+		case wire.Devices:
+			c.events = append(c.events, DevicesAnswer{f})
+		case wire.RevokeResult:
+			c.events = append(c.events, RevokeAnswer{f})
 		case wire.Ack:
 			c.conn.onAck(now, &f)
 		case wire.IPPacket:
@@ -572,8 +659,15 @@ func (c *Client) onAuthResult(now time.Time, r wire.AuthResult) {
 	}
 	if r.Status != 0 {
 		err := ErrAuthFailed
-		if r.Status == uint8(wire.CodeCapacity) {
+		switch wire.ErrorCode(r.Status) {
+		case wire.CodeCapacity:
 			err = ErrCapacity
+		case wire.CodeInviteUsed:
+			err = ErrInviteUsed
+		case wire.CodeInviteExpired:
+			err = ErrInviteExpired
+		case wire.CodeRevoked:
+			err = ErrRevoked
 		}
 		c.state, c.err = StateClosed, err
 		c.events = append(c.events, Closed{Err: err})

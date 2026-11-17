@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"net"
@@ -17,7 +18,7 @@ import (
 )
 
 // RelayConfig configures a relay engine. Session.Authorize is set to
-// Gateway.Authorize.
+// Gateway.AuthorizeSession.
 type RelayConfig struct {
 	Session session.RelayConfig
 	Conn    DatagramConn
@@ -43,7 +44,21 @@ type RelayConfig struct {
 	// Diagnostics, if set, keeps clients' diagnostics uploads (spec
 	// §11.4), and the relay advertises that it accepts them.
 	Diagnostics *diag.Store
+
+	// Attempts logs handshakes that never complete and TLS connections;
+	// nil logs to Logger. Pass the same one as Streams' Report, so
+	// sessions on TLS carriers are logged with their TCP peers.
+	Attempts *AttemptLog
+	// RefusalInterval is how often the relay logs the connections its
+	// admission limits refused, if any were (default a minute).
+	RefusalInterval time.Duration
 }
+
+// refuser is a Streams endpoint that counts the connections its
+// admission limits refused.
+type refuser interface{ Refusals() stream.Refusals }
+
+var _, _ refuser = (*stream.Listener)(nil), (*stream.Front)(nil)
 
 // DialTimeout bounds how long the relay tries to connect a stream.
 const DialTimeout = 15 * time.Second
@@ -78,7 +93,13 @@ func RunRelay(ctx context.Context, cfg RelayConfig) error {
 	}
 	go readPackets(ctx, cfg.TUN, tunCh, errc)
 
-	cfg.Session.Authorize = cfg.Gateway.Authorize
+	attempts := cfg.Attempts
+	if attempts == nil {
+		attempts = NewAttemptLog(log)
+	}
+	cfg.Session.Authorize = cfg.Gateway.AuthorizeSession
+	cfg.Session.Invites = cfg.Gateway.MintInvite
+	cfg.Session.Devices, cfg.Session.Revoke = cfg.Gateway.ListDevices, cfg.Gateway.RevokeDevice
 	cfg.Session.Diagnostics = cfg.Diagnostics != nil
 	r := session.NewRelay(cfg.Session, time.Now())
 	timer := time.NewTimer(time.Hour)
@@ -89,6 +110,13 @@ func RunRelay(ctx context.Context, cfg RelayConfig) error {
 		defer t.Stop()
 		status = t.C
 	}
+	if cfg.RefusalInterval <= 0 {
+		cfg.RefusalInterval = time.Minute
+	}
+	refusalTicker := time.NewTicker(cfg.RefusalInterval)
+	defer refusalTicker.Stop()
+	refusers, _ := cfg.Streams.(refuser)
+
 	var out, sout, toTUN [][]byte
 	var to, sto []netip.AddrPort
 
@@ -141,13 +169,28 @@ func RunRelay(ctx context.Context, cfg RelayConfig) error {
 		for e, ok := r.PollEvent(); ok; e, ok = r.PollEvent() {
 			switch e := e.(type) {
 			case session.SessionEstablished:
-				cfg.Gateway.Bind(e.Session)
 				addr := netip.AddrFrom4(e.Session.Config().IPv4)
-				log.Info("session established", "client", e.Session.Addr(time.Now()),
-					"address", addr, "account", cfg.Gateway.AccountName(addr))
+				if !cfg.Gateway.Bind(e.Session) {
+					// Revoked between AUTH and now.
+					r.Revoke(time.Now(), e.Session, wire.CodeAuthFailed, gateway.ErrRevoked)
+					continue
+				}
+				attempts.established(e.Session, time.Now(), "address", addr, "account", cfg.Gateway.AccountName(addr),
+					"device", cfg.Gateway.DeviceName(addr))
+				if d := e.Session.Enrolled(); d != nil {
+					log.Info("device enrolled", "account", cfg.Gateway.AccountName(addr), "device", d.Name,
+						"id", hex.EncodeToString(d.DeviceID[:]))
+				}
+			case session.HandshakeFailed:
+				attempts.failed(e)
 			case session.SessionClosed:
-				addr := netip.AddrFrom4(e.Session.Config().IPv4)
-				log.Info("session closed", "address", addr, "account", cfg.Gateway.AccountName(addr), "reason", e.Err)
+				if e.Session.Handshake().Established.IsZero() {
+					attempts.unestablished(e.Session, e.Err)
+				} else {
+					addr := netip.AddrFrom4(e.Session.Config().IPv4)
+					log.Info("session closed", "address", addr, "account", cfg.Gateway.AccountName(addr),
+						"device", cfg.Gateway.DeviceName(addr), "reason", e.Err)
+				}
 				cfg.Gateway.Release(e.Session)
 				for k, b := range bridges {
 					if k.s == e.Session {
@@ -243,6 +286,20 @@ func RunRelay(ctx context.Context, cfg RelayConfig) error {
 			}
 		case e := <-bridgeEvents:
 			e.b.handle(time.Now(), e)
+		case <-cfg.Gateway.Revocations():
+			now := time.Now()
+			for _, rv := range cfg.Gateway.TakeRevocations() {
+				addr := netip.AddrFrom4(rv.Session.Config().IPv4)
+				log.Warn("session revoked", "address", addr, "account", cfg.Gateway.AccountName(addr),
+					"device", cfg.Gateway.DeviceName(addr), "reason", rv.Err)
+				r.Revoke(now, rv.Session, rv.Code, rv.Err)
+			}
+		case <-refusalTicker.C:
+			var tls stream.Refusals
+			if refusers != nil {
+				tls = refusers.Refusals()
+			}
+			attempts.refusals(r.Stats(), tls)
 		case <-status:
 			now := time.Now()
 			for _, s := range r.LiveSessions() {

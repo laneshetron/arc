@@ -3,6 +3,9 @@
 //
 //	arc-client run -relay 192.0.2.1:4433 -relay-key BASE64 -token-file token -full-tunnel
 //	arc-client run -relay 192.0.2.1:4433 -relay-key BASE64 -token-file token -route 198.51.100.0/24
+//	arc-client enroll -profile ~/.config/arc/relay arc1:...
+//	arc-client run -profile ~/.config/arc/relay -full-tunnel
+//	arc-client invite -profile ~/.config/arc/relay
 package main
 
 import (
@@ -22,11 +25,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"syscall"
-	"time"
 
-	"github.com/laneshetron/arc/internal/carrier/sockopt"
-	"github.com/laneshetron/arc/internal/carrier/stream"
-	"github.com/laneshetron/arc/internal/carrier/udp"
 	"github.com/laneshetron/arc/internal/crypto"
 	"github.com/laneshetron/arc/internal/diag"
 	"github.com/laneshetron/arc/internal/engine"
@@ -38,11 +37,24 @@ import (
 )
 
 func main() {
-	if len(os.Args) < 2 || os.Args[1] != "run" {
-		fmt.Fprintln(os.Stderr, "usage: arc-client run [flags]")
+	var err error
+	switch {
+	case len(os.Args) >= 2 && os.Args[1] == "run":
+		err = run(os.Args[2:])
+	case len(os.Args) >= 2 && os.Args[1] == "enroll":
+		err = enroll(os.Args[2:])
+	case len(os.Args) >= 2 && os.Args[1] == "invite":
+		err = inviteCmd(os.Args[2:])
+	case len(os.Args) >= 2 && os.Args[1] == "devices":
+		err = devicesCmd(os.Args[2:])
+	case len(os.Args) >= 2 && os.Args[1] == "revoke":
+		err = revokeCmd(os.Args[2:])
+	default:
+		fmt.Fprintln(os.Stderr, "usage: arc-client run [flags]\n       arc-client enroll [flags] INVITE\n       arc-client invite [flags]\n"+
+			"       arc-client devices [flags]\n       arc-client revoke [flags] DEVICE")
 		os.Exit(2)
 	}
-	if err := run(os.Args[2:]); err != nil {
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "arc-client:", err)
 		os.Exit(1)
 	}
@@ -62,6 +74,7 @@ func (p *prefixList) Set(s string) error {
 
 func run(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
+	profileDir := fs.String("profile", "", "use the profile arc-client enroll wrote in this directory: its key, token and relay settings, which other flags override")
 	relay := fs.String("relay", "", "relay UDP address, host:port")
 	relayKey := fs.String("relay-key", "", "relay static public key (base64), pinned")
 	tokenFile := fs.String("token-file", "token", "file containing the access token")
@@ -105,6 +118,7 @@ func run(args []string) error {
 	tlsFragment := fs.Int("tls-fragment", 0, "send the TLS ClientHello in TCP segments of at most this many bytes (optional; the relay certificate is still verified unless -tls-cover is set)")
 	frontAddr := fs.String("front", "", "relay HTTPS front endpoint, host:port: like -tls, but the carrier rides an authenticated HTTP upgrade inside an ordinary HTTPS session; the relay's front serves cover content to everyone else. The admission token is the session's -token-file token. -tls-cover, -tls-fingerprint, and -tls-fragment shape the outer handshake as for -tls")
 	noOffload := fs.Bool("no-offload", false, "send and receive without UDP GSO/GRO, for comparison")
+	noUDP := fs.Bool("no-udp", false, "open no UDP carriers: reach the relay only through -tls or -front (-relay is then the session's address, the -tls endpoint, say)")
 	fecMode := wire.FECAuto
 	fs.Func("fec", "forward error correction: auto (default; while loss is at least 0.5%), off, or always", func(v string) error {
 		switch v {
@@ -138,6 +152,15 @@ func run(args []string) error {
 	table := fs.Int("table", 5243, "routing table for -full-tunnel (Linux)")
 	prof := profiling.Register(fs)
 	fs.Parse(args)
+	if *profileDir != "" {
+		p, err := loadProfile(*profileDir)
+		if err != nil {
+			return err
+		}
+		if err := p.apply(fs); err != nil {
+			return err
+		}
+	}
 	if !*fullTunnel {
 		var dnsFlag bool
 		fs.Visit(func(f *flag.Flag) {
@@ -235,119 +258,15 @@ func run(args []string) error {
 		return fmt.Errorf("create TUN: %w", err)
 	}
 	defer dev.Close()
-	// Each carrier talks only to the relay, so its socket is connected.
-	sockOpts := udp.Options{NoOffload: *noOffload, Peer: relayAddr}
-	if len(binds) == 0 {
-		binds = []string{""}
+	carriers, closeCarriers, err := openCarriers(log, carrierOptions{
+		Relay: relayAddr, Binds: binds, NoOffload: *noOffload, NoUDP: *noUDP, FullTunnel: *fullTunnel, Mark: uint32(*mark),
+		TLS: *tlsAddr, TLSCA: *tlsCA, TLSName: *tlsName, TLSCover: *tlsCover, TLSFingerprint: *tlsFingerprint,
+		TLSFragment: *tlsFragment, Front: *frontAddr, FrontToken: tokens[0],
+	})
+	if err != nil {
+		return err
 	}
-	if *fullTunnel && tun.PolicyRouting {
-		sockOpts.Mark = uint32(*mark)
-	} else if *fullTunnel {
-		// Without marks, an unbound carrier would route into the tunnel
-		// it carries. This binding doesn't follow later changes of the
-		// default route; pass -bind for each interface to use them all.
-		for i, iface := range binds {
-			if iface == "" {
-				if binds[i], err = tun.Underlay(); err != nil {
-					return err
-				}
-				log.Info("binding carrier to the default route's interface", "interface", binds[i])
-			}
-		}
-	}
-	carriers := make([]engine.Carrier, 0, len(binds))
-	for _, iface := range binds {
-		name := iface
-		if name == "" {
-			name = "default"
-		}
-		sockOpts.Device = iface
-		sockOpts.OnReconnect = func(local netip.AddrPort) {
-			log.Info("carrier reconnected to the relay", "carrier", name, "local", local)
-		}
-		conn, err := udp.Listen(netip.MustParseAddrPort("0.0.0.0:0"), sockOpts)
-		if err != nil {
-			return fmt.Errorf("open carrier %q: %w", iface, err)
-		}
-		defer conn.Close()
-		log.Info("carrier", "carrier", name, "local", conn.LocalAddr())
-		carriers = append(carriers, engine.Carrier{Name: name, Conn: conn})
-	}
-	var camo *stream.Camouflage
-	if *tlsCover != "" || *tlsFingerprint != "" || *tlsFragment != 0 {
-		camo = &stream.Camouflage{
-			Name: *tlsCover, Fingerprint: *tlsFingerprint, Fragment: *tlsFragment,
-		}
-		if err := camo.Validate(); err != nil {
-			return fmt.Errorf("-tls-fingerprint/-tls-fragment: %w", err)
-		}
-		log.Info("tls carrier will pose as ordinary web traffic",
-			"cover", camo.Name, "fingerprint", camo.Fingerprint, "fragment", camo.Fragment)
-	}
-	if *tlsAddr != "" {
-		tlsConfig, err := clientTLS(*tlsAddr, *tlsCA, *tlsName)
-		if err != nil {
-			return err
-		}
-		bootstrap, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		tlsEndpoints, err := stream.ResolveEndpoints(bootstrap, *tlsAddr)
-		cancel()
-		if err != nil {
-			// The UDP carriers may work regardless; the TLS carrier keeps
-			// resolving the relay until it can.
-			log.Warn("resolving the TLS relay; retrying when the carrier connects", "relay", *tlsAddr, "err", err)
-		}
-		for _, iface := range binds {
-			name := iface
-			if name == "" {
-				name = "default"
-			}
-			conn := stream.Dial(stream.ClientOptions{
-				Addr: *tlsAddr, Endpoints: tlsEndpoints, TLS: tlsConfig, Peer: relayAddr,
-				Camouflage: camo,
-				Sockopt:    sockopt.Options{Mark: sockOpts.Mark, Device: iface},
-				OnState: func(err error) {
-					if err != nil {
-						log.Debug("tls carrier", "carrier", name+"/tls", "err", err)
-					}
-				},
-			})
-			defer conn.Close()
-			carriers = append(carriers, engine.Carrier{Name: name + "/tls", Conn: conn, Fallback: true})
-		}
-	}
-	if *frontAddr != "" {
-		frontTLS, err := clientTLS(*frontAddr, *tlsCA, *tlsName)
-		if err != nil {
-			return err
-		}
-		// As for -tls: resolve before full-tunnel DNS can route lookups
-		// into the tunnel the carrier exists to rescue.
-		bootstrap, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		frontEndpoints, err := stream.ResolveEndpoints(bootstrap, *frontAddr)
-		cancel()
-		if err != nil {
-			log.Warn("resolving the relay front; retrying when the carrier connects", "front", *frontAddr, "err", err)
-		}
-		for _, iface := range binds {
-			name := iface
-			if name == "" {
-				name = "default"
-			}
-			conn := stream.Dial(stream.ClientOptions{
-				Addr: *frontAddr, Endpoints: frontEndpoints, TLS: frontTLS, Peer: relayAddr,
-				Camouflage: camo, Front: &stream.FrontDialOptions{Token: tokens[0]},
-				Sockopt: sockopt.Options{Mark: sockOpts.Mark, Device: iface},
-				OnState: func(err error) {
-					if err != nil {
-						log.Debug("front carrier", "carrier", name+"/front", "err", err)
-					}
-				},
-			})
-			defer conn.Close()
-			carriers = append(carriers, engine.Carrier{Name: name + "/front", Conn: conn, Fallback: true})
-		}
-	}
+	defer closeCarriers()
 
 	var cleanup func() error
 	var cleanupDNS func() error

@@ -300,6 +300,19 @@ Client                                          Relay
 - The relay caches the `HANDSHAKE_RESP` for each completed `HANDSHAKE_INIT` while the session is pending. If byte-identical INIT bytes arrive from the same source, it re-sends the cached response without doing a new Diffie-Hellman computation. INITs from different sources are separate handshakes: the relay keeps a pending session for each, and those the client does not authenticate expire.
 - Until `AUTH_RESULT` arrives, the client repeats `AUTH` in new `DATA` packets at the INIT interval, rather than on its loss-recovery timer, which backs off. It gives up 10 s after processing the response. The relay MUST process duplicate `AUTH` idempotently, and it answers each one.
 - The relay keeps a session that has not authenticated for 20 s from its INIT, covering both client phases.
+- A relay that cannot decide an `AUTH` at once (an enrollment, below, waiting for its write to the accounts store) MAY leave it unanswered; the client's repeated `AUTH` gets the answer once the relay has it.
+
+**Enrollment** (spec/self-service-accounts.md §3.4). `AUTH` carries either a token or an **enrollment credential**, which redeems a single-use invite and registers the token the client generated, bound to its static key:
+
+```text
+"\x00ARC-ENROLL1" || invite_id[8] || secret[16] || u8 len || token || u8 len || device_name
+```
+
+- Tokens are printable ASCII, so the leading zero byte tells the two apart. A token registered by enrollment authenticates only a handshake from the static key it enrolled with.
+- An unknown invite or wrong secret is `AUTH_FAILED`, like a wrong token. An invite another device redeemed is `INVITE_USED`, and one past its expiry `INVITE_EXPIRED`, in both `AUTH_RESULT.status` and `CLOSE`. An account at its device cap is `CAPACITY`.
+- The relay answers a repeat of an enrollment it already made (the same invite, token and static key) with success, even after the invite has expired.
+- With a successful `AUTH_RESULT`, and only in answer to an enrollment credential, the relay sends `ENROLLED` with the device's ID and name. `AUTH_RESULT` is unchanged.
+- A client that may have enrolled before losing the answer, and is then refused `INVITE_USED`, `INVITE_EXPIRED` or `AUTH_FAILED`, tries once more with its token: success means it was enrolled.
 
 **Resource limits.** The relay MUST implement handshake timeouts, a cap on pending handshakes, per-source rate limits, and the cookie mechanism in §9.3.
 
@@ -376,12 +389,19 @@ frame_value:  frame_length bytes
 | `15` | `MAX_DATA` | 8 bytes: `max:u64` (§11.3) | Both, if negotiated | Yes |
 | `16` | `STREAM_RESET` | 14 bytes: `stream_id:u32; code:u16; final:u64` (§11.3) | Both, if negotiated | Yes |
 | `17` | `DIAGNOSTICS_OPEN` | 4 bytes: `stream_id:u32` (§11.4) | Client → relay, if negotiated | Yes |
+| `18` | `ENROLLED` | `device_id:8B; len:u8; name` (name 1–32 bytes of letters, digits, `.`, `_`, `-`; §9.2) | Relay → client, only after an enrollment credential | Yes |
+| `19` | `INVITE_REQUEST` | 8 bytes: `request_id:8B` (below) | Client → relay, with features bit 4 | Yes |
+| `1A` | `INVITE` | 37 bytes: `request_id:8B; status:u8; invite_id:8B; secret:16B; expires:u32` (below) | Relay → client, answering `INVITE_REQUEST` | Yes |
+| `1B` | `DEVICES_REQUEST` | 8 bytes: `request_id:8B` (below) | Client → relay, with features bit 5 | Yes |
+| `1C` | `DEVICES` | `request_id:8B; status:u8; n:u8;` n × `device_id:8B; parent:8B; created:u32; last_seen:u32; key:8B; len:u8; name` (below) | Relay → client, answering `DEVICES_REQUEST` | Yes |
+| `1D` | `REVOKE_REQUEST` | 17 bytes: `request_id:8B; device_id:8B; flags:u8` (below) | Client → relay, with features bit 5 | Yes |
+| `1E` | `REVOKE_RESULT` | 9 bytes: `request_id:8B; status:u8` (below) | Relay → client, answering `REVOKE_REQUEST` | Yes |
 
 **`AUTH_RESULT`:**
 - `status=0` means success. Any other value is a failure, and all other fields MUST then be zero.
 - `tun_mtu` MUST be at least 1280 on success.
 - `dns_ipv4=0` means the relay supplied no resolver. Full-tunnel mode MUST then get an authenticated resolver setting from trusted, explicit client configuration.
-- `features` bit 0 (`REDUNDANCY`): the relay accepts `IP_DATAGRAM` and `REDUNDANCY` (§11.1). Bit 1 (`FEC`): the relay accepts `IP_DATAGRAM`, `FEC_REPAIR` and `FEC` (§11.2). Bit 2 (`STREAMS`): the relay accepts `STREAM_OPEN` and carries streams (§11.3). Bit 3 (`DIAGNOSTICS`): the relay accepts `DIAGNOSTICS_OPEN` (§11.4). A relay MUST send other bits as zero, and a client MUST ignore bits it does not know.
+- `features` bit 0 (`REDUNDANCY`): the relay accepts `IP_DATAGRAM` and `REDUNDANCY` (§11.1). Bit 1 (`FEC`): the relay accepts `IP_DATAGRAM`, `FEC_REPAIR` and `FEC` (§11.2). Bit 2 (`STREAMS`): the relay accepts `STREAM_OPEN` and carries streams (§11.3). Bit 3 (`DIAGNOSTICS`): the relay accepts `DIAGNOSTICS_OPEN` (§11.4). Bit 4 (`INVITES`): the session's device may ask for invites to its account (`INVITE_REQUEST`, below). Bit 5 (`DEVICES`): the session's device may list and revoke its account's devices (`DEVICES_REQUEST`, `REVOKE_REQUEST`, below). A relay MUST send other bits as zero, and a client MUST ignore bits it does not know.
 - IPv6 configuration and pushed routes are deferred to an extension frame.
 - The relay controls address assignment by deployment policy. Receiving an address does not by itself authorize inbound Internet exposure.
 
@@ -392,7 +412,20 @@ frame_value:  frame_length bytes
 - `offset + data_len <= total_len`, and `20 <= total_len <= 65535`.
 - Fragments whose byte ranges overlap with conflicting contents cause the whole datagram to be discarded.
 
-**`ERROR` codes:** `1 MALFORMED`, `2 AUTH_FAILED`, `3 UNAUTHORIZED`, `4 PATH_UNAVAILABLE`, `5 CAPACITY`, `6 UNSUPPORTED`, `7 SESSION_EXPIRED`, `8 PROTOCOL_VIOLATION`, `9 CONNECT_FAILED`, `10 ABORTED` (the last two for `STREAM_RESET`, §11.3). Unknown values are informational and MUST NOT crash an implementation. `CLOSE` and `PATH_ABANDON` use the same code space, plus `0 NO_ERROR`.
+**`INVITE_REQUEST` and `INVITE`** (spec/self-service-accounts.md §3.6). A device asks for a single-use invite to its own account, for a new device to enroll with (§9.2):
+- The client picks a random, nonzero `request_id` (a frame with a zero one is malformed), keeps it (across sessions and restarts) until answered or for at most an hour, and sends `INVITE_REQUEST` reliably, repeating it every 2 s until `INVITE` arrives: the relay may leave a request unanswered while it writes the invite to its accounts store.
+- The relay answers a repeat of a request (the same device and `request_id`) with the same invite for as long as it keeps the invite's record, and with `INVITE_EXPIRED` once that invite has expired; it never mints a second invite for one request.
+- `status=0` carries the invite: its ID, its secret and its expiry (Unix seconds). Otherwise every field but `request_id` and `status` MUST be zero: `CAPACITY` (the account is at its device cap, has 2 unredeemed invites, or the device's lineage is full), `INVITE_EXPIRED`, or `UNAUTHORIZED` (the device may not mint invites).
+- The client builds the invite string from the relay settings it already has.
+
+**`DEVICES_REQUEST`, `DEVICES`, `REVOKE_REQUEST` and `REVOKE_RESULT`** (spec/self-service-accounts.md §3.8). A device lists its account's devices, and revokes them:
+- Each request carries a random, nonzero `request_id` (a frame with a zero one is malformed), and is sent reliably, repeated every 2 s until answered: the relay may leave a request unanswered while it is not serving, or while it writes a revocation to its accounts store.
+- `DEVICES` with `status=0` lists at most 16 devices. `parent` is the device whose invite enrolled it (zero for an operator invite); `created` and `last_seen` are Unix seconds (`last_seen` 0 when the relay has seen no session of it); `key` is the first 8 bytes of its static key (zero for a device bound to none); `name` is 1–32 bytes of letters, digits, `.`, `_` and `-`. Any other status (`UNAUTHORIZED`) has `n=0`.
+- `REVOKE_REQUEST` names a device of the account; flags bit 0 also revokes every device enrolled through its invites, and theirs in turn (even when the named device was already revoked), and other bits MUST be zero. The relay answers `status=0` once the revocation is committed, or at once if there is nothing left to revoke; `UNAUTHORIZED` if the device may not manage devices, names no device of its account, or was enrolled less than 24 hours ago and would revoke any device but itself. A device may revoke itself; its session then closes with `REVOKED` instead.
+- The relay records each revocation's `request_id` with it in the accounts store, and answers a repeat of a request it carried out (the same device and `request_id`) as done while it keeps that record (7 days), whatever changed since, across restarts: a repeat never revokes a device the operator has restored.
+- A revoked device's sessions close with `REVOKED`, and its client stops reconnecting. While the relay remembers the revocation (7 days), the device's token is refused with `AUTH_RESULT.status=REVOKED` rather than `AUTH_FAILED`, so a client that missed the `CLOSE` still learns why.
+
+**`ERROR` codes:** `1 MALFORMED`, `2 AUTH_FAILED`, `3 UNAUTHORIZED`, `4 PATH_UNAVAILABLE`, `5 CAPACITY`, `6 UNSUPPORTED`, `7 SESSION_EXPIRED`, `8 PROTOCOL_VIOLATION`, `9 CONNECT_FAILED`, `10 ABORTED` (these two for `STREAM_RESET`, §11.3), `11 INVITE_USED`, `12 INVITE_EXPIRED` (these two refuse an enrollment, §9.2), `13 REVOKED` (in `CLOSE` and `AUTH_RESULT.status`: the device was revoked; the client stops reconnecting). Unknown values are informational and MUST NOT crash an implementation. `CLOSE` and `PATH_ABANDON` use the same code space, plus `0 NO_ERROR`.
 
 ### 10.2 `ACK` frame
 

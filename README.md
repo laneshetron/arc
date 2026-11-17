@@ -163,10 +163,59 @@ friend  c47a…
 
 A name may repeat, giving its account several tokens. The relay reads
 the file only at startup, so changing it means restarting the relay, which
-interrupts every session. Several tokens allow a staged migration (add the
-new token, move clients to it, then remove the old one, a restart each
-time) but not yet an uninterrupted rotation, which needs credentials the
-relay can reload.
+interrupts every session.
+
+#### Changing accounts while the relay runs
+
+With `-accounts-store`, the relay keeps its accounts in a store instead,
+and changes them without restarting
+([spec/self-service-accounts.md](spec/self-service-accounts.md)). An empty
+store is seeded from `-tokens-file` (each token becomes a device named
+`legacy-N`), and the store keeps only hashes of tokens. The store is one
+object, replaced whole by conditional writes:
+
+- `s3://BUCKET/KEY`: an S3 object, so accounts outlive the relay's host.
+  Credentials and the region (`AWS_REGION`) come from the environment or
+  the instance role, which needs `s3:GetObject` and `s3:PutObject` on the
+  object and `s3:ListBucket` on the bucket (without it, S3 answers a
+  missing object with 403, and the relay will not seed an empty store).
+  With SSE-KMS, it also needs `kms:GenerateDataKey` (writes) and
+  `kms:Decrypt` (reads, including the read-back after an unconfirmed
+  write) on the bucket's key: granted already for the AWS-managed
+  `aws/s3` key by its key policy, but for a customer-managed key in both
+  the key policy and the role's policy. Turn on versioning, which keeps
+  every generation as history.
+- `file:PATH`: a local file, for a relay whose accounts need not survive
+  its host.
+
+```sh
+arc-relay accounts list
+arc-relay accounts add alexei                 # -relay, -max-devices N
+arc-relay accounts add-token alexei laptop    # prints the new token once
+arc-relay accounts revoke alexei/laptop       # closes its session at once
+arc-relay accounts remove alexei
+```
+
+The commands talk to the running relay through its control socket
+(`-accounts-control`, default `/run/arc-relay`, root only). With the relay
+stopped, pass `-store` (the relay's `-accounts-store`) and they change the
+store themselves. Either way, a command succeeds only once the store has
+the change. If the store does not confirm a write and cannot be read back,
+the command says the outcome is unknown (and `add-token` still prints the
+token, in case the device was added): run `list` to see.
+
+The store also holds a **writer lease**: the relay authenticates clients
+only while it holds it, renewing it every minute (`-accounts-lease`,
+default 15 minutes). A relay that cannot renew it, because the store is
+unreachable or another relay took it, stops after the lease runs out and
+closes its sessions; its clients are told the relay is full and keep
+retrying. A clean shutdown releases the lease. After a crash, the relay
+restarted with the same `-accounts-control` directory retakes it at once,
+proven its own by the lease token it keeps there; any other relay, even one
+with the same `-accounts-holder` name, waits for it to expire, or for
+`arc-relay accounts takeover`, which you run only when the old relay is
+gone: on the waiting relay's host, that relay takes the lease at once
+(with no relay running, pass `-store`). `-front-listen` still needs `-tokens-file`.
 
 Clients of one account can reach each other's tunnel addresses; clients of
 different accounts never can. (Split TCP never connects a stream to another
@@ -193,6 +242,95 @@ account needs the host's other addresses, a host firewall rule such as
 `iptables -A INPUT -i arc0 ! -d 10.77.0.1 -j DROP` adds a second line of
 defense for IP forwarding (not for split TCP, which only the relay's own
 checks cover).
+
+#### Enrolling devices with invites
+
+With `-accounts-store`, a device can enroll itself: the operator prints a
+single-use invite for an account, and its holder redeems it with
+`arc-client enroll`, over ARC itself, on the carriers the invite names
+([spec/self-service-accounts.md](spec/self-service-accounts.md) §3.3–3.4).
+
+```sh
+# on the relay host (or through its control socket)
+arc-relay accounts invite -address 203.0.113.7 alexei            # UDP 4433
+arc-relay accounts invite -address 203.0.113.7 -tls-port 443 \
+    -tls-cover s3.amazonaws.com -tls-fingerprint chrome -ttl 24h alexei
+# on the device
+arc-client enroll -profile ~/.config/arc/relay arc1:...
+sudo arc-client run -profile ~/.config/arc/relay -full-tunnel
+```
+
+A TLS invite's device poses as a browser (the cover name, and the
+fingerprint if given), so a relay inviting with `-tls-port` runs with
+`-tls-camouflage`. An invite without a UDP port makes a profile with
+`no-udp=true`: the device opens only its TLS carrier. Invites are for
+IPv4 addresses only, as clients reach relays over IPv4.
+
+The invite (about 100 characters) holds the relay's address, ports and
+pinned key, and a secret that only travels inside the Noise handshake.
+`enroll` makes the device a key and a token, writes them with the relay's
+settings to the profile directory **before** connecting, and registers
+the token, bound to that key: a copied token is refused from any other
+machine. An interrupted enrollment is rerun with the same command and
+resumes with the same key and token, which the relay recognizes even
+after the invite has expired. An invite another device already redeemed,
+or one past its expiry (48 hours by default), is refused, and the relay
+logs a warning for the first. `run -profile` fills in `-relay`,
+`-relay-key`, `-token-file`, `-key-file` and the TLS settings; flags given
+on the command line win. The store keeps only the invite's hash.
+
+An enrolled device can invite another device to its own account, without
+the operator, when the relay runs with `-invite-key-file`
+([spec/self-service-accounts.md](spec/self-service-accounts.md) §3.6):
+
+```sh
+sudo arc-relay run ... -accounts-store s3://... -invite-key-file /etc/arc/invite.key
+arc-client invite -profile ~/.config/arc/relay        # prints arc1:..., valid 24 hours
+```
+
+Only devices that enrolled with a key may mint, and only while their
+account allows it (`invites=yes`, the default). An account may have 2
+unredeemed invites outstanding, and no more devices than its cap; a chain
+of devices inviting devices is at most 8 long. The invite's secret is
+derived from the invite key, which is kept apart from the accounts store
+(a copy of the store yields no secret): every relay serving the store
+needs the same key. `invite` keeps its request in the profile until it is
+answered, so a rerun after an interruption prints the same invite, never a
+second one. The relay logs each minted invite.
+
+Each device remembers the device that invited it. For a device known to
+be compromised, `arc-relay accounts revoke -descendants ACCOUNT/DEVICE`
+also revokes every device enrolled through its invites, and theirs in
+turn. When it is unclear which device was compromised, `arc-relay
+accounts rotate ACCOUNT` (with the invite flags) revokes all the account's
+devices and invites, keeps its policy, and prints a fresh operator invite.
+
+A device can also list its account's devices and revoke them, so a person
+who loses a laptop can cut it off from their desktop at once
+([spec/self-service-accounts.md](spec/self-service-accounts.md) §3.8):
+
+```sh
+arc-client devices -profile ~/.config/arc/relay        # a tree of who invited whom
+arc-client revoke -profile ~/.config/arc/relay laptop  # -descendants: its invitees too
+```
+
+Only devices that enrolled with a key may, while their account allows it
+(`manage=yes`, the default), and a device may revoke others only once it
+has been enrolled for 24 hours (it may always revoke itself, but not its
+descendants with it). A revoked
+device's sessions close at once, and its client stops reconnecting. Since
+a stolen device can use these commands too, revocations by devices are
+soft: the relay logs each as a warning, and for 7 days the operator can
+undo them, then revoke the thief's device:
+
+```sh
+arc-relay accounts list                        # shows devices revoked by devices
+arc-relay accounts restore alexei/desktop      # same ID, token and key as before
+arc-relay accounts revoke -descendants alexei/laptop
+```
+
+Operator revocations are final, and `rotate` makes earlier revocations by
+devices final too.
 
 ### Diagnostics
 
@@ -230,6 +368,38 @@ account, an upload that stalls for two minutes or runs past thirty is
 abandoned, and empty uploads are refused. Other files you put in an
 account's directory count toward its 64 MiB but are never deleted.
 `-journal` without `-share-diagnostics` keeps the journal locally only.
+
+A client that never gets a session up never uploads, so the relay logs
+what it sees of attempts, with each client's address:
+
+- `handshake not completed`: a handshake arrived and the relay answered,
+  but the client never authenticated. `init_resends` counts how often the
+  client resent its first message; it does so only until it hears the
+  answer, so resends mean the relay's replies were not reaching it.
+  None means nothing after the first message arrived.
+- `handshake rejected: unknown token`; `handshake rejected: relay at
+  capacity`; `handshake rejected: authorization failed` for a valid token
+  refused for another `reason`, such as an exhausted address pool; and
+  `handshake failed`, for a client pinning another relay key (or a
+  corrupted packet).
+- `tls connection failed`, with the `stage` it stopped at: `tcp` (nothing
+  arrived), `client_hello` (a ClientHello started but did not finish, or
+  did not parse), `after_client_hello` (the relay parsed it but sent
+  nothing back), `after_server_hello` (the relay answered and the
+  handshake then failed), or `alpn`; with its SNI and ALPN (cut short if
+  long), bytes each way and duration. A carrier that ends logs `tls
+  carrier closed` likewise.
+- `session established` names the TLS carrier's TCP peer, not its
+  internal address, and adds `handshake_seconds` and `init_resends`.
+- `connections refused by admission limits`, at most once a minute and
+  only if any were: handshakes dropped because the relay was full
+  (`udp_relay_full`) or over its handshake rate (`udp_rate_limited`), and
+  TCP connections closed before TLS because a limit was reached, by
+  which limit, with how many sources and the one refused most
+  (`tls_top_source`).
+
+These lines are unauthenticated, so they are limited to 60 a minute; the
+next line logged counts those dropped as `suppressed`.
 
 The end-to-end test builds this setup in three network namespaces:
 

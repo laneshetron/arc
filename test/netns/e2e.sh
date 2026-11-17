@@ -221,6 +221,13 @@ if wait_for 15 "session over TLS/TCP" grep -q "session established" "$WORK/clien
 else
   fail "could not connect with UDP blocked"
 fi
+# The relay names the TLS carrier's TCP peer (on either link), not its
+# synthetic address.
+if grep 'msg="session established"' "$WORK/relay.log" | grep 'carrier=tls' | grep -q 'client=192\.168\.1[01]\.1:'; then
+  pass "relay logged the TLS session with the client's address"
+else
+  fail "relay did not log the TLS session with the client's address"
+fi
 block_udp D
 
 # Starting with one link down (a modem unplugged, Wi-Fi off): the client
@@ -249,6 +256,16 @@ if $C ip rule | grep -q 5243; then
 else
   pass "routing rules removed on exit"
 fi
+
+# An unknown token: the relay logs the rejection with the client's address.
+echo "not-a-token" > "$WORK/bad-token"
+$C "$BIN/arc-client" run -relay 192.168.10.2:4433 -relay-key "$RELAY_PUB" -token-file "$WORK/bad-token" \
+  -route 10.77.0.0/16 -bind c0 >"$WORK/client-bad.log" 2>&1 &
+BAD_PID=$!
+PIDS+=("$BAD_PID")
+wait_for 10 "rejection logged" grep -q 'msg="handshake rejected: unknown token".*client=192\.168\.10\.1:.*carrier=udp' "$WORK/relay.log" &&
+  pass "relay logged a rejected token with the client's address"
+kill "$BAD_PID" 2>/dev/null || true; wait "$BAD_PID" 2>/dev/null || true
 
 echo
 if [[ $failures -eq 0 ]]; then echo "e2e: all checks passed"; else echo "e2e: $failures check(s) failed"; exit 1; fi
