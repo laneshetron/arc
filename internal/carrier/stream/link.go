@@ -45,10 +45,17 @@ type link struct {
 	unanswered atomic.Int64
 	// frames counts frames read.
 	frames atomic.Int64
+
+	// rotateAt, when positive, signals rotate once track has read this
+	// many bytes. Client links only; both are set before run.
+	rotateAt int64
+	track    *trackingConn
+	rotate   chan struct{}
 }
 
 func newLink(conn net.Conn, addr netip.AddrPort, queue int, idle time.Duration) *link {
-	return &link{conn: conn, addr: addr, out: make(chan []byte, queue), done: make(chan struct{}), idle: idle}
+	return &link{conn: conn, addr: addr, out: make(chan []byte, queue), done: make(chan struct{}), idle: idle,
+		rotate: make(chan struct{}, 1)}
 }
 
 // errStalled ends a link that stopped receiving while it had frames in
@@ -147,6 +154,12 @@ func (l *link) read(in chan<- inbound) {
 		}
 		l.frames.Add(1)
 		l.unanswered.Store(0)
+		if l.rotateAt > 0 && l.track.read.Load() >= l.rotateAt {
+			select {
+			case l.rotate <- struct{}{}:
+			default:
+			}
+		}
 		var pkt []byte
 		if n <= bufpool.Packet {
 			pkt = append(bufpool.Get(), buf[:n]...)

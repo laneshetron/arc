@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -211,5 +212,146 @@ func TestIdleConnectionDoesNotStall(t *testing.T) {
 	case err := <-states:
 		t.Fatalf("idle connection ended: %v", err)
 	case <-time.After(time.Second):
+	}
+}
+
+// frozenRelay starts a listener behind a freezer with the given budget and
+// a relay loop that answers each packet from the client with 1 KB, on the
+// connection it came from.
+func frozenRelay(t *testing.T, budget int64) (*freezer, *x509.CertPool) {
+	t.Helper()
+	certPEM, keyPEM, err := SelfSigned([]string{"127.0.0.1"}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := Listen("127.0.0.1:0", ListenerOptions{TLS: &tls.Config{Certificates: []tls.Certificate{cert}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		bufs, sizes, addrs := [][]byte{make([]byte, maxFrame)}, []int{0}, []netip.AddrPort{{}}
+		down := bytes.Repeat([]byte{9}, 1024)
+		for {
+			if _, err := ln.ReadBatch(bufs, sizes, addrs); err != nil {
+				return
+			}
+			ln.WriteBatch([][]byte{down}, addrs[:1])
+		}
+	}()
+	roots := x509.NewCertPool()
+	roots.AppendCertsFromPEM(certPEM)
+	return newFreezer(t, ln.Addr().String(), budget), roots
+}
+
+// pump writes a packet every 5 ms and counts packets received, until the
+// test ends.
+func pump(t *testing.T, c *Client) *atomic.Int64 {
+	var got atomic.Int64
+	stop := make(chan struct{})
+	t.Cleanup(func() { close(stop) })
+	go func() {
+		bufs, sizes, addrs := [][]byte{make([]byte, maxFrame)}, []int{0}, []netip.AddrPort{{}}
+		for {
+			if _, err := c.ReadBatch(bufs, sizes, addrs); err != nil {
+				return
+			}
+			got.Add(1)
+		}
+	}()
+	go func() {
+		up := bytes.Repeat([]byte{7}, 100)
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(5 * time.Millisecond):
+				c.WriteBatch([][]byte{up}, nil)
+			}
+		}
+	}()
+	return &got
+}
+
+// TestClientLearnsCapAndRotates: after two stalls at the same byte count,
+// the carrier rotates connections before the cap, so data keeps flowing
+// without further stalls.
+func TestClientLearnsCapAndRotates(t *testing.T) {
+	const budget = 16 << 10
+	fz, roots := frozenRelay(t, budget)
+	states := make(chan error, 256)
+	learned := make(chan int64, 4)
+	c := Dial(ClientOptions{
+		Addr: fz.ln.Addr().String(), TLS: &tls.Config{RootCAs: roots, ServerName: "127.0.0.1"},
+		Peer: netip.MustParseAddrPort("192.0.2.1:4433"), StallTimeout: 300 * time.Millisecond,
+		OnState: func(err error) { states <- err }, OnLearn: func(b int64) { learned <- b },
+	})
+	t.Cleanup(func() { c.Close() })
+	got := pump(t, c)
+
+	var b int64
+	select {
+	case b = <-learned:
+	case <-time.After(10 * time.Second):
+		t.Fatal("no budget learned in 10 s")
+	}
+	if b < budget/4 || b > budget/2+2048 {
+		t.Errorf("learned budget %d, want about half of %d", b, budget)
+	}
+	// From here on, no stalls: drain what was reported, then watch.
+	time.Sleep(300 * time.Millisecond)
+	for len(states) > 0 {
+		<-states
+	}
+	conns, before := fz.count(), got.Load()
+	window := time.After(2 * time.Second)
+	for done := false; !done; {
+		select {
+		case err := <-states:
+			if err != nil {
+				t.Errorf("after learning: %v", err)
+			}
+		case <-window:
+			done = true
+		}
+	}
+	if n := got.Load() - before; n < 200 {
+		t.Errorf("%d packets received in 2 s after learning, want ≥ 200 (one per 5 ms write, less rotation gaps)", n)
+	}
+	if fz.count()-conns < 5 {
+		t.Errorf("%d connections in 2 s after learning, want rotations", fz.count()-conns)
+	}
+}
+
+// TestClientRotatesConfiguredBudget: with RotateBytes, no connection
+// ever reaches the cap.
+func TestClientRotatesConfiguredBudget(t *testing.T) {
+	const budget = 16 << 10
+	fz, roots := frozenRelay(t, budget)
+	states := make(chan error, 256)
+	c := Dial(ClientOptions{
+		Addr: fz.ln.Addr().String(), TLS: &tls.Config{RootCAs: roots, ServerName: "127.0.0.1"},
+		Peer: netip.MustParseAddrPort("192.0.2.1:4433"), StallTimeout: 300 * time.Millisecond,
+		RotateBytes: budget / 2, OnState: func(err error) { states <- err },
+	})
+	t.Cleanup(func() { c.Close() })
+	got := pump(t, c)
+	window := time.After(2 * time.Second)
+	for done := false; !done; {
+		select {
+		case err := <-states:
+			if err != nil {
+				t.Errorf("rotating carrier: %v", err)
+			}
+		case <-window:
+			done = true
+		}
+	}
+	if n := got.Load(); n < 200 {
+		t.Errorf("%d packets received in 2 s, want ≥ 200", n)
 	}
 }

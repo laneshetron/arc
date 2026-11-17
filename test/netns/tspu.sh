@@ -159,8 +159,8 @@ scenario_freeze() {
   fi
   pcap freeze
   local got
-  got=$(download 5201 20)
-  echo "freeze: received $got bytes in 20 s; kbit/s per second: $(intervals 5201)"
+  got=$(download 5201 "${DURATION:-20}")
+  echo "freeze: received $got bytes in ${DURATION:-20} s; kbit/s per second: $(intervals 5201)"
   echo "freeze: censor events: $(censor_events)"
   if ((got > 4 * FREEZE_BYTES)); then
     pass "freeze: downlink kept flowing past the freeze ($got bytes, > 4 × $FREEZE_BYTES)"

@@ -70,6 +70,15 @@ type ClientOptions struct {
 	// the carrier on it until TCP gives up, many minutes later. Default
 	// DefaultStallTimeout; negative disables.
 	StallTimeout time.Duration
+	// RotateBytes, when positive, moves the carrier to a fresh connection
+	// each time the current one has received this many bytes, dialing
+	// the next one ahead of time: a censor that caps each connection's
+	// downlink (the TSPU freeze) then never freezes one in use. Without
+	// it, the carrier learns a budget from its stalls (see learn).
+	RotateBytes int64
+	// OnLearn, if set, is called when the carrier learns a rotation
+	// budget from its stalls.
+	OnLearn func(budget int64)
 	// OnState, if set, is called when the connection comes up (err nil)
 	// or a dial attempt or connection fails.
 	OnState func(err error)
@@ -93,7 +102,14 @@ type Client struct {
 	mu  sync.Mutex
 	cur *link
 
-	// Used by the connecting goroutine only.
+	// Used by the connecting goroutine only (and by one spare dial at a
+	// time, which it hands over through spareCh).
+	budget    int64 // rotate connections after receiving this much; 0: never
+	lastStall int64 // bytes the last stalled connection received
+	spare     *dialed
+	spareBusy bool // a spare dial is running and will send on spareCh
+	spareCh   chan dialed
+
 	endpoints    []netip.AddrPort
 	nextEndpoint int
 	lookup       func(context.Context, string, string) ([]netip.Addr, error) // nil: the system resolver
@@ -112,69 +128,213 @@ func Dial(opts ClientOptions) *Client {
 		opts.StallTimeout = DefaultStallTimeout
 	}
 	ctx, stop := context.WithCancel(context.Background())
-	c := &Client{opts: opts, in: make(chan inbound, opts.Queue), ctx: ctx, stop: stop}
+	c := &Client{opts: opts, in: make(chan inbound, opts.Queue), ctx: ctx, stop: stop,
+		budget: max(opts.RotateBytes, 0), spareCh: make(chan dialed, 1)}
 	go c.connectLoop()
 	return c
 }
 
+// dialed is the outcome of one connection attempt.
+type dialed struct {
+	l     *link
+	track *trackingConn
+	err   error
+	at    time.Time
+}
+
+// maxSpareAge bounds how long a pre-dialed spare connection waits unused
+// before it is replaced: the relay or a middlebox may have dropped it.
+const maxSpareAge = time.Minute
+
 func (c *Client) connectLoop() {
 	const initialBackoff = 500 * time.Millisecond
 	backoff := initialBackoff
+	d := c.take()
 	for c.ctx.Err() == nil {
-		redial := false // dial again without waiting
-		l, track, err := c.connect()
-		if c.ctx.Err() != nil { // closed mid-dial: nothing to report
-			if l != nil {
-				l.close()
+		if d.err != nil {
+			if c.opts.OnState != nil {
+				c.opts.OnState(d.err)
 			}
-			return
-		}
-		if err == nil {
-			c.setLink(l) // before OnState, so a write it prompts is not dropped
-		}
-		if c.opts.OnState != nil {
-			c.opts.OnState(err)
-		}
-		if err == nil {
-			start := time.Now()
-			go func() { // Close may have missed a link that was still dialing
-				select {
-				case <-c.ctx.Done():
-					l.close()
-				case <-l.done:
-				}
-			}()
-			derr := l.run(c.in)
-			c.setLink(nil)
-			if c.ctx.Err() != nil {
+			if !c.sleep(backoff) {
 				return
 			}
-			if c.opts.OnState != nil {
-				if derr != nil {
-					c.opts.OnState(classifyDeath(track, derr))
-				} else {
-					c.opts.OnState(errors.New("stream: connection closed"))
+			backoff = min(2*backoff, c.opts.MaxBackoff)
+			d = c.take()
+			continue
+		}
+		l, track := d.l, d.track
+		if c.budget > 0 {
+			l.track, l.rotateAt = track, c.budget
+		}
+		c.setLink(l) // before OnState, so a write it prompts is not dropped
+		if c.opts.OnState != nil {
+			c.opts.OnState(nil)
+		}
+		c.startSpare()
+		start := time.Now()
+		ran := make(chan error, 1)
+		go func() { ran <- l.run(c.in) }()
+
+		var derr error
+		rotated, rotate := false, l.rotate
+	wait:
+		for {
+			select {
+			case derr = <-ran:
+				break wait
+			case <-rotate:
+				// The connection nears the censor's cap: move to the
+				// spare (make before break, spec/freeze-and-udp-ban.md §3).
+				next := c.take()
+				if next.err != nil {
+					// Keep this one; it may still stall and redial.
+					rotate = nil
+					continue
 				}
+				go c.retire(l, ran)
+				d, rotated = next, true
+				break wait
+			case <-c.ctx.Done():
+				l.close()
+				c.dropSpare()
+				return
 			}
-			switch {
-			case errors.Is(derr, errStalled) && l.frames.Load() > 0:
-				// It carried data until a censor froze it: redial at once.
-				// Stalls pace these dials to one per StallTimeout.
-				backoff, redial = initialBackoff, true
-			case time.Since(start) > 10*time.Second:
-				backoff = initialBackoff // it worked for a while
+		}
+		if rotated {
+			continue
+		}
+		c.setLink(nil)
+		if c.ctx.Err() != nil {
+			return
+		}
+		if c.opts.OnState != nil {
+			if derr != nil {
+				c.opts.OnState(classifyDeath(track, derr))
+			} else {
+				c.opts.OnState(errors.New("stream: connection closed"))
 			}
 		}
 		wait := backoff
-		if redial {
-			wait = 0
+		switch {
+		case errors.Is(derr, errStalled) && l.frames.Load() > 0:
+			// It carried data until a censor froze it: redial at once.
+			// Stalls pace these dials to one per StallTimeout.
+			c.learn(track.read.Load())
+			backoff, wait = initialBackoff, 0
+		case time.Since(start) > 10*time.Second:
+			backoff = initialBackoff // it worked for a while
+			wait = backoff
 		}
-		select {
-		case <-time.After(wait):
-		case <-c.ctx.Done():
+		if wait > 0 && !c.sleep(wait) {
 			return
 		}
-		backoff = min(2*backoff, c.opts.MaxBackoff)
+		if wait > 0 {
+			backoff = min(2*backoff, c.opts.MaxBackoff)
+		}
+		d = c.take()
+	}
+	c.dropSpare()
+}
+
+// sleep waits d, reporting false if the carrier closed meanwhile.
+func (c *Client) sleep(d time.Duration) bool {
+	select {
+	case <-time.After(d):
+		return true
+	case <-c.ctx.Done():
+		return false
+	}
+}
+
+// take returns the next connection: the spare, if one is ready or being
+// dialed and fresh, otherwise a new dial. Only one dial runs at a time.
+func (c *Client) take() dialed {
+	if c.spareBusy {
+		select {
+		case sp := <-c.spareCh:
+			c.spare = &sp
+		case <-c.ctx.Done():
+			return dialed{err: context.Canceled}
+		}
+		c.spareBusy = false
+	}
+	if sp := c.spare; sp != nil {
+		c.spare = nil
+		if sp.err == nil && time.Since(sp.at) < maxSpareAge {
+			return *sp
+		}
+		if sp.l != nil {
+			sp.l.close()
+		}
+	}
+	l, track, err := c.connect()
+	return dialed{l: l, track: track, err: err, at: time.Now()}
+}
+
+// startSpare dials a spare connection in the background, if connections
+// rotate (a byte budget is known) and none is ready or being dialed.
+func (c *Client) startSpare() {
+	if c.budget <= 0 || c.spareBusy || c.spare != nil {
+		return
+	}
+	c.spareBusy = true
+	go func() {
+		l, track, err := c.connect()
+		c.spareCh <- dialed{l: l, track: track, err: err, at: time.Now()}
+	}()
+}
+
+// dropSpare closes the spare connection, waiting for one being dialed.
+func (c *Client) dropSpare() {
+	if c.spareBusy {
+		sp := <-c.spareCh
+		c.spareBusy, c.spare = false, &sp
+	}
+	if c.spare != nil && c.spare.l != nil {
+		c.spare.l.close()
+	}
+	c.spare = nil
+}
+
+// retire closes a link the carrier rotated away from, once the relay has
+// had StallTimeout to move its downlink to the successor. Until then it
+// keeps delivering what the relay still sends on it.
+func (c *Client) retire(l *link, ran <-chan error) {
+	grace := c.opts.StallTimeout
+	if grace <= 0 {
+		grace = DefaultStallTimeout
+	}
+	select {
+	case <-time.After(grace):
+	case <-ran:
+	case <-c.ctx.Done():
+	}
+	l.close()
+}
+
+// minCap is the least a stalled connection must have received for its
+// stall to count as a byte cap rather than a dead link.
+const minCap = 4 << 10
+
+// learn records how much a stalled connection received. Two consecutive
+// stalls within 25% of each other, both above minCap, are a byte cap
+// (spec/freeze-and-udp-ban.md §3): later connections rotate at half the
+// smaller count. A configured budget is never changed.
+func (c *Client) learn(read int64) {
+	prev := c.lastStall
+	c.lastStall = read
+	if c.opts.RotateBytes > 0 || prev < minCap || read < minCap {
+		return
+	}
+	lo, hi := min(prev, read), max(prev, read)
+	if 4*(hi-lo) > hi {
+		return
+	}
+	if budget := lo / 2; c.budget == 0 || budget < c.budget {
+		c.budget = budget
+		if c.opts.OnLearn != nil {
+			c.opts.OnLearn(budget)
+		}
 	}
 }
 

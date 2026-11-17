@@ -29,6 +29,7 @@ type carrierOptions struct {
 	TLSCover, TLSFingerprint string
 	TLSFragment              int
 	Front, FrontToken        string
+	RotateBytes              int64 // stream connections rotate after this many bytes received; 0: learn
 }
 
 // openCarriers opens a UDP carrier per interface, unless NoUDP, and a TLS
@@ -135,12 +136,16 @@ func openCarriers(log *slog.Logger, o carrierOptions) ([]engine.Carrier, func(),
 			name += "/" + sc.kind
 			conn := stream.Dial(stream.ClientOptions{
 				Addr: sc.addr, Endpoints: endpoints, TLS: tlsConfig, Peer: o.Relay,
-				Camouflage: camo, Front: sc.front,
+				Camouflage: camo, Front: sc.front, RotateBytes: o.RotateBytes,
 				Sockopt: sockopt.Options{Mark: sockOpts.Mark, Device: iface},
 				OnState: func(err error) {
 					if err != nil {
 						log.Debug(sc.kind+" carrier", "carrier", name, "err", err)
 					}
+				},
+				OnLearn: func(budget int64) {
+					log.Info("connections stall at a byte cap; rotating them ahead of it",
+						"carrier", name, "budget_bytes", budget)
 				},
 			})
 			closers = append(closers, conn)
