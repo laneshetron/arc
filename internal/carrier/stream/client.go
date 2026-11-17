@@ -188,6 +188,12 @@ func (c *Client) connectLoop() {
 		// when both the budget is reached and the spare is ready.
 		var derr error
 		rotated, rotate, due := false, l.rotate, false
+		// A spare dial that fails is retried in the background, backing
+		// off, for as long as this link carries traffic: the endpoint may
+		// come back before the link reaches its cap.
+		spareBackoff := initialBackoff
+		var retry *time.Timer
+		var retryC <-chan time.Time
 	wait:
 		for {
 			var spareDone chan dialed
@@ -200,13 +206,26 @@ func (c *Client) connectLoop() {
 			case <-rotate:
 				due = true
 			case sp := <-spareDone:
-				c.spareBusy, c.spare = false, &sp
-				if sp.err != nil && c.opts.OnState != nil {
-					c.opts.OnState(sp.err)
+				c.spareBusy = false
+				if sp.err != nil {
+					if c.opts.OnState != nil {
+						c.opts.OnState(sp.err)
+					}
+					retry = time.NewTimer(spareBackoff)
+					retryC = retry.C
+					spareBackoff = min(2*spareBackoff, c.opts.MaxBackoff)
+				} else {
+					c.spare, spareBackoff = &sp, initialBackoff
 				}
+			case <-retryC:
+				retryC = nil
+				c.startSpare()
 			case <-c.ctx.Done():
 				l.close()
 				c.dropSpare()
+				if retry != nil {
+					retry.Stop()
+				}
 				return
 			}
 			if !due || c.spareBusy {
@@ -214,9 +233,12 @@ func (c *Client) connectLoop() {
 			}
 			next, ok := c.freshSpare()
 			if !ok {
-				// No usable spare: keep this connection. It may still
-				// stall and redial; the next one dials a new spare.
-				due, rotate = false, nil
+				// No usable spare (none yet, or it went stale): keep
+				// this connection and dial one, unless a retry after a
+				// failed dial is already scheduled.
+				if retryC == nil {
+					c.startSpare()
+				}
 				continue
 			}
 			// The connection nears the censor's cap: move to the spare
@@ -224,6 +246,9 @@ func (c *Client) connectLoop() {
 			go c.retire(l, ran)
 			d, rotated = next, true
 			break wait
+		}
+		if retry != nil {
+			retry.Stop()
 		}
 		if rotated {
 			continue

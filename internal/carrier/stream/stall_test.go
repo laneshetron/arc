@@ -27,6 +27,9 @@ type freezer struct {
 	// hangAfter open without forwarding anything: the dial's TCP handshake
 	// succeeds and the TLS one never ends.
 	hangAfter int
+	// failConn, when positive, is the one connection (counting from 1)
+	// closed at once, so that dial fails.
+	failConn int
 
 	mu    sync.Mutex
 	conns int
@@ -53,7 +56,12 @@ func (f *freezer) serve() {
 		f.mu.Lock()
 		f.conns++
 		hang := f.hangAfter > 0 && f.conns > f.hangAfter
+		failed := f.failConn > 0 && f.conns == f.failConn
 		f.mu.Unlock()
+		if failed {
+			c.Close()
+			continue
+		}
 		if hang {
 			go func() { io.Copy(io.Discard, c); c.Close() }()
 			continue
@@ -539,4 +547,62 @@ func TestRefusedPacketDoesNotArmStall(t *testing.T) {
 	case <-time.After(500 * time.Millisecond):
 	}
 	l.close()
+}
+
+// TestSpareRetriedAfterFailure: a spare dial that fails once is retried
+// while the active link still works, so the carrier rotates before the
+// cap instead of riding the link into a stall.
+func TestSpareRetriedAfterFailure(t *testing.T) {
+	const budget = 16 << 10
+	fz, roots := frozenRelay(t, budget)
+	fz.mu.Lock()
+	fz.failConn = 2 // the first spare
+	fz.mu.Unlock()
+	states := make(chan error, 64)
+	c := Dial(ClientOptions{
+		Addr: fz.ln.Addr().String(), TLS: &tls.Config{RootCAs: roots, ServerName: "127.0.0.1"},
+		Peer: netip.MustParseAddrPort("192.0.2.1:4433"), StallTimeout: 300 * time.Millisecond,
+		RotateBytes: budget / 2, OnState: func(err error) { states <- err },
+	})
+	t.Cleanup(func() { c.Close() })
+	if err := <-states; err != nil {
+		t.Fatal(err)
+	}
+	// Slow enough (1 KB per 50 ms) that the cap is ~0.8 s away: time for
+	// the first spare to fail and a retry, 0.5 s later, to come up.
+	stop := make(chan struct{})
+	t.Cleanup(func() { close(stop) })
+	go func() {
+		bufs, sizes, addrs := [][]byte{make([]byte, maxFrame)}, []int{0}, []netip.AddrPort{{}}
+		for {
+			if _, err := c.ReadBatch(bufs, sizes, addrs); err != nil {
+				return
+			}
+		}
+	}()
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(50 * time.Millisecond):
+				c.WriteBatchEliciting([][]byte{bytes.Repeat([]byte{7}, 100)}, nil, []bool{true})
+			}
+		}
+	}()
+	window := time.After(3 * time.Second)
+	for {
+		select {
+		case err := <-states:
+			var f *Failure
+			if errors.As(err, &f) && f.Mode == ModeTimeoutAtNBytes {
+				t.Fatalf("active link stalled at the cap: the failed spare was not retried (%v)", err)
+			}
+		case <-window:
+			if n := fz.count(); n < 4 {
+				t.Errorf("%d connections in 3 s, want the failed spare, its retry, and rotations", n)
+			}
+			return
+		}
+	}
 }
