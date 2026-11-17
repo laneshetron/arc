@@ -101,10 +101,19 @@ the switch. A spare older than a minute is replaced before use.
 The relay's downlink lag is the weak point: whatever the relay has
 queued or sent on the old connection past the cap is lost (the inner
 connections recover it), and §14.5 holds the downlink there for a
-validation round trip. Moving it at once for stream-to-stream changes
-is safe (a stream address is a TCP connection that completed TLS with
-the relay, and its packets cannot be captured for replay), but the
-measured gain decides whether it is worth the special case.
+validation round trip. That round trip stays: the outer carrier is
+untrusted (TLS on it is cover, not security), so `PATH_CHALLENGE` on the
+new address remains the requirement for moving the downlink. (Moving it
+at once was also measured, and was worse.)
+
+**Path identity.** A redial or rotation does not open a new ARC path.
+The client carrier keeps the session's path ID; the relay sees the same
+path's authenticated packets arrive from a new synthetic address and
+treats it as an address change on that path (§14.5): it validates the
+new address, then moves the downlink. The handoff's §14.5 bullet "on
+stream carriers, a new connection is a new path" describes a different
+design than the implementation; this note follows the implementation,
+and the handoff should be corrected to match.
 
 **Cost and limits.** Throughput is bounded by budget per connection
 setup: with a warm spare, the switch itself costs about one round trip,
