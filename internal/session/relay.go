@@ -89,6 +89,10 @@ type RelayConfig struct {
 	// block. Without it, or without the feature, requests are refused
 	// UNAUTHORIZED.
 	Invites func(s *RelaySession, req wire.InviteRequest) (wire.Invite, bool)
+	// Devices and Revoke answer a session's DEVICES_REQUEST and
+	// REVOKE_REQUEST likewise, for sessions given FeatureDevices.
+	Devices func(s *RelaySession, req wire.DevicesRequest) (wire.Devices, bool)
+	Revoke  func(s *RelaySession, req wire.RevokeRequest) (wire.RevokeResult, bool)
 
 	// Diagnostics accepts clients' diagnostics uploads (§11.4): each
 	// arrives as a StreamOpened with Diagnostics set, which the caller
@@ -450,6 +454,10 @@ func (r *Relay) handleData(now time.Time, from netip.AddrPort, b []byte) {
 			}
 		case wire.InviteRequest:
 			s.onInviteRequest(f)
+		case wire.DevicesRequest:
+			s.onDevicesRequest(f)
+		case wire.RevokeRequest:
+			s.onRevokeRequest(f)
 		case wire.Redundancy:
 			s.onRedundancy(f)
 		case wire.IPFragment:
@@ -890,6 +898,41 @@ func (s *RelaySession) onInviteRequest(f wire.InviteRequest) {
 		return
 	}
 	if a, ok := s.relay.cfg.Invites(s, f); ok {
+		a.RequestID = f.RequestID
+		s.conn.queue(a)
+	}
+}
+
+// onDevicesRequest answers DEVICES_REQUEST, or leaves it for the
+// client's repeat.
+func (s *RelaySession) onDevicesRequest(f wire.DevicesRequest) {
+	if s.state != StateActive {
+		return
+	}
+	if s.result.Features&wire.FeatureDevices == 0 || s.relay.cfg.Devices == nil {
+		s.conn.queue(wire.Devices{RequestID: f.RequestID, Status: wire.CodeUnauthorized})
+		return
+	}
+	if a, ok := s.relay.cfg.Devices(s, f); ok {
+		if a.Status != 0 {
+			a.Devices = nil
+		}
+		a.RequestID = f.RequestID
+		s.conn.queue(a)
+	}
+}
+
+// onRevokeRequest answers REVOKE_REQUEST, or leaves it for the client's
+// repeat.
+func (s *RelaySession) onRevokeRequest(f wire.RevokeRequest) {
+	if s.state != StateActive {
+		return
+	}
+	if s.result.Features&wire.FeatureDevices == 0 || s.relay.cfg.Revoke == nil {
+		s.conn.queue(wire.RevokeResult{RequestID: f.RequestID, Status: wire.CodeUnauthorized})
+		return
+	}
+	if a, ok := s.relay.cfg.Revoke(s, f); ok {
 		a.RequestID = f.RequestID
 		s.conn.queue(a)
 	}

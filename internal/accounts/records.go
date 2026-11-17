@@ -82,6 +82,33 @@ type Device struct {
 	Created   time.Time
 }
 
+// record is the device's line in the file.
+func (d *Device) record() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "device %v %v %s token=%x front=%x", d.ID, d.Account, d.Name, d.TokenHash, d.Front)
+	if d.Key != nil {
+		fmt.Fprintf(&b, " key=%x", d.Key)
+	}
+	fmt.Fprintf(&b, " lineage=%s", joinIDs(d.Lineage))
+	if !d.Via.IsZero() {
+		fmt.Fprintf(&b, " via=%v", d.Via)
+	}
+	fmt.Fprintf(&b, " created=%s", stamp(d.Created))
+	return b.String()
+}
+
+// parseDevice reads a device's line, as record writes it.
+func parseDevice(line string) (*Device, error) {
+	var s State
+	if !strings.HasPrefix(line, "device ") {
+		return nil, errors.New("not a device record")
+	}
+	if err := s.parseRecord(line); err != nil {
+		return nil, err
+	}
+	return s.Devices[0], nil
+}
+
 // Bound reports whether the device's token authenticates only its own key.
 func (d *Device) Bound() bool { return d.Key != nil }
 
@@ -101,10 +128,13 @@ type Invite struct {
 
 // A Tombstone remembers a revoked device until Until.
 type Tombstone struct {
-	ID    ID
-	Until time.Time
-	By    ID     // the device that revoked it, for a device's revocation
-	Rest  string // the revoked record, for restore
+	ID        ID
+	Until     time.Time
+	TokenHash [32]byte  // the revoked token's hash, to tell its holder it was revoked; zero if unknown
+	By        ID        // the device that revoked it, for a device's revocation
+	Request   ID        // with By, the REVOKE_REQUEST that did, so its repeats are answered as done
+	Restored  time.Time // when the operator restored the device; zero if not
+	Rest      string    // the revoked record, for restore; cleared once restored or made final
 }
 
 // A Lease names the one writer that may commit and authenticate (§3.2).
@@ -327,15 +357,8 @@ func (s *State) Marshal() []byte {
 		fmt.Fprintf(&b, " max_devices=%d invites=%s manage=%s\n", a.MaxDevices, yesNo(a.Invites), yesNo(a.Manage))
 	}
 	for _, d := range s.Devices {
-		fmt.Fprintf(&b, "device %v %v %s token=%x front=%x", d.ID, d.Account, d.Name, d.TokenHash, d.Front)
-		if d.Key != nil {
-			fmt.Fprintf(&b, " key=%x", d.Key)
-		}
-		fmt.Fprintf(&b, " lineage=%s", joinIDs(d.Lineage))
-		if !d.Via.IsZero() {
-			fmt.Fprintf(&b, " via=%v", d.Via)
-		}
-		fmt.Fprintf(&b, " created=%s\n", stamp(d.Created))
+		b.WriteString(d.record())
+		b.WriteByte('\n')
 	}
 	for _, i := range s.Invites {
 		fmt.Fprintf(&b, "invite %v %v %x front=%x expires=%s", i.ID, i.Account, i.SecretHash, i.Front, stamp(i.Expires))
@@ -349,8 +372,17 @@ func (s *State) Marshal() []byte {
 	}
 	for _, t := range s.Revoked {
 		fmt.Fprintf(&b, "revoked %v until=%s", t.ID, stamp(t.Until))
+		if t.TokenHash != ([32]byte{}) {
+			fmt.Fprintf(&b, " token=%x", t.TokenHash)
+		}
 		if !t.By.IsZero() {
 			fmt.Fprintf(&b, " by=%v", t.By)
+		}
+		if !t.Request.IsZero() {
+			fmt.Fprintf(&b, " req=%v", t.Request)
+		}
+		if !t.Restored.IsZero() {
+			fmt.Fprintf(&b, " restored=%s", stamp(t.Restored))
 		}
 		if t.Rest != "" {
 			fmt.Fprintf(&b, " record=%s", t.Rest)
@@ -533,9 +565,18 @@ func (s *State) parseRecord(line string) error {
 		if len(pos) != 1 {
 			return errors.New("want revoked ID until=T")
 		}
-		t := &Tombstone{ID: id(pos[0]), By: optID("by"), Rest: opts["record"]}
+		t := &Tombstone{ID: id(pos[0]), By: optID("by"), Request: optID("req"), Rest: opts["record"]}
 		if err == nil {
 			t.Until, err = parseStamp(opts["until"])
+		}
+		if v, ok := opts["token"]; ok && err == nil {
+			err = hexInto(t.TokenHash[:], v, "token")
+		}
+		if v, ok := opts["restored"]; ok && err == nil {
+			t.Restored, err = parseStamp(v)
+		}
+		if err == nil && !t.Request.IsZero() && t.By.IsZero() {
+			err = errors.New("req= without by=")
 		}
 		s.Revoked = append(s.Revoked, t)
 	default:

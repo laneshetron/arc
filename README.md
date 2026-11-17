@@ -305,6 +305,33 @@ turn. When it is unclear which device was compromised, `arc-relay
 accounts rotate ACCOUNT` (with the invite flags) revokes all the account's
 devices and invites, keeps its policy, and prints a fresh operator invite.
 
+A device can also list its account's devices and revoke them, so a person
+who loses a laptop can cut it off from their desktop at once
+([spec/self-service-accounts.md](spec/self-service-accounts.md) §3.8):
+
+```sh
+arc-client devices -profile ~/.config/arc/relay        # a tree of who invited whom
+arc-client revoke -profile ~/.config/arc/relay laptop  # -descendants: its invitees too
+```
+
+Only devices that enrolled with a key may, while their account allows it
+(`manage=yes`, the default), and a device may revoke others only once it
+has been enrolled for 24 hours (it may always revoke itself, but not its
+descendants with it). A revoked
+device's sessions close at once, and its client stops reconnecting. Since
+a stolen device can use these commands too, revocations by devices are
+soft: the relay logs each as a warning, and for 7 days the operator can
+undo them, then revoke the thief's device:
+
+```sh
+arc-relay accounts list                        # shows devices revoked by devices
+arc-relay accounts restore alexei/desktop      # same ID, token and key as before
+arc-relay accounts revoke -descendants alexei/laptop
+```
+
+Operator revocations are final, and `rotate` makes earlier revocations by
+devices final too.
+
 ### Diagnostics
 
 When someone else runs a client on a network that interferes with ARC,

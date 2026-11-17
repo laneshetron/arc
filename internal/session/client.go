@@ -87,6 +87,13 @@ type Enrolled struct {
 // InviteAnswer reports the relay's INVITE, answering RequestInvite.
 type InviteAnswer struct{ wire.Invite }
 
+// DevicesAnswer reports the relay's DEVICES, answering RequestDevices.
+type DevicesAnswer struct{ wire.Devices }
+
+// RevokeAnswer reports the relay's REVOKE_RESULT, answering
+// RequestRevoke.
+type RevokeAnswer struct{ wire.RevokeResult }
+
 // PathValidated reports that a path opened with OpenPath can carry traffic.
 type PathValidated struct{ ID uint32 }
 
@@ -112,6 +119,8 @@ type StreamUpdate struct{ ID uint32 }
 func (Established) clientEvent()       {}
 func (Enrolled) clientEvent()          {}
 func (InviteAnswer) clientEvent()      {}
+func (DevicesAnswer) clientEvent()     {}
+func (RevokeAnswer) clientEvent()      {}
 func (PathValidated) clientEvent()     {}
 func (PathClosed) clientEvent()        {}
 func (Closed) clientEvent()            {}
@@ -187,6 +196,41 @@ func (c *Client) State() State { return c.state }
 // ErrNoInvites: the relay does not let this session's device mint
 // invites (AUTH_RESULT without FeatureInvites).
 var ErrNoInvites = errors.New("session: the relay does not offer invites to this device")
+
+// ErrNoDevices: the relay does not let this session's device manage
+// devices (AUTH_RESULT without FeatureDevices).
+var ErrNoDevices = errors.New("session: the relay does not let this device manage devices")
+
+// RequestDevices asks the relay for the account's devices (§10.1),
+// reliably. The answer comes as a DevicesAnswer; the caller repeats the
+// request, with the same id, until answered.
+func (c *Client) RequestDevices(id [8]byte) error {
+	if c.state != StateActive {
+		return ErrNotActive
+	}
+	if c.config.Features&wire.FeatureDevices == 0 {
+		return ErrNoDevices
+	}
+	c.conn.queue(wire.DevicesRequest{RequestID: id})
+	return nil
+}
+
+// RequestRevoke asks the relay to revoke one of the account's devices,
+// and with descendants every device enrolled through its invites
+// (§10.1), reliably. The answer comes as a RevokeAnswer once the
+// revocation is committed; the caller repeats the request, with the same
+// id, until answered. Revoking this session's own device closes the
+// session with ErrRevoked instead.
+func (c *Client) RequestRevoke(id, device [8]byte, descendants bool) error {
+	if c.state != StateActive {
+		return ErrNotActive
+	}
+	if c.config.Features&wire.FeatureDevices == 0 {
+		return ErrNoDevices
+	}
+	c.conn.queue(wire.RevokeRequest{RequestID: id, DeviceID: device, Descendants: descendants})
+	return nil
+}
 
 // RequestInvite asks the relay for an invite to the session's account
 // (§10.1), reliably. The answer comes as an InviteAnswer; the relay may
@@ -432,6 +476,10 @@ func (c *Client) handleData(now time.Time, b []byte) {
 			}
 		case wire.Invite:
 			c.events = append(c.events, InviteAnswer{f})
+		case wire.Devices:
+			c.events = append(c.events, DevicesAnswer{f})
+		case wire.RevokeResult:
+			c.events = append(c.events, RevokeAnswer{f})
 		case wire.Ack:
 			c.conn.onAck(now, &f)
 		case wire.IPPacket:
@@ -618,6 +666,8 @@ func (c *Client) onAuthResult(now time.Time, r wire.AuthResult) {
 			err = ErrInviteUsed
 		case wire.CodeInviteExpired:
 			err = ErrInviteExpired
+		case wire.CodeRevoked:
+			err = ErrRevoked
 		}
 		c.state, c.err = StateClosed, err
 		c.events = append(c.events, Closed{Err: err})

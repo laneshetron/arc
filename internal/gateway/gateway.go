@@ -114,6 +114,7 @@ type credential struct {
 	name    string
 	key     []byte // the Noise static key it is bound to, if any
 	mint    bool   // the device may mint invites
+	manage  bool   // the device may list and revoke its account\'s devices
 }
 
 // A Revocation is a session the relay must close: its device was
@@ -139,21 +140,25 @@ type Gateway struct {
 	revoke   []Revocation
 	kick     chan struct{}
 
-	st         *accounts.State // the last applied, for enrollments; nil with static accounts
-	enrolling  map[enrollKey]*enrollment
-	minting    map[accounts.ID]*minting // by device: at most one commit in flight each
-	committing int                      // minting commits not yet done
+	st            *accounts.State // the last applied, for enrollments; nil with static accounts
+	enrolling     map[enrollKey]*enrollment
+	minting       map[accounts.ID]*pending  // by device: at most one commit in flight each
+	revoking      map[accounts.ID]*pending  // likewise, for REVOKE_REQUEST
+	revokedTokens map[[32]byte]time.Time    // revoked devices' token hashes, until their tombstones end
+	committing    int                       // commits for devices' requests not yet done
+	seen          map[accounts.ID]time.Time // when each device's last session ended
 }
 
-// A minting is a device's invite request waiting for its commit.
-type minting struct {
+// A pending is a device's request (an invite, a revocation) waiting for
+// its commit.
+type pending struct {
 	request accounts.ID
 	started time.Time
 	done    bool
 	err     error
 }
 
-// maxMinting bounds the minting commits in flight.
+// maxMinting bounds the commits for devices' requests in flight.
 const maxMinting = 64
 
 // An enrollment is a redemption waiting for its commit, keyed by what
@@ -190,7 +195,7 @@ func New(cfg Config) (*Gateway, error) {
 			return nil, fmt.Errorf("gateway: deny prefix %v is not IPv4", p)
 		}
 	}
-	g := &Gateway{cfg: cfg, accounts: map[accounts.ID]*Account{}, creds: map[[32]byte]credential{}, enrolling: map[enrollKey]*enrollment{}, minting: map[accounts.ID]*minting{},
+	g := &Gateway{cfg: cfg, accounts: map[accounts.ID]*Account{}, creds: map[[32]byte]credential{}, enrolling: map[enrollKey]*enrollment{}, minting: map[accounts.ID]*pending{}, revoking: map[accounts.ID]*pending{}, seen: map[accounts.ID]time.Time{},
 		next: cfg.Network.Masked().Addr().Next(), leased: map[netip.Addr]lease{}, kick: make(chan struct{}, 1)}
 	for i := range accts {
 		a := &accts[i]
@@ -242,14 +247,27 @@ func (g *Gateway) Apply(st *accounts.State) {
 	devices := map[accounts.ID]bool{}
 	for _, d := range st.Devices {
 		creds[d.TokenHash] = credential{account: g.accounts[d.Account], device: d.ID, name: d.Name, key: d.Key,
-			mint: len(g.cfg.InviteKey) == accounts.InviteKeySize && g.cfg.Commit != nil && st.MayMint(d)}
+			mint:   len(g.cfg.InviteKey) == accounts.InviteKeySize && g.cfg.Commit != nil && st.MayMint(d),
+			manage: g.cfg.Commit != nil && st.MayManage(d)}
 		devices[d.ID] = true
 	}
 	g.logMintedLocked(st)
+	g.logRevokedLocked(st)
 	g.creds, g.static, g.st = creds, nil, st
+	g.revokedTokens = map[[32]byte]time.Time{}
+	for _, t := range st.Revoked {
+		if t.TokenHash != ([32]byte{}) && t.Restored.IsZero() {
+			g.revokedTokens[t.TokenHash] = t.Until
+		}
+	}
 	for addr, l := range g.leased {
 		if !l.revoked && !devices[l.device] {
-			g.revokeLocked(addr, l, wire.CodeAuthFailed, ErrRevoked)
+			g.revokeLocked(addr, l, wire.CodeRevoked, ErrRevoked)
+		}
+	}
+	for d := range g.seen {
+		if !devices[d] {
+			delete(g.seen, d)
 		}
 	}
 }
@@ -357,6 +375,11 @@ func (g *Gateway) authorizeLocked(token, clientStatic []byte, prior *wire.AuthRe
 	if testHookAuthorize != nil {
 		testHookAuthorize()
 	}
+	if until, revoked := g.revokedTokens[hash]; !ok && revoked && g.now().Before(until) {
+		// Its holder learns it was revoked, as CLOSE(REVOKED) would have
+		// told it, in case that was lost.
+		return wire.AuthResult{}, &session.AuthError{Code: wire.CodeRevoked, Err: fmt.Errorf("%w: %w", ErrBadCredential, ErrRevoked)}
+	}
 	if !ok || c.account == nil {
 		return wire.AuthResult{}, ErrBadCredential
 	}
@@ -386,6 +409,9 @@ func (g *Gateway) authorizeLocked(token, clientStatic []byte, prior *wire.AuthRe
 	}
 	if c.mint {
 		r.Features |= wire.FeatureInvites
+	}
+	if c.manage {
+		r.Features |= wire.FeatureDevices
 	}
 	return r, nil
 }
@@ -438,6 +464,9 @@ func (g *Gateway) Release(s *session.RelaySession) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if l, ok := g.leased[a]; ok && l.session == s {
+		if !l.device.IsZero() {
+			g.seen[l.device] = g.now()
+		}
 		delete(g.leased, a)
 		g.free = append(g.free, a)
 	}
@@ -740,29 +769,36 @@ func (g *Gateway) mint(addr netip.Addr, s *session.RelaySession, req wire.Invite
 	case g.committing >= maxMinting:
 		return wire.Invite{}, false
 	}
-	p := &minting{request: request, started: now}
-	g.minting[device] = p
+	// Apply, given the committed state, logs the mint.
+	g.startCommitLocked(g.minting, device, request, now, func(st *accounts.State) error {
+		_, _, minted, err := accounts.MintInvite(st, g.cfg.InviteKey, device, request, now)
+		if err == nil && !minted {
+			return errNoChange
+		}
+		return err
+	})
+	return wire.Invite{}, false
+}
+
+// startCommitLocked commits change for a device's request, apart from
+// the caller, noting it in m until the device's next request collects
+// its outcome.
+func (g *Gateway) startCommitLocked(m map[accounts.ID]*pending, device, request accounts.ID, now time.Time, change func(*accounts.State) error) {
+	p := &pending{request: request, started: now}
+	m[device] = p
 	g.committing++
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		err := g.cfg.Commit(ctx, func(st *accounts.State) error {
-			_, _, minted, err := accounts.MintInvite(st, g.cfg.InviteKey, device, request, now)
-			if err == nil && !minted {
-				return errNoChange
-			}
-			return err
-		})
+		err := g.cfg.Commit(ctx, change)
 		if errors.Is(err, errNoChange) {
 			err = nil
 		}
-		// Apply, given the committed state, logs the mint.
 		g.mu.Lock()
 		p.done, p.err = true, err
 		g.committing--
 		g.mu.Unlock()
 	}()
-	return wire.Invite{}, false
 }
 
 // errNoChange ends a commit with nothing to write.
@@ -785,9 +821,11 @@ func mintRefusal(err error) wire.ErrorCode {
 // sweepMinting forgets finished requests whose clients never came back
 // for the answer.
 func (g *Gateway) sweepMinting(now time.Time) {
-	for k, p := range g.minting {
-		if p.done && now.Sub(p.started) > 5*time.Minute {
-			delete(g.minting, k)
+	for _, m := range []map[accounts.ID]*pending{g.minting, g.revoking} {
+		for k, p := range m {
+			if p.done && now.Sub(p.started) > 5*time.Minute {
+				delete(m, k)
+			}
 		}
 	}
 }

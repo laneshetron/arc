@@ -58,6 +58,9 @@ jobs:
       - name: device-minted invites end to end in network namespaces
         if: success() || failure()
         run: sudo ./test/netns/invites.sh bin
+      - name: devices managing devices end to end in network namespaces
+        if: success() || failure()
+        run: sudo ./test/netns/devices.sh bin
 
   degraded:
     runs-on: ubuntu-latest

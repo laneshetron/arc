@@ -62,6 +62,10 @@ var (
 	// They wrap ErrAuthFailed.
 	ErrInviteUsed    = fmt.Errorf("%w: invite already redeemed by another device", ErrAuthFailed)
 	ErrInviteExpired = fmt.Errorf("%w: invite expired", ErrAuthFailed)
+	// ErrRevoked: the relay closed the session with REVOKED, because its
+	// device was revoked (a PeerClosedError matches it). It wraps
+	// ErrAuthFailed, so the client stops reconnecting.
+	ErrRevoked = fmt.Errorf("%w: this device was revoked", ErrAuthFailed)
 	// ErrHandshakeTimeout ends a relay session the client never
 	// authenticated, such as one of the extra handshakes a client with
 	// several carriers starts (§9.2).
@@ -82,7 +86,17 @@ var (
 // PeerClosedError reports a CLOSE frame from the peer.
 type PeerClosedError struct{ Code wire.ErrorCode }
 
-func (e *PeerClosedError) Error() string { return "session: closed by peer" }
+func (e *PeerClosedError) Error() string {
+	if e.Code == wire.CodeRevoked {
+		return ErrRevoked.Error()
+	}
+	return "session: closed by peer"
+}
+
+// Is matches ErrRevoked, and so ErrAuthFailed, for a CLOSE with REVOKED.
+func (e *PeerClosedError) Is(target error) bool {
+	return e.Code == wire.CodeRevoked && (target == ErrRevoked || target == ErrAuthFailed)
+}
 
 // PathInfo describes one path for observability.
 type PathInfo struct {

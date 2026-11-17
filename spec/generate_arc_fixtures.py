@@ -31,7 +31,8 @@ F = dict(PADDING=0x00, AUTH=0x01, AUTH_RESULT=0x02, IP_PACKET=0x03, IP_FRAGMENT=
          PATH_ABANDON=0x09, PING=0x0A, ACK=0x0B, CLOSE=0x0C, ERROR=0x0D,
          IP_DATAGRAM=0x0E, REDUNDANCY=0x0F, FEC_REPAIR=0x10, FEC=0x11, STREAM_OPEN=0x12,
          STREAM=0x13, MAX_STREAM_DATA=0x14, MAX_DATA=0x15, STREAM_RESET=0x16,
-         DIAGNOSTICS_OPEN=0x17, ENROLLED=0x18, INVITE_REQUEST=0x19, INVITE=0x1A)
+         DIAGNOSTICS_OPEN=0x17, ENROLLED=0x18, INVITE_REQUEST=0x19, INVITE=0x1A,
+         DEVICES_REQUEST=0x1B, DEVICES=0x1C, REVOKE_REQUEST=0x1D, REVOKE_RESULT=0x1E)
 
 CLIENT_CID = bytes.fromhex("c1c2c3c4c5c6c7c8")
 RELAY_CID = bytes.fromhex("a1a2a3a4a5a6a7a8")
@@ -244,6 +245,23 @@ def build():
           "secret_hex": bytes(range(0x10, 0x20)).hex(), "expires": 1_800_000_000}),
         ("INVITE_REFUSED", F["INVITE"], bytes.fromhex("e1e2e3e4e5e6e7e8") + bytes([5]) + bytes(28),
          {"request_id_hex": "e1e2e3e4e5e6e7e8", "status": 5, "invite_id_hex": "00" * 8, "secret_hex": "00" * 16, "expires": 0}),
+        ("DEVICES_REQUEST", F["DEVICES_REQUEST"], bytes.fromhex("e1e2e3e4e5e6e7e8"), {"request_id_hex": "e1e2e3e4e5e6e7e8"}),
+        ("DEVICES", F["DEVICES"], bytes.fromhex("e1e2e3e4e5e6e7e8") + bytes([0, 2]) +
+         bytes.fromhex("d1d2d3d4d5d6d7d8") + bytes(8) + struct.pack("!II", 1_790_000_000, 1_800_000_000) +
+         bytes.fromhex("a1a2a3a4a5a6a7a8") + bytes([7]) + b"desktop" +
+         bytes.fromhex("c1c2c3c4c5c6c7c8") + bytes.fromhex("d1d2d3d4d5d6d7d8") + struct.pack("!II", 1_795_000_000, 0) +
+         bytes.fromhex("b1b2b3b4b5b6b7b8") + bytes([6]) + b"laptop",
+         {"request_id_hex": "e1e2e3e4e5e6e7e8", "status": 0, "devices": [
+             {"device_id_hex": "d1d2d3d4d5d6d7d8", "parent_hex": "00" * 8, "created": 1_790_000_000,
+              "last_seen": 1_800_000_000, "key_hex": "a1a2a3a4a5a6a7a8", "name": "desktop"},
+             {"device_id_hex": "c1c2c3c4c5c6c7c8", "parent_hex": "d1d2d3d4d5d6d7d8", "created": 1_795_000_000,
+              "last_seen": 0, "key_hex": "b1b2b3b4b5b6b7b8", "name": "laptop"}]}),
+        ("DEVICES_REFUSED", F["DEVICES"], bytes.fromhex("e1e2e3e4e5e6e7e8") + bytes([3, 0]),
+         {"request_id_hex": "e1e2e3e4e5e6e7e8", "status": 3, "devices": []}),
+        ("REVOKE_REQUEST", F["REVOKE_REQUEST"], bytes.fromhex("e1e2e3e4e5e6e7e8") + bytes.fromhex("c1c2c3c4c5c6c7c8") + bytes([1]),
+         {"request_id_hex": "e1e2e3e4e5e6e7e8", "device_id_hex": "c1c2c3c4c5c6c7c8", "descendants": True}),
+        ("REVOKE_RESULT", F["REVOKE_RESULT"], bytes.fromhex("e1e2e3e4e5e6e7e8") + bytes([0]),
+         {"request_id_hex": "e1e2e3e4e5e6e7e8", "status": 0}),
         ("UNKNOWN_EXTENSION", 0x9F, b"\xAA\xBB", {"ignorable": True}),
     ]
     fixtures["frames"] = [
@@ -371,6 +389,15 @@ def build():
         {"name": "invite_request zero request_id", "hex": frame(0x19, bytes(8)).hex()},
         {"name": "invite zero request_id", "hex": frame(0x1A, bytes(8) + bytes([5]) + bytes(28)).hex()},
         {"name": "invite refusal with secret", "hex": frame(0x1A, bytes([1]) + bytes(7) + bytes([5]) + bytes(8) + bytes([1]) + bytes(19)).hex()},
+        {"name": "devices_request zero request_id", "hex": frame(0x1B, bytes(8)).hex()},
+        {"name": "devices refusal with devices", "hex": frame(0x1C, bytes([1]) + bytes(7) + bytes([3, 1]) + bytes([1]) + bytes(31) + bytes([1]) + b"a").hex()},
+        {"name": "devices count past entries", "hex": frame(0x1C, bytes([1]) + bytes(7) + bytes([0, 1])).hex()},
+        {"name": "devices too many", "hex": frame(0x1C, bytes([1]) + bytes(7) + bytes([0, 17]) + (bytes([1]) + bytes(31) + bytes([1]) + b"a") * 17).hex()},
+        {"name": "devices name invalid", "hex": frame(0x1C, bytes([1]) + bytes(7) + bytes([0, 1]) + bytes([1]) + bytes(31) + bytes([3]) + b"a b").hex()},
+        {"name": "devices trailing bytes", "hex": frame(0x1C, bytes([1]) + bytes(7) + bytes([0, 0, 0])).hex()},
+        {"name": "revoke_request device zero", "hex": frame(0x1D, bytes([1]) + bytes(7) + bytes(8) + bytes([0])).hex()},
+        {"name": "revoke_request unknown flags", "hex": frame(0x1D, bytes([1]) + bytes(7) + bytes([1]) + bytes(7) + bytes([2])).hex()},
+        {"name": "revoke_result wrong size", "hex": frame(0x1E, bytes([1]) + bytes(7)).hex()},
         {"name": "redundancy unknown mode", "hex": frame(0x0F, struct.pack("!IB", 1, 2)).hex()},
         {"name": "path_join wrong size", "hex": "06000700000000000000"},
         {"name": "ping with value", "hex": "0a000100"},

@@ -37,6 +37,10 @@ const (
 	FrameEnrolled      FrameType = 0x18
 	FrameInviteRequest FrameType = 0x19
 	FrameInvite        FrameType = 0x1A
+	FrameDevicesReq    FrameType = 0x1B
+	FrameDevices       FrameType = 0x1C
+	FrameRevokeRequest FrameType = 0x1D
+	FrameRevokeResult  FrameType = 0x1E
 
 	// Frame types at or above FirstExtensionFrame are optional extensions
 	// that receivers may ignore; unknown types below it are required.
@@ -87,6 +91,9 @@ const (
 	// Enrollment refusals (§9.2), in AUTH_RESULT and CLOSE.
 	CodeInviteUsed    ErrorCode = 11 // another device redeemed the invite
 	CodeInviteExpired ErrorCode = 12
+	// CodeRevoked, in CLOSE, ends a revoked device's sessions: its client
+	// stops reconnecting.
+	CodeRevoked ErrorCode = 13
 )
 
 const (
@@ -154,6 +161,10 @@ const (
 	// FeatureInvites: the session's device may ask for invites to its
 	// account with INVITE_REQUEST (self-service-accounts.md §3.6).
 	FeatureInvites uint64 = 1 << 4
+	// FeatureDevices: the session's device may list its account's devices
+	// and revoke them, with DEVICES_REQUEST and REVOKE_REQUEST
+	// (self-service-accounts.md §3.8).
+	FeatureDevices uint64 = 1 << 5
 )
 
 // MaxStreamOffset bounds stream offsets and flow control limits, so that
@@ -203,6 +214,52 @@ type Invite struct {
 	ID        [8]byte
 	Secret    [16]byte
 	Expires   uint32
+}
+
+// DevicesRequest asks the relay for the session's account's devices
+// (§10.1). Client to relay only, with FeatureDevices.
+type DevicesRequest struct {
+	RequestID [8]byte
+}
+
+// MaxListedDevices bounds DEVICES: an account has at most 16 devices.
+const MaxListedDevices = 16
+
+// Devices answers a DevicesRequest: with Status 0, the account's devices;
+// otherwise a code (UNAUTHORIZED) and no devices. Relay to client only.
+type Devices struct {
+	RequestID [8]byte
+	Status    ErrorCode
+	Devices   []DeviceInfo
+}
+
+// DeviceInfo describes one device in DEVICES.
+type DeviceInfo struct {
+	ID       [8]byte
+	Parent   [8]byte // the device whose invite enrolled it; zero for an operator invite
+	Created  uint32  // Unix seconds
+	LastSeen uint32  // Unix seconds of its last session the relay knows of; 0 for none
+	Key      [8]byte // the first 8 bytes of its static key; zero for a device bound to none
+	Name     string
+}
+
+const deviceInfoFixed = 8 + 8 + 4 + 4 + 8 + 1
+
+// RevokeRequest asks the relay to revoke a device of the session's
+// account, and with Descendants every device enrolled through its
+// invites, and theirs (§10.1). Client to relay only, with FeatureDevices.
+type RevokeRequest struct {
+	RequestID   [8]byte
+	DeviceID    [8]byte
+	Descendants bool
+}
+
+// RevokeResult answers a RevokeRequest: Status 0 once the revocation is
+// committed (or the device was already revoked), otherwise a code
+// (UNAUTHORIZED). Relay to client only.
+type RevokeResult struct {
+	RequestID [8]byte
+	Status    ErrorCode
 }
 
 // Stream carries bytes of a stream starting at Offset. Fin marks the end of
@@ -328,34 +385,38 @@ type Unknown struct {
 	Value     []byte
 }
 
-func (Padding) Type() FrameType       { return FramePadding }
-func (Auth) Type() FrameType          { return FrameAuth }
-func (AuthResult) Type() FrameType    { return FrameAuthResult }
-func (IPPacket) Type() FrameType      { return FrameIPPacket }
-func (IPFragment) Type() FrameType    { return FrameIPFragment }
-func (NewPath) Type() FrameType       { return FrameNewPath }
-func (PathJoin) Type() FrameType      { return FramePathJoin }
-func (PathChallenge) Type() FrameType { return FramePathChallenge }
-func (PathResponse) Type() FrameType  { return FramePathResponse }
-func (PathAbandon) Type() FrameType   { return FramePathAbandon }
-func (Ping) Type() FrameType          { return FramePing }
-func (Ack) Type() FrameType           { return FrameAck }
-func (CloseFrame) Type() FrameType    { return FrameClose }
-func (ErrorFrame) Type() FrameType    { return FrameError }
-func (IPDatagram) Type() FrameType    { return FrameIPDatagram }
-func (Redundancy) Type() FrameType    { return FrameRedundancy }
-func (FECRepair) Type() FrameType     { return FrameFECRepair }
-func (FEC) Type() FrameType           { return FrameFEC }
-func (StreamOpen) Type() FrameType    { return FrameStreamOpen }
-func (Stream) Type() FrameType        { return FrameStream }
-func (MaxStreamData) Type() FrameType { return FrameMaxStreamData }
-func (MaxData) Type() FrameType       { return FrameMaxData }
-func (StreamReset) Type() FrameType   { return FrameStreamReset }
-func (DiagOpen) Type() FrameType      { return FrameDiagOpen }
-func (Enrolled) Type() FrameType      { return FrameEnrolled }
-func (InviteRequest) Type() FrameType { return FrameInviteRequest }
-func (Invite) Type() FrameType        { return FrameInvite }
-func (u Unknown) Type() FrameType     { return u.FrameType }
+func (Padding) Type() FrameType        { return FramePadding }
+func (Auth) Type() FrameType           { return FrameAuth }
+func (AuthResult) Type() FrameType     { return FrameAuthResult }
+func (IPPacket) Type() FrameType       { return FrameIPPacket }
+func (IPFragment) Type() FrameType     { return FrameIPFragment }
+func (NewPath) Type() FrameType        { return FrameNewPath }
+func (PathJoin) Type() FrameType       { return FramePathJoin }
+func (PathChallenge) Type() FrameType  { return FramePathChallenge }
+func (PathResponse) Type() FrameType   { return FramePathResponse }
+func (PathAbandon) Type() FrameType    { return FramePathAbandon }
+func (Ping) Type() FrameType           { return FramePing }
+func (Ack) Type() FrameType            { return FrameAck }
+func (CloseFrame) Type() FrameType     { return FrameClose }
+func (ErrorFrame) Type() FrameType     { return FrameError }
+func (IPDatagram) Type() FrameType     { return FrameIPDatagram }
+func (Redundancy) Type() FrameType     { return FrameRedundancy }
+func (FECRepair) Type() FrameType      { return FrameFECRepair }
+func (FEC) Type() FrameType            { return FrameFEC }
+func (StreamOpen) Type() FrameType     { return FrameStreamOpen }
+func (Stream) Type() FrameType         { return FrameStream }
+func (MaxStreamData) Type() FrameType  { return FrameMaxStreamData }
+func (MaxData) Type() FrameType        { return FrameMaxData }
+func (StreamReset) Type() FrameType    { return FrameStreamReset }
+func (DiagOpen) Type() FrameType       { return FrameDiagOpen }
+func (Enrolled) Type() FrameType       { return FrameEnrolled }
+func (InviteRequest) Type() FrameType  { return FrameInviteRequest }
+func (Invite) Type() FrameType         { return FrameInvite }
+func (DevicesRequest) Type() FrameType { return FrameDevicesReq }
+func (Devices) Type() FrameType        { return FrameDevices }
+func (RevokeRequest) Type() FrameType  { return FrameRevokeRequest }
+func (RevokeResult) Type() FrameType   { return FrameRevokeResult }
+func (u Unknown) Type() FrameType      { return u.FrameType }
 
 // AppendFrame appends the TLV encoding of f to b. It panics if the encoded
 // value exceeds 65535 bytes, which no valid ARC packet can contain.
@@ -460,6 +521,38 @@ func (i Invite) appendValue(b []byte) []byte {
 	b = append(b, i.ID[:]...)
 	b = append(b, i.Secret[:]...)
 	return binary.BigEndian.AppendUint32(b, i.Expires)
+}
+
+func (r DevicesRequest) appendValue(b []byte) []byte { return append(b, r.RequestID[:]...) }
+
+func (d Devices) appendValue(b []byte) []byte {
+	b = append(b, d.RequestID[:]...)
+	b = append(b, byte(d.Status), byte(len(d.Devices)))
+	for _, x := range d.Devices {
+		b = append(b, x.ID[:]...)
+		b = append(b, x.Parent[:]...)
+		b = binary.BigEndian.AppendUint32(b, x.Created)
+		b = binary.BigEndian.AppendUint32(b, x.LastSeen)
+		b = append(b, x.Key[:]...)
+		b = append(b, byte(len(x.Name)))
+		b = append(b, x.Name...)
+	}
+	return b
+}
+
+func (r RevokeRequest) appendValue(b []byte) []byte {
+	b = append(b, r.RequestID[:]...)
+	b = append(b, r.DeviceID[:]...)
+	var flags byte
+	if r.Descendants {
+		flags = 1
+	}
+	return append(b, flags)
+}
+
+func (r RevokeResult) appendValue(b []byte) []byte {
+	b = append(b, r.RequestID[:]...)
+	return append(b, byte(r.Status))
 }
 
 func (f Stream) appendValue(b []byte) []byte {
@@ -572,6 +665,11 @@ var (
 	errEnrolledName     = malformed("ENROLLED device name invalid")
 	errInviteFields     = malformed("INVITE refusal with nonzero fields")
 	errInviteRequestID  = malformed("invite request_id zero")
+	errRequestID        = malformed("request_id zero")
+	errDevicesFields    = malformed("DEVICES refusal with devices")
+	errDevicesCount     = malformed("DEVICES lists too many devices")
+	errDevicesName      = malformed("DEVICES device ID zero or name invalid")
+	errRevokeFields     = malformed("REVOKE_REQUEST device zero or unknown flags")
 	errStreamFlags      = malformed("STREAM unknown flags")
 	errStreamOffset     = malformed("stream offset or limit too large")
 	errIPVersion        = malformed("IP_PACKET has unknown IP version")
@@ -754,6 +852,41 @@ func parseValue(t FrameType, v []byte) (Frame, error) {
 			return nil, errInviteFields
 		}
 		return i, nil
+
+	case FrameDevicesReq:
+		if len(v) != 8 {
+			return nil, errFrameSize
+		}
+		if [8]byte(v) == [8]byte{} {
+			return nil, errRequestID
+		}
+		return DevicesRequest{RequestID: [8]byte(v)}, nil
+
+	case FrameDevices:
+		return parseDevices(v)
+
+	case FrameRevokeRequest:
+		if len(v) != 17 {
+			return nil, errFrameSize
+		}
+		r := RevokeRequest{RequestID: [8]byte(v[:8]), DeviceID: [8]byte(v[8:16]), Descendants: v[16] == 1}
+		switch {
+		case r.RequestID == [8]byte{}:
+			return nil, errRequestID
+		case r.DeviceID == [8]byte{} || v[16] > 1:
+			return nil, errRevokeFields
+		}
+		return r, nil
+
+	case FrameRevokeResult:
+		if len(v) != 9 {
+			return nil, errFrameSize
+		}
+		r := RevokeResult{RequestID: [8]byte(v[:8]), Status: ErrorCode(v[8])}
+		if r.RequestID == [8]byte{} {
+			return nil, errRequestID
+		}
+		return r, nil
 
 	case FrameStream:
 		if len(v) < streamFixed {
@@ -948,6 +1081,40 @@ func parseAck(v []byte) (Frame, error) {
 }
 
 // validDeviceName: letters, digits, '.', '_' and '-', not "." or "..".
+func parseDevices(v []byte) (Frame, error) {
+	if len(v) < 10 {
+		return nil, errFrameSize
+	}
+	d := Devices{RequestID: [8]byte(v[:8]), Status: ErrorCode(v[8])}
+	n := int(v[9])
+	switch {
+	case d.RequestID == [8]byte{}:
+		return nil, errRequestID
+	case d.Status != 0 && n != 0:
+		return nil, errDevicesFields
+	case n > MaxListedDevices:
+		return nil, errDevicesCount
+	}
+	rest := v[10:]
+	for range n {
+		if len(rest) < deviceInfoFixed || len(rest) < deviceInfoFixed+int(rest[deviceInfoFixed-1]) {
+			return nil, errFrameSize
+		}
+		l := int(rest[deviceInfoFixed-1])
+		x := DeviceInfo{ID: [8]byte(rest[:8]), Parent: [8]byte(rest[8:16]), Created: binary.BigEndian.Uint32(rest[16:20]),
+			LastSeen: binary.BigEndian.Uint32(rest[20:24]), Key: [8]byte(rest[24:32]), Name: string(rest[deviceInfoFixed : deviceInfoFixed+l])}
+		if l > MaxDeviceName || !validDeviceName(x.Name) || x.ID == [8]byte{} {
+			return nil, errDevicesName
+		}
+		d.Devices = append(d.Devices, x)
+		rest = rest[deviceInfoFixed+l:]
+	}
+	if len(rest) != 0 {
+		return nil, errFrameSize
+	}
+	return d, nil
+}
+
 func validDeviceName(s string) bool {
 	if s == "" || s == "." || s == ".." {
 		return false

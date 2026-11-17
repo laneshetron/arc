@@ -62,12 +62,13 @@ func askInvite(ctx context.Context, t *testing.T, relay *udp.Conn, relayKey, key
 	tun := newMemTUN()
 	t.Cleanup(func() { tun.Close() })
 	done, answers := make(chan error, 1), make(chan session.InviteAnswer, 1)
+	req := InviteRequest(id, func(a session.InviteAnswer) error { answers <- a; return errStop })
+	req.Repeat = repeat
 	go func() {
 		done <- RunClient(ctx, ClientConfig{
 			Session: session.ClientConfig{Static: key, RelayPublic: relayKey.Public, Credential: token},
 			Relay:   relay.LocalAddr(), Carriers: []Carrier{{Name: "lo", Conn: conn}}, TUN: tun,
-			ReconnectDelay: 50 * time.Millisecond, InviteRequest: &id, InviteRepeat: repeat,
-			OnInvite: func(a session.InviteAnswer) error { answers <- a; return errStop },
+			ReconnectDelay: 50 * time.Millisecond, Request: req,
 		})
 	}()
 	return done, answers
