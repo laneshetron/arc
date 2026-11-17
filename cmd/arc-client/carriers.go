@@ -143,9 +143,9 @@ func openCarriers(log *slog.Logger, o carrierOptions) ([]engine.Carrier, func(),
 						log.Debug(sc.kind+" carrier", "carrier", name, "err", err)
 					}
 				},
-				OnLearn: func(budget int64) {
+				OnLearn: func(dest netip.AddrPort, budget int64) {
 					log.Info("connections stall at a byte cap; rotating them ahead of it",
-						"carrier", name, "budget_bytes", budget)
+						"carrier", name, "relay", dest, "budget_bytes", budget)
 				},
 			})
 			closers = append(closers, conn)

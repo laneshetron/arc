@@ -2,6 +2,7 @@ package stream
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
@@ -22,6 +23,10 @@ type freezer struct {
 	ln     net.Listener
 	target string
 	budget int64
+	// hangAfter, when positive, holds every connection after the first
+	// hangAfter open without forwarding anything: the dial's TCP handshake
+	// succeeds and the TLS one never ends.
+	hangAfter int
 
 	mu    sync.Mutex
 	conns int
@@ -47,7 +52,12 @@ func (f *freezer) serve() {
 		}
 		f.mu.Lock()
 		f.conns++
+		hang := f.hangAfter > 0 && f.conns > f.hangAfter
 		f.mu.Unlock()
+		if hang {
+			go func() { io.Copy(io.Discard, c); c.Close() }()
+			continue
+		}
 		go func() {
 			s, err := net.Dial("tcp", f.target)
 			if err != nil {
@@ -293,7 +303,7 @@ func TestClientLearnsCapAndRotates(t *testing.T) {
 	c := Dial(ClientOptions{
 		Addr: fz.ln.Addr().String(), TLS: &tls.Config{RootCAs: roots, ServerName: "127.0.0.1"},
 		Peer: netip.MustParseAddrPort("192.0.2.1:4433"), StallTimeout: 300 * time.Millisecond,
-		OnState: func(err error) { states <- err }, OnLearn: func(b int64) { learned <- b },
+		OnState: func(err error) { states <- err }, OnLearn: func(_ netip.AddrPort, b int64) { learned <- b },
 	})
 	t.Cleanup(func() { c.Close() })
 	got := pump(t, c)
@@ -399,4 +409,108 @@ func TestFastReplyDoesNotRearmStall(t *testing.T) {
 	case <-time.After(500 * time.Millisecond):
 	}
 	l.close()
+}
+
+// TestActiveLinkHandledWhileSpareDials: a rotation is due but the spare
+// is still dialing (here, forever). The active connection's stall must
+// still be reported and the link dropped at once, not after the spare's
+// dial gives up.
+func TestActiveLinkHandledWhileSpareDials(t *testing.T) {
+	const budget = 16 << 10
+	fz, roots := frozenRelay(t, budget)
+	fz.mu.Lock()
+	fz.hangAfter = 1
+	fz.mu.Unlock()
+	states := make(chan error, 64)
+	c := Dial(ClientOptions{
+		Addr: fz.ln.Addr().String(), TLS: &tls.Config{RootCAs: roots, ServerName: "127.0.0.1"},
+		Peer: netip.MustParseAddrPort("192.0.2.1:4433"), StallTimeout: 300 * time.Millisecond,
+		RotateBytes: budget / 4, OnState: func(err error) { states <- err },
+	})
+	t.Cleanup(func() { c.Close() })
+	if err := <-states; err != nil {
+		t.Fatal(err)
+	}
+	pump(t, c)
+	start := time.Now()
+	for {
+		select {
+		case err := <-states:
+			var f *Failure
+			if !errors.As(err, &f) || f.Mode != ModeTimeoutAtNBytes {
+				continue
+			}
+			if d := time.Since(start); d > 3*time.Second {
+				t.Fatalf("stall reported after %v, want about the 300 ms stall timeout", d)
+			}
+			if c.Connected() {
+				t.Error("still connected after the active link stalled")
+			}
+			return
+		case <-time.After(5 * time.Second):
+			t.Fatal("stall of the active link not reported while the spare dialed")
+		}
+	}
+}
+
+// TestFrontUpgradeBounded: a front that completes TLS but never answers
+// the HTTP upgrade fails the dial within connectTimeout.
+func TestFrontUpgradeBounded(t *testing.T) {
+	old := connectTimeout
+	connectTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { connectTimeout = old })
+	certPEM, keyPEM, err := SelfSigned([]string{"127.0.0.1"}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{"http/1.1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() { // handshake, read the upgrade, answer nothing
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() { io.Copy(io.Discard, conn); conn.Close() }()
+		}
+	}()
+	roots := x509.NewCertPool()
+	roots.AppendCertsFromPEM(certPEM)
+	c := &Client{ctx: context.Background(), opts: ClientOptions{Addr: ln.Addr().String(),
+		TLS: &tls.Config{RootCAs: roots}, Front: &FrontDialOptions{Token: "t"}, Queue: 1}}
+	start := time.Now()
+	d := c.connect()
+	var f *Failure
+	if !errors.As(d.err, &f) || f.Mode != ModeTimeoutAtNBytes {
+		t.Fatalf("unanswered upgrade: %v, want %s", d.err, ModeTimeoutAtNBytes)
+	}
+	if el := time.Since(start); el > 2*time.Second {
+		t.Errorf("unanswered upgrade took %v, want about %v", el, connectTimeout)
+	}
+}
+
+// TestLearnedBudgetPerDestination: stalls on two addresses do not agree
+// into a cap, and a cap learned on one address does not apply to another.
+func TestLearnedBudgetPerDestination(t *testing.T) {
+	a, b := netip.MustParseAddrPort("192.0.2.1:443"), netip.MustParseAddrPort("198.51.100.1:443")
+	c := &Client{budgets: map[netip.AddrPort]int64{}, lastStall: map[netip.AddrPort]int64{}}
+	c.learn(a, 16<<10)
+	c.learn(b, 16<<10)
+	if c.budget(a) != 0 || c.budget(b) != 0 {
+		t.Fatalf("one stall on each address taught budgets %d, %d; want none", c.budget(a), c.budget(b))
+	}
+	c.learn(a, 17<<10)
+	if c.budget(a) != 8<<10 {
+		t.Errorf("two stalls on %v taught %d, want %d", a, c.budget(a), 8<<10)
+	}
+	if c.budget(b) != 0 {
+		t.Errorf("%v got budget %d from %v's stalls", b, c.budget(b), a)
+	}
 }
