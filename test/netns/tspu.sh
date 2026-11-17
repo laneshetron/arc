@@ -172,6 +172,11 @@ scenario_freeze() {
   else
     fail "freeze: no timeout-at-N-bytes stall reported"
   fi
+  if grep -q 'rotating them ahead of it' "$WORK/freeze.log"; then
+    pass "freeze: learned the cap and rotated connections ahead of it"
+  else
+    fail "freeze: no byte cap learned"
+  fi
   # Still alive after the transfer: a ping through the tunnel.
   if $C ping -c 3 -W 5 -i 0.5 $SERVER >/dev/null 2>&1 || $C ping -c 3 -W 5 -i 0.5 $SERVER >/dev/null 2>&1; then
     pass "freeze: tunnel still answers after the transfer"
