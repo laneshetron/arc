@@ -18,10 +18,14 @@ import (
 
 // carrierOptions are the flags that choose a client's carriers.
 type carrierOptions struct {
-	Relay      netip.AddrPort
-	Binds      []string
-	NoOffload  bool
-	NoUDP      bool // only the TLS and front carriers
+	Relay     netip.AddrPort
+	Binds     []string
+	NoOffload bool
+	NoUDP     bool // only the TLS and front carriers
+	// Censorship holds UDP back from any relay address a stream carrier
+	// uses: under TSPU, UDP to foreign hosting gets the whole address
+	// banned for minutes, stream carriers included.
+	Censorship bool
 	FullTunnel bool
 	Mark       uint32
 
@@ -51,6 +55,25 @@ func openCarriers(log *slog.Logger, o carrierOptions) ([]engine.Carrier, func(),
 	}
 	if !o.Relay.Addr().Unmap().Is4() {
 		return fail(fmt.Errorf("relay %v: only IPv4 relays are supported", o.Relay.Addr()))
+	}
+	// Resolve each stream endpoint once, before full-tunnel DNS can route
+	// lookups into the tunnel the carrier exists to rescue. The same
+	// answer decides the UDP hold-back and is what the stream carrier
+	// dials, so a second lookup cannot disagree with the first. A stream
+	// carrier whose lookup failed keeps resolving when it connects.
+	resolved := map[string]resolution{}
+	for _, addr := range []string{o.TLS, o.Front} {
+		if _, done := resolved[addr]; addr != "" && !done {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			eps, err := resolveEndpoints(ctx, addr)
+			cancel()
+			resolved[addr] = resolution{eps, err}
+		}
+	}
+	if o.Censorship && !o.NoUDP && sharesStreamAddr(log, o.Relay, resolved) {
+		log.Info("censorship posture: no UDP to the relay; a UDP ban on its address would take the TLS carriers down too",
+			"relay", o.Relay.Addr())
+		o.NoUDP = true
 	}
 	binds := append([]string(nil), o.Binds...)
 	// Each carrier talks only to the relay, so its socket is connected.
@@ -118,13 +141,7 @@ func openCarriers(log *slog.Logger, o carrierOptions) ([]engine.Carrier, func(),
 		if err != nil {
 			return fail(err)
 		}
-		// Resolve before full-tunnel DNS can route lookups into the
-		// tunnel the carrier exists to rescue. The UDP carriers may work
-		// regardless; the stream carrier keeps resolving the relay until
-		// it can.
-		bootstrap, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		endpoints, err := stream.ResolveEndpoints(bootstrap, sc.addr)
-		cancel()
+		endpoints, err := resolved[sc.addr].eps, resolved[sc.addr].err
 		if err != nil {
 			log.Warn("resolving the relay's "+sc.kind+" endpoint; retrying when the carrier connects", "relay", sc.addr, "err", err)
 		}
@@ -153,4 +170,33 @@ func openCarriers(log *slog.Logger, o carrierOptions) ([]engine.Carrier, func(),
 		}
 	}
 	return carriers, closeAll, nil
+}
+
+// resolution is one lookup of a stream endpoint.
+type resolution struct {
+	eps []netip.AddrPort
+	err error
+}
+
+// resolveEndpoints is stream.ResolveEndpoints; tests replace it.
+var resolveEndpoints = stream.ResolveEndpoints
+
+// sharesStreamAddr reports whether a stream carrier (-tls or -front)
+// reaches the relay at relay's address, judged by the resolutions the
+// stream carriers will dial. A stream endpoint whose lookup failed counts
+// as shared: it resolves again when it connects, perhaps to that address,
+// and the answer that risks a ban is the one to avoid.
+func sharesStreamAddr(log *slog.Logger, relay netip.AddrPort, resolved map[string]resolution) bool {
+	for addr, r := range resolved {
+		if r.err != nil {
+			log.Warn("censorship posture: cannot resolve the stream endpoint; presuming it shares the relay's address", "endpoint", addr, "err", r.err)
+			return true
+		}
+		for _, ep := range r.eps {
+			if ep.Addr().Unmap() == relay.Addr().Unmap() {
+				return true
+			}
+		}
+	}
+	return false
 }

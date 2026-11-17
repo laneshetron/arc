@@ -120,6 +120,7 @@ func run(args []string) error {
 	noOffload := fs.Bool("no-offload", false, "send and receive without UDP GSO/GRO, for comparison")
 	rotateBytes := fs.Int64("stream-rotate-bytes", 0, "move each -tls or -front carrier to a fresh TCP connection after it has received this many bytes, dialed ahead of time, to stay under a censor's per-connection cap (the TSPU freeze to foreign hosting); 0: learn the cap from stalled connections")
 	noUDP := fs.Bool("no-udp", false, "open no UDP carriers: reach the relay only through -tls or -front (-relay is then the session's address, the -tls endpoint, say)")
+	censorship := fs.Bool("censorship", false, "censorship posture: presume the relay sits on foreign hosting behind a censor that bans an address for minutes after UDP to it (TSPU), so open no UDP carrier to an address a -tls or -front carrier uses (spec/freeze-and-udp-ban.md §4)")
 	fecMode := wire.FECAuto
 	fs.Func("fec", "forward error correction: auto (default; while loss is at least 0.5%), off, or always", func(v string) error {
 		switch v {
@@ -260,7 +261,7 @@ func run(args []string) error {
 	}
 	defer dev.Close()
 	carriers, closeCarriers, err := openCarriers(log, carrierOptions{
-		Relay: relayAddr, Binds: binds, NoOffload: *noOffload, NoUDP: *noUDP, FullTunnel: *fullTunnel, Mark: uint32(*mark),
+		Relay: relayAddr, Binds: binds, NoOffload: *noOffload, NoUDP: *noUDP, Censorship: *censorship, FullTunnel: *fullTunnel, Mark: uint32(*mark),
 		TLS: *tlsAddr, TLSCA: *tlsCA, TLSName: *tlsName, TLSCover: *tlsCover, TLSFingerprint: *tlsFingerprint,
 		TLSFragment: *tlsFragment, Front: *frontAddr, FrontToken: tokens[0], RotateBytes: *rotateBytes,
 	})

@@ -14,13 +14,13 @@
 #
 # Usage: tspu.sh BIN_DIR [SCENARIO...]
 #   BIN_DIR holds arc-client, arc-relay and mini-tspu.
-#   Scenarios (default: all): freeze
+#   Scenarios (default: all): freeze udp-ban
 set -euo pipefail
 
 BIN=$(cd "${1:?usage: tspu.sh BIN_DIR [SCENARIO...]}" && pwd)
 shift
 SCENARIOS=("$@")
-((${#SCENARIOS[@]})) || SCENARIOS=(freeze)
+((${#SCENARIOS[@]})) || SCENARIOS=(freeze udp-ban)
 for b in arc-client arc-relay mini-tspu; do
   [[ -x $BIN/$b ]] || { echo "tspu.sh: $BIN/$b missing" >&2; exit 2; }
 done
@@ -225,6 +225,34 @@ scenario_freeze() {
   else
     fail "freeze: tunnel dead after the transfer"
   fi
+  stop_client
+}
+
+# udp-ban: UDP and the front, as by default, but under the -censorship
+# posture. UDP to a hosting address gets the relay's whole address
+# banned, front included, so the client must not send any.
+scenario_udp-ban() {
+  # POSTURE= runs the default posture, for comparison: the ban fires.
+  start_client udp-ban ${POSTURE--censorship}
+  if wait_until 15 grep -q "session established" "$WORK/udp-ban.log"; then
+    pass "udp-ban: session established"
+  else
+    fail "udp-ban: no session"
+  fi
+  # Traffic, so a UDP carrier (if any) carries well over the ban's
+  # 25 datagrams; the ban fires as soon as it does.
+  $C ping -c 60 -i 0.05 -W 1 $SERVER >/dev/null 2>&1 || true
+  if grep -q '"rule":"udp-ban"' "$WORK/censor.json"; then
+    fail "udp-ban: the censor banned the relay's address"
+  else
+    pass "udp-ban: no UDP ban"
+  fi
+  if alive; then
+    pass "udp-ban: tunnel answers over the front"
+  else
+    fail "udp-ban: tunnel dead"
+  fi
+  echo "udp-ban: censor events: $(censor_events)"
   stop_client
 }
 
