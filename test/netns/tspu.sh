@@ -109,6 +109,11 @@ wait_until 10 $S ip addr show arc0 || { fail "relay up"; exit 1; }
 
 for port in 5201 5202; do $I iperf3 -s -D -p $port -I "$WORK/iperf3.$port.pid"; done
 
+# alive: the tunnel answers a ping within 15 s. The relay sits behind the
+# freeze, so the connection under the session may be frozen when the
+# check starts; the carrier needs a stall timeout and a redial to answer.
+alive() { wait_until 15 $C ping -c 1 -W 2 $SERVER; }
+
 CLIENT_PID=
 # PCAP=1 captures the client's tunnel and link (for OUT=dir).
 pcap() { # NAME
@@ -202,7 +207,7 @@ scenario_freeze() {
     fail "freeze: no timeout-at-N-bytes stall reported"
   fi
   # Still alive after the transfer: a ping through the tunnel.
-  if $C ping -c 3 -W 5 -i 0.5 $SERVER >/dev/null 2>&1 || $C ping -c 3 -W 5 -i 0.5 $SERVER >/dev/null 2>&1; then
+  if alive; then
     pass "freeze: tunnel still answers after the transfer"
   else
     fail "freeze: tunnel dead after the transfer"
