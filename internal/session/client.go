@@ -69,6 +69,11 @@ const (
 type Datagram struct {
 	PathID uint32
 	Data   []byte
+	// AckEliciting is set when the relay owes this packet a reply: an
+	// acknowledgement within its maximum ACK delay. ACK-only packets are
+	// not answered; a carrier that watches for replies (a stream
+	// carrier's stall detection) must not wait for one.
+	AckEliciting bool
 }
 
 // ClientEvent is reported by Client.PollEvent.
@@ -317,7 +322,7 @@ func (c *Client) startHandshake(now time.Time) error {
 
 func (c *Client) sendInit(now time.Time) {
 	init := c.hs.Init(c.cookie)
-	c.out = append(c.out, Datagram{PathID: 0, Data: init.Append(nil)})
+	c.out = append(c.out, Datagram{PathID: 0, Data: init.Append(nil), AckEliciting: true})
 	c.nextInit = now.Add(c.handshakeInterval(now))
 }
 
@@ -391,8 +396,8 @@ func (c *Client) sendAuth(now time.Time) {
 	c.nextInit = now.Add(c.handshakeInterval(now))
 }
 
-func (c *Client) emit(p *path, b []byte, _ bool) {
-	c.out = append(c.out, Datagram{PathID: p.id, Data: b})
+func (c *Client) emit(p *path, b []byte, _, ackEliciting bool) {
+	c.out = append(c.out, Datagram{PathID: p.id, Data: b, AckEliciting: ackEliciting})
 }
 
 // primary keeps the current path while it is healthy and not much lossier

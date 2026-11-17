@@ -2,6 +2,7 @@ package stream
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
@@ -22,6 +23,13 @@ type freezer struct {
 	ln     net.Listener
 	target string
 	budget int64
+	// hangAfter, when positive, holds every connection after the first
+	// hangAfter open without forwarding anything: the dial's TCP handshake
+	// succeeds and the TLS one never ends.
+	hangAfter int
+	// failConn, when positive, is the one connection (counting from 1)
+	// closed at once, so that dial fails.
+	failConn int
 
 	mu    sync.Mutex
 	conns int
@@ -47,7 +55,17 @@ func (f *freezer) serve() {
 		}
 		f.mu.Lock()
 		f.conns++
+		hang := f.hangAfter > 0 && f.conns > f.hangAfter
+		failed := f.failConn > 0 && f.conns == f.failConn
 		f.mu.Unlock()
+		if failed {
+			c.Close()
+			continue
+		}
+		if hang {
+			go func() { io.Copy(io.Discard, c); c.Close() }()
+			continue
+		}
 		go func() {
 			s, err := net.Dial("tcp", f.target)
 			if err != nil {
@@ -136,7 +154,7 @@ func TestClientRedialsFrozenConnection(t *testing.T) {
 			case <-stop:
 				return
 			case <-time.After(10 * time.Millisecond):
-				c.WriteBatch([][]byte{up}, nil)
+				c.WriteBatchEliciting([][]byte{up}, nil, []bool{true})
 			}
 		}
 	}()
@@ -175,8 +193,9 @@ func TestClientRedialsFrozenConnection(t *testing.T) {
 	}
 }
 
-// TestIdleConnectionDoesNotStall: with nothing written, silence is not a
-// stall, however long it lasts.
+// TestIdleConnectionDoesNotStall: once every reply-eliciting packet has
+// been answered, silence is not a stall, however long it lasts, and
+// packets the relay owes no reply (ACK-only) do not make it one.
 func TestIdleConnectionDoesNotStall(t *testing.T) {
 	certPEM, keyPEM, err := SelfSigned([]string{"127.0.0.1"}, time.Hour)
 	if err != nil {
@@ -203,11 +222,15 @@ func TestIdleConnectionDoesNotStall(t *testing.T) {
 	if err := <-states; err != nil {
 		t.Fatal(err)
 	}
-	// One exchange, answered, then silence.
-	c.WriteBatch([][]byte{bytes.Repeat([]byte{1}, 100)}, nil)
+	// One exchange, answered, then an ACK-only packet, then silence.
+	c.WriteBatchEliciting([][]byte{bytes.Repeat([]byte{1}, 100)}, nil, []bool{true})
 	_, from := readOne(t, ln)
 	ln.WriteBatch([][]byte{bytes.Repeat([]byte{2}, 100)}, []netip.AddrPort{from})
 	readOne(t, c)
+	c.WriteBatchEliciting([][]byte{bytes.Repeat([]byte{3}, 100)}, nil, []bool{false})
+	readOne(t, ln)
+	c.WriteBatch([][]byte{bytes.Repeat([]byte{4}, 100)}, nil) // no hint: elicits nothing
+	readOne(t, ln)
 	select {
 	case err := <-states:
 		t.Fatalf("idle connection ended: %v", err)
@@ -270,7 +293,7 @@ func pump(t *testing.T, c *Client) *atomic.Int64 {
 			case <-stop:
 				return
 			case <-time.After(5 * time.Millisecond):
-				c.WriteBatch([][]byte{up}, nil)
+				c.WriteBatchEliciting([][]byte{up}, nil, []bool{true})
 			}
 		}
 	}()
@@ -288,7 +311,7 @@ func TestClientLearnsCapAndRotates(t *testing.T) {
 	c := Dial(ClientOptions{
 		Addr: fz.ln.Addr().String(), TLS: &tls.Config{RootCAs: roots, ServerName: "127.0.0.1"},
 		Peer: netip.MustParseAddrPort("192.0.2.1:4433"), StallTimeout: 300 * time.Millisecond,
-		OnState: func(err error) { states <- err }, OnLearn: func(b int64) { learned <- b },
+		OnState: func(err error) { states <- err }, OnLearn: func(_ netip.AddrPort, b int64) { learned <- b },
 	})
 	t.Cleanup(func() { c.Close() })
 	got := pump(t, c)
@@ -353,5 +376,233 @@ func TestClientRotatesConfiguredBudget(t *testing.T) {
 	}
 	if n := got.Load(); n < 200 {
 		t.Errorf("%d packets received in 2 s, want ≥ 200", n)
+	}
+}
+
+// TestFastReplyDoesNotRearmStall: a reply that arrives before the write
+// that elicited it has returned answers it. On a synchronous pipe the
+// reply is read while the writer is still inside Flush; a link that armed
+// stall detection after flushing would then wait for a reply already
+// received and close a healthy connection.
+func TestFastReplyDoesNotRearmStall(t *testing.T) {
+	near, far := net.Pipe()
+	t.Cleanup(func() { near.Close(); far.Close() })
+	go func() { // the peer: answer each frame at once
+		fr := newFrameReader(far)
+		buf := make([]byte, maxFrame)
+		for {
+			n, err := fr.next(buf)
+			if err != nil {
+				return
+			}
+			if _, err := far.Write(appendFrame(nil, buf[:n])); err != nil {
+				return
+			}
+		}
+	}()
+	l := newLink(near, netip.AddrPort{}, 16, 0)
+	l.stall = 100 * time.Millisecond
+	in := make(chan inbound, 16)
+	ran := make(chan error, 1)
+	go func() { ran <- l.run(in) }()
+	l.send(bytes.Repeat([]byte{5}, 100), true)
+	select {
+	case <-in:
+	case <-time.After(2 * time.Second):
+		t.Fatal("no reply")
+	}
+	select {
+	case err := <-ran:
+		t.Fatalf("answered link closed: %v", err)
+	case <-time.After(500 * time.Millisecond):
+	}
+	l.close()
+}
+
+// TestActiveLinkHandledWhileSpareDials: a rotation is due but the spare
+// is still dialing (here, forever). The active connection's stall must
+// still be reported and the link dropped at once, not after the spare's
+// dial gives up.
+func TestActiveLinkHandledWhileSpareDials(t *testing.T) {
+	const budget = 16 << 10
+	fz, roots := frozenRelay(t, budget)
+	fz.mu.Lock()
+	fz.hangAfter = 1
+	fz.mu.Unlock()
+	states := make(chan error, 64)
+	c := Dial(ClientOptions{
+		Addr: fz.ln.Addr().String(), TLS: &tls.Config{RootCAs: roots, ServerName: "127.0.0.1"},
+		Peer: netip.MustParseAddrPort("192.0.2.1:4433"), StallTimeout: 300 * time.Millisecond,
+		RotateBytes: budget / 4, OnState: func(err error) { states <- err },
+	})
+	t.Cleanup(func() { c.Close() })
+	if err := <-states; err != nil {
+		t.Fatal(err)
+	}
+	pump(t, c)
+	start := time.Now()
+	for {
+		select {
+		case err := <-states:
+			var f *Failure
+			if !errors.As(err, &f) || f.Mode != ModeTimeoutAtNBytes {
+				continue
+			}
+			if d := time.Since(start); d > 3*time.Second {
+				t.Fatalf("stall reported after %v, want about the 300 ms stall timeout", d)
+			}
+			if c.Connected() {
+				t.Error("still connected after the active link stalled")
+			}
+			return
+		case <-time.After(5 * time.Second):
+			t.Fatal("stall of the active link not reported while the spare dialed")
+		}
+	}
+}
+
+// TestFrontUpgradeBounded: a front that completes TLS but never answers
+// the HTTP upgrade fails the dial within connectTimeout.
+func TestFrontUpgradeBounded(t *testing.T) {
+	old := connectTimeout
+	connectTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { connectTimeout = old })
+	certPEM, keyPEM, err := SelfSigned([]string{"127.0.0.1"}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{"http/1.1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() { // handshake, read the upgrade, answer nothing
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() { io.Copy(io.Discard, conn); conn.Close() }()
+		}
+	}()
+	roots := x509.NewCertPool()
+	roots.AppendCertsFromPEM(certPEM)
+	c := &Client{ctx: context.Background(), opts: ClientOptions{Addr: ln.Addr().String(),
+		TLS: &tls.Config{RootCAs: roots}, Front: &FrontDialOptions{Token: "t"}, Queue: 1}}
+	start := time.Now()
+	d := c.connect()
+	var f *Failure
+	if !errors.As(d.err, &f) || f.Mode != ModeTimeoutAtNBytes {
+		t.Fatalf("unanswered upgrade: %v, want %s", d.err, ModeTimeoutAtNBytes)
+	}
+	if el := time.Since(start); el > 2*time.Second {
+		t.Errorf("unanswered upgrade took %v, want about %v", el, connectTimeout)
+	}
+}
+
+// TestLearnedBudgetPerDestination: stalls on two addresses do not agree
+// into a cap, and a cap learned on one address does not apply to another.
+func TestLearnedBudgetPerDestination(t *testing.T) {
+	a, b := netip.MustParseAddrPort("192.0.2.1:443"), netip.MustParseAddrPort("198.51.100.1:443")
+	c := &Client{budgets: map[netip.AddrPort]int64{}, lastStall: map[netip.AddrPort]int64{}}
+	c.learn(a, 16<<10)
+	c.learn(b, 16<<10)
+	if c.budget(a) != 0 || c.budget(b) != 0 {
+		t.Fatalf("one stall on each address taught budgets %d, %d; want none", c.budget(a), c.budget(b))
+	}
+	c.learn(a, 17<<10)
+	if c.budget(a) != 8<<10 {
+		t.Errorf("two stalls on %v taught %d, want %d", a, c.budget(a), 8<<10)
+	}
+	if c.budget(b) != 0 {
+		t.Errorf("%v got budget %d from %v's stalls", b, c.budget(b), a)
+	}
+}
+
+// TestRefusedPacketDoesNotArmStall: a reply-eliciting packet the full
+// queue refuses was never sent, so no reply is owed and the healthy
+// link must not stall waiting for one.
+func TestRefusedPacketDoesNotArmStall(t *testing.T) {
+	near, far := net.Pipe()
+	t.Cleanup(func() { near.Close(); far.Close() })
+	l := newLink(near, netip.AddrPort{}, 1, 0)
+	l.stall = 100 * time.Millisecond
+	if !l.send(bytes.Repeat([]byte{1}, 100), false) { // fills the queue
+		t.Fatal("first packet refused")
+	}
+	if l.send(bytes.Repeat([]byte{2}, 100), true) {
+		t.Fatal("second packet accepted by a full queue")
+	}
+	go func() { io.Copy(io.Discard, far) }() // the peer drains, owes nothing
+	in := make(chan inbound, 1)
+	ran := make(chan error, 1)
+	go func() { ran <- l.run(in) }()
+	select {
+	case err := <-ran:
+		t.Fatalf("healthy link closed: %v", err)
+	case <-time.After(500 * time.Millisecond):
+	}
+	l.close()
+}
+
+// TestSpareRetriedAfterFailure: a spare dial that fails once is retried
+// while the active link still works, so the carrier rotates before the
+// cap instead of riding the link into a stall.
+func TestSpareRetriedAfterFailure(t *testing.T) {
+	const budget = 16 << 10
+	fz, roots := frozenRelay(t, budget)
+	fz.mu.Lock()
+	fz.failConn = 2 // the first spare
+	fz.mu.Unlock()
+	states := make(chan error, 64)
+	c := Dial(ClientOptions{
+		Addr: fz.ln.Addr().String(), TLS: &tls.Config{RootCAs: roots, ServerName: "127.0.0.1"},
+		Peer: netip.MustParseAddrPort("192.0.2.1:4433"), StallTimeout: 300 * time.Millisecond,
+		RotateBytes: budget / 2, OnState: func(err error) { states <- err },
+	})
+	t.Cleanup(func() { c.Close() })
+	if err := <-states; err != nil {
+		t.Fatal(err)
+	}
+	// Slow enough (1 KB per 50 ms) that the cap is ~0.8 s away: time for
+	// the first spare to fail and a retry, 0.5 s later, to come up.
+	stop := make(chan struct{})
+	t.Cleanup(func() { close(stop) })
+	go func() {
+		bufs, sizes, addrs := [][]byte{make([]byte, maxFrame)}, []int{0}, []netip.AddrPort{{}}
+		for {
+			if _, err := c.ReadBatch(bufs, sizes, addrs); err != nil {
+				return
+			}
+		}
+	}()
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(50 * time.Millisecond):
+				c.WriteBatchEliciting([][]byte{bytes.Repeat([]byte{7}, 100)}, nil, []bool{true})
+			}
+		}
+	}()
+	window := time.After(3 * time.Second)
+	for {
+		select {
+		case err := <-states:
+			var f *Failure
+			if errors.As(err, &f) && f.Mode == ModeTimeoutAtNBytes {
+				t.Fatalf("active link stalled at the cap: the failed spare was not retried (%v)", err)
+			}
+		case <-window:
+			if n := fz.count(); n < 4 {
+				t.Errorf("%d connections in 3 s, want the failed spare, its retry, and rotations", n)
+			}
+			return
+		}
 	}
 }

@@ -864,7 +864,7 @@ func (r *Relay) closeSession(now time.Time, s *RelaySession, err error, notify b
 // emit sends a packet to the path's address, or to its candidate address,
 // enforcing the 3x anti-amplification limit toward any address that has
 // not been validated (§14.4).
-func (s *RelaySession) emit(p *path, b []byte, toCandidate bool) {
+func (s *RelaySession) emit(p *path, b []byte, toCandidate, _ bool) {
 	to := p.addr
 	switch {
 	case toCandidate:
