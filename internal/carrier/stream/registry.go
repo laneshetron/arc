@@ -94,7 +94,7 @@ func (r *registry) writeBatch(pkts [][]byte, addrs []netip.AddrPort) error {
 	defer r.mu.Unlock()
 	for i, p := range pkts {
 		if k := r.links[addrs[i]]; k != nil {
-			k.send(p)
+			k.send(p, false)
 		}
 	}
 	return nil

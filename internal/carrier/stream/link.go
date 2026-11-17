@@ -35,13 +35,15 @@ type link struct {
 
 	idle time.Duration // close after this long without a received packet; 0: never
 
-	// stall, when positive, closes the link with errStalled once a frame
-	// written after the last one read has gone this long without any
-	// frame read since: bytes in flight, no progress (a censor's silent
-	// freeze, spec/freeze-and-udp-ban.md §2). Client links only.
+	// stall, when positive, closes the link with errStalled once a packet
+	// the peer owes a reply has gone this long with no frame read since:
+	// an exchange in flight, no progress (a censor's silent freeze,
+	// spec/freeze-and-udp-ban.md §2). Client links only.
 	stall time.Duration
-	// unanswered is when the oldest frame written since the last frame
-	// read was flushed (UnixNano), or 0 if none has been.
+	// unanswered is when the oldest reply-eliciting packet queued since
+	// the last frame read was queued (UnixNano), or 0 if none has been.
+	// It is set before the packet is queued, so a reply that arrives
+	// before the write returns clears it rather than racing it.
 	unanswered atomic.Int64
 	// frames counts frames read.
 	frames atomic.Int64
@@ -88,12 +90,16 @@ func (l *link) stopWith(err error) {
 }
 
 // send queues a copy of pkt, reporting false if the queue is full or the
-// link closed.
-func (l *link) send(pkt []byte) bool {
+// link closed. elicits marks a packet the peer owes a reply, which arms
+// stall detection.
+func (l *link) send(pkt []byte, elicits bool) bool {
 	select {
 	case <-l.done:
 		return false
 	default:
+	}
+	if elicits && l.stall > 0 {
+		l.unanswered.CompareAndSwap(0, time.Now().UnixNano())
 	}
 	var b []byte
 	if len(pkt) <= bufpool.Packet {
@@ -191,9 +197,6 @@ func (l *link) write() {
 		if err := w.Flush(); err != nil {
 			l.stopWith(err)
 			return
-		}
-		if l.stall > 0 {
-			l.unanswered.CompareAndSwap(0, time.Now().UnixNano())
 		}
 	}
 }

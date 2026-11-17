@@ -152,8 +152,9 @@ type carrierState struct {
 	path    uint32
 	retryAt time.Time // when an unbound carrier may next try to join
 
-	out [][]byte         // reused per flush: datagrams for this carrier
-	to  []netip.AddrPort // and their destinations
+	out    [][]byte         // reused per flush: datagrams for this carrier
+	to     []netip.AddrPort // and their destinations
+	elicit []bool           // and whether the relay owes each a reply
 
 	warnAt    time.Time // when the next send failure may be logged
 	sendFails int       // send failures since the last one logged
@@ -610,6 +611,7 @@ func flushTransmits(c *session.Client, carriers []*carrierState, pinned int, log
 				if pinned < 0 || i == pinned {
 					// A copy each: the buffers are returned per carrier.
 					cs.out, cs.to = append(cs.out, append(bufpool.Get(), d.Data...)), append(cs.to, cs.Relay)
+					cs.elicit = append(cs.elicit, d.AckEliciting)
 				}
 			}
 			bufpool.Put(d.Data)
@@ -619,6 +621,7 @@ func flushTransmits(c *session.Client, carriers []*carrierState, pinned int, log
 		for _, cs := range carriers {
 			if cs.bound && cs.path == d.PathID {
 				cs.out, cs.to = append(cs.out, d.Data), append(cs.to, cs.Relay)
+				cs.elicit = append(cs.elicit, d.AckEliciting)
 				sent = true
 				break
 			}
@@ -631,7 +634,13 @@ func flushTransmits(c *session.Client, carriers []*carrierState, pinned int, log
 		if len(cs.out) == 0 {
 			continue
 		}
-		if err := cs.Conn.WriteBatch(cs.out, cs.to); err != nil {
+		var err error
+		if ew, ok := cs.Conn.(elicitingWriter); ok {
+			err = ew.WriteBatchEliciting(cs.out, cs.to, cs.elicit)
+		} else {
+			err = cs.Conn.WriteBatch(cs.out, cs.to)
+		}
+		if err != nil {
 			cs.sendFailed(log, time.Now(), err)
 		}
 		// WriteBatch has copied or sent everything; the buffers are free.
@@ -639,8 +648,15 @@ func flushTransmits(c *session.Client, carriers []*carrierState, pinned int, log
 			bufpool.Put(p)
 			cs.out[i] = nil
 		}
-		cs.out, cs.to = cs.out[:0], cs.to[:0]
+		cs.out, cs.to, cs.elicit = cs.out[:0], cs.to[:0], cs.elicit[:0]
 	}
+}
+
+// elicitingWriter is a carrier that is told which datagrams the relay
+// owes a reply (session.Datagram.AckEliciting): a stream carrier watches
+// for those replies to find a connection a censor silently froze.
+type elicitingWriter interface {
+	WriteBatchEliciting(pkts [][]byte, addrs []netip.AddrPort, eliciting []bool) error
 }
 
 // startUpload uploads what the journal holds on a diagnostics stream, if

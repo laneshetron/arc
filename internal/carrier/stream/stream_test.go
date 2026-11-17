@@ -174,7 +174,7 @@ func TestFullQueueDrops(t *testing.T) {
 	k := newLink(nil, netip.AddrPort{}, 4, 0)
 	sent := 0
 	for range 10 {
-		if k.send(make([]byte, 100)) {
+		if k.send(make([]byte, 100), false) {
 			sent++
 		}
 	}
