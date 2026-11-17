@@ -174,8 +174,12 @@ the job without one; locally, Docker builds it from `../mini-tspu`.
 - A packet-count rotation budget (§3).
 - `TCP_INFO`-based stall detection (unacked bytes with no ACK progress)
   for a faster, RTT-scaled stall timeout.
-- Relay-side budgets: the relay knows exactly how much it wrote on each
-  connection and could stop short of the cap and FIN, so the client
-  rotates without the learning phase.
+- Relay-side budgets: the client tells the relay its budget (a session
+  frame), and the relay stops writing on a connection at it and hands
+  what it holds to the successor. Measured in mini-tspu, rotation with a
+  PING on each move holds a steady ~400 kbit/s at a 50 ms round trip
+  with no silences, because a fresh connection's initial window (~14.5 KB)
+  stays under the cap. Only sub-millisecond paths (Docker) burst past it.
+  Deferred until a field path shows the bursts.
 - Feeding stalls and bans into a persisted upstream profile (§3), so a
   second session starts with the budget and the posture already learned.
