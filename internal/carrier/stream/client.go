@@ -148,6 +148,12 @@ type dialed struct {
 	at    time.Time
 }
 
+// handoffReserve is how much a connection must receive after it becomes
+// the active one before it may rotate: room for the relay's address
+// validation of it (§14.5) and then some data, so a reply never leaves
+// on a different connection from the one the relay challenged.
+const handoffReserve = 2 << 10
+
 // maxSpareAge bounds how long a pre-dialed spare connection waits unused
 // before it is replaced: the relay or a middlebox may have dropped it.
 const maxSpareAge = time.Minute
@@ -171,7 +177,13 @@ func (c *Client) connectLoop() {
 		l, track, dest := d.l, d.track, d.dest
 		budget := c.budget(dest)
 		if budget > 0 {
-			l.track, l.rotateAt = track, budget
+			// The connection must outlast its own handoff: the PING
+			// announcing it, the relay's PATH_CHALLENGE and the reply all
+			// travel on it, and the relay migrates only once the reply
+			// arrives from the address it challenged. TLS setup may have
+			// used most of a small budget, so the budget counts from no
+			// less than handoffReserve past what the connection has read.
+			l.track, l.rotateAt = track, max(budget, track.read.Load()+handoffReserve)
 		}
 		c.setLink(l) // before OnState, so a write it prompts is not dropped
 		select {
