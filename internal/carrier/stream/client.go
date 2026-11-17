@@ -112,6 +112,7 @@ type Client struct {
 	spare     *dialed
 	spareBusy bool // a spare dial is running and will send on spareCh
 	spareCh   chan dialed
+	moved     chan struct{} // see Moved
 
 	endpoints    []netip.AddrPort
 	nextEndpoint int
@@ -132,7 +133,8 @@ func Dial(opts ClientOptions) *Client {
 	}
 	ctx, stop := context.WithCancel(context.Background())
 	c := &Client{opts: opts, in: make(chan inbound, opts.Queue), ctx: ctx, stop: stop,
-		budgets: map[netip.AddrPort]int64{}, lastStall: map[netip.AddrPort]int64{}, spareCh: make(chan dialed, 1)}
+		budgets: map[netip.AddrPort]int64{}, lastStall: map[netip.AddrPort]int64{}, spareCh: make(chan dialed, 1),
+		moved: make(chan struct{}, 1)}
 	go c.connectLoop()
 	return c
 }
@@ -145,6 +147,12 @@ type dialed struct {
 	err   error
 	at    time.Time
 }
+
+// handoffReserve is how much a connection must receive after it becomes
+// the active one before it may rotate: room for the relay's address
+// validation of it (§14.5) and then some data, so a reply never leaves
+// on a different connection from the one the relay challenged.
+const handoffReserve = 2 << 10
 
 // maxSpareAge bounds how long a pre-dialed spare connection waits unused
 // before it is replaced: the relay or a middlebox may have dropped it.
@@ -169,9 +177,19 @@ func (c *Client) connectLoop() {
 		l, track, dest := d.l, d.track, d.dest
 		budget := c.budget(dest)
 		if budget > 0 {
-			l.track, l.rotateAt = track, budget
+			// The connection must outlast its own handoff: the PING
+			// announcing it, the relay's PATH_CHALLENGE and the reply all
+			// travel on it, and the relay migrates only once the reply
+			// arrives from the address it challenged. TLS setup may have
+			// used most of a small budget, so the budget counts from no
+			// less than handoffReserve past what the connection has read.
+			l.track, l.rotateAt = track, max(budget, track.read.Load()+handoffReserve)
 		}
 		c.setLink(l) // before OnState, so a write it prompts is not dropped
+		select {
+		case c.moved <- struct{}{}:
+		default:
+		}
 		if c.opts.OnState != nil {
 			c.opts.OnState(nil)
 		}
@@ -566,6 +584,13 @@ func (c *Client) setLink(l *link) {
 	c.cur = l
 	c.mu.Unlock()
 }
+
+// Moved receives a value each time the carrier starts writing on a new
+// connection (after a redial or a rotation). The relay sends to the old
+// one until a packet reaches it on the new one, so the session should
+// send one at once (session.Client.Probe) rather than wait to have
+// something to say: a client that is only receiving has nothing.
+func (c *Client) Moved() <-chan struct{} { return c.moved }
 
 // Connected reports whether the carrier has a connection now.
 func (c *Client) Connected() bool {

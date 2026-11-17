@@ -85,6 +85,14 @@ for nsdev in "$NS_C:c0" "$NS_T:t0" "$NS_T:t1" "$NS_S:s0" "$NS_S:s1" "$NS_I:i0"; 
   ip netns exec "$ns" ethtool -K "$dev" tx off tso off gso off gro off >/dev/null 2>&1 || true
   ip -n "$ns" link set "$dev" up
 done
+# DELAY (e.g. 25ms) delays each direction of the censored link, for
+# round trips like a real path's: a fresh TCP connection's first flight
+# is then limited by its initial window, as it is in the field, rather
+# than by a sub-millisecond RTT.
+if [[ -n ${DELAY:-} ]]; then
+  $C tc qdisc add dev c0 root netem delay "$DELAY" limit 10000
+  $S tc qdisc add dev s0 root netem delay "$DELAY" limit 10000
+fi
 $S sysctl -qw net.ipv4.ip_forward=1
 $S iptables -t nat -A POSTROUTING -s 10.77.0.0/16 -o s1 -j MASQUERADE
 
@@ -108,6 +116,11 @@ PIDS+=("$!")
 wait_until 10 $S ip addr show arc0 || { fail "relay up"; exit 1; }
 
 for port in 5201 5202; do $I iperf3 -s -D -p $port -I "$WORK/iperf3.$port.pid"; done
+
+# alive: the tunnel answers a ping within 15 s. The relay sits behind the
+# freeze, so the connection under the session may be frozen when the
+# check starts; the carrier needs a stall timeout and a redial to answer.
+alive() { wait_until 15 $C ping -c 1 -W 2 $SERVER; }
 
 CLIENT_PID=
 # PCAP=1 captures the client's tunnel and link (for OUT=dir).
@@ -139,6 +152,8 @@ download() {
   python3 - "$WORK/iperf.$1" <<'EOF' 2>/dev/null || echo 0
 import json, sys
 r = json.load(open(sys.argv[1]))
+if r.get("error"):
+    print("iperf3: " + r["error"], file=sys.stderr)
 print(int(r["end"]["sum_received"]["bytes"]))
 EOF
 }
@@ -172,13 +187,27 @@ scenario_freeze() {
   got=$(download 5201 "${DURATION:-20}")
   echo "freeze: received $got bytes in ${DURATION:-20} s; kbit/s per second: $(intervals 5201)"
   echo "freeze: censor events: $(censor_events)"
-  # More than six connections' worth: stall-and-redial alone gets
-  # ~55–100 KB in 20 s; rotating ahead of the cap, ~0.3–1.4 MB.
-  local want=$((${FREEZE_FLOOR:-6} * FREEZE_BYTES))
-  if ((got > want)); then
-    pass "freeze: downlink kept flowing past the freeze ($got bytes, > $want)"
+  # The carrier redialed: more than one connection froze. A carrier
+  # that stays on its first connection gets one frozen; one that learns
+  # the cap, at least the two it learns from.
+  local freezes
+  freezes=$(grep -c '"rule":"freeze"' "$WORK/censor.json" || true)
+  if ((freezes >= 2)); then
+    pass "freeze: carrier redialed past the freeze ($freezes connections frozen)"
   else
-    fail "freeze: downlink stopped at the freeze ($got bytes, want > $want)"
+    fail "freeze: carrier stayed on its frozen connection ($freezes frozen, want ≥ 2)"
+  fi
+  # Throughput, in connections' worth (FREEZE_FLOOR, default 6). Stall
+  # and redial alone moves ~55–100 KB in 20 s, too erratic to hold to a
+  # floor; rotating ahead of the cap moves ~1 MB or more.
+  local FREEZE_FLOOR=${FREEZE_FLOOR:-6}
+  if ((FREEZE_FLOOR > 0)); then
+    local want=$((FREEZE_FLOOR * FREEZE_BYTES))
+    if ((got > want)); then
+      pass "freeze: downlink kept flowing past the freeze ($got bytes, > $want)"
+    else
+      fail "freeze: downlink stopped at the freeze ($got bytes, want > $want)"
+    fi
   fi
   if grep -q 'timeout-at-N-bytes' "$WORK/freeze.journal"; then
     pass "freeze: stalls reported as timeout-at-N-bytes"
@@ -191,7 +220,7 @@ scenario_freeze() {
     fail "freeze: no byte cap learned"
   fi
   # Still alive after the transfer: a ping through the tunnel.
-  if $C ping -c 3 -W 5 -i 0.5 $SERVER >/dev/null 2>&1 || $C ping -c 3 -W 5 -i 0.5 $SERVER >/dev/null 2>&1; then
+  if alive; then
     pass "freeze: tunnel still answers after the transfer"
   else
     fail "freeze: tunnel dead after the transfer"

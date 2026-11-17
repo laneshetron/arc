@@ -2,6 +2,7 @@ package stream
 
 import (
 	"bufio"
+	"io"
 	"net"
 	"net/netip"
 	"sync"
@@ -47,6 +48,12 @@ type link struct {
 	unanswered atomic.Int64
 	// frames counts frames read.
 	frames atomic.Int64
+	// unwritten counts packets the writer had taken from out but never
+	// handed to TCP whole, because a write or flush failed. Set before the
+	// writer stops the link, read after it exits (writerDone).
+	unwritten  atomic.Int64
+	writerDone chan struct{}
+	heldPeak   atomic.Int64 // most frames the writer held at once (tests)
 
 	// rotateAt, when positive, signals rotate once track has read this
 	// many bytes. Client links only; both are set before run.
@@ -132,6 +139,24 @@ func (l *link) send(pkt []byte, elicits bool) bool {
 	}
 }
 
+// drain empties a closed link's queue, returning how many packets it
+// never handed to TCP: those still queued, and those the writer held
+// when a write or flush failed. Packets TCP accepted but never delivered
+// (in its send buffer, or in flight) are not counted. Call it after run
+// returns.
+func (l *link) drain() int {
+	n := int(l.unwritten.Load())
+	for {
+		select {
+		case p := <-l.out:
+			bufpool.Put(p)
+			n++
+		default:
+			return n
+		}
+	}
+}
+
 func (l *link) close() {
 	l.once.Do(func() {
 		close(l.done)
@@ -143,12 +168,17 @@ func (l *link) close() {
 // link is closed, with the first fatal transport error if there was one.
 // Received packets go to in.
 func (l *link) run(in chan<- inbound) error {
-	go l.write()
+	l.writerDone = make(chan struct{})
+	go func() {
+		defer close(l.writerDone)
+		l.write()
+	}()
 	if l.stall > 0 {
 		go l.watchStall()
 	}
 	l.read(in)
 	l.close()
+	<-l.writerDone // so drain sees what a failing flush lost
 	if p := l.death.Load(); p != nil {
 		return *p
 	}
@@ -193,8 +223,28 @@ func (l *link) read(in chan<- inbound) {
 // write sends queued packets, coalescing whatever is queued into one
 // flush.
 func (l *link) write() {
-	w := bufio.NewWriterSize(l.conn, 64<<10)
+	cw := &countingWriter{w: l.conn}
+	w := bufio.NewWriterSize(cw, 64<<10)
 	var frame []byte
+	// held lists where each frame the writer still holds ends, in bytes
+	// given to w since the link started: those not yet handed to TCP
+	// whole. Frames leave it as bufio's writes to the connection succeed,
+	// so it never holds more than bufio's buffer plus one frame.
+	var held []int64
+	var given int64
+	retire := func() {
+		i := 0
+		for i < len(held) && held[i] <= cw.n {
+			i++
+		}
+		held = held[:copy(held, held[i:])]
+	}
+	// fail counts the frames TCP did not take whole, then stops the link.
+	fail := func(err error) {
+		retire()
+		l.unwritten.Add(int64(len(held)))
+		l.stopWith(err)
+	}
 	for {
 		var pkt []byte
 		select {
@@ -205,10 +255,16 @@ func (l *link) write() {
 		for {
 			frame = appendFrame(frame[:0], pkt)
 			bufpool.Put(pkt)
+			held = append(held, given+int64(len(frame)))
+			if n := int64(len(held)); n > l.heldPeak.Load() {
+				l.heldPeak.Store(n)
+			}
+			given += int64(len(frame))
 			if _, err := w.Write(frame); err != nil {
-				l.stopWith(err)
+				fail(err)
 				return
 			}
+			retire()
 			select {
 			case pkt = <-l.out:
 				continue
@@ -217,10 +273,23 @@ func (l *link) write() {
 			break
 		}
 		if err := w.Flush(); err != nil {
-			l.stopWith(err)
+			fail(err)
 			return
 		}
+		retire()
 	}
+}
+
+// countingWriter counts the bytes its writer accepted.
+type countingWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (c *countingWriter) Write(b []byte) (int, error) {
+	n, err := c.w.Write(b)
+	c.n += int64(n)
+	return n, err
 }
 
 // readBatch fills bufs from in, blocking until at least one packet is
