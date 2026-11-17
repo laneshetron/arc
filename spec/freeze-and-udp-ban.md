@@ -41,16 +41,26 @@ and is abandoned after 30 s of silence, §14.6), but abandoning the path
 does nothing to the TCP connection under it: the carrier keeps writing
 into the same frozen connection, and rejoining puts the path back on it.
 
-**Rule.** A client stream connection is *stalled* when it has written at
-least one frame since it last read one, and the oldest such write is
-older than the stall timeout. The carrier then closes the connection,
-reports `timeout-at-N-bytes` (§8 taxonomy, `At` = bytes exchanged), and
-redials.
+**Rule.** A client stream connection is *stalled* when it has queued at
+least one **ack-eliciting** packet since it last read a frame, and the
+oldest such packet is older than the stall timeout. The carrier then
+closes the connection, reports `timeout-at-N-bytes` (§8 taxonomy, `At` =
+bytes exchanged), and redials.
 
-- *Bytes in flight but no progress* is measured at the frame layer, not
-  from `TCP_INFO`, so it works the same on every OS and through every
-  TLS profile. A read of any frame is progress. An idle connection
-  (nothing written) never stalls, so keepalive spacing is irrelevant.
+- Only packets the relay owes a reply arm the timer: the session marks
+  each outgoing datagram ack-eliciting or not (the relay acknowledges
+  those within its maximum ACK delay), and ACK-only packets, which the
+  relay never answers, do not count. A carrier that is not told (plain
+  `WriteBatch`) arms nothing.
+- The timer is armed when the packet is accepted into the send queue,
+  before the writer can transmit it, so a reply that arrives before the
+  write returns clears it. A packet the full queue refuses was never
+  sent and arms nothing.
+- *An exchange in flight but no progress* is measured at the frame
+  layer, not from `TCP_INFO`, so it works the same on every OS and
+  through every TLS profile. A read of any frame is progress. An idle
+  connection (nothing owed) never stalls, so keepalive spacing is
+  irrelevant.
 - **Stall timeout:** 2 s by default. The
   session already sends a PING at least every PTO on a suspect path
   (§14.1), so a frozen connection has writes outstanding within one PTO

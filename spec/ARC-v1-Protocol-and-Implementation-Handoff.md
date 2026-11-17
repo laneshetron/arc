@@ -697,7 +697,7 @@ The client usually cannot tell that its NAT mapping changed, so the relay handle
 - It sends `PATH_CHALLENGE` to the new address, subject to the 3× limit.
 - It switches path `p` to the new address only after a matching `PATH_RESPONSE` arrives from that address.
 - Unauthenticated packets never trigger this.
-- On stream carriers, a new connection is a new path.
+- On stream carriers, a reconnection is an address change on the same path, not a new path. The relay gives each stream connection its own synthetic address (§16.3), so a client stream carrier that redials, after a failure or to rotate ahead of a censor's per-connection cap (`freeze-and-udp-ban.md`), keeps its path ID, and the relay validates the new connection's address with `PATH_CHALLENGE`, as above, before moving the downlink. TLS on the carrier is not a substitute: the outer carrier is untrusted.
 
 ### 14.6 Path death and recovery
 
