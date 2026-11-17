@@ -98,20 +98,29 @@ func (l *link) send(pkt []byte, elicits bool) bool {
 		return false
 	default:
 	}
-	if elicits && l.stall > 0 {
-		l.unanswered.CompareAndSwap(0, time.Now().UnixNano())
-	}
 	var b []byte
 	if len(pkt) <= bufpool.Packet {
 		b = append(bufpool.Get(), pkt...)
 	} else {
 		b = append([]byte(nil), pkt...)
 	}
+	// Arm stall detection before queueing, so a reply that arrives
+	// before the writer has even returned clears it, and disarm it if
+	// the queue refuses the packet: nothing was sent, so no reply is owed.
+	var armed int64
+	if elicits && l.stall > 0 {
+		if now := time.Now().UnixNano(); l.unanswered.CompareAndSwap(0, now) {
+			armed = now
+		}
+	}
 	select {
 	case l.out <- b:
 		return true
 	default:
 		bufpool.Put(b)
+		if armed != 0 {
+			l.unanswered.CompareAndSwap(armed, 0)
+		}
 		return false
 	}
 }
