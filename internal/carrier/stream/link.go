@@ -47,6 +47,11 @@ type link struct {
 	unanswered atomic.Int64
 	// frames counts frames read.
 	frames atomic.Int64
+	// unwritten counts packets the writer had taken from out but never
+	// handed to TCP whole, because a write or flush failed. Set before the
+	// writer stops the link, read after it exits (writerDone).
+	unwritten  atomic.Int64
+	writerDone chan struct{}
 
 	// rotateAt, when positive, signals rotate once track has read this
 	// many bytes. Client links only; both are set before run.
@@ -132,9 +137,13 @@ func (l *link) send(pkt []byte, elicits bool) bool {
 	}
 }
 
-// drain empties a closed link's queue, returning how many packets it held.
+// drain empties a closed link's queue, returning how many packets it
+// never handed to TCP: those still queued, and those the writer held
+// when a write or flush failed. Packets TCP accepted but never delivered
+// (in its send buffer, or in flight) are not counted. Call it after run
+// returns.
 func (l *link) drain() int {
-	n := 0
+	n := int(l.unwritten.Load())
 	for {
 		select {
 		case p := <-l.out:
@@ -157,12 +166,17 @@ func (l *link) close() {
 // link is closed, with the first fatal transport error if there was one.
 // Received packets go to in.
 func (l *link) run(in chan<- inbound) error {
-	go l.write()
+	l.writerDone = make(chan struct{})
+	go func() {
+		defer close(l.writerDone)
+		l.write()
+	}()
 	if l.stall > 0 {
 		go l.watchStall()
 	}
 	l.read(in)
 	l.close()
+	<-l.writerDone // so drain sees what a failing flush lost
 	if p := l.death.Load(); p != nil {
 		return *p
 	}
@@ -209,6 +223,21 @@ func (l *link) read(in chan<- inbound) {
 func (l *link) write() {
 	w := bufio.NewWriterSize(l.conn, 64<<10)
 	var frame []byte
+	var ends []int // where each frame of the batch ends, in bytes appended to w
+	// fail records the frames of the batch TCP did not take whole, then
+	// stops the link. bufio keeps what a failed flush did not write, so
+	// what reached TCP is everything given to w but its Buffered tail.
+	fail := func(given int, err error) {
+		written := given - w.Buffered()
+		lost := 0
+		for _, end := range ends {
+			if end > written {
+				lost++
+			}
+		}
+		l.unwritten.Add(int64(lost))
+		l.stopWith(err)
+	}
 	for {
 		var pkt []byte
 		select {
@@ -216,11 +245,16 @@ func (l *link) write() {
 		case <-l.done:
 			return
 		}
+		ends = ends[:0]
+		given := 0
 		for {
 			frame = appendFrame(frame[:0], pkt)
 			bufpool.Put(pkt)
-			if _, err := w.Write(frame); err != nil {
-				l.stopWith(err)
+			ends = append(ends, given+len(frame))
+			n, err := w.Write(frame)
+			given += n
+			if err != nil {
+				fail(given, err)
 				return
 			}
 			select {
@@ -231,7 +265,7 @@ func (l *link) write() {
 			break
 		}
 		if err := w.Flush(); err != nil {
-			l.stopWith(err)
+			fail(given, err)
 			return
 		}
 	}
