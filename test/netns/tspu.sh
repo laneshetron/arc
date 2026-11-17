@@ -162,9 +162,9 @@ scenario_freeze() {
   got=$(download 5201 "${DURATION:-20}")
   echo "freeze: received $got bytes in ${DURATION:-20} s; kbit/s per second: $(intervals 5201)"
   echo "freeze: censor events: $(censor_events)"
-  # More than two connections' worth: the carrier redialed and the
-  # downlink resumed. Stall-and-redial alone gets ~55–100 KB in 20 s.
-  local want=$((${FREEZE_FLOOR:-2} * FREEZE_BYTES))
+  # More than six connections' worth: stall-and-redial alone gets
+  # ~55–100 KB in 20 s; rotating ahead of the cap, ~0.3–1.4 MB.
+  local want=$((${FREEZE_FLOOR:-6} * FREEZE_BYTES))
   if ((got > want)); then
     pass "freeze: downlink kept flowing past the freeze ($got bytes, > $want)"
   else
