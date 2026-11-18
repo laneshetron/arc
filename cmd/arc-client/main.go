@@ -113,13 +113,14 @@ func run(args []string) error {
 	tlsAddr := fs.String("tls", "", "relay TLS/TCP endpoint, host:port: adds a TLS carrier per interface, used only while no UDP path works")
 	tlsCA := fs.String("tls-ca", "", "PEM certificates to trust for -tls (default: the system roots)")
 	tlsName := fs.String("tls-server-name", "", "name to verify the relay's TLS certificate against (default: the -tls host)")
-	tlsCover := fs.String("tls-cover", "", "pose the TLS carrier as this host instead of the -tls host: present it as the server name (SNI); with no -tls-ca, certificate verification is skipped, since ARC authenticates the relay itself (spec D2)")
+	tlsCover := fs.String("tls-cover", "", "pose the TLS carrier as this host instead of the -tls host: present it as the server name (SNI); with no -tls-ca, certificate verification is skipped, since ARC authenticates the relay itself (spec D2). Several comma-separated names are tried in turn: a carrier moves to the next when a handshake dies right after its ClientHello, as under an allowlist")
 	tlsFingerprint := fs.String("tls-fingerprint", "", "shape the TLS ClientHello as a browser's: chrome, edge, safari, ios, or firefox (optional; the relay certificate is still verified unless -tls-cover is set)")
 	tlsFragment := fs.Int("tls-fragment", 0, "send the TLS ClientHello in TCP segments of at most this many bytes (optional; the relay certificate is still verified unless -tls-cover is set)")
 	frontAddr := fs.String("front", "", "relay HTTPS front endpoint, host:port: like -tls, but the carrier rides an authenticated HTTP upgrade inside an ordinary HTTPS session; the relay's front serves cover content to everyone else. The admission token is the session's -token-file token. -tls-cover, -tls-fingerprint, and -tls-fragment shape the outer handshake as for -tls")
 	noOffload := fs.Bool("no-offload", false, "send and receive without UDP GSO/GRO, for comparison")
 	rotateBytes := fs.Int64("stream-rotate-bytes", 0, "move each -tls or -front carrier to a fresh TCP connection after it has received this many bytes, dialed ahead of time, to stay under a censor's per-connection cap (the TSPU freeze to foreign hosting); 0: learn the cap from stalled connections")
 	noUDP := fs.Bool("no-udp", false, "open no UDP carriers: reach the relay only through -tls or -front (-relay is then the session's address, the -tls endpoint, say)")
+	allowlist := fs.Bool("allowlist", false, "allowlist posture, for a censor that passes only approved names (and at its stricter stage approved addresses), as mobile \"white lists\" do: open no UDP carrier, reach the relay through -tls or -front with a browser's ClientHello (chrome unless -tls-fingerprint says otherwise), presenting the -tls-cover names in turn")
 	censorship := fs.Bool("censorship", false, "censorship posture: presume the relay sits on foreign hosting behind a censor that bans an address for minutes after UDP to it (TSPU), so open no UDP carrier to an address a -tls or -front carrier uses (spec/freeze-and-udp-ban.md §4)")
 	fecMode := wire.FECAuto
 	fs.Func("fec", "forward error correction: auto (default; while loss is at least 0.5%), off, or always", func(v string) error {
@@ -261,7 +262,7 @@ func run(args []string) error {
 	}
 	defer dev.Close()
 	carriers, closeCarriers, err := openCarriers(log, carrierOptions{
-		Relay: relayAddr, Binds: binds, NoOffload: *noOffload, NoUDP: *noUDP, Censorship: *censorship, FullTunnel: *fullTunnel, Mark: uint32(*mark),
+		Relay: relayAddr, Binds: binds, NoOffload: *noOffload, NoUDP: *noUDP, Censorship: *censorship, Allowlist: *allowlist, FullTunnel: *fullTunnel, Mark: uint32(*mark),
 		TLS: *tlsAddr, TLSCA: *tlsCA, TLSName: *tlsName, TLSCover: *tlsCover, TLSFingerprint: *tlsFingerprint,
 		TLSFragment: *tlsFragment, Front: *frontAddr, FrontToken: tokens[0], RotateBytes: *rotateBytes,
 	})

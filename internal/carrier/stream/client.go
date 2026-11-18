@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/laneshetron/arc/internal/carrier/sockopt"
@@ -49,6 +50,19 @@ type ClientOptions struct {
 	// ClientHello segmentation) instead of verifying the relay and
 	// negotiating ALPN "arc/1".
 	Camouflage *Camouflage
+	// CoverNames, with Camouflage, are server names to present in turn,
+	// overriding Camouflage.Name: the carrier keeps a name while its
+	// dials succeed and moves to the next after a handshake that dies
+	// right after the ClientHello (reset, closed, timed out, or killed
+	// after the ServerHello) -- what an allowlist does to a name it does
+	// not approve. A failure to connect at all says nothing about the
+	// name (an allowlist that also checks addresses drops the SYN), so it
+	// keeps the name. Approved names differ by operator and region, so a
+	// list lets the carrier find one that passes.
+	CoverNames []string
+	// OnCoverRejected, if set, is called when the carrier gives up on a
+	// cover name, with the name it moves to.
+	OnCoverRejected func(rejected, next string)
 	// Front, when set, upgrades the TLS session into the stream carrier
 	// through the relay's fail-closed HTTPS front, rather than speaking
 	// the carrier's own ALPN.
@@ -116,7 +130,10 @@ type Client struct {
 
 	endpoints    []netip.AddrPort
 	nextEndpoint int
-	lookup       func(context.Context, string, string) ([]netip.Addr, error) // nil: the system resolver
+	// cover indexes CoverNames: the name dials present. Atomic, since a
+	// spare dial runs beside the connecting goroutine.
+	cover  atomic.Uint32
+	lookup func(context.Context, string, string) ([]netip.Addr, error) // nil: the system resolver
 }
 
 // Dial starts a client carrier. It returns at once; the connection comes
@@ -524,10 +541,13 @@ func (c *Client) dialTLS(ctx context.Context) (net.Conn, *trackingConn, netip.Ad
 	if t, ok := tcp.(*net.TCPConn); ok {
 		t.SetNoDelay(true)
 	}
-	conn, alpn, err := c.handshakeTLS(ctx, raw)
+	cover := c.cover.Load()
+	conn, alpn, err := c.handshakeTLS(ctx, raw, cover)
 	if err != nil {
 		raw.Close()
-		return nil, nil, dest, "", classifyHandshake(raw, err)
+		ferr := classifyHandshake(raw, err)
+		c.rejectCover(cover, ferr)
+		return nil, nil, dest, "", ferr
 	}
 	return conn, raw, dest, alpn, nil
 }
@@ -536,14 +556,17 @@ func (c *Client) dialTLS(ctx context.Context) (net.Conn, *trackingConn, netip.Ad
 // carrier (spec §16.3) with verified identity and ALPN arc/1, the
 // camouflage profile, which hands the whole outer handshake its shape,
 // or the front, which negotiates HTTP/1.1 for its upgrade.
-func (c *Client) handshakeTLS(ctx context.Context, raw *trackingConn) (net.Conn, string, error) {
+func (c *Client) handshakeTLS(ctx context.Context, raw *trackingConn, cover uint32) (net.Conn, string, error) {
 	if cam := c.opts.Camouflage; cam != nil {
-		if c.opts.Front != nil { // per-dial override, not a mutation of the caller's
-			clone := *cam
-			clone.ALPN = []string{"http/1.1"} // the upgrade is an HTTP/1.1 mechanism
-			return clone.Handshake(ctx, raw, c.opts.Addr, c.opts.TLS)
+		// Per-dial overrides, not mutations of the caller's.
+		clone := *cam
+		if n := len(c.opts.CoverNames); n > 0 {
+			clone.Name = c.opts.CoverNames[int(cover)%n]
 		}
-		return cam.Handshake(ctx, raw, c.opts.Addr, c.opts.TLS)
+		if c.opts.Front != nil {
+			clone.ALPN = []string{"http/1.1"} // the upgrade is an HTTP/1.1 mechanism
+		}
+		return clone.Handshake(ctx, raw, c.opts.Addr, c.opts.TLS)
 	}
 	cfg, err := clientConfig(c.opts.TLS, c.opts.Addr)
 	if err != nil {
@@ -644,4 +667,25 @@ func (c *Client) Close() error {
 	}
 	c.mu.Unlock()
 	return nil
+}
+
+// rejectCover moves to the next cover name after a handshake failure
+// that points at the name: the connection died right after the
+// ClientHello, or after the ServerHello. Only the dial that used the
+// current name moves it, so a spare dial failing with the same name does
+// not skip one.
+func (c *Client) rejectCover(used uint32, err error) {
+	n := len(c.opts.CoverNames)
+	var f *Failure
+	if n < 2 || c.opts.Camouflage == nil || !errors.As(err, &f) {
+		return
+	}
+	switch f.Mode {
+	case ModeRSTAfterClientHello, ModeEOFAfterClientHello, ModeTimeoutAfterClientHello, ModeKilledAfterServerHello:
+	default:
+		return
+	}
+	if c.cover.CompareAndSwap(used, used+1) && c.opts.OnCoverRejected != nil {
+		c.opts.OnCoverRejected(c.opts.CoverNames[int(used)%n], c.opts.CoverNames[int(used+1)%n])
+	}
 }

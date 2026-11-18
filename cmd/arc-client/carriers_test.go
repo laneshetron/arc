@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/netip"
+	"slices"
 	"testing"
 )
 
@@ -85,5 +86,48 @@ func TestCensorshipUsesOneResolution(t *testing.T) {
 		if !c.Fallback {
 			t.Errorf("UDP carrier opened though the stream endpoint did not resolve")
 		}
+	}
+}
+
+// TestAllowlistPosture: under an allowlist no UDP carrier opens, wherever
+// the stream carriers point, and the posture needs one of them.
+func TestAllowlistPosture(t *testing.T) {
+	relay := netip.MustParseAddrPort("203.0.113.7:4433")
+	for _, o := range []carrierOptions{
+		{Allowlist: true, TLS: "198.51.100.9:443", TLSCover: "gosuslugi.ru,ya.ru"},
+		{Allowlist: true, Front: "203.0.113.7:443"},
+	} {
+		o.Relay = relay
+		carriers, closeAll, err := openCarriers(slog.New(slog.DiscardHandler), o)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, c := range carriers {
+			if !c.Fallback {
+				t.Errorf("%+v: UDP carrier %q opened under an allowlist", o, c.Name)
+			}
+		}
+		if len(carriers) != 1 {
+			t.Errorf("%+v: carriers %+v, want the one stream carrier", o, carriers)
+		}
+		closeAll()
+	}
+	if _, _, err := openCarriers(slog.New(slog.DiscardHandler), carrierOptions{Relay: relay, Allowlist: true}); err == nil {
+		t.Error("-allowlist without -tls or -front accepted")
+	}
+}
+
+func TestCoverNames(t *testing.T) {
+	for in, want := range map[string][]string{
+		"":                         nil,
+		"gosuslugi.ru":             {"gosuslugi.ru"},
+		" gosuslugi.ru , ya.ru,, ": {"gosuslugi.ru", "ya.ru"},
+	} {
+		if got := coverNames(in); !slices.Equal(got, want) {
+			t.Errorf("coverNames(%q) = %q, want %q", in, got, want)
+		}
+	}
+	if coverList([]string{"one"}) != nil || len(coverList([]string{"a", "b"})) != 2 {
+		t.Error("coverList: one name is Camouflage.Name; only several rotate")
 	}
 }

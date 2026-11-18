@@ -29,10 +29,10 @@ type profile struct {
 
 // Profile keys. The relay keys are run's flag names, which -profile
 // fills in.
-var profileKeys = []string{"relay", "relay-key", "no-udp", "tls", "tls-cover", "tls-fingerprint", "device", "device-id", "invite"}
+var profileKeys = []string{"relay", "relay-key", "no-udp", "allowlist", "tls", "tls-cover", "tls-fingerprint", "device", "device-id", "invite"}
 
 // runKeys are the profile keys that set run's flags.
-var runKeys = []string{"relay", "relay-key", "no-udp", "tls", "tls-cover", "tls-fingerprint"}
+var runKeys = []string{"relay", "relay-key", "no-udp", "allowlist", "tls", "tls-cover", "tls-fingerprint"}
 
 func (p *profile) path(name string) string { return filepath.Join(p.dir, name) }
 
