@@ -106,7 +106,7 @@ Other bits are sent as zero and ignored on receipt.
 | IP reassembly | 1,024 datagrams / 8 MiB / 5 s / 8,192 completed IDs | 11 |
 | Datagram dedup window (redundancy) | ≥ 65,000 IDs (reference: 65,472) | 11.1 |
 | Redundancy `auto` thresholds | on at ≥ 1% loss, off below 0.4% | 11.1 |
-| Cell reassembly (bound association) | 64 packets / 256 KiB / 10 s | 12.1 |
-| Cell reassembly (unbound association) | 4 packets / 16 KiB | 12.1 |
-| DNS downlink cell | sized to the question: 168 B full-name, up to 409 B with EDNS(0) | 16.5, `dns-lifeline.md` §2.2 |
+| Cell reassembly (bound association) | 64 packets / 256 KiB / 10 s (a slow carrier may override the expiry: `dns-lifeline.md` §2.4) | 12.1 |
+| Cell reassembly (unbound association) | 4 packets / 16 KiB; handshake replies only (`dns-lifeline.md` §4.2.1) | 12.1 |
+| DNS downlink cell | sized to the question: 168 B full-name, up to 409 B with EDNS(0) | 16.5, `dns-lifeline.md` §2.2.2 |
 | DNS uplink cell | from the zone suffix: 136 B at `_arc.example.net` | 16.5 |

@@ -45,7 +45,8 @@ conditions, and neither is optional:
   operator controls, and is used by ARC users only.
 - The volume is bounded by policy (§5.3) at a rate that keeps the zone
   uninteresting: a session that establishes, stays alive, and moves a few
-  kilobytes a minute, not a session that streams.
+  kilobytes a minute (§2.3: 2.4 KiB/min down at the steady rate, 12 at
+  the ceiling), not a session that streams.
 
 Under those conditions the lifeline is worth its risk. A tunnel that
 moves a video is not, and the posture that enables this path never
@@ -72,9 +73,11 @@ the zone suffix:
 
 A zone suffix of about 20 bytes therefore carries 118-byte chunks: a PING
 (37 B), a `PATH_JOIN` (45 B), an `AUTH_RESULT` (65 B), an `AUTH` with a
-43-byte token (80 B) and a `HANDSHAKE_RESP` (81 B) each fit in one cell;
-`HANDSHAKE_INIT` (122 B) takes 2; a full 1280-byte IP packet (1317 B)
-takes 12.
+43-byte token (80 B) and a `HANDSHAKE_RESP` (81 B) each fit in one cell,
+and `HANDSHAKE_INIT` (122 B) takes 2. A full 1280-byte IP packet would
+take 12 cells, which is why it is never sent as one packet on this path:
+§2.4 caps the packet size so that every packet completes inside the
+reassembly window.
 
 ### 2.2 Downlink: one cell per answer
 
@@ -93,20 +96,53 @@ state at the relay, and costs nothing, because a resolver answers one
 question at a time. It is also the reason the downlink does not simply
 grow with the question.
 
-For zone `_arc.example.net`, uplink cell → question → largest downlink
-cell (the answer's size in bytes is in parentheses):
+#### 2.2.1 The question grammar, and how padding stays decodable
 
-| uplink cell | question name | query | answer ≤ 512 B | EDNS(0) 1232 |
-|---|---|---|---|---|
-| 26 B | 75 B | 91 B | 124 B | 141 B |
-| 37 B (PING) | 94 B | 110 B | 153 B | 169 B |
-| **37 B, name padded to 155 B** | **155 B** | **171 B** | **243 B** (512) | 255 B |
-| 55 B | 122 B | 138 B | 194 B | 210 B |
-| 65 B | 139 B | 155 B | 219 B | 236 B |
-| 81 B | 165 B | 181 B | 235 B (512) | 275 B |
-| 99 B | 195 B | 211 B | 213 B (512) | 320 B |
-| 122 B | 232 B | 248 B | 186 B (512) | 375 B |
-| 136 B (full name) | 255 B | 271 B | 168 B (511) | 409 B (846) |
+§16.5 says the labels between the nonce and the suffix are the base32 of
+exactly one cell, and a cell's chunk length is inferred from the bytes
+left over — so a padded name is ambiguous unless the padding is marked.
+It is, by the alphabet: base32 (RFC 4648) has no `0` or `1`, so a label
+beginning with `0` **cannot** be cell data. That is the grammar:
+
+```text
+<nonce>.<b32 cell labels>.[0<padding>...]._arc.<zone>
+```
+
+- `<nonce>`: 13 lowercase base32 characters (8 random bytes).
+- cell labels: lowercase base32 of exactly one cell, each at most 50
+  characters, as §16.5 already specifies.
+- zero or more padding labels: `0` followed by 1–62 base32 characters.
+  A decoder MUST skip every label whose first character is `0`, and MUST
+  reject a `0` label of length 1 or above 63. The nameserver emits them;
+  the relay ignores them.
+- Because a cell's chunk length is `cell_len − 18` and `cell_len` is
+  `⌊5·chars/8⌋`, the decoder recovers the chunk boundary exactly, with no
+  padding involved: 60 chars → 37 B, 189 → 118 B, 218 → 136 B. Padding
+  rides entirely outside the cell, so a padded name decodes to one cell by
+  the same rule an unpadded one does.
+
+The upstream direction therefore has a small vocabulary of names rather
+than one, and a golden fixture must round-trip a *fragmented* cell with
+padding present: two cells of one `HANDSHAKE_INIT`, the first padded to
+155 bytes of name and the second not.
+
+#### 2.2.2 The table
+
+For zone `_arc.example.net`, cell size → question → largest downlink cell
+(the answer's size in bytes is in parentheses). A packet of *n* bytes is
+carried in a cell of *n*+18:
+
+| cell | packet it carries | question name | query | answer ≤ 512 B | EDNS(0) 1232 |
+|---|---|---|---|---|---|
+| 26 B | 8 B | 75 B | 91 B | 124 B | 141 B |
+| 37 B | 19 B | 94 B | 110 B | 153 B | 169 B |
+| **55 B (+32 B pad)** | **37 B (a PING)** | **155 B** | **171 B** | **243 B** (512) | 260 B |
+| 55 B | 37 B | 122 B | 138 B | 194 B | 210 B |
+| 65 B | 47 B | 139 B | 155 B | 219 B | 236 B |
+| 81 B | 63 B | 165 B | 181 B | 235 B | 275 B |
+| 99 B | 81 B | 195 B | 211 B | 213 B | 320 B |
+| 122 B | 104 B | 232 B | 248 B | 186 B | 375 B |
+| 136 B | 118 B (full name) | 255 B | 271 B | 168 B (511) | 409 B (846) |
 
 Two different regimes, and the adapter has to know which it is in:
 
@@ -117,8 +153,8 @@ Two different regimes, and the adapter has to know which it is in:
 - **Without EDNS(0)** — the common case behind a hotel, airline or ISP
   resolver — the 512-byte answer cap binds for long questions and the 3×
   rule binds for short ones. There is a **maximum in the middle**: a
-  37-byte cell in a name padded out to 155 bytes (a 171-byte query) buys
-  243 B down, and no question of any length, padded or not, buys more.
+  37-byte PING in a name padded to 155 bytes (a 171-byte query) buys 243 B
+  down, and no question of any length, padded or not, buys more.
 
 So a client draining a downlink backlog sizes its polls to the regime:
 full-name queries when the resolver showed it honors EDNS(0), and
@@ -139,13 +175,13 @@ answer carrying 136 B up and 168 B down. With EDNS(0) 1232, it is a
 ### 2.3 Rates
 
 A poll is one query and one answer, and a poll is the *only* way anything
-moves downlink. Zone `_arc.example.net`, full-name questions, EDNS(0):
+moves downlink. Zone `_arc.example.net`, full-cell questions, EDNS(0):
 
 | polls/min | interval | up | down | on the wire | |
 |---|---|---|---|---|---|
-| 6 | 10 s | 13.6 B/s | 40.9 B/s | 0.90 kbit/s | **steady: exactly the keepalive** |
-| 12 | 5 s | 27.2 B/s | 81.8 B/s | 1.80 kbit/s | an active small transfer |
-| 30 | 2 s | 68.0 B/s | 204.5 B/s | 4.51 kbit/s | **ceiling** |
+| 6 | 10 s | 11.8 B/s | 40.9 B/s | 0.90 kbit/s | **steady: exactly the keepalive** |
+| 12 | 5 s | 23.6 B/s | 81.8 B/s | 1.80 kbit/s | an active small transfer |
+| 30 | 2 s | 59.0 B/s | 204.5 B/s | 4.51 kbit/s | **ceiling** |
 
 The steady rate is not a preference, it is the floor: `DefaultKeepalive`
 is 10 s, a path silent longer than `keepalive + max(3·PTO, keepalive/2)`
@@ -162,10 +198,63 @@ budget accordingly: 136 B every 10 s is about 48 KiB an hour of cell
 payload, all of it control when the user is idle (§5.3).
 
 Without EDNS(0), the same questions move 168 B down per poll instead of
-409 B, and a mid-sized question does better than a full one (§2.2):
+409 B, and a mid-sized question does better than a full one (§2.2.2):
 at 6 polls/min, 16.8 B/s down; at 30, 84 B/s.
 
-### 2.4 Establishment
+### 2.4 A packet must finish inside the reassembly window
+
+Cell reassembly expires incomplete packets on a timer (§12.1: 10 s for a
+bound association), and this path delivers **one cell per poll**. Those
+two facts collide, and the collision decides how large a packet this path
+may carry:
+
+| cells | packet | IP payload | spans, at 30/min | at 6/min |
+|---|---|---|---|---|
+| 2 | 236 B | 199 B | 2 s | 10 s |
+| 3 | 354 B | 317 B | 4 s | 20 s |
+| 6 | 708 B | 671 B | 10 s | 50 s |
+| 12 | 1416 B | 1379 B | 22 s | 110 s |
+
+Under the existing 10-second expiry a sustained 6/min session could never
+send a packet of more than **two cells**, and even at the ceiling it would
+be capped at six. A full 1317-byte `DATA` packet (12 cells) takes 22 s at
+the ceiling and 110 s at steady state: it can never be reassembled. The
+path would establish — the handshake's largest packet is
+`HANDSHAKE_INIT` at 122 B, two cells — and then fail to carry anything
+larger than 317 bytes.
+
+**Rule.** The DNS adapter sets its own reassembly expiry, and the session
+respects a path-specific maximum packet size:
+
+- **Expiry 60 s** for DNS associations, replacing the 10 s of §12.1 for
+  this carrier only. It is stated per-carrier because it is a property of
+  the pacing, not of cells in general: an ICMP adapter carrying a cell per
+  echo needs no such allowance.
+- **`max_packet` 472 B** (4 cells, spanning 30 s at the steady rate) when
+  the path first validates, raised to **708 B** (6 cells, 50 s) once a
+  session has held the steady rate for a minute without a stall. Both stay
+  under the 60 s expiry with margin; a 7-cell packet would span exactly
+  60 s and is deliberately out of reach. `session.path.maxPacket` already
+  exists and the scheduler fragments above it (`conn.sendOn` →
+  `IP_FRAGMENT`), so a 1280-byte IP packet becomes four fragments of
+  438 B at first (four cells each), then two of 674 and 636 bytes.
+- The relay reassembles with the same expiry for a bound association, and
+  **must not** raise it further: 60 s is already six poll intervals of
+  slack at the ceiling, and a longer window is a longer time to hold
+  attacker-chosen bytes.
+
+The margin is the point. A path whose pacing degrades past the steady rate
+— a resolver that starts answering in 3 s instead of 10 — pushes a pending
+packet past the expiry and loses it, which is correct: the cell layer is
+telling the session that the path is no longer fast enough to carry
+objects of that size. Recovery is the ordinary stall recovery of §14.6,
+not a reassembly special case.
+
+This is the one place the lifeline changes a §12.1 constant rather than
+just its own pacing, and it needs a test that fails on the 10 s value:
+establish, then send a 472-byte packet at 6/min and assert it reassembles.
+
+### 2.5 Establishment
 
 Path 0 carries the handshake, and the session is active once `AUTH_RESULT`
 arrives (§14.2), so establishment is the handshake and nothing else:
@@ -178,41 +267,55 @@ arrives (§14.2), so establishment is the handshake and nothing else:
 | `AUTH_RESULT` | 65 | 1 | down |
 
 A poll carries one uplink cell and returns one downlink cell, so
-establishment is **three polls**: two for the INIT (the relay cannot
-answer until both cells reassemble), then one for the AUTH, whose answer
-carries `AUTH_RESULT`. No `PATH_CHALLENGE` is needed — `AUTH_RESULT` is
-what validates path 0 on the client side.
+establishment is **three polls** when the relay accepts the first INIT,
+and **five** when cookies are required (§4.2.1) — the case that matters,
+since a DNS listener should set `AlwaysRequireCookie`. No
+`PATH_CHALLENGE` is needed either way: `AUTH_RESULT` is what validates
+path 0 on the client side.
 
 The time budget is the real constraint. `HandshakeTimeout` is 10 s and
 applies to **each phase separately**: the client restarts the whole
 handshake if `HANDSHAKE_RESP` has not arrived 10 s after the INIT phase
 started, and if `AUTH_RESULT` has not arrived 10 s after that
-(`Client.Tick`). So the two INIT cells must both reach the nameserver and
-the response must come back within 10 s, on a path whose every step is a
-recursive lookup.
+(`Client.Tick`). So with cookies the four INIT-phase polls must fit in
+10 s, on a path whose every step is a recursive lookup.
 
 That makes the establishment poll rate a requirement, not a knob: at 30
-polls/min (2 s apart) the two INIT cells cost 2 s of the 10, leaving 8 s
-of resolver latency — enough for a slow ISP resolver, not enough for a
-congested one. The adapter therefore polls at the ceiling from the first
-INIT, and if establishment fails three times in a row it reports this
-path unusable on this network rather than retrying forever inside a
-10-second window it cannot meet.
+polls/min (2 s apart) the four INIT polls cost 6 s of the 10, leaving 4 s
+of resolver latency for each of four recursions — enough for a slow ISP
+resolver, not enough for a congested one. The adapter therefore polls at
+the ceiling from the first INIT, and if establishment fails three times
+in a row it reports this path unusable on this network rather than
+retrying forever inside a 10-second window it cannot meet.
 
-### 2.5 What an IP packet costs
+### 2.6 What an IP packet costs
 
 A full-name poll moves 136 B up and 409 B down with EDNS(0), on 1128
 bytes of query and answer. Inner IP traffic pays base32, cell headers,
 IP-framing and query overhead together, and needs one poll per cell in
 each direction. The asymmetry is large and worth knowing:
 
-| inner IP packet | ARC packet | cells | polls up | wire up | overhead up | polls down | wire down | overhead down |
+| inner IP packet | ARC packet | cells up | polls up | wire up | × | polls down | wire down | × |
 |---|---|---|---|---|---|---|---|---|
-| 40 B | 77 B | 1 | 1 | 1128 | 14.6× | 1 | 1128 | 14.6× |
-| 100 B | 137 B | 2 | 2 | 2256 | 16.5× | 1 | 1128 | 8.2× |
-| 300 B | 337 B | 3 | 3 | 3384 | 10.0× | 1 | 1128 | 3.3× |
-| 600 B | 637 B | 6 | 6 | 6768 | 10.6× | 2 | 2256 | 3.5× |
-| 1200 B | 1237 B | 11 | 11 | 12408 | 10.0× | 4 | 4512 | 3.6× |
+| 40 B | 77 B | 1 | 1 | 1128 | 28.2× | 1 | 1128 | 28.2× |
+| 100 B | 137 B | 2 | 2 | 2256 | 22.6× | 1 | 1128 | 11.3× |
+| 300 B | 337 B | 3 | 3 | 3384 | 11.3× | 1 | 1128 | 3.8× |
+| 600 B | 637 B | 6 | 6 | 6768 | 11.3× | 2 | 2256 | 3.8× |
+| 1200 B | 1237 B | 11 | 11 | 12408 | 10.3× | 4 | 4512 | 3.8× |
+
+The small-packet rows are the worst and the ones a user will meet first: a
+40-byte packet costs a whole 1128-byte poll in either direction. That is
+why §5.4 says this path carries application DNS and little else — a
+lookup's *answer* is the payload, and it is the only common flow whose
+size is worth the envelope.
+
+Cells are counted after §2.4's fragmentation, at `max_packet` 708 (the
+value after the first minute). At the initial 472 a 600-byte packet takes
+two fragments rather than one, a 1200-byte one three rather than two, and
+a 1280-byte one four (13 cells rather than 12): each fragment pays 15
+bytes of `IP_FRAGMENT` header. Fragmentation costs a few percent, not
+multiples, which is why §2.4 accepts it rather than lowering the TUN MTU
+for this path.
 
 The ratio is per *poll*, not per byte: on the wire both directions carry
 about 0.48 bytes of cell per byte of DNS message (0.482 up on base32,
@@ -245,7 +348,7 @@ bytes, fresh for every query, so no answer is ever served from a cache
 and no response can be correlated with another. Any recursive resolver
 may relay it; the operator's authoritative server answers it.
 
-`<beacon-zone>` is a zone of its own, not a carrier zone (§3.4); the
+`<beacon-zone>` is a zone of its own, not a carrier zone (§3.6); the
 sizing examples below use `_arcb.example.net` for brevity, standing for
 `_arcb.` plus whatever zone the deployment delegates.
 
@@ -287,44 +390,72 @@ half the client knows out of band: in the profile at enrollment, or
 what makes rotation work — a beacon that could only speak for one relay
 could not move a client off a dead one.
 
-Sizes, zone `example.net`, one relay and one cover name and one carrier
-zone: body 150 B, TXT content 204 characters in one character-string, and
-an unpadded answer of 266 B. With the padding of §3.2 the query is 109 B
-and the answer 326 B.
+Sizes, zone `example.net`, one relay with a key, one cover name and one
+carrier zone: body 154 B, TXT content 210 characters in one
+character-string, and an answer of 494 B against a query of 271 B. That is
+the largest deployment shape that fits a 512-byte answer without EDNS(0)
+(§3.2).
 
-### 3.2 The 3× rule applies here too
+### 3.2 The cold-start query is fixed, and the 3× rule binds it
 
-An authoritative nameserver that answers a 54-byte question with a
-326-byte answer is an amplifier, and one day it will be used as one. The
-client **pads its beacon question** so that the answer is at most three
-times the query: one extra label (`p` followed by base32 junk) sized to
-reach ⌈answer/3⌉ bytes, which for the record above is 59 bytes, taking the
-query to 109 B for a 326 B answer — a ratio of 2.99.
+Two constraints meet on the first query, and one of them makes the other
+binding:
 
-The nameserver refuses (`REFUSED`) any beacon answer that would exceed 3×
-the query, so the property survives a client that forgets, and the padding
-is cheap in exactly the way it matters: it costs the client bytes it would
-have spent on nothing, and it costs a reflector nothing to reject.
+- **A name is at most 255 bytes**, so a query is at most 271 bytes
+  without EDNS(0) (12 header + 255 name + 4 type/class) and 282 with a
+  bare OPT record. A 410-byte query does not exist; RFC 1035 §2.3.4 caps
+  the name, and nothing the client sends can exceed it.
+- **The answer is at most 3× the query**, so the largest possible beacon
+  answer is 813 B without EDNS(0) and 846 B with it.
 
-A beacon therefore fits a 512-byte answer with no EDNS(0):
+A cold client also cannot size its query to a record it has not fetched,
+and a rotation can grow the record. So the beacon has exactly **two
+query profiles**, and the client tries them in order:
 
-| deployment | body | query | answer |
-|---|---|---|---|
-| 1 relay, 1 cover name, 1 zone | 150 B | 109 B | 326 B |
-| 2 relays, 1 cover name, 1 zone | 190 B | 136 B | 408 B |
-| 2 relays, 2 cover names, 1 zone | 208 B | 148 B | 444 B |
-| 2 relays, 2 cover names, 2 zones | 226 B | 160 B | 480 B |
-| 3 relays, 1 cover name, 1 zone | 230 B | 163 B | 488 B |
+| profile | name | query | answer cap | max body |
+|---|---|---|---|---|
+| bootstrap | padded to 255 bytes | 271 B | 512 B (≤ 3×) | **168 B** |
+| bootstrap + EDNS(0) | padded to 255 bytes | 282 B | 845 B (≤ 3×) | **408 B** |
 
-The ceiling is a 242-byte body in a 512-byte answer (query 171 B): three
-relays and one cover name, or two relays and two cover names in two
-carrier zones. Past that, deployments publish several beacon names
-(`b1._arcb`, `b2._arcb`, …) and the client queries them in order until one
-verifies; each is signed independently over its own name (§3.1), and a
-client that verifies two of them keeps the newer `published`. With EDNS(0)
-1232 the ceiling rises to a 600-byte body in a 1230-byte answer (query
-410 B), still under the 3× cap — 12 relays and a cover name in one record,
-or 4 relays and 16 cover names.
+Padding is by the §2.2.1 grammar, with `0`-labelled labels: the beacon
+zone leaves 222 bytes of room under `_arcb.example.net`, so it is three
+labels of at most 63. The client always sends the *bootstrap* profile
+first with its longest name, because that maximizes the answer under any
+resolver's buffer; if the answer is truncated or the authority signals a
+larger record, it retries once with EDNS(0) 1232 and never sizes a query
+to the record it expects.
+
+The authority enforces the same bound: it refuses (`REFUSED`) any answer
+that would exceed 3× the query it received, measured on the wire. That
+survives a client that forgets to pad, and costs a reflector nothing to
+reject.
+
+So a beacon deployment fits this, in the 512-byte profile:
+
+| relays | cover names | carrier zones | body | fits 512 B? |
+|---|---|---|---|---|
+| 1 | 1 | 1 | 154 B | yes |
+| 1 | 0 | 0 | 117 B | yes |
+| 2 | 0 | 0 | 157 B | yes |
+| 2 | 1 | 0 | 177 B | no — needs EDNS(0) |
+| 3 | 0 | 0 | 197 B | no — needs EDNS(0) |
+| 4 | 0 | 0 | 237 B | no — needs EDNS(0) |
+
+Two relays and one cover name is the practical limit without EDNS(0).
+Past that, the deployment either requires EDNS(0) — which many hotel and
+airline resolvers do not send, so it is a real constraint — or publishes
+several beacon names (`b1._arcb`, `b2._arcb`, …) and the client queries
+them in order until one verifies. Each is signed independently over its
+own name (§3.1), and a client that verifies two keeps the newer
+`published`.
+
+**Publication limit.** Because a cold query caps out at 168 body bytes,
+the operator must publish a record that fits one of the two profiles and
+must treat growth as a breaking change: adding a third relay to a
+two-relay deployment moves it from "works anywhere" to "needs EDNS(0)".
+The relay count in the record is therefore a deployment decision made
+once, not something rotation grows — rotation replaces a relay in place
+(`n_relays` stays the same), and adding capacity means a new beacon name.
 
 ### 3.3 What the client does with it
 
@@ -360,7 +491,77 @@ or 4 relays and 16 cover names.
   configuration, and a certificate that does not cover one is still a
   failure.
 
-### 3.4 Zones must be independent
+### 3.4 What `not_after` does and does not retire
+
+`not_after` is the time the operator stops vouching for the record, and a
+client that keeps dialing a retired relay key indefinitely has quietly
+turned a rotation into a vulnerability. Three different things must not
+be conflated, so this section separates them:
+
+- **An existing session.** It continues. A session is bound to a relay
+  key and a Noise state; `not_after` says nothing about whether the peers
+  already talking to each other may keep doing so. Closing live sessions
+  on a beacon's schedule would make rotation a self-inflicted outage.
+- **A relay learned only from the beacon.** These keys **expire** for new
+  connections at `not_after`. Past it the client MAY still use what it
+  learned to *reach* an existing session, and MUST NOT use it to start a
+  new one unless its own enrollment independently pins that relay.
+- **An independently enrolled relay.** Its pin comes from the invite, not
+  the beacon, so it stays dialable forever regardless of any beacon. That
+  is the only reason a beacon outage cannot lock a device out.
+
+**The rollback watermark.** The client persists the newest `published` it
+has accepted, with the beacon name it came from, alongside the profile.
+A beacon older than that watermark is refused even if it verifies and its
+`not_after` is still in the future — otherwise a restart, or a second
+device on the same profile directory, would reopen the window in which
+the operator's *previous* rotation is still valid. The watermark is
+written before the beacon's relays are adopted, so a crash mid-adoption
+leaves a client that refuses the old record rather than one that accepts
+both.
+
+### 3.5 Whom the beacon can actually point at
+
+A signed address and a pinned key tell the client whom to authenticate;
+they do not provision the device there. This is the operational hole in
+rotation, and it has two independent halves:
+
+- **The accounts store is the authority.** A relay with `-accounts-store`
+  authenticates only while it holds the store's **writer lease**
+  (`accounts.Writer.Serving`), so a standby listed in a beacon is
+  reachable and trusted yet refuses credentials until the current holder's
+  lease expires or it takes over (`arc-relay accounts takeover`). A
+  beacon that lists a standby without saying so is a beacon that points
+  at a refusing relay.
+- **The front is not store-backed.** `-front-listen` requires
+  `-tokens-file` and admits by **plaintext token** (the `Authorization:
+  Bearer` header), which an `-accounts-store` deployment does not keep —
+  `main.go` refuses the combination outright. So a device holding only an
+  enrolled token can use a beacon-listed **`-tls`** endpoint and cannot
+  use a beacon-listed **front**, unless the operator provisions a matching
+  plaintext token for it.
+
+Both are operator prerequisites, not client behaviour, so the spec states
+them as such:
+
+- The record distinguishes endpoint kinds: each relay entry names whether
+  its port is a `-tls` (raw ARC after TLS), `-front` (HTTP upgrade), or UDP
+  endpoint. A front entry carries no `key` requirement for admission but
+  does carry the front's domain, and a client will not try a front for a
+  device whose profile has no front token.
+- Rotation requires that **every listed relay either serve the same store
+  or be the acknowledged holder of its lease**. A deployment rotating
+  between two hosts sharing one S3 store satisfies this; one rotating to a
+  host with its own `-tokens-file` does not, and the beacon cannot express
+  the difference — so the operator must, by listing only relays that are
+  actually serving.
+- **The staging test rotates for real:** enroll a device, stand up a
+  second relay on the same store, publish a beacon naming only the second,
+  and assert the device establishes a **new session on the replacement**
+  with its existing credential and no operator action. That test is what
+  turns "rotation" from a claim into a property.
+
+### 3.6 Zones must be independent
 
 The beacon zone MUST NOT be the carrier zone, and SHOULD be delegated to
 different infrastructure (ideally a different provider). The beacon is
@@ -422,14 +623,70 @@ and both are code changes:
 
 `assoc_id` is chosen when the carrier opens, and is carried on every cell
 (§12.1). The relay binds it to a session the first time a fully
-reassembled packet carrying it authenticates. Until then its answers
-carry `A1:-` and no content for anyone, and its per-resolver budget is
-enforced against the unbound-association limits (4 packets, 16 KiB).
+reassembled packet carrying it authenticates. A recursive resolver may
+send one client's queries from many egress addresses, so nothing is keyed
+by source address — this is why `assoc_id` exists, and §12.1's rule
+against keying reassembly on the source is load bearing here.
 
-A recursive resolver may send one client's queries from many egress
-addresses, so nothing is keyed by source address — this is why `assoc_id`
-exists, and §12.1's rule against keying reassembly on the source is load
-bearing here.
+#### 4.2.1 The pre-authentication reply path
+
+§12.1 and §16.5 say an unbound association gets `A1:-` and nothing else.
+That cannot work here, and it is the reason this section exists: the
+client's very first packets are a `HANDSHAKE_INIT`, which the relay
+answers with `HANDSHAKE_RESP` (or `COOKIE_REPLY` under load, §9.3) — both
+*before* anything has authenticated, and therefore before an `assoc_id`
+can be bound. With only `A1:-` available, `HANDSHAKE_RESP` could never
+reach the client and no DNS-only session could ever establish.
+
+**Rule.** An association that is not yet bound MAY carry downlink cells,
+under all of these limits:
+
+- **Only handshake packets.** `COOKIE_REPLY` (25 B), `HANDSHAKE_RESP`
+  (81 B), and `STATELESS_RESET` (25 B) — the three packet types a
+  pre-authentication peer can legitimately need. Anything else on an
+  unbound association is dropped, and a `DATA` packet that would not
+  authenticate is dropped silently as today.
+- **One cell per answer, and only in answer to a poll.** The relay sends
+  a pre-auth cell on the same query that carried the uplink cell
+  provoking it, never unsolicited, so an unbound association cannot be
+  used to make the nameserver emit traffic on its own.
+- **The same 3× cap per answer** (§2.2), so a pre-auth reply is bounded by
+  what the query carried. No padding is needed: `HANDSHAKE_RESP` in one
+  99-byte cell costs a 359-byte answer to a 211-byte query, a ratio of
+  1.7, and the 25-byte replies are 1.6.
+- **A rate limit per source resolver and globally**, as `A1:-` already
+  has, since this is now a path that emits a reply to an unauthenticated
+  stranger. A cookie makes the relay cheap to defend and is required here
+  more than on UDP: `AlwaysRequireCookie` SHOULD be set for a DNS
+  listener, so every pre-auth reply except the cookie itself follows a
+  validated round trip.
+- **A short unbound budget.** The existing limits (4 incomplete packets,
+  16 KiB, no expiry) stay, plus: at most 8 pre-auth cells per association
+  per minute, after which it gets `A1:-` until it authenticates. That
+  bounds a single `assoc_id` guesser without affecting a real client,
+  whose entire pre-auth exchange is the cookie, the response, and the
+  AUTH.
+
+`HANDSHAKE_INIT` is 122 B, which is two cells, so a cold start with
+cookies required is **five polls**:
+
+| poll | carries | answers with |
+|---|---|---|
+| 1 | INIT, cell 1 | `A1:-` |
+| 2 | INIT, cell 2 | `COOKIE_REPLY` |
+| 3 | INIT with cookie, cell 1 | `A1:-` |
+| 4 | INIT with cookie, cell 2 | `HANDSHAKE_RESP` |
+| 5 | `AUTH` | `AUTH_RESULT` |
+
+Three poll intervals elapse inside the INIT phase (6 s of its 10 s), and
+the AUTH poll starts the second phase. That is the budget the ceiling rate
+buys, and it is why §2.5 says establishment runs at the ceiling rather
+than at the steady rate. **The stage 2 exit criterion is exactly this
+exchange, with cookies required**, which is why §7 says so explicitly.
+
+This is the one place the lifeline relaxes a §12.1 rule rather than
+working within it, and it relaxes it only for the three handshake packet
+types, only in answer to a poll, and only under a per-association budget.
 
 The relay's downlink queue for a bound association is drained one cell
 per answer, FIFO, and any answer may carry the next cell even while the
@@ -462,13 +719,114 @@ it is the adapter's, not the engine's. Rules:
   a row the poll holds only a PING, and application cells wait.
 - **Giving up is explicit.** A path that cannot meet the floor at all —
   answers arriving after the 15 s suspect threshold, five failures in a
-  row, or establishment failing three times (§2.4) — is reported unusable
+  row, or establishment failing three times (§2.5) — is reported unusable
   and closed, rather than kept at a rate that makes the session flap.
 - **One answer, one cell.** An answer that carries a cell which does not
   authenticate (a stale cache entry for a repeated name, a rewriting
   middlebox, an off-path injector) is discarded and the poll repeated
   with a fresh nonce. A rejected answer proves nothing about the path;
   only an absence of authenticated progress for the stall timeout does.
+
+#### 4.3.1 Who asks the session for a packet
+
+The adapter cannot seal, and it must not try: `WriteBatch` receives
+already-encrypted datagrams, and only `session` holds the keys. But the
+poll loop needs a *fresh* packet at times the engine will not volunteer
+one, so the contract has to say who asks and what comes back.
+
+**The adapter asks; the session decides.** One addition to the session's
+public surface, alongside `Probe` (which exists and sends a PING on a
+validated path):
+
+```go
+// PollPacket returns one fresh datagram for the path, if the session has
+// one to send, or false. It is the request/response carriers' substitute
+// for the engine's push model: the adapter calls it when its poll timer
+// fires, so a keepalive is minted on demand rather than one interval late.
+func (c *Client) PollPacket(now time.Time, id uint32) (Datagram, bool)
+```
+
+It returns, in this order of preference: an unbound control frame due for
+this path (a PING when the keepalive is due, a retransmission when a PTO
+has fired), then any path-bound frame queued, then nothing. It never
+mints a `PATH_JOIN`, a handshake message, or a `DATA` packet carrying IP
+traffic — those come through the engine as they do today.
+
+- **Before validation** the adapter polls with whatever the handshake
+  needs, and here the answer is *not* a fresh packet: `HANDSHAKE_INIT`
+  and `AUTH` are retransmitted by `Client.Tick` on their own schedule
+  (§2.5), at 100 ms early and 1 s once quiet. The adapter drains them from
+  `PollTransmit` exactly as a UDP carrier does, one cell per poll, and
+  **coalesces**: if `Client.Tick` has queued two INITs for the same
+  attempt, only the newest is carried. That matters because the ceiling
+  is one poll per 2 s while the session's retransmit interval is 100 ms,
+  so without coalescing the adapter would queue twenty obsolete copies of
+  the same handshake packet per poll interval.
+- **Obsolete attempts are dropped, not queued.** A `Datagram` for a
+  handshake attempt whose `HandshakeAttempt()` counter has advanced is
+  discarded by the adapter; the session's own restart invalidates it, and
+  a DNS path must never spend a poll on an INIT for a session it has
+  already abandoned. The same rule covers a path that dies mid-poll: its
+  queued cells go, because the path ID will never be reused (§14.3).
+- **Backpressure.** When the session has more to send than the poll loop
+  can carry, the adapter does not buffer it: `PollTransmit` returning
+  datagrams faster than polls happen is a sign the path is overloaded,
+  and a DNS path that queues for a minute delivers a packet that will
+  expire anyway (§2.4). The adapter keeps at most one packet's cells in
+  flight and drops the rest with a counter, exactly as the stream carrier
+  drops into a full queue rather than blocking the event loop (§16.3).
+
+So the division is: the session owns *what* to send and *when it is due*;
+the adapter owns *how often it can ask*. A PING is due at the keepalive,
+a retransmission at a PTO, and both are questions the adapter poses by
+calling `PollPacket` on its own timer.
+
+#### 4.3.2 Committing a downlink cell: the query is the receipt
+
+FIFO dequeue on any query has two holes, and both lose data:
+
+1. **A recursive resolver retries.** If the authority's answer is lost on
+   the way back, the resolver re-sends the *same* query — and if the relay
+   dequeues on arrival, that retry consumes a second cell while the client
+   only ever sees one. Every lost authoritative reply would silently drop
+   a cell of a fragmented packet.
+2. **The next poll may be smaller.** A cell sized for an EDNS 1232 poll is
+   409 B; the very next poll may be a 91-byte no-EDNS query whose answer
+   cap is 124 B. A cell already committed cannot be delivered.
+
+**Rule: the relay commits a downlink cell only when it knows the answer
+reached the client, and sizes it to the poll that will carry it.**
+
+- **Idempotency by query name.** Each query name embeds a fresh 8-byte
+  nonce (§16.5), so every poll is distinguishable. The relay keeps, per
+  association, the nonce of the last poll it answered and the cell it
+  gave that poll — one entry, not a cache. A repeated nonce gets the
+  **same** cell again, not the next one. That makes a resolver retry
+  harmless and costs 8 bytes of state per association.
+- **The queue cursor advances on the *next* poll.** A cell handed to
+  nonce *n* is marked "in flight" and dequeued; if poll *n+1* arrives, the
+  in-flight cell is committed (the client had the previous answer) and
+  the next cell goes out. If instead nonce *n* arrives again, the in-flight
+  cell is re-sent. If neither arrives before the association's expiry,
+  the in-flight cell returns to the head of the queue. This is a
+  one-deep sender window, which is all a request/response channel with a
+  10-second pacing floor needs.
+- **Sizing to the arriving poll.** The relay sizes the cell to *this*
+  query's answer budget — `min(resolver buffer, 3 × query)` — not to the
+  largest the association has seen. A 409-byte cell that no longer fits
+  the query's budget stays queued and goes out on a later, larger poll;
+  the client's polling rules (§4.3) already prefer large queries when the
+  downlink is backlogged, so this is rare and self-correcting.
+- **The client tolerates a repeat.** Because a cell can legitimately
+  arrive twice (a retried resolver, a re-sent in-flight cell), the client
+  discards a cell whose `(assoc_id, cell_packet_id, offset)` it has
+  already accepted. Reassembly already keys on the first two; the offset
+  check makes a duplicate chunk a no-op rather than a conflict.
+
+Two tests come out of this, both of which fail if the relay dequeues
+naively: a lost authoritative reply followed by a resolver retry must not
+skip a cell, and a fragmented packet whose polls switch from EDNS to
+no-EDNS mid-transfer must still complete.
 
 ### 4.4 Answers are not liveness
 
@@ -514,15 +872,36 @@ looking alive for the record's TTL. TTL 0 is requested for carrier zones
 
 ### 5.1 When the client opens it
 
-Never by default. Two ways in:
+Never by default, and never on someone else's opt-in. Three gates, all of
+which must open:
 
-- `-dns-lifeline ZONE` — operator or user explicitly enables the carrier
-  for `ZONE`; combined with `-lifeline-beacon ZONE` (or a profile that
-  carries both) it also enables rendezvous.
-- **Posture-driven.** Under `network-profiling.md` §6.2, `regime =
-  allowlist` or `shutdown` selects it automatically, but only when the
-  posture was itself opted into (`-allowlist`, `-censorship`), matching
-  the rule for every camouflage behaviour.
+- **Permission.** `-dns-lifeline ZONE` names the carrier zone the operator
+  delegated to this use, and `-lifeline-beacon ZONE` (or a profile key)
+  names the beacon zone. §16.5 already requires "explicit authorization to
+  use the network's DNS facility in this way"; a posture flag is not that
+  authorization, and this section makes the distinction load-bearing.
+- **Posture.** Under `network-profiling.md` §6.2, `regime = allowlist` or
+  `shutdown` *selects* the lifeline — but only among carriers the
+  permission gate already admitted. So the posture can choose this path
+  and can never introduce it.
+- **Absence of a better one.** The carrier is opened only while no other
+  validated path exists, and §5.1's closing rules below take it away again
+  when one appears.
+
+The separation matters because `-allowlist` and `-censorship` exist to
+shape how *ordinary* carriers behave: which cover names to try, whether to
+send UDP to a hosting address. Broadening them to silently authorize a
+DNS carrier would change what a user consented to when they passed the
+flag, and the DNS carrier is the one with a third party's infrastructure
+involved — a resolver, and a zone the operator must have registered. A
+flag that meant "be careful with UDP" must not come to mean "tunnel
+through your ISP's resolver".
+
+So a client with `-allowlist` and no `-dns-lifeline` behaves exactly as it
+does today: approved destinations, cover names, no DNS carrier, and a
+status line that says the lifeline is unavailable *because it was not
+configured*, not because the network refused it. The two are different
+facts and the user should see which one they have.
 
 The reverse is a harder rule: the client closes the carrier and stops
 polling when (a) any other validated path exists and the profile is not
@@ -532,14 +911,51 @@ is here, right now" to every resolver on the path.
 
 ### 5.2 Which resolver
 
-The client uses the resolver the network gave it — captured from the
-system configuration *before* the tunnel is installed, and pinned, like
-every other carrier socket, outside the TUN routing loop
-(`network-profiling.md` §3.2). That is deliberate: under an allowlist,
-the permitted resolver is the permitted infrastructure, and using it is
-the least conspicuous choice available. `-dns-lifeline-resolver ADDR`
-overrides it. The path never resolves its own names through the tunnel
-(§17.3).
+The client uses the resolver the network gave it — but "the resolver the
+network gave it" is usually a **local stub**, and a stub is not a
+destination this path can use. On a systemd host `/etc/resolv.conf`
+names `127.0.0.53`; on macOS it names an address in `127.0.0.1` or
+`fe80::1%en0`. Pinning an adapter socket to a stub address does not pin
+where its queries go, and once ARC is up the stub is worse than useless:
+managed DNS installs `~.` with `default-route yes` on the tunnel link
+(`tun.dnsState.configure`), so the stub will forward the lifeline's own
+queries back into the tunnel the lifeline exists to rescue.
+
+**Rule: the lifeline never uses a stub, and never uses a resolver it
+reaches through the tunnel.**
+
+- **Discover the physical link's real upstream.** Before installing the
+  tunnel, the client resolves which link carries the default route and
+  asks the platform for *that link's* upstream servers: `resolvectl dns
+  <ifindex>` on Linux (which returns the configured upstreams, not the
+  stub), `scutil --dns` and the `State:/Network/Service/*/DNS` entries
+  filtered to the link's service on macOS. If every answer is loopback,
+  link-local, or the stub itself, the lifeline is **unavailable** on this
+  host and the client says so — it does not fall back to the stub.
+- **Reject ineligible addresses** by the same predicate `tun.ValidateDNS`
+  already applies to an installed resolver: IPv4 global unicast, not
+  loopback, not link-local, not multicast. A DoH/DoT-only network with no
+  plain resolver address exposes none of these, which is a correct
+  "unsupported" rather than a silent leak into the tunnel.
+- **Pin the socket to the link**, not just to the address: `IP_BOUND_IF` /
+  `SO_BINDTODEVICE` on the physical interface, exactly as the carrier
+  sockets are, so even a stub's address that happens to be routable is
+  reached outside the TUN route.
+- **Re-check on link change.** The upstream is a property of the
+  attachment, not of the process: a Wi-Fi→Ethernet move or a captive
+  portal's post-auth resolver swap must re-run discovery, and a lifeline
+  bound to the old link's resolver is closed and reopened.
+- **`-dns-lifeline-resolver ADDR` overrides all of it**, for an operator
+  who knows the address; it is validated by the same predicate.
+- The path never resolves its own names through the tunnel (§17.3), and
+  this is the concrete mechanism: the query goes to an address on the
+  physical link, from a socket bound to that link, with no dependency on
+  the system resolver at all.
+
+The test for this is a full tunnel with managed DNS active: the lifeline
+must keep answering while `resolvectl query` on the host returns answers
+*through the tunnel*, and the journal must show the physical upstream, not
+`127.0.0.53`.
 
 ### 5.3 Budgets
 
@@ -562,6 +978,45 @@ Three independent caps, all mandatory:
   a cooldown and the client backs off; it is never worth hammering a
   shared resolver, and §16.5 already forbids pretending otherwise.
 
+#### 5.3.1 The budget must be enforced before sealing, not after
+
+The adapter sees opaque datagrams. `session.Datagram` is a path ID, bytes
+and an `AckEliciting` bit — no frame types — and one ARC packet may carry
+an ACK, a PING and two `IP_PACKET`s together. So an adapter that counts
+bytes cannot tell control from application traffic, and "control-only
+after the budget" is unimplementable at the adapter layer. The budget
+belongs where the frames are still visible.
+
+**Rule.** The session enforces it for a path it knows is constrained:
+
+- `session.path` gains `constrained` and `allowance` (an
+  `allowance` = bytes and polls remaining in the current hour). Both are
+  set when the path is created, from the carrier, alongside the
+  `maxPacket` of §2.4.
+- **When assembling a packet for a constrained path, the session admits
+  frames by class:** unbound control (PING, ACK, `PATH_*`, `CLOSE`,
+  `ERROR`) always; `AUTH` and handshake frames always; `IP_PACKET`,
+  `IP_FRAGMENT` and `STREAM*` only while the allowance lasts, and
+  **dropped rather than queued** when it does not. The scheduler already
+  decides which path a flow goes to, so a flow placed elsewhere loses
+  nothing; a flow with nowhere else to go sees the packet drop, which is
+  the truthful outcome for a link that is out of budget.
+- **Exhaustion is reported, not silent.** The client counts drops per
+  class and says so in the journal and the status line; a dropped
+  `IP_PACKET` on the only path closes the flow's TCP connection rather
+  than letting it hang, matching what a full transmit queue does (§16.3).
+- **The reserved application-DNS slice is a session-side flow label,** not
+  an adapter heuristic: `flowTable` already keys flows, so the client
+  marks the inner resolver's 5-tuple (the relay's pushed `dns_ipv4`, or
+  the configured `-dns`) as privileged, and those packets draw on their
+  own small allowance ahead of other IP traffic. That is a rule about
+  addresses the session knows, which is why it can be a rule at all.
+
+This is the second thing the current contract cannot express (the first
+being §4.1's constrained flag), and it is the same fix: the session has to
+know a path's budget, because only the session can see what a packet
+carries.
+
 ### 5.4 What may ride it
 
 - **Control, always.** Handshake, AUTH, path validation, keepalives,
@@ -571,7 +1026,9 @@ Three independent caps, all mandatory:
   needs on a captive or allowlisted network is a name resolved to an
   address, and if ARC will not carry that query, the tunnel is up and
   useless. Application DNS therefore gets a reserved slice of the budget
-  (the first 4 KiB/hour of downlink, say) ahead of any other flow.
+  (the first 4 KiB/hour of downlink, say) ahead of any other flow, marked
+  as a privileged flow by the session (§5.3.1), not guessed at by the
+  adapter.
 - **Everything else, subject to §15.2 item 6.** A flow is placed here
   only when nothing else is validated. A `TCP_MSS`-shaped request to a
   plain-HTTP endpoint is the largest thing that plausibly completes: it
@@ -588,19 +1045,28 @@ Three independent caps, all mandatory:
 responder and a censor inline, and asserts behavior end to end. The
 responder is a small Go binary in `test/`; it implements the zone of §4
 and the beacon of §3, and it *refuses* any answer above 3× its query, so
-the amplification rule is tested rather than trusted.
+the amplification rule is tested rather than trusted. It can also be told
+to require cookies, drop its first reply to force a resolver retry, and
+shrink its answer budget mid-transfer.
 
 | Scenario | Assertion |
 |---|---|
-| Everything but DNS blocked (`iptables` default drop, resolver allowed) | A session establishes over the DNS path alone inside one handshake attempt (10 s per phase), and a ping through the tunnel gets its reply within two polls |
-| Beacon queried cold, no session possible | The client learns endpoints and cover names from a signed record and logs the regime |
-| Beacon forged (signature flipped), replayed past `not_after`, sinkholed by a wildcard | Each is rejected and logged; the client falls back to its enrolled relay |
+| Everything but DNS blocked (`iptables` default drop, resolver allowed), **cookies required** | A session establishes over the DNS path alone inside one handshake attempt (10 s per phase) in the five polls of §4.2.1, and a ping through the tunnel gets its reply within two polls |
+| Beacon queried cold, no session possible | The client sends the fixed 271-byte bootstrap query, learns endpoints and cover names from a signed record, and logs the regime |
+| Beacon forged (signature flipped), replayed past `not_after`, rolled back to an older `published` after a restart, sinkholed by a wildcard | Each is rejected and logged; the client falls back to its enrolled relay and never adopts a retired key for a new connection |
 | Beacon answer above 3× the query | The nameserver refuses it; a client that stops padding gets no beacon and says so |
+| Beacon too large for the bootstrap profile (3 relays) | No answer in the 512-byte profile; the client retries with EDNS(0) and succeeds there, and logs which profile it used |
 | Full-length uplink cells against a 512-byte answer budget | The downlink cell is 168 B, not the 243 B a padded short query gets — a client that fills the name loses downlink — and no answer exceeds 3× its query |
+| A padded name carrying a fragmented cell | Two cells of one `HANDSHAKE_INIT`, the first with padding labels; both reassemble to exactly one cell each, and a `0`-led label is never read as cell data |
+| A 472-byte packet sent at 6 polls/min | Reassembles inside the 60 s DNS expiry; the same packet fails on the 10 s value, which is why the expiry is carrier-specific |
+| Resolver retries after the authority's reply is lost | The relay re-sends the same cell for the repeated nonce; no cell of a fragmented packet is skipped |
+| Answer budget shrinks mid-transfer (EDNS → no EDNS) | The oversized cell stays queued and the packet still completes on a later, larger poll |
 | Resolver rewriting TXT content / truncating / caching stale cells | Cells that do not authenticate are discarded; the path is not declared dead until the stall timeout |
 | Resolver returning `SERVFAIL` at 20 polls/min | The path keeps the 6/min floor with PING-only polls, sheds application cells, and either recovers or is reported unusable — it never backs off below the floor |
 | A faster path available | The DNS path stops polling within one idle interval and carries no flows |
-| Budget exhausted (256 KiB) | The path drops to control only at the 6/min keepalive floor, keeps the session alive, and reports it |
+| Budget exhausted (256 KiB) with application data queued both ways | Control continues at the 6/min floor; application packets are dropped by the session, not queued, and the drop is counted and reported |
+| Full tunnel with managed DNS active (`~.` on the tunnel) | The lifeline keeps answering; the journal shows the physical link's upstream, never `127.0.0.53` or a loopback stub |
+| `-allowlist` without `-dns-lifeline` | No DNS carrier is opened; the status line says it was not configured, not that the network refused it |
 | 300-byte application DNS answer through the tunnel | Completes in three polls (two up, one down); the journal records the wire cost |
 
 The responder's own assertions replace what a lab DNS zone would
@@ -613,19 +1079,29 @@ no delegation, and no internet.
    delivers rendezvous, which `network-profiling.md` §10 defers, and is
    useful on its own: a device whose enrolled relay address died can
    learn the new one with one ordinary query.
-2. **Uplink carrier.** Cells up, `A1:-` answers, poll loop and pacing.
-   Exit: a session establishes over DNS alone and holds for 10 minutes
-   with its path never going `SUSPECT`.
-3. **Downlink carrier.** One cell per answer, backlog polling, and
-   application DNS as the first IP flow. Exit: a name lookup through the
-   tunnel completes in three polls.
-4. **Postures and budgets.** `allowlist`/`shutdown` regime selection,
-   byte budgets, the status line, and `dns.sh` in CI.
+2. **Uplink carrier.** Cells up, `A1:-` answers, the pre-auth reply path
+   of §4.2.1, poll loop and pacing. Exit: a session establishes over DNS
+   alone **with cookies required**, the five-poll cold start above, and
+   holds for 10 minutes with its path never going `SUSPECT`.
+3. **Downlink carrier.** One cell per answer, the commit rules of §4.3.2,
+   backlog polling, and application DNS as the first IP flow. Exit: a name
+   lookup through the tunnel completes in three polls, and a 472-byte
+   packet reassembles at the steady rate.
+4. **Rotation.** A second relay on the same store, a beacon naming only
+   it, and an enrolled device establishing a new session there with no
+   operator action (§3.5). Exit: that test passes, and a retired key is
+   refused for a new connection.
+5. **Postures and budgets.** `allowlist`/`shutdown` regime selection
+   behind the permission gate of §5.1, session-side budgets (§5.3.1), the
+   status line, and `dns.sh` in CI.
 
 No wire changes at any stage: the lifeline uses `CELL` (§12.1) and
-`TXT` unchanged. It needs no new frame type, no new feature bit, and no
-relay-side protocol negotiation — only a responder, a client adapter,
-and the policy above.
+`TXT` unchanged, with no new frame type and no new feature bit. What it
+does need beyond the adapter is three small additions to the session, all
+named where they are argued: a **constrained** flag and a `max_packet` on
+the path (§2.4, §4.1), a **`PollPacket`** query for request/response
+carriers (§4.3.1), and a **per-path allowance** admitted before sealing
+(§5.3.1).
 
 ## 8. Deferred
 
@@ -633,12 +1109,19 @@ and the policy above.
   A beacon could be encoded across four A records (4 bytes each per
   query, one relay per name, round-robin by index) without TXT at all.
   Deferred until a field report shows TXT is filtered where A is not.
-- **Several cells per answer.** EDNS(0) 4096 fits roughly 2.8 KB of cell
-  in one answer, which would cut the poll count for a downlink burst by
-  6×. It also makes the answer an amplifier worth abusing and a shape
-  worth blocking, and it depends on a resolver honoring the client's
-  buffer size. Revisit if any deployment's resolver forwards 4096-byte
-  answers intact.
+- **Several cells per answer.** A 4096-byte EDNS(0) buffer fits roughly
+  2.8 KB of cell in one answer, which would cut the poll count for a
+  downlink burst by 6×. It also makes the answer an amplifier worth
+  abusing, depends on a resolver honoring the client's buffer size, and
+  under the 3× rule would require a query of at least 934 bytes — which a
+  255-byte name cannot produce. It becomes possible only with the next
+  entry.
+- **Tunnelling inside the answer's own extra bytes.** §2.2's 3× rule is
+  what caps the downlink; a query *body* larger than a name would lift it,
+  and DNS has no such body. This is where a real TCP-length query (or a
+  large EDNS(0) option field, which some resolvers echo) would change the
+  arithmetic, and it is deferred because it depends on resolver behaviour
+  the operator does not control.
 - **DoT/DoH as the transport.** Encrypting the query hides the label
   entropy from the resolver's path but not from the endpoints; it also
   turns the carrier into HTTPS, which the front carrier (§16.4) already
