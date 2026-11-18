@@ -99,7 +99,7 @@ func TestCoverNamesRotateOnRejection(t *testing.T) {
 					}
 				}
 				// The working name stays: a fresh dial uses it.
-				if got := c.cover.Load(); got != 2 {
+				if got := c.coverFor(netip.MustParseAddrPort(proxy)); got != 2 {
 					t.Fatalf("cover index %d after connecting, want 2", got)
 				}
 				return
@@ -118,24 +118,77 @@ func TestCoverNamesRotateOnRejection(t *testing.T) {
 // A failure that says nothing about the name keeps it; so does a single
 // name, and a stale dial's failure.
 func TestCoverNamesKeepOnOtherFailures(t *testing.T) {
+	dest := netip.MustParseAddrPort("192.0.2.7:443")
+	other := netip.MustParseAddrPort("192.0.2.8:443")
 	c := &Client{opts: ClientOptions{Camouflage: &Camouflage{}, CoverNames: []string{"a.example", "b.example"}}}
 	for _, mode := range []string{ModeConnectRefused, ModeConnectTimeout, ModeFrontRefused, ModeDied} {
-		c.rejectCover(0, &Failure{Mode: mode})
-		if c.cover.Load() != 0 {
+		c.rejectCover(dest, 0, &Failure{Mode: mode})
+		if c.coverFor(dest) != 0 {
 			t.Fatalf("%s moved the cover name", mode)
 		}
 	}
-	c.rejectCover(0, &Failure{Mode: ModeTimeoutAfterClientHello})
-	if c.cover.Load() != 1 {
+	c.rejectCover(dest, 0, &Failure{Mode: ModeTimeoutAfterClientHello})
+	if c.coverFor(dest) != 1 {
 		t.Fatal("a timeout after the ClientHello kept the name")
 	}
-	c.rejectCover(0, &Failure{Mode: ModeRSTAfterClientHello}) // a spare dial with the old name
-	if c.cover.Load() != 1 {
+	if c.coverFor(other) != 0 {
+		t.Fatal("a rejection at one endpoint moved another's name")
+	}
+	c.rejectCover(dest, 0, &Failure{Mode: ModeRSTAfterClientHello}) // a spare dial with the old name
+	if c.coverFor(dest) != 1 {
 		t.Fatal("a stale dial's failure skipped a name")
 	}
 	one := &Client{opts: ClientOptions{Camouflage: &Camouflage{}, CoverNames: []string{"a.example"}}}
-	one.rejectCover(0, &Failure{Mode: ModeRSTAfterClientHello})
-	if one.cover.Load() != 0 {
+	one.rejectCover(dest, 0, &Failure{Mode: ModeRSTAfterClientHello})
+	if one.coverFor(dest) != 0 {
 		t.Fatal("a single name moved")
+	}
+}
+
+// TestCoverNamesWithSeveralEndpoints: each endpoint works through the
+// names on its own, so a working pair is found even when the endpoint and
+// name rotations would otherwise move in step. Here endpoint 1 approves
+// only the second name and endpoint 2 approves none: in lockstep the
+// carrier would alternate (1, first) and (2, second) forever.
+func TestCoverNamesWithSeveralEndpoints(t *testing.T) {
+	certPEM, keyPEM, err := SelfSigned([]string{"b.example"}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := Listen("127.0.0.1:0", ListenerOptions{TLS: &tls.Config{Certificates: []tls.Certificate{cert}}, Camouflage: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	good := allowlistProxy(t, ln.Addr().String(), "b.example")
+	bad := allowlistProxy(t, ln.Addr().String(), "nothing.example")
+	states := make(chan error, 32)
+	c := Dial(ClientOptions{
+		Addr: good, TLS: &tls.Config{}, MaxBackoff: 50 * time.Millisecond,
+		Endpoints:  []netip.AddrPort{netip.MustParseAddrPort(good), netip.MustParseAddrPort(bad)},
+		Camouflage: &Camouflage{Fingerprint: "chrome"},
+		CoverNames: []string{"a.example", "b.example"},
+		Peer:       netip.MustParseAddrPort("192.0.2.1:4433"),
+		OnState:    func(err error) { states <- err },
+	})
+	defer c.Close()
+	deadline := time.After(10 * time.Second)
+	for failures := 0; ; {
+		select {
+		case err := <-states:
+			if err == nil {
+				if failures > 4 {
+					t.Fatalf("connected after %d failures; want at most one per endpoint and name", failures)
+				}
+				return
+			}
+			failures++
+		case <-deadline:
+			t.Fatal("never found the endpoint and name that pass")
+		}
 	}
 }

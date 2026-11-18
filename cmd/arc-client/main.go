@@ -120,7 +120,7 @@ func run(args []string) error {
 	noOffload := fs.Bool("no-offload", false, "send and receive without UDP GSO/GRO, for comparison")
 	rotateBytes := fs.Int64("stream-rotate-bytes", 0, "move each -tls or -front carrier to a fresh TCP connection after it has received this many bytes, dialed ahead of time, to stay under a censor's per-connection cap (the TSPU freeze to foreign hosting); 0: learn the cap from stalled connections")
 	noUDP := fs.Bool("no-udp", false, "open no UDP carriers: reach the relay only through -tls or -front (-relay is then the session's address, the -tls endpoint, say)")
-	allowlist := fs.Bool("allowlist", false, "allowlist posture, for a censor that passes only approved names (and at its stricter stage approved addresses), as mobile \"white lists\" do: open no UDP carrier, reach the relay through -tls or -front with a browser's ClientHello (chrome unless -tls-fingerprint says otherwise), presenting the -tls-cover names in turn")
+	allowlist := fs.Bool("allowlist", false, "allowlist posture, for a censor that passes only approved names (and at its stricter stage approved addresses), as mobile \"white lists\" do: open no UDP carrier, reach the relay through -tls or -front with a browser's ClientHello (chrome unless -tls-fingerprint says otherwise), presenting the -tls-cover names in turn. With -tls-ca, the relay certificate must list every cover name; a -tls relay needs -tls-camouflage; -split-tcp is refused")
 	censorship := fs.Bool("censorship", false, "censorship posture: presume the relay sits on foreign hosting behind a censor that bans an address for minutes after UDP to it (TSPU), so open no UDP carrier to an address a -tls or -front carrier uses (spec/freeze-and-udp-ban.md §4)")
 	fecMode := wire.FECAuto
 	fs.Func("fec", "forward error correction: auto (default; while loss is at least 0.5%), off, or always", func(v string) error {
@@ -163,6 +163,12 @@ func run(args []string) error {
 		if err := p.apply(fs); err != nil {
 			return err
 		}
+	}
+	if *allowlist && splitMode != engine.SplitOff {
+		// The posture leaves only TLS-borne carriers, and split TCP would
+		// put inner TLS records on them: a TLS-in-TLS shape, which a
+		// censorship posture keeps off them (spec/network-profiling.md §6.2).
+		return errors.New("-split-tcp cannot be used with -allowlist: its only carriers are TLS-borne, and split TCP would carry TLS inside TLS (spec/network-profiling.md §6.2)")
 	}
 	if !*fullTunnel {
 		var dnsFlag bool

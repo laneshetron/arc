@@ -12,3 +12,15 @@ func TestSplitTunnelRejectsIgnoredDNSFlags(t *testing.T) {
 		}
 	}
 }
+
+// TestAllowlistRejectsSplitTCP: the posture leaves only TLS-borne
+// carriers, so split TCP, which would carry inner TLS inside them, is
+// refused rather than placed there.
+func TestAllowlistRejectsSplitTCP(t *testing.T) {
+	for _, mode := range []string{"auto", "always"} {
+		err := run([]string{"-allowlist", "-front", "203.0.113.7:443", "-split-tcp", mode})
+		if err == nil || !strings.Contains(err.Error(), "-split-tcp cannot be used with -allowlist") {
+			t.Errorf("-split-tcp %s: %v", mode, err)
+		}
+	}
+}
