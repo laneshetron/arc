@@ -145,3 +145,36 @@ func TestWritePrivateConcurrent(t *testing.T) {
 		t.Errorf("temporary files left: %v", left)
 	}
 }
+
+// TestProfileCarriesAllowlist: a profile can hold the allowlist posture
+// and its cover names, which run then uses unless overridden.
+func TestProfileCarriesAllowlist(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "p")
+	inv := &invite.Invite{Carriers: invite.CarrierTLS, Addr: netip.MustParseAddr("203.0.113.7"),
+		TLSPort: 443, ServerName: "s3.amazonaws.com", ID: [8]byte{1}, Secret: [16]byte{2}}
+	p, _, _, err := prepareProfile(dir, inv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delete(p.settings, "invite")
+	p.settings["allowlist"], p.settings["tls-cover"] = "true", "gosuslugi.ru,ya.ru"
+	if err := p.save(); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := loadProfile(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs := flag.NewFlagSet("run", flag.ContinueOnError)
+	for _, f := range []string{"relay", "relay-key", "token-file", "key-file", "tls", "tls-cover", "tls-fingerprint"} {
+		fs.String(f, "", "")
+	}
+	fs.Bool("no-udp", false, "")
+	fs.Bool("allowlist", false, "")
+	if err := loaded.apply(fs); err != nil {
+		t.Fatal(err)
+	}
+	if fs.Lookup("allowlist").Value.String() != "true" || fs.Lookup("tls-cover").Value.String() != "gosuslugi.ru,ya.ru" {
+		t.Errorf("allowlist %s, covers %s", fs.Lookup("allowlist").Value, fs.Lookup("tls-cover").Value)
+	}
+}

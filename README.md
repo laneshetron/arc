@@ -81,6 +81,21 @@ sudo bin/arc-client run ... -tls RELAY_HOST:443 -tls-cover COVER_HOST -tls-finge
 # -token-file token.
 sudo bin/arc-client run ... -front cdn.example.com:443 -tls-fingerprint chrome
 
+# Where only approved destinations work (the mobile "white lists", which pass
+# a TLS handshake only if it names an approved domain, and at their stricter
+# stage only to approved addresses), -allowlist opens no UDP carrier and
+# defaults the fingerprint to chrome. Several comma-separated -tls-cover names
+# are tried in turn: a carrier moves to the next when a handshake dies right
+# after its ClientHello, and keeps one that works. At the stricter stage the
+# relay must also sit on an approved address. With -tls-ca pinned, the
+# relay's certificate must list every cover name (arc-relay gencert -hosts
+# RELAY_HOST,NAME1,NAME2,NAME3): a name it lacks fails verification, which
+# keeps that name, since the network did not reject it. A -tls relay
+# (rather than -front) needs -tls-camouflage, as the posture's browser
+# ClientHello offers a browser's ALPN. -split-tcp is refused: it would carry
+# TLS inside the TLS carriers, the only kind the posture leaves
+sudo bin/arc-client run ... -allowlist -front RELAY_HOST:443 -tls-cover NAME1,NAME2,NAME3
+
 # Forward error correction is on by default (-fec auto): while a link loses
 # 0.5% or more, repair packets let the far end rebuild losses without TCP
 # retransmitting; -fec off disables it, -fec always keeps it on

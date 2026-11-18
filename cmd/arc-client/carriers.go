@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/netip"
+	"strings"
 	"time"
 
 	"github.com/laneshetron/arc/internal/carrier/sockopt"
@@ -26,6 +27,12 @@ type carrierOptions struct {
 	// uses: under TSPU, UDP to foreign hosting gets the whole address
 	// banned for minutes, stream carriers included.
 	Censorship bool
+	// Allowlist is the posture for a censor that lets through only
+	// approved names (and, at its stricter stage, addresses): the mobile
+	// "white lists". No UDP carrier is opened, since nothing but a TLS
+	// handshake naming an approved domain passes, and the stream
+	// carriers present the -tls-cover names in turn until one does.
+	Allowlist  bool
 	FullTunnel bool
 	Mark       uint32
 
@@ -52,6 +59,22 @@ func openCarriers(log *slog.Logger, o carrierOptions) ([]engine.Carrier, func(),
 	}
 	if o.NoUDP && o.TLS == "" && o.Front == "" {
 		return fail(errors.New("-no-udp needs -tls or -front"))
+	}
+	covers := coverNames(o.TLSCover)
+	if o.Allowlist {
+		if o.TLS == "" && o.Front == "" {
+			return fail(errors.New("-allowlist needs -tls or -front: under an allowlist only a TLS handshake naming an approved domain gets through"))
+		}
+		if !o.NoUDP {
+			log.Info("allowlist posture: no UDP carriers; only a TLS handshake naming an approved domain gets through")
+			o.NoUDP = true
+		}
+		if len(covers) == 0 {
+			log.Warn("allowlist posture without -tls-cover: the carriers present the relay's own name, which passes only if the allowlist approves it")
+		}
+		if o.TLSFingerprint == "" {
+			o.TLSFingerprint = "chrome" // the approved traffic is browsers'
+		}
 	}
 	if !o.Relay.Addr().Unmap().Is4() {
 		return fail(fmt.Errorf("relay %v: only IPv4 relays are supported", o.Relay.Addr()))
@@ -119,13 +142,16 @@ func openCarriers(log *slog.Logger, o carrierOptions) ([]engine.Carrier, func(),
 		carriers = append(carriers, engine.Carrier{Name: name, Conn: conn})
 	}
 	var camo *stream.Camouflage
-	if o.TLSCover != "" || o.TLSFingerprint != "" || o.TLSFragment != 0 {
-		camo = &stream.Camouflage{Name: o.TLSCover, Fingerprint: o.TLSFingerprint, Fragment: o.TLSFragment}
+	if len(covers) > 0 || o.TLSFingerprint != "" || o.TLSFragment != 0 {
+		camo = &stream.Camouflage{Fingerprint: o.TLSFingerprint, Fragment: o.TLSFragment}
+		if len(covers) > 0 {
+			camo.Name = covers[0]
+		}
 		if err := camo.Validate(); err != nil {
 			return fail(fmt.Errorf("-tls-fingerprint/-tls-fragment: %w", err))
 		}
 		log.Info("tls carrier will pose as ordinary web traffic",
-			"cover", camo.Name, "fingerprint", camo.Fingerprint, "fragment", camo.Fragment)
+			"cover", strings.Join(covers, ","), "fingerprint", camo.Fingerprint, "fragment", camo.Fragment)
 	}
 	for _, sc := range []struct {
 		addr, kind string
@@ -154,6 +180,10 @@ func openCarriers(log *slog.Logger, o carrierOptions) ([]engine.Carrier, func(),
 			conn := stream.Dial(stream.ClientOptions{
 				Addr: sc.addr, Endpoints: endpoints, TLS: tlsConfig, Peer: o.Relay,
 				Camouflage: camo, Front: sc.front, RotateBytes: o.RotateBytes,
+				CoverNames: coverList(covers),
+				OnCoverRejected: func(rejected, next string) {
+					log.Info("cover name rejected after its ClientHello; trying the next", "carrier", name, "rejected", rejected, "next", next)
+				},
 				Sockopt: sockopt.Options{Mark: sockOpts.Mark, Device: iface},
 				OnState: func(err error) {
 					if err != nil {
@@ -170,6 +200,26 @@ func openCarriers(log *slog.Logger, o carrierOptions) ([]engine.Carrier, func(),
 		}
 	}
 	return carriers, closeAll, nil
+}
+
+// coverNames splits -tls-cover's comma-separated names.
+func coverNames(s string) []string {
+	var names []string
+	for _, n := range strings.Split(s, ",") {
+		if n = strings.TrimSpace(n); n != "" {
+			names = append(names, n)
+		}
+	}
+	return names
+}
+
+// coverList is the carrier's CoverNames: only for several names, which
+// rotate; one name is Camouflage.Name.
+func coverList(names []string) []string {
+	if len(names) < 2 {
+		return nil
+	}
+	return names
 }
 
 // resolution is one lookup of a stream endpoint.

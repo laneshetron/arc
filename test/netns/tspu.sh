@@ -14,13 +14,13 @@
 #
 # Usage: tspu.sh BIN_DIR [SCENARIO...]
 #   BIN_DIR holds arc-client, arc-relay and mini-tspu.
-#   Scenarios (default: all): freeze udp-ban
+#   Scenarios (default: all): freeze udp-ban allowlist allowlist-strict
 set -euo pipefail
 
 BIN=$(cd "${1:?usage: tspu.sh BIN_DIR [SCENARIO...]}" && pwd)
 shift
 SCENARIOS=("$@")
-((${#SCENARIOS[@]})) || SCENARIOS=(freeze udp-ban)
+((${#SCENARIOS[@]})) || SCENARIOS=(freeze udp-ban allowlist allowlist-strict)
 for b in arc-client arc-relay mini-tspu; do
   [[ -x $BIN/$b ]] || { echo "tspu.sh: $BIN/$b missing" >&2; exit 2; }
 done
@@ -37,6 +37,8 @@ S="ip netns exec $NS_S"
 I="ip netns exec $NS_I"
 HOSTING=10.0.0.4
 SERVER=192.168.20.2
+ALLOWED=gosuslugi.example # the allowlist scenarios' approved name
+DENIED=denied.example     # a cover name the allowlist rejects
 FREEZE_BYTES=16384
 PIDS=()
 WORK=$(mktemp -d)
@@ -97,17 +99,31 @@ $S sysctl -qw net.ipv4.ip_forward=1
 $S iptables -t nat -A POSTROUTING -s 10.77.0.0/16 -o s1 -j MASQUERADE
 
 echo "$HOSTING/32" >"$WORK/hosting.txt"
-$T "$BIN/mini-tspu" -inside t0 -outside t1 -hosting "$WORK/hosting.txt" \
-  >"$WORK/censor.json" 2>"$WORK/censor.log" &
-PIDS+=("$!")
-wait_until 5 grep -q bridging "$WORK/censor.log" || { fail "censor up"; exit 1; }
+CENSOR_PID=
+# start_censor ARGS...: (re)start the censor with these rules. Scenarios
+# that change them restore the default (the hosting freeze and UDP ban)
+# when they finish.
+start_censor() {
+  if [[ -n $CENSOR_PID ]]; then
+    kill "$CENSOR_PID" 2>/dev/null || true
+    wait "$CENSOR_PID" 2>/dev/null || true
+  fi
+  $T "$BIN/mini-tspu" -inside t0 -outside t1 "$@" >"$WORK/censor.json" 2>"$WORK/censor.log" &
+  CENSOR_PID=$!
+  PIDS+=("$CENSOR_PID")
+  wait_until 5 grep -q bridging "$WORK/censor.log" || { fail "censor up"; exit 1; }
+}
+default_censor() { start_censor -hosting "$WORK/hosting.txt"; }
+default_censor
 
 # --- relay on the hosting address: UDP and the HTTPS front -------------------
 "$BIN/arc-relay" genkey >"$WORK/relay.key"
 RELAY_PUB=$("$BIN/arc-relay" pubkey <"$WORK/relay.key")
 echo tok >"$WORK/tokens"
 echo tok >"$WORK/token"
-"$BIN/arc-relay" gencert -hosts $HOSTING -cert "$WORK/relay.crt" -key "$WORK/relay.tls.key" 2>/dev/null
+# The certificate lists the cover names the allowlist scenarios present,
+# so a client that pins it verifies whichever name it uses.
+"$BIN/arc-relay" gencert -hosts "$HOSTING,$ALLOWED,$DENIED" -cert "$WORK/relay.crt" -key "$WORK/relay.tls.key" 2>/dev/null
 $S "$BIN/arc-relay" run -listen $HOSTING:4433 -key-file "$WORK/relay.key" \
   -reset-secret-file "$WORK/reset.secret" -tokens-file "$WORK/tokens" \
   -front-listen $HOSTING:443 -tls-cert "$WORK/relay.crt" -tls-key "$WORK/relay.tls.key" \
@@ -255,6 +271,65 @@ scenario_udp-ban() {
   echo "udp-ban: censor events: $(censor_events)"
   stop_client
 }
+
+# allowlist: a censor that passes only TLS handshakes naming an approved
+# domain (the mobile "white lists"), dropping everything else. Under the
+# -allowlist posture the client opens no UDP carrier and presents its
+# cover names in turn: the first is rejected, so it must move to the
+# second. ALLOW_ACTION=reset or throttle tries the censor's other
+# answers; POSTURE= runs the default client, for comparison.
+allowlist_censor() { # MODE
+  "$BIN/mini-tspu" -h 2>&1 | grep -q -- -allowlist || return 1
+  echo "$ALLOWED" >"$WORK/allow-sni.txt"
+  echo "$HOSTING/32" >"$WORK/allow-ip.txt"
+  start_censor -allowlist "$1" -allowlist-action "${ALLOW_ACTION:-drop}" \
+    -allow-sni "$WORK/allow-sni.txt" -allow-ip "$WORK/allow-ip.txt"
+}
+run_allowlist() { # NAME MODE
+  local name=$1
+  if ! allowlist_censor "$2"; then
+    echo "::notice::$name: this mini-tspu has no allowlist mode; skipping"
+    return
+  fi
+  local posture=${POSTURE--allowlist -tls-cover $DENIED,$ALLOWED}
+  local start=$SECONDS
+  start_client "$name" $posture
+  # A rejected name costs a dial's timeout (10 s) when the censor drops.
+  if wait_until 40 grep -q "session established" "$WORK/$name.log"; then
+    pass "$name: session established in $((SECONDS - start)) s"
+  else
+    fail "$name: no session in 40 s"
+    echo "$name: censor events: $(censor_events)"
+    stop_client
+    default_censor
+    return
+  fi
+  if grep -q '"proto":"udp"' "$WORK/censor.json"; then
+    fail "$name: the client sent UDP, which the allowlist denies"
+  else
+    pass "$name: no UDP sent"
+  fi
+  if [[ -n ${POSTURE-x} ]] && grep -q "cover name rejected" "$WORK/$name.log"; then
+    pass "$name: moved past the rejected cover name"
+  elif [[ -n ${POSTURE-x} ]]; then
+    fail "$name: never moved past the rejected cover name"
+  fi
+  local got
+  got=$(download 5202 "${DURATION:-10}")
+  echo "$name: received $got bytes in ${DURATION:-10} s; kbit/s per second: $(intervals 5202)"
+  if ((got > 1000000)); then
+    pass "$name: traffic flows through the allowlist ($got bytes)"
+  else
+    fail "$name: traffic stalled ($got bytes)"
+  fi
+  echo "$name: censor events: $(grep -o '"detail":"[^"]*"' "$WORK/censor.json" | sort | uniq -c | tr -s ' \n' ' ')"
+  stop_client
+  default_censor
+}
+scenario_allowlist() { run_allowlist allowlist sni; }
+# allowlist-strict: the stricter stage, which also requires an approved
+# address; the relay's is approved here.
+scenario_allowlist-strict() { run_allowlist allowlist-strict ip+sni; }
 
 for s in "${SCENARIOS[@]}"; do
   echo "=== $s"
