@@ -234,8 +234,9 @@ respects a path-specific maximum packet size:
   the path first validates, raised to **708 B** (6 cells, 50 s) once a
   session has held the steady rate for a minute without a stall. Both stay
   under the 60 s expiry with margin; a 7-cell packet would span exactly
-  60 s and is deliberately out of reach. `session.path.maxPacket` already
-  exists and the scheduler fragments above it (`conn.sendOn` →
+  60 s and is out of reach, which is deliberate — it is also the point
+  where the loss cost (§4.3.2) stops being small. `session.path.maxPacket`
+  already exists and the scheduler fragments above it (`conn.sendOn` →
   `IP_FRAGMENT`), so a 1280-byte IP packet becomes four fragments of
   438 B at first (four cells each), then two of 674 and 636 bytes.
 - The relay reassembles with the same expiry for a bound association, and
@@ -249,6 +250,16 @@ packet past the expiry and loses it, which is correct: the cell layer is
 telling the session that the path is no longer fast enough to carry
 objects of that size. Recovery is the ordinary stall recovery of §14.6,
 not a reassembly special case.
+
+**The expiry is not the only reason `max_packet` is small, and it is not
+the more important one.** A packet of *n* cells arrives only if all *n*
+do, so at cell loss *p* its delivery probability is `(1 − p)^n` (§4.3.2):
+a 7-cell packet at 2% cell loss fails one time in eight. `max_packet` is
+therefore a loss-rate tuning knob first and a reassembly-window limit
+second, which is why it starts at 4 cells — losing one packet in thirteen
+at 2% rather than one in eight — and why it rises only after a minute of
+clean running. The two constraints happen to point the same way; when a
+deployment's loss is known, that is what should set the value.
 
 This is the one place the lifeline changes a §12.1 constant rather than
 just its own pacing, and it needs a test that fails on the 10 s value:
@@ -429,12 +440,14 @@ query profiles**, and the client tries them in order:
 | bootstrap + EDNS(0) | padded to 255 bytes | 282 B | 845 B (≤ 3×) | **408 B** |
 
 Padding is by the §2.2.1 grammar, with `0`-labelled labels: the beacon
-zone leaves 222 bytes of room under `_arcb.example.net`, so it is three
-labels of at most 63. The client always sends the *bootstrap* profile
-first with its longest name, because that maximizes the answer under any
-resolver's buffer; if the answer is truncated or the authority signals a
-larger record, it retries once with EDNS(0) 1232 and never sizes a query
-to the record it expects.
+zone leaves 222 wire bytes of room under `_arcb.example.net`, which is
+four labels — 63 + 63 + 63 + 29, plus one length byte each. (A single
+label reaches only 63, so "a few labels" is 3–4 depending on the zone, and
+the adapter computes the split rather than assuming one.) The client
+always sends the *bootstrap* profile first with its longest name, because
+that maximizes the answer under any resolver's buffer; if the answer is
+truncated or the authority signals a larger record, it retries once with
+EDNS(0) 1232 and never sizes a query to the record it expects.
 
 The authority enforces the same bound: it refuses (`REFUSED`) any answer
 that would exceed 3× the query it received, measured on the wire. That
@@ -450,31 +463,44 @@ records, and claimed a 177-byte row fitted a 168-byte limit.
 
 | record | body | 512-byte profile | EDNS(0) |
 |---|---|---|---|
-| 1 relay, `tls`+`udp`, 1 cover name, 1 zone | 153 B | **yes** | yes |
+| 1 relay, `tls`+`udp`, 1 cover name, 1 zone, `_arc.example.net` | 153 B | **yes** | yes |
 | 1 relay, `tls`+`udp`+`front`, 1 name, 1 zone | 172 B | no | yes |
+| 2 relays, `tls` only, no names, `_arc.x.io` | 167 B | **yes** | yes |
+| 2 relays, `tls` only, no names, `_arc.example.net` | 174 B | no | yes |
 | 2 relays, `tls`+`udp`, 1 cover name, 1 zone | 196 B | no | yes |
-| 2 relays, `tls`+`udp`, no cover names, 1 zone | 180 B | no | yes |
 | 3 relays, `tls`+`udp`, no cover names, 1 zone | 223 B | no | yes |
 
-**So the 512-byte profile carries exactly one relay.** That is the honest
-limit and it is a real constraint, since many hotel and airline resolvers
-send no EDNS(0). Two relays fit only with EDNS(0) — 408 body bytes are
-available there, which is about four relays with one endpoint each.
+**The limit is 168 body bytes, and what fits under it depends on the
+record.** A two-relay record does fit — 167 bytes — if the carrier zone is
+short (`_arc.x.io`), each relay has one endpoint, and there are no cover
+names. It is 174 bytes with `_arc.example.net` and does not fit. So "one
+relay per record" is not a property of the grammar, and my previous
+revision was wrong to state it as one: it is a **publication rule**.
 
-The consequence for the design is not a footnote: **rotation cannot be
-expressed in a one-relay record.** §3.5 therefore says a deployment that
-must rotate publishes two beacon names (`b1._arcb`, `b2._arcb`), each
-carrying one relay, and the client queries them in order until one
-verifies. That is a strict improvement over a single two-relay record: it
-works on the resolvers that send no EDNS(0), and it lets the operator
-retire one name without rewriting the other. Each name is signed
-independently over its own suffix (§3.1), so a record cannot be moved
-between them.
+The rule is this, and it is a policy choice for a reason:
+
+> A bootstrap record SHALL carry one relay, so that its size does not
+> depend on the zone suffix, the number of endpoints, or whether cover
+> names are present. Deployments that must rotate publish several beacon
+> names instead of several relays in one record.
+
+That is chosen over packing relays in because the alternative is a record
+whose fit depends on a zone name a client cannot control, and because
+rotation needs **independent retirement**: `b1._arcb` can be republished
+or allowed to expire without touching `b2._arcb`, whereas a two-relay
+record requires rewriting both entries at once — during exactly the
+outage rotation exists to survive. With §3.3's candidate iteration the two
+names behave like a pool anyway.
 
 A front endpoint costs 1 + 2 + 1 + len(domain) bytes per relay, which is
 why `front` usually pushes a record over 168. The front's domain is needed
 because the client must present it as the cover name, and it is not
 derivable from the beacon's own name.
+
+**The padding example needs four labels, not one.** The beacon zone leaves
+222 wire bytes of padding under `_arcb.example.net`, and a label tops out
+at 63 bytes: 63 + 63 + 63 + 29, with their length bytes, is 222. My
+earlier "three labels of at most 63" could not reach it.
 
 ### 3.3 What the client does with it
 
@@ -492,8 +518,27 @@ derivable from the beacon's own name.
   adversary's relay, and the client's own Noise handshake would not
   notice — it authenticates whatever key it was told to expect.
 - **Precedence.** The device's enrolled relay address is tried first,
-  then the beacon's relays in the order listed. A beacon cannot displace
-  a working enrolled endpoint; it exists to replace one that is gone.
+  then the beacon's relays. A beacon cannot displace a working enrolled
+  endpoint; it exists to replace one that is gone.
+- **Acceptance is not selection, and selection is not final.** A record
+  that verifies gives the client a *candidate list*, not a relay to use.
+  The enrolled endpoint is candidate 1, the first beacon name's relays are
+  candidates 2..n, the second beacon name's after them, and so on down the
+  configured list. The client tries candidates in order and moves to the
+  next on failure — connection refused, handshake failure, or a session
+  that dies before it is stable.
+
+  This matters more than it looks. A valid, unexpired record can name a
+  relay that is simply **dead**, and re-querying the first beacon name
+  will keep returning it: signature valid, `not_after` in the future,
+  nothing wrong with the record. Without candidate iteration the client
+  would loop on a correct answer to the wrong question, and the live
+  replacement at `b2._arcb` would never be reached. So §3.5's two-name
+  rotation depends on this rule, not just on §3.2's sizing.
+- **The retry state is per candidate.** A candidate that failed is
+  skipped for a cooldown (default 5 minutes, doubling to an hour) rather
+  than retried first on the next attempt, so a list with one dead relay at
+  the front does not cost a failed handshake every time.
 - **Staleness.** A client keeps the newest beacon it has accepted until
   its `not_after`, and §3.4 governs what that expires: an existing session
   continues, a beacon-only key stops being usable for a *new* connection,
@@ -577,18 +622,20 @@ them as such:
   host with its own `-tokens-file` does not, and the beacon cannot express
   the difference — so the operator must list only relays that are actually
   serving.
-- **Rotation uses two beacon names, not two relays in one record.** §3.2
-  derives that a 512-byte answer holds exactly one relay with a key, so
+- **Rotation uses two beacon names, not two relays in one record.** That is
+  §3.2's publication rule, and it is chosen for independent retirement:
   the rotating deployment publishes `b1._arcb` and `b2._arcb`, each with
-  one relay, and flips which one is current. Two names is strictly better
-  here than a two-relay record that many resolvers cannot even return: it
-  works without EDNS(0), and retiring a relay means republishing one name
-  while the other keeps a resolvable answer.
+  one relay, and flips which one is current. A two-relay record would
+  require rewriting both entries during the outage rotation exists to
+  survive — and, with a longer zone or any cover name, would not fit a
+  512-byte answer at all.
 - **The staging test rotates for real:** enroll a device, stand up a
   second relay on the same store, publish a beacon naming only the second,
   and assert the device establishes a **new session on the replacement**
-  with its existing credential and no operator action. That test is what
-  turns "rotation" from a claim into a property.
+  with its existing credential and no operator action. Then leave
+  `b1._arcb` as a valid record naming the now-dead first relay and assert
+  the client still reaches the second — which is §3.3's candidate
+  iteration, and the reason a valid record alone is not enough.
 
 ### 3.6 Zones must be independent
 
@@ -871,68 +918,95 @@ a retransmission at a PTO, or — through `demand` — whenever the adapter
 has downlink waiting, and each is a question the adapter poses through the
 engine's loop rather than on its own goroutine.
 
-#### 4.3.2 Committing a downlink cell: an ARC receipt, not a new query
+#### 4.3.2 Downlink is unreliable by construction; ARC repairs it
 
-A new query nonce proves a different query arrived. It does **not** prove
-the previous answer was delivered, or that the client accepted it. My
-first attempt at this rule treated "poll *n+1* arrived" as a receipt for
-poll *n*'s cell, and that is wrong in two ways the reviewer named:
+My previous two attempts at this section were both wrong in the same way:
+they tried to make the cell layer reliable. It cannot be, and it does not
+need to be.
 
-- §4.3 says a cell that fails to authenticate is discarded and the poll
-  repeated. That is exactly the case where the answer arrived and was
-  rejected — and the rule would have committed it.
-- A late recursive retry of an old query looks like a new poll once the
-  one-entry cache has moved on, so it would commit a cell the client never
-  saw.
+**The relay cannot re-send a packet.** `conn.open` checks
+`p.replay.Check(h.PacketNumber)` *before* decrypting, so identical
+ciphertext is dropped as a replay and never reaches `lastRecv` or the
+frame parser. Re-sending the same bytes therefore achieves nothing at all
+— it cannot refresh liveness, cannot redeliver data, and cannot even
+schedule a fresh ACK. Only the *session*, which re-seals frames into a
+new packet number, can retransmit.
 
-**Rule: the relay commits a downlink cell only on evidence from the
-*tunnel*, and it keeps the cell until then.**
+So the cell layer is a **lossy pipe**, and what runs over it is ARC's
+existing retransmission:
 
-ARC already has that evidence, for every packet this path sends, with no
-new wire elements:
+- **Cells are not acknowledged.** No new ack, no receipt, no cursor that
+  depends on the client having seen a particular cell.
+- **A downlink ARC packet is emitted across however many polls it takes**,
+  one cell per poll, sized to each poll's budget (§2.2.2). If any cell is
+  lost, the packet does not arrive, the session never acknowledges it, and
+  the ordinary PTO path re-seals its frames into a fresh packet — which
+  the adapter re-fragments from scratch. That is the recovery mechanism,
+  already built and already tested.
+- **The cursor is per emission attempt, not per cell acknowledgement.** A
+  packet's cells are emitted in order on successive polls; the cursor
+  advances as each poll is answered. When the packet is acknowledged (as a
+  whole, by number) it leaves the queue. If the retransmission timer fires
+  first, the emitter starts over at offset 0 with a new `cell_packet_id`,
+  and the older attempt's remaining cells are dropped.
+- **A lost middle cell needs no special recovery.** The cursor does not
+  wait for confirmation of any particular cell, so it never stalls on one:
+  it reaches the tail on schedule. If a middle cell was lost, the packet
+  fails to assemble and ARC's PTO re-seals the whole thing. There is
+  deliberately no "re-send fragment 2" path, because there is no way for
+  the relay to learn that fragment 2 alone was lost.
+- **Partial packets are discarded, not patched.** A packet whose cells did
+  not all arrive is dropped when its assembly window closes (§2.4), and
+  ARC's loss detection does the rest. There is no partial delivery to
+  reason about.
 
-| queued packet | the receipt | why it is proof |
-|---|---|---|
-| `COOKIE_REPLY` | the next `INIT`, carrying that cookie | only a client that received it can echo it |
-| `HANDSHAKE_RESP` | the `AUTH` that follows | it is encrypted under keys from message 2 |
-| `AUTH_RESULT` | the client's first `DATA` or `ACK` | the session exists only if it saw the lease |
-| `DATA` (downlink) | the `ACK` frame covering that packet number | the client's own acknowledgement, inside its AEAD |
-| `STATELESS_RESET` | nothing — it is terminal | no commit; the association is gone |
+**The cost, stated plainly.** A *n*-cell packet arrives only if all *n*
+cells do, so packet loss is `1 − (1 − p)^n` for cell loss *p*:
 
-So the downlink queue holds **whole packets, not pre-split cells**, and a
-packet leaves the queue when the tunnel acknowledges it:
+| cells | p=1% | p=2% | p=5% | p=10% |
+|---|---|---|---|---|
+| 2 | 98% | 96% | 90% | 81% |
+| 4 | 96% | 92% | 81% | 66% |
+| 6 | 94% | 89% | 74% | 53% |
+| 7 | 93% | 87% | 70% | 48% |
 
-- **Refragmentation, which also answers the next finding.** Because the
-  queue holds a packet, the relay sizes *each cell* to the arriving poll's
-  answer budget: `min(resolver buffer, 3 × query)` (§2.2.2). A packet that
-  went out as a 409-byte cell under EDNS and then faces a 168-byte budget
-  is simply re-split — the remaining unsent bytes become smaller cells.
-  Nothing is stranded: there is no committed cell that no longer fits, no
-  head-of-line block, and no need to wait for a larger poll that may never
-  come. A cell that was *sent* but not acknowledged is re-sent, in
-  whatever size the current poll allows.
-- **Re-sends are idempotent at the client.** A cell carries
-  `(assoc_id, cell_packet_id, offset)`; the client keeps the accepted
-  ranges for the packet in flight and drops a duplicate. A retried
-  resolver query gets the same cells again, and the client ignores them.
-- **One packet in flight per association.** The path carries a few hundred
-  bytes a second; a window deeper than one is queueing for a link that
-  cannot absorb it (§2.4). So the relay's downlink state is one packet's
-  bytes, one cursor, and one `cell_packet_id`.
-- **A lost answer is not a lost cell.** If the authoritative reply never
-  reaches the client, nothing is acknowledged, nothing is committed, and
-  the next poll re-sends the same bytes. That is the resolver-retry case
-  solved by construction rather than by tracking nonces.
+At the 6-cell `max_packet` of §2.4 and 2% cell loss, one packet in nine is
+lost and retransmitted; at the initial 4 cells it is one in thirteen. That
+is why §2.4's `max_packet` starts at 4 cells and only rises after a minute
+without a stall, and why this path is for control and small objects: a big
+packet is an expensive lottery. `max_packet` is a *tuning knob for the
+loss rate*, which is a more honest reason for it than the reassembly
+window alone.
 
-The `cell_packet_id` therefore changes only when a packet is committed,
-which is what makes the client's duplicate detection sound: a repeat
-within one packet is a replay, and a repeat across packets cannot happen.
+**Two consequences for the emitter, both from the review:**
 
-Tests: a lost authoritative reply followed by a resolver retry must
-re-send the same bytes; a sustained loss of EDNS capability mid-transfer
-must re-split and complete (the reviewer's second case); and a client that
-receives but *rejects* a cell (a middlebox rewrote it) must not have its
-packet committed.
+- **A non-ack-eliciting packet still needs progress.** An idle client's
+  PING can be answered by an ACK-only packet, and no ACK will ever be
+  returned for it (§10.2 forbids acknowledging a packet of only
+  non-ack-eliciting frames). So the emitter cannot wait for an
+  acknowledgement on such a packet: it is **retired when the next poll
+  confirms the client is still there**, which for an ACK-only answer means
+  the following poll's own success. It carries no state the session needs,
+  which is exactly why it does not matter if it is lost.
+- **An ACK-only packet never holds the queue.** The one-packet window
+  admits at most one *ack-eliciting* packet; ACK-only packets go out
+  alongside or not at all, and are dropped rather than queued, because
+  keeping a stale ACK is worse than losing it (a fresh one follows).
+
+**And one more, on the AUTH receipt.** My table said "the client's first
+`DATA` or `ACK`" proves `AUTH_RESULT` arrived. It does not: `Client.Tick`
+repeats `AUTH` in *new* DATA packets until the result comes back, so a
+retried AUTH looks exactly like the receipt. The relay therefore keys that
+receipt to the packet number of its `AUTH_RESULT` (visible in the header
+before decryption) appearing under an ACK — or simply retires it after one
+emission, since the client will retry AUTH and the relay re-sends on the
+retry. The second is simpler and is what the reference should do.
+
+Tests: an idle session receiving only ACK-only replies stays healthy and
+does not wedge the queue; a lost uplink ACK for an ack-eliciting downlink
+packet recovers by PTO re-seal; a 3-cell packet with the middle answer
+lost is retransmitted whole; and a lost `AUTH_RESULT` followed by another
+AUTH still ends in an established session.
 
 ### 4.4 Answers are not liveness
 
@@ -1096,12 +1170,28 @@ point**, because the ceilings differ by a factor of three and a single
   keeps counting. Otherwise closing and reopening the path would be a
   trivial way to reset the budget, which is the one thing an operator's
   resolver must not see.
-- **The relay enforces its own copy** per bound association at the
-  authoritative server, answering `A1:-` to anything over — it cannot see
-  the client's counters, and must not trust them.
-- **The exhaustion test names its traffic:** application data queued in
-  *both* directions, with the assertion that control continues and that
-  the dropped packets are counted per direction (§5.3.1).
+- **The relay keys its copy on the authenticated device, not the
+  association.** This is the one place the relay's accounting must not
+  follow the transport. An association's synthetic address (§4.2.1) is
+  deliberately per-association, so a relay that counted per association
+  would reset its quota every time the path reopened — exactly the reset
+  the client already refuses. The authoritative server therefore charges
+  the bound **device identity** (the token's device, from `AUTH`), and it
+  keeps a small table of per-device usage for the hour. Before a device
+  has authenticated there is nothing to charge, so the pre-auth path keeps
+  its own per-association budget (§4.2.2) and nothing else.
+- **Cross-relay continuity is client-side only, and that is stated.** Two
+  relays serving one deployment do not share usage counters — nothing
+  reads the accounts store for this, and adding that would put a write on
+  the hot path of every poll. So a device that alternates between two
+  relays is bounded per relay, twice its own cap in the worst case. That
+  is acceptable because the client enforces its own device-wide budget
+  first (§5.3.1 meters before sealing); the relay's copy is a backstop for
+  a misbehaving client, not the primary limit.
+- **The exhaustion test reconnects on a new association:** the same
+  authenticated device exhausts its allowance, closes the path, opens a
+  new association, and the relay still answers `A1:-` — which is the
+  assertion that the quota is keyed on the device.
 
 #### 5.3.1 The budget must be enforced before sealing, not after
 
@@ -1198,19 +1288,25 @@ shrink its answer budget mid-transfer.
 | Beacon queried cold, no session possible | The client sends the fixed 271-byte bootstrap query, learns endpoints and cover names from a signed record, and logs the regime |
 | Beacon forged (signature flipped), replayed past `not_after`, rolled back to an older `published` after a restart, sinkholed by a wildcard | Each is rejected and logged; the client falls back to its enrolled relay and never adopts a retired key for a new connection |
 | Beacon answer above 3× the query | The nameserver refuses it; a client that stops padding gets no beacon and says so |
-| Beacon too large for the bootstrap profile (3 relays) | No answer in the 512-byte profile; the client retries with EDNS(0) and succeeds there, and logs which profile it used |
+| Beacon too large for the bootstrap profile (a `front` endpoint, or a long zone) | No answer in the 512-byte profile; the client retries with EDNS(0) and succeeds there, and logs which profile it used |
+| A legal two-relay record (167 B, `_arc.x.io`) | Accepted in the 512-byte profile even though the publication rule asks for one relay per record, so a client is not broken by an operator who packs two |
 | Full-length uplink cells against a 512-byte answer budget | The downlink cell is 168 B, not the 243 B a padded short query gets — a client that fills the name loses downlink — and no answer exceeds 3× its query |
 | A padded name carrying a fragmented cell | Two cells of one `HANDSHAKE_INIT`, the first with padding labels; both reassemble to exactly one cell each, and a `0`-led label is never read as cell data |
 | A 472-byte packet sent at 6 polls/min | Reassembles inside the 60 s DNS expiry; the same packet fails on the 10 s value, which is why the expiry is carrier-specific |
-| Resolver retries after the authority's reply is lost | Nothing is committed, because nothing was acknowledged: the next poll re-sends the same packet bytes, and the client's duplicate detection ignores the repeat |
-| Answer budget shrinks mid-transfer (EDNS → no EDNS) | The queued *packet* is re-split to the smaller answer budget and completes; no cell is stranded waiting for a larger poll |
-| A client receives but rejects a cell (a middlebox rewrote it) | The packet is not committed; the relay re-sends the same bytes on the next poll |
+| Resolver retries a query whose answer was lost | Harmless: the repeated name gets the same emission, and since identical ciphertext is dropped by `p.replay.Check`, nothing depends on it — the packet's absence is repaired by ARC's PTO re-seal |
+| Answer budget shrinks mid-transfer (EDNS → no EDNS) | The emission re-splits to the smaller budget and reaches the tail; no cell is stranded waiting for a larger poll |
+| A client receives but rejects a cell (a middlebox rewrote it) | The packet fails to assemble, is dropped at the assembly window, and a whole fresh copy is sent after the PTO |
+| A 3-cell packet with the middle answer lost, last one delivered | The packet fails to assemble and is retransmitted whole; the cursor reached the tail regardless, so no cell stalls it |
+| An idle session receiving only ACK-only replies | The path stays healthy and the queue does not wedge: an ACK-only packet is retired on the next successful poll, never awaited |
+| A lost uplink ACK for an ack-eliciting downlink packet | Recovers by PTO: the session re-seals the frames into a new packet with a new number, since replayed ciphertext would be dropped |
+| `AUTH_RESULT` lost, client sends another AUTH | The session still establishes; the relay does not treat the retried AUTH as a receipt for the missing result |
+| A valid first beacon record naming a dead relay, a live second | The client accepts both records, fails on the first candidate, and establishes on the second |
 | Resolver changing source port and egress between the two INITs | Cookies still verify, because they key on the association's synthetic address (§4.2.1), not the resolver's |
 | A downlink-only transfer with no uplink work | The client's backlog polls each carry a fresh demand-PING, so the packet drains at the ceiling rather than one cell per keepalive |
 | Resolver rewriting TXT content / truncating / caching stale cells | Cells that do not authenticate are discarded; the path is not declared dead until the stall timeout |
 | Resolver returning `SERVFAIL` at 20 polls/min | The path keeps the 6/min floor with PING-only polls, sheds application cells, and either recovers or is reported unusable — it never backs off below the floor |
 | A faster path available | The DNS path stops polling within one idle interval and carries no flows |
-| Budget exhausted (`-dns-lifeline-up-bytes` and `-down-bytes` both) with application data queued in both directions | Control continues at the 6/min floor; application packets are dropped by the session, not queued, and the drops are counted per direction; closing and reopening the path does not reset the counters |
+| Budget exhausted (`-dns-lifeline-up-bytes` and `-down-bytes` both) with application data queued in both directions | Control continues at the 6/min floor; application packets are dropped by the session, not queued; drops are counted per direction; closing and reopening the path does not reset the counters **and neither does a new association**: the relay still answers `A1:-`, because its quota is keyed on the authenticated device (§5.3) |
 | Full tunnel with managed DNS active (`~.` on the tunnel) | The lifeline keeps answering; the journal shows the physical link's upstream, never `127.0.0.53` or a loopback stub |
 | `-allowlist` without `-dns-lifeline` | No DNS carrier is opened; the status line says it was not configured, not that the network refused it |
 | 300-byte application DNS answer through the tunnel | Completes in three polls (two up, one down); the journal records the wire cost |
