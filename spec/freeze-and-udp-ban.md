@@ -173,6 +173,16 @@ This is the §6.2 row "QUIC throttled/blocked → demote UDP carriers"
 taken one step further for hosting: under a censorship posture to a
 hosting address, UDP is not merely demoted but not sent.
 
+**Where this leaves the ladder.** With UDP held back, a host blocked by
+the freeze, and TLS connections that must be rotated, the stream carrier
+is still the data plane and the DNS lifeline (`dns-lifeline.md`) is the
+rung below it: rendezvous from a signed beacon when the relay's address
+is burned, and a session that survives on whatever the resolver will
+carry. Under the freeze the ordering is: rotate stream connections to
+keep the data plane, and keep the DNS path for control, not for data —
+its ceiling (§2.3 there) is a few hundred bytes per second, which
+rotation beats by two orders of magnitude.
+
 ## 5. Testing
 
 `test/netns/tspu.sh` runs arc's client through the mini-tspu bridge with

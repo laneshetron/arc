@@ -51,9 +51,12 @@ All other type values are reserved: drop them silently.
 | `0x1D` | `REVOKE_REQUEST` | 17 (`request_id[8]; device_id[8]; flags:u8`) | yes |
 | `0x1E` | `REVOKE_RESULT` | 9 (`request_id[8]; status:u8`) | yes |
 | `0x1F`–`0x7F` | reserved, required | — | reject the packet |
-| `0x80`–`0xFF` | extensions, ignorable | — | ignore |
+| `0x80` | `SCHEDULE` | 9 (`gen:u32; interval_ms:u16; floor_ms:u16; window:u8`) | yes |
+| `0x81` | reserved, extension | — | ignore |
+| `0x82` | `SCHEDULE_ACK` | 4 (`gen:u32`) | yes |
+| `0x83`–`0xFF` | extensions, ignorable | — | ignore |
 
-`IP_DATAGRAM` and `REDUNDANCY` are sent only when `AUTH_RESULT` advertises features bit 0 (§11.1), and `FEC_REPAIR` and `FEC` only with bit 1 (§11.2), which also allows `IP_DATAGRAM`. The stream frames (`0x12`–`0x16`) are sent only with bit 2 (§11.3), and `DIAGNOSTICS_OPEN` only with bit 3, which also allows `0x13`–`0x16` for the upload (§11.4). Stream IDs are never 0, and stream offsets and limits stay below 2^62. `ENROLLED` is sent only with a successful `AUTH_RESULT` answering an enrollment credential (§9.2), so clients that authenticate with tokens never receive it. `INVITE_REQUEST` is sent only with bit 4, and `INVITE` only in answer to it; `request_id` is never zero, and a refusing `INVITE` has every field but `request_id` and `status` zero. `DEVICES_REQUEST` and `REVOKE_REQUEST` are sent only with bit 5, and `DEVICES` and `REVOKE_RESULT` only in answer to them; their `request_id` is never zero, a refusing `DEVICES` lists no devices, `DEVICES` lists at most 16, and `REVOKE_REQUEST` names a nonzero device and sets only flags bit 0.
+`IP_DATAGRAM` and `REDUNDANCY` are sent only when `AUTH_RESULT` advertises features bit 0 (§11.1), and `FEC_REPAIR` and `FEC` only with bit 1 (§11.2), which also allows `IP_DATAGRAM`. The stream frames (`0x12`–`0x16`) are sent only with bit 2 (§11.3), and `DIAGNOSTICS_OPEN` only with bit 3, which also allows `0x13`–`0x16` for the upload (§11.4). Stream IDs are never 0, and stream offsets and limits stay below 2^62. `ENROLLED` is sent only with a successful `AUTH_RESULT` answering an enrollment credential (§9.2), so clients that authenticate with tokens never receive it. `INVITE_REQUEST` is sent only with bit 4, and `INVITE` only in answer to it; `request_id` is never zero, and a refusing `INVITE` has every field but `request_id` and `status` zero. `DEVICES_REQUEST` and `REVOKE_REQUEST` are sent only with bit 5, and `DEVICES` and `REVOKE_RESULT` only in answer to them; their `request_id` is never zero, a refusing `DEVICES` lists no devices, `DEVICES` lists at most 16, and `REVOKE_REQUEST` names a nonzero device and sets only flags bit 0. `SCHEDULE` (`dns-lifeline.md` §4.4.2) declares a request/response carrier's polling schedule: `gen` a monotonically increasing generation, `interval_ms` while active, `floor_ms` at the keepalive floor, and `window` the number of polls in flight. `SCHEDULE_ACK` echoes the highest `gen` applied, since a frame in the extension range is never acknowledged by the packet-level ACK. Both are in the ignorable extension range so a peer predating them drops the frame rather than the packet; a relay that never receives a `SCHEDULE` assumes `window = 1` at its own floor, and a relay applies a declaration only when its `gen` is newer than the last applied, so a reordered backoff cannot roll the pace back.
 
 ## AUTH_RESULT features (§10.1)
 
@@ -106,6 +109,7 @@ Other bits are sent as zero and ignored on receipt.
 | IP reassembly | 1,024 datagrams / 8 MiB / 5 s / 8,192 completed IDs | 11 |
 | Datagram dedup window (redundancy) | ≥ 65,000 IDs (reference: 65,472) | 11.1 |
 | Redundancy `auto` thresholds | on at ≥ 1% loss, off below 0.4% | 11.1 |
-| Cell reassembly (bound association) | 64 packets / 256 KiB / 10 s | 12.1 |
-| Cell reassembly (unbound association) | 4 packets / 16 KiB | 12.1 |
-| DNS downlink cell | ≤ 280 B | 16.5 |
+| Cell reassembly (bound association) | 64 packets / 256 KiB / 10 s (a slow carrier bounds its packet size instead: `dns-lifeline.md` §2.4) | 12.1 |
+| Cell reassembly (unbound association) | 4 packets / 16 KiB; handshake replies only (`dns-lifeline.md` §4.2.2) | 12.1 |
+| DNS downlink cell | sized to the question: 168 B full-name, up to 409 B with EDNS(0) | 16.5, `dns-lifeline.md` §2.2.2 |
+| DNS uplink cell | from the zone suffix: 136 B at `_arc.example.net` | 16.5 |

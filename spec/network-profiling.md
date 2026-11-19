@@ -222,7 +222,7 @@ and check the relay persona canary (§7).
 | fingerprint-sensitive | Parrot verified by §5.2 self-check before relay contact |
 | QUIC throttled/blocked | Demote UDP carriers; TLS/TCP primary; FEC/split-TCP per link quality (except under a censorship profile: see below) |
 | ECH-intolerant | Never send ECH (it flags) |
-| allowlist | Only carriers reachable through allowed shared infrastructure, plus DNS/ICMP lifelines (§16.5–16.6); inform user full tunnel is unavailable |
+| allowlist | Only carriers reachable through allowed shared infrastructure, plus DNS/ICMP lifelines (§16.5–16.6, `dns-lifeline.md`); inform user full tunnel is unavailable. Built so far only as the `-allowlist` client posture on another branch: no UDP carriers, a browser ClientHello, cover names tried in turn. The DNS lifeline and regime detection remain |
 | shutdown | Lifelines keep probing at low rate; session resumes on regime lift (path death ≠ session death, §14.6) |
 
 **Split TCP under a censorship profile.** Split TCP (§11.3) carries the bytes of real inner connections — most often TLS records themselves — inside the carrier. On a TLS-borne camouflage carrier those bytes present a genuine TLS-in-TLS shape to a passive classifier, whatever the ClientHello cover says. Split-TCP streams are therefore scheduled per link quality only in profiles without a censorship posture; under a censorship profile they are never placed on TLS-borne carriers (they remain free on every other carrier). Record-layer padding is optional hardening for the same shape problem, not a prerequisite for this rule.
@@ -295,10 +295,14 @@ reappearing flips a classification and fails CI.
   for cases where ISP-vs-national attribution changes the response.
 - **Allowed-infrastructure carriers** for the allowlist regime (the
   "application-layer lifeline" adapter contract below DNS/ICMP in the D6
-  sense); rendezvous-only role, never data plane.
+  sense); rendezvous-only role, never data plane. The DNS lifeline
+  (`dns-lifeline.md`) is the first concrete instance and shares its
+  adapter shape.
 - **Rendezvous and relay rotation** proper: private-relay distribution,
   fronted low-bandwidth broker, migration story. Profiling assumes these
-  exist; it does not specify them.
+  exist; it does not specify them. `dns-lifeline.md` §3 specifies a
+  signed DNS beacon as one rendezvous channel; distribution and the
+  operator's side of rotation remain open.
 - **Probe budgeting.** Adaptive caps on probe rate/volume per network to
   bound the profiler's own observability; needs measurement first.
 - **Per-jurisdiction safety policy** for canary selection (§3.3), with
