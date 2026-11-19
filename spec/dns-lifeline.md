@@ -196,11 +196,11 @@ polls and in reachable datagram size (§2.4.1):
 
 | polls/min | interval | q/s | down | inner datagram | detectability |
 |---|---|---|---|---|---|
-| 6 | 10 s | 0.1 | 0.04 KiB/s | 66 B | **floor; indistinguishable from an idle host** |
-| 30 | 2 s | 0.5 | 0.20 KiB/s | 198 B | default ceiling; unremarkable |
-| 120 | 0.5 s | 2 | 0.80 KiB/s | 660 B | a busy client; still ordinary |
-| 300 | 0.2 s | 5 | 2.0 KiB/s | 1.5 KB | **visible to any zone-volume monitor** |
-| 1200 | 0.05 s | 20 | 8.0 KiB/s | 6.2 KB | textbook tunnel; expect the zone blocked |
+| 6 | 10 s | 0.1 | 0.04 KiB/s | none (control only) | **floor; indistinguishable from an idle host** |
+| 30 | 2 s | 0.5 | 0.20 KiB/s | 66 B | default ceiling; unremarkable |
+| 120 | 0.5 s | 2 | 0.80 KiB/s | 528 B | a busy client; still ordinary |
+| 300 | 0.2 s | 5 | 2.0 KiB/s | 1.45 KB | **visible to any zone-volume monitor** |
+| 1200 | 0.05 s | 20 | 8.0 KiB/s | 6.1 KB | textbook tunnel; expect the zone blocked |
 
 **The default is 30/min and the operator raises it, because the cost is
 not ours to pay.** Every poll above the floor is a query to somebody
@@ -342,38 +342,42 @@ IP packet larger than `max_packet` into several `IP_FRAGMENT`s, sent one
 per poll. So the inner datagram a path can carry is set by how many
 fragments fit before that expiry at the rate it is polling — with a margin
 for one round trip, since the clock starts when the first fragment
-arrives:
+arrives, **and for the control polls that may interrupt the emission**
+(§4.3.2):
 
-| rate | interval | fragments (5 s − RTT margin) | largest inner IP datagram |
-|---|---|---|---|
-| 6/min | 10 s | 1 | 66 B |
-| 30/min | 2 s | 3 | 198 B |
-| 120/min | 0.5 s | 10 | 660 B |
-| 300/min | 0.2 s | 24 | 1,584 B |
+| rate | interval | ideal | with 2 interruptions | largest datagram |
+|---|---|---|---|---|
+| 6/min | 10 s | 1 | **0** | **none: control only** |
+| 30/min | 2 s | 3 | 1 | 66 B |
+| 120/min | 0.5 s | 10 | 8 | 528 B |
+| 300/min | 0.2 s | 24 | 22 | 1,452 B |
+
+**The floor cannot carry IP at all, and that is the honest answer.** Two
+interruptions cost 20 s of a 6/min path's 5 s window, so no datagram of
+two or more fragments can complete — and a one-fragment datagram is the
+floor case that a 66-byte payload barely covers. So the lifeline at 6/min
+is **control only**, and the dial is what makes IP possible: 30/min buys
+one fragment, 120/min buys eight.
 
 **The rate dial (§2.3) is therefore also the inner-MTU dial**, and that is
 the strongest argument for raising it: at 6/min a 100-byte DNS query (137 B
-of ARC packet, three fragments) is *impossible*, not merely slow. Every
-step up the rate ladder buys reachable datagram size linearly, which
-matters more than the byte rate for real applications.
+of ARC packet, three fragments) is not merely slow but impossible, and it
+stays impossible at 30/min where only one fragment fits. Every step up the
+rate ladder buys reachable datagram size roughly linearly, which matters
+more than the byte rate for real applications.
 
 **Use a deadline below 5 s, not equal to it.** The expiry starts when the
 *first* fragment arrives, and the last must be there strictly before it —
-so the count is `⌊(5 s − margin) / interval⌋ + 1` with a margin covering
-one resolver round trip, not `⌊5 s / interval⌋ + 1`:
+so the bound is `⌊(5 s − RTT − interruptions) / interval⌋ + 1`, with a
+margin covering one resolver round trip and the control polls that may
+interrupt the emission. The table in §2.4.1 gives the result for each rate,
+with and without interruptions, and that is the only place it is stated.
 
-| interval | naive `⌊5/iv⌋+1` | with 0.2 s margin | IP payload |
-|---|---|---|---|
-| 10 s | 1 | 1 | 66 B |
-| 2 s | 3 | 3 | 198 B |
-| 1 s | 6 | **5** | 330 B |
-| 0.5 s | 11 | **10** | 660 B |
-| 0.2 s | 26 | **24** | 1,584 B |
-
-The divergence grows with the rate, which is exactly where the dial is
-worth having — so the adapter recomputes the bound from its **measured**
-RTT after each round trip rather than from a nominal figure, and shrinks
-the accepted datagram if the path gets slower.
+The divergence from the naive `⌊5 s / interval⌋ + 1` grows with the rate,
+which is exactly where the dial is worth having — so the adapter recomputes
+the bound from its **measured** RTT after each round trip rather than from
+a nominal figure, and shrinks the accepted datagram if the path gets
+slower.
 
 Fragments of one datagram go out on consecutive polls, so they are
 `interval × (n−1)` apart and the last must land inside the window. The
@@ -484,25 +488,29 @@ traffic needs **one poll per ARC packet** (§2.4), and because the two
 directions have different `max_packet` values they fragment differently:
 **66 B of IP per uplink fragment, 354 B per downlink packet.**
 
-| inner IP | up: fragments | at 6/min | at 30/min | at 120/min | down: polls (EDNS) | down (no EDNS, 113 B) |
+| inner IP | up: fragments | at 6/min | at 30/min | at 120/min | at 300/min | down: polls (EDNS) |
 |---|---|---|---|---|---|---|
-| 40 B | 1 | yes | yes | yes | 1 | 1 |
-| 66 B | 1 | yes | yes | yes | 1 | 1 |
-| 150 B | 3 | **no** | yes | yes | 1 | 2 |
-| 300 B | 5 | **no** | **no** | yes | 1 | 3 |
-| 1,200 B | 19 | **no** | **no** | **no** | 4 | 11 |
+| 40 B | 1 | **no** | yes | yes | yes | 1 |
+| 66 B | 1 | **no** | yes | yes | yes | 1 |
+| 150 B | 3 | **no** | **no** | yes | yes | 1 |
+| 300 B | 5 | **no** | **no** | yes | yes | 1 |
+| 1,200 B | 19 | **no** | **no** | **no** | yes | 4 |
 
-The "at N/min" columns are §2.4.1's 5 s window applied to the uplink: one
-66-byte fragment fits at 6/min, three (198 B) at 30, eleven (726 B) at 120.
+The "at N/min" columns are §2.4.1's budget **with interruptions** (§4.3.2),
+which is the operative number: none at 6/min, one fragment (66 B) at 30,
+eight (528 B) at 120, twenty-two (1,452 B) at 300. So the uplink carries
+almost nothing until the dial is raised — a 100-byte DNS query needs 150 B
+and therefore 120/min or better.
+
 The downlink is far more generous — 354 B per packet with EDNS(0), so a
-300-byte answer is one poll and a 1,200-byte one four. Only a resolver that
-does not honour EDNS(0) fragments the downlink at all.
+300-byte answer is one poll and a 1,200-byte one four, and only a resolver
+that does not honour EDNS(0) multiplies that.
 
 That asymmetry is the practical argument for the rate dial: at 30/min the
 downlink already carries 354 B per poll, which is more than most DNS
-answers need, while the uplink is still limited to 198 B of datagram by
-the 5 s window. Raising the rate helps the uplink roughly four times as
-much as the downlink, and that gap is why the dial exists.
+answers need, while the uplink carries one 66-byte fragment. Raising the
+rate helps the uplink far more than the downlink, and that gap is why the
+dial exists.
 
 The ratio is per *poll*, not per byte: on the wire both directions carry
 about 0.48 bytes of cell per byte of DNS message (0.482 up on base32,
@@ -1027,16 +1035,27 @@ it is the adapter's, not the engine's. Rules:
   cell, never an empty unauthenticated one (§16.5), so the relay can tell
   a live client from a curious resolver — and so a cell the relay queued
   unprompted actually gets collected.
-- **Pacing.** A token bucket of `-dns-lifeline-rate` polls per minute —
-  the dial of §2.3, default 30, floor 6 — and a separate per-resolver
-  bucket, so a client cannot spend a shared resolver's patience. On
-  `SERVFAIL`, `REFUSED`, `FORMERR`, or an answer later than the interval,
-  the bucket drains and the interval stretches — but **never past the
-  keepalive floor of §2.3**: the floor is what keeps the session alive, so
-  backing off below it is not caution, it is a slower way to close the
-  session. What backs off instead is what the poll carries: after three
-  failures in a row the poll holds only a PING, and application cells
-  wait.
+- **Pacing, and the request timeout is not the send interval.** A token
+  bucket of `-dns-lifeline-rate` polls per minute — the dial of §2.3,
+  default 30, floor 6 — and a separate per-resolver bucket, so a client
+  cannot spend a shared resolver's patience.
+
+  These are two different numbers and conflating them breaks both
+  directions. The **send interval** is `60 / rate` and is when the next
+  *slot* opens; the **request timeout** is how long an individual query may
+  go unanswered before its slot is declared lost, and it must be at least
+  one resolver round trip — which at 120/min (0.5 s interval) is usually
+  *longer* than the interval and at 6/min is far shorter. So:
+
+  - A poll is declared lost after `max(2 × interval, 2 × srtt)` — never
+    less than two round trips, so a slow resolver is not judged by the
+    dial.
+  - The interval stretches on `SERVFAIL`, `REFUSED`, `FORMERR`, or a lost
+    poll — but **never past the keepalive floor of §2.3**: the floor is
+    what keeps the session alive, so backing off below it is not caution,
+    it is a slower way to close the session.
+  - What backs off instead is what the poll carries: after three failures
+    in a row the poll holds only a PING, and application cells wait.
 - **Giving up is explicit.** A path that cannot meet the floor at all —
   answers arriving after the 15 s suspect threshold, five failures in a
   row, or establishment failing three times (§2.5) — is reported unusable
@@ -1138,11 +1157,27 @@ found the first two:
 
   When the queue is full and more IP arrives, the adapter **drops new
   datagrams** rather than evicting fragments of one already in emission —
-  evicting would waste the polls already spent. Control is never dropped
-  and never queued behind a datagram: it takes the next poll, and the
-  datagram's remaining fragments resume after. A dropped datagram is
+  evicting would waste the polls already spent. A dropped datagram is
   counted and reported (§5.3.1), and because ARC does not retransmit IP
   (§4.3.4) it is simply lost, which is the honest outcome.
+
+  **Control interrupting an emission is bounded, and it is why the bound
+  is computed conservatively.** A PING or an ACK owed to the relay takes
+  the next poll ahead of a datagram's fragments — it must, or the ACK
+  deadline of §4.4.1 slips — and each interruption spends one of the
+  datagram's 5 s. So the fragment budget assumes interruptions rather than
+  hoping for none:
+
+  - The budget is `⌊(5 s − RTT − interruptions × interval) / interval⌋ + 1`,
+    with `interruptions` = 2, one for a keepalive and one for an ACK.
+  - If interruptions exhaust the slack, the datagram is **abandoned**
+    rather than half-emitted: its remaining fragments are dropped and
+    counted, and the next admitted datagram starts clean. Half-delivering
+    a datagram that cannot assemble is strictly worse than dropping it.
+  - Control is never delayed to protect a datagram. A datagram is
+    best-effort (§4.3.4) and the session is not, so the priority is
+    unambiguous — but the *budget* is what keeps best-effort from
+    meaning "usually fails at the floor".
 - **Before validation** the adapter polls with whatever the handshake
   needs, and here the answer is *not* a fresh packet: `HANDSHAKE_INIT`
   and `AUTH` are retransmitted by `Client.Tick` on their own schedule
@@ -1261,15 +1296,30 @@ fit a 150 B no-EDNS answer. Three rules, and they are ordered:
    outstanding-age clock (§4.4.1) clears and the path stays healthy. The
    alternative — treating "did not fit" as "lost" — would mark a working
    path unhealthy every time a resolver dropped EDNS.
-3. **A frame that cannot fit any answer for `2 × W × interval` is
-   reported.** That is a genuine stall (a frame larger than any cell the
-   path will ever carry, e.g. after a resolver permanently stopped
-   honouring EDNS), so it is logged and the path is reported degraded. It
-   is *not* retried forever, and it is not silently dropped either — the
-   operator needs to know the resolver changed shape.
+3. **A frame that has outgrown every answer gets a terminal outcome, not
+   an indefinite queue stay.** This is distinct from a frame that merely
+   does not fit *this* answer: the queue can be temporarily squeezed by a
+   no-EDNS poll and then relax, but a frame can also be permanently
+   unsendable — a 391 B packet after the resolver stopped honouring EDNS
+   entirely. The two must not read the same to a timer.
 
-This is the case the review asked about and I had left implicit: "does not
-fit" and "was lost" look identical to a timer, and they must not.
+   The adapter therefore tracks the largest answer it has seen since the
+   frame was queued. If the frame has not fitted any answer for
+   `2 × W × interval`, it is **failed** — requeued for re-sealing if the
+   session can (control, stream: the session re-fragments at the current
+   `max_packet`), or dropped and reported if it cannot (`IP_PACKET`, since
+   the fragment boundary is fixed at sealing). Either way the outcome is
+   terminal and the path is reported degraded, because the operator needs
+   to know the resolver changed shape.
+
+   Requeuing rather than dropping is what makes this recover: a control
+   frame re-sealed at the *current* `max_packet` will fit the *current*
+   answers, which is exactly the shape of the failure.
+
+So: "did not fit this answer" is progress and keeps the path healthy;
+"fits no answer any more" is a terminal outcome and a degraded path. The
+difference is which of the two the adapter has observed, and it is
+observable.
 
 #### 4.3.4 What ARC does and does not repair
 
@@ -1382,7 +1432,8 @@ the budget that poll's query allows. Three properties matter:
   interval.** Two polls are in flight, so the client may already have sent
   slot 1 before slot 0's answer returns; it cannot acknowledge slot 0 in a
   poll that has left. The next opportunity is the *reuse* of slot 0, which
-  is `W × interval` after it was issued:
+  is `W × interval` after it was issued, with `W` and `interval` the
+  client's **declared** values (§4.4.2):
 
   | rate | W | interval | timeout at RTT 0.5 s | vs PTO 0.69 s |
   |---|---|---|---|---|
@@ -1474,9 +1525,52 @@ the outstanding-age clause must be measured against
 Without that, a relay at 6/min would call its own answers lost 0.68 s after
 sending them, thirty times before an ACK was possible — the same error the
 ack-timeout finding caught, in the health clock rather than the
-retransmission one. Both now derive from one place: **the carrier reports
-its `W × interval` to the session, and the session adds it to every
-deadline that waits on the peer's next poll.**
+retransmission one.
+
+#### 4.4.2 How the relay learns the peer's poll interval
+
+The previous paragraph says the session adds the carrier's `W × interval`
+to every deadline that waits on the peer's next poll. On a client that is
+local knowledge; **on the relay it is not, and it cannot be measured.**
+
+A relay watching polls arrive cannot infer the interval from their
+spacing:
+
+- a **backlogged** client polls as fast as its token bucket allows, so
+  spacing collapses towards the RTT;
+- an **idle** client polls at the keepalive floor, not at the dial;
+- a client keeping **`W` slots busy** issues `W` polls per interval, so
+  spacing is `interval / W`.
+
+Every one of those underestimates the interval, and the second and third
+underestimate it by exactly the factor the deadline needs. A relay that
+measured spacing would be as wrong as one that assumed a constant.
+
+**Rule: the client declares its interval, and the relay uses the declared
+value for the whole session.** It travels in the **`AUTH` credential** —
+already authenticated, already per-session, and read before the relay seals
+anything that would need the deadline. The credential's existing envelope
+carries it as an optional trailing field, so a client that omits it is
+treated as `W = 1, interval = 60 / rate-floor` and simply gets a
+conservative deadline; no client is refused for not knowing about it.
+
+Three consequences:
+
+- **It is a claim, not an observation.** A client that understates its
+  interval makes the relay's deadlines shorter, which costs only spurious
+  retransmissions for itself — a self-inflicted penalty, like misreporting
+  a budget, so nothing needs policing.
+- **A rate change restates it.** Raising the dial mid-session is worth a
+  fresh `AUTH` (§9.4 already permits credential refresh), because the
+  declared interval is what the relay's timers are built on.
+- **The relay's own `W` is its own.** It answers one poll with one cell,
+  so its `W` is 1 and only the *client's* interval enters the sum. The
+  two directions do not share a window.
+
+This is the one piece of the deadline story that had no mechanism behind
+it — I asserted the relay applies `W × interval` without saying where the
+number came from, and measuring it is not merely unreliable but wrong in
+the direction that hurts.
 
 Two consequences:
 
@@ -1791,22 +1885,24 @@ resolver became the bottleneck without correlating two logs.
 
 - **Control, always.** Handshake, AUTH, path validation, keepalives,
   ACKs, `CLOSE`, `PATH_ABANDON`.
-- **IP traffic, but only what one fragment carries below the ceiling.**
-  The narrowness is forced by numbers, not caution: at the steady 6
-  polls/min only a single 66-byte fragment reassembles inside the 5 s
-  window (§2.4.1), so a 100-byte DNS query is *impossible* there and a
-  30-byte answer is the largest comfortable datagram. At the default three
-  fragments fit (198 B). Application DNS still gets a reserved slice of
-  the budget — the first 4 KiB/hour of downlink, marked as a privileged
-  flow by the session (§5.3.1) — but a query that does not fit one
-  fragment is **refused**, not slowly attempted: a half-delivered datagram
-  wastes a poll and delivers nothing.
+- **IP traffic, but only when the dial is high enough to carry it.** The
+  narrowness is forced by numbers, not caution: at the 6/min floor control
+  interruptions (§4.3.2) consume the whole 5 s window, so the lifeline
+  carries **no inner IP at all**. At the 30/min default exactly one
+  66-byte fragment fits; eight fragments (528 B) need 120/min and
+  twenty-two (1,452 B) need 300. A 100-byte DNS query is 150 B and
+  therefore needs 120/min or better.
+
+  Application DNS still gets a reserved slice of the byte budget — the
+  first 4 KiB/hour of downlink, marked as a privileged flow by the session
+  (§5.3.1) — but a query that does not fit the current fragment budget is
+  **refused**, not slowly attempted: a half-delivered datagram wastes
+  polls and delivers nothing.
 - **Everything else, subject to §15.2 item 6.** A flow is placed here
   only when nothing else is validated, and only while its packets fit the
   current fragment budget. Messaging that sends one small datagram at a
-  time: reachable. Anything whose first exchange exceeds 69 bytes needs
-  the path to be at its ceiling, and the adapter will say so rather than
-  stall.
+  time: reachable at 120/min or above. Anything larger needs a higher dial,
+  and the adapter says so rather than stalling.
 - **The user is told.** `regime = allowlist` and `shutdown` both surface
   a status line ("lifeline only: full tunnel unavailable") and the
   journal records the regime, the poll rate and the budget remaining.
