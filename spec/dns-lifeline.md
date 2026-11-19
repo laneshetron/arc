@@ -359,21 +359,33 @@ That is simpler than my last two revisions made it: the slot label costs
 case that used to fit a one-cell INIT — no longer does, and there is a
 single establishment sequence rather than two.
 
-**The enrollment credential needs two cells, and that is why the handshake
-is exempt from the one-cell rule.** An enrollment `AUTH` carries the magic
-(12 B), invite id (8), secret (16), a length-prefixed 43-byte token and a
-32-byte device name — 113 B of credential, 116 B with its frame header,
-against a 78-byte frame budget at `max_packet` 115. It does not fit, and it
+**The enrollment credential needs two cells, and that forces a mechanism
+the adapter cannot invent.** An enrollment `AUTH` carries the magic (12 B),
+invite id (8), secret (16), a length-prefixed 43-byte token and a 32-byte
+device name — 113 B of credential, 116 B with its frame header, against a
+78-byte frame budget at `max_packet` 115. It does not fit one cell, and it
 cannot be shrunk: every field is load-bearing and the name is the
 operator's.
 
-So `AUTH` may span cells when it carries an enrollment, and §2.4's
-one-cell rule is stated as applying to **everything but the handshake**.
-That is safe for the reason §2.4 already gives: handshake packets never
-enter `sentLog` (`sendInit` writes to `c.out`; `sendAuth` passes `AUTH` as
-`extra`), so no PTO can preempt a two-cell emission, and their own timers
-drive the retries. The same exemption that makes the two-cell `INIT`
-possible covers this.
+Saying "`AUTH` may span cells" is not enough, because **`sendAuth` calls
+`conn.transmit`, which seals one packet and emits one datagram.** Spreading
+the cells of one sealed packet across two polls would mean the adapter
+splitting a `Datagram` — and the alternative, sealing two packets, produces
+two `AUTH` frames, two relay answers, and a doubled credential.
+
+So the handshake needs one explicit rule, stated where it belongs rather
+than implied: **a handshake packet may be emitted across as many polls as it
+has cells, and the adapter holds its remaining cells between them.** Its
+bytes are stable across retransmissions (`TestInitIsStableAcrossRetransmissionsAndCookies`),
+so the adapter can carry cell *n* of a given attempt on poll *n* and know
+the bytes are the ones it already started; it must not interleave two
+attempts' cells, which is the same rule the two-cell `INIT` already needs.
+
+That is safe for the reason §2.4 gives rather than a new one: handshake
+packets never enter `sentLog` (`sendInit` writes to `c.out`; `sendAuth`
+passes `AUTH` as `extra`), so no PTO can preempt a two-cell emission, and
+their own timers drive the retries. The exemption that allows the two-cell
+`INIT` covers the enrollment `AUTH` for the same reason.
 
 A poll carries one uplink cell and returns one downlink cell. The INIT
 needs two cells, so the relay cannot see a complete INIT until the second
@@ -431,6 +443,29 @@ falls back to. Concretely:
   its rate again to reconnect. That is why §5.1's "open the lifeline"
   sequence sets the rate to the establishment minimum before the first
   `INIT` and only relaxes to the dial afterwards.
+
+**The burst is bounded by the operator's ceiling, not by the minimum.**
+Those two sentences pull against each other, and the review is right to
+notice: if the operator configured 6/min, a client that polls at 20/min to
+establish is doing three times what it was told, and every `SCHEDULE`
+bound in §4.4.2 was derived from the declared interval. Two rules resolve
+it:
+
+- **The ceiling wins.** `-dns-lifeline-rate` is a limit, so a dial below the
+  establishment minimum means **this carrier cannot be established on this
+  configuration** — the client reports that and does not burst past it.
+  Silently exceeding an operator's configured rate to make the design work
+  would make the dial meaningless at the one moment it matters most.
+- **The burst, when permitted, is declared.** A client that establishes
+  above its steady dial sends a `SCHEDULE` carrying the establishment
+  interval before the first `INIT`, and a second one at the steady interval
+  once it is active. The relay's deadlines therefore track what the client
+  is actually doing, and §4.4.2's "declare when your pacing changes" covers
+  this case rather than being an exception to it.
+
+So the table above is a statement about what the *protocol* needs, and
+§5.1's floor for a usable configuration is 20/min — not a licence to
+exceed a lower one.
 
 This was implicit in my last revision ("polls at the dial's rate from the
 first INIT") and wrong for any dial below 20/min, which includes the
@@ -1711,6 +1746,14 @@ which must open:
   validated path exists, and §5.1's closing rules below take it away again
   when one appears.
 
+**And a configured rate that can establish.** §2.5 shows that a carrier
+needs a poll interval under 3.33 s to complete a handshake inside
+`HandshakeTimeout`, so `-dns-lifeline-rate` below 20/min means this carrier
+cannot be brought up at all on that configuration. The client says so at
+startup rather than trying and failing repeatedly, and it does **not** burst
+past the configured ceiling to make it work — the ceiling is the operator's
+decision (§2.5).
+
 The separation matters because `-allowlist` and `-censorship` exist to
 shape how *ordinary* carriers behave: which cover names to try, whether to
 send UDP to a hosting address. Broadening them to silently authorize a
@@ -1806,12 +1849,12 @@ different rates. Four caps:
   the honest way to expose it.
 - **The caps are per hour wall-clock**, not rolling windows, so exhaustion
   is a clean boundary a test can hit, and the reset is predictable.
-- **Exhaustion carries control only**, at the floor of 6/min: keepalives
-  and ACKs continue, and every other frame waits for the next hour or the
-  path to be closed. Control cannot be throttled further without killing
-  the session (§2.3) — and §5.3.1 explains that this must be enforced in
-  the relay's session, where frames are classifiable, not at the
-  nameserver.
+- **Exhaustion sheds keepalives before it sheds acknowledgements.** The
+  exact order is in §5.3.1: `ACK`, `CLOSE` and handshake frames are never
+  shed; `PING`, `PATH_*`, `NEW_PATH` and `SCHEDULE` are shed once the
+  allowance is gone, which eventually kills the path — deliberately, and
+  reported. §5.3.1 also explains why this must be enforced in the relay's
+  session rather than at the nameserver.
 - **What survives path replacement.** The caps belong to the *device*, not
   the path: a lifeline that dies and reopens, or moves to a second relay,
   keeps counting. Otherwise closing and reopening the path would be a
@@ -1856,8 +1899,9 @@ belongs where the frames are still visible.
   set when the path is created, from the carrier, alongside the
   `maxPacket` of §2.4.
 - **When assembling a packet for a constrained path, the session admits
-  frames by class:** unbound control (`PING`, `ACK`, `PATH_*`, `CLOSE`,
-  `ERROR`), handshake and `SCHEDULE` frames always; **everything else is
+  frames by class:** `ACK`, `CLOSE`, handshake (including `ENROLLED`) and
+  `ERROR` are never shed; `PING`, `PATH_*`, `NEW_PATH` and `SCHEDULE` are
+  shed when the allowance is gone (see below); **everything else is
   refused, unconditionally, because this revision carries no inner IP**
   (§2.6, §5.4).
 
@@ -1866,15 +1910,35 @@ belongs where the frames are still visible.
   with no allowance left still carries every control frame. Two separate
   rules — a **class gate** that never opens for payload in this revision,
   and a **byte allowance** that bounds the control traffic itself.
-- **The allowance therefore bounds control only**, and at the floor it
-  never binds: 6 polls/min of a 133-byte cell is 47 KiB an hour, well
-  inside any sane cap. It exists so that a client which raises the dial and
-  then misbehaves is still bounded, and so the relay's per-device copy has
-  something to count that is not frame-class-dependent.
-- **Exhaustion is reported, not silent.** The client counts control frames
-  shed by the allowance and says so in the journal and the status line.
-  With no payload admitted, exhaustion is a rare operator-policy event
-  rather than a normal consequence of use.
+- **What a depleted allowance sheds, precisely.** This was contradictory
+  in my last revision — control was "always" admitted *and* bounded by an
+  allowance — so here is the order of operations. Frames are considered in
+  this sequence, and the first rule that matches wins:
+
+  1. **Never shed:** `ACK`, `CLOSE`, and handshake frames (including
+     `ENROLLED`). Dropping an ACK breaks the health mechanism (§4.4.1);
+     dropping a `CLOSE` leaves the peer hanging; dropping a handshake
+     frame makes the path unestablishable. These three are the minimum for
+     a session that continues to exist.
+  2. **Shed only when the allowance is gone:** `PING`, `PATH_*`,
+     `NEW_PATH`, `SCHEDULE`, `SCHEDULE_ACK`. A path with no keepalive
+     left will go `SUSPECT` and eventually die — which is the intended
+     effect of an exhausted allowance, and it is why exhaustion is
+     **reported** rather than silent.
+  3. **Never admitted in this revision:** payload (§5.4).
+
+  So "control, always" was wrong as written. The correct statement is that
+  **a starving session keeps its acknowledgements, its closes and its
+  handshake, and loses its keepalives** — the smallest set that lets it
+  either recover on the next window or die cleanly.
+- **At the floor the allowance never binds:** 6 polls/min of a 133-byte
+  cell is 47 KiB an hour, and every frame in rule 2 fits. It exists so a
+  client that raises the dial and then misbehaves is bounded, and so the
+  relay's per-device copy has a non-class-dependent quantity to count.
+- **Exhaustion is reported, not silent**, per the journal and status line,
+  with the frame classes shed — because a session that lost its keepalives
+  and then died should be explicable from the log rather than looking like
+  a network fault.
 - **The application-DNS slice is moot in this revision**, since no IP
   flows are admitted (§2.6). The rule is retained for the inner-IP
   revision: `flowTable` already keys flows, so the inner resolver's
@@ -1946,9 +2010,17 @@ resolver became the bottleneck without correlating two logs.
 **This revision carries control frames and nothing else** (§2.6).
 
 - **Carried:** handshake (`HANDSHAKE_INIT`, `COOKIE_REPLY`,
-  `HANDSHAKE_RESP`, `AUTH`, `AUTH_RESULT`), `PATH_JOIN`,
+  `HANDSHAKE_RESP`, `AUTH`, `AUTH_RESULT`, and **`ENROLLED`**), `PATH_JOIN`,
   `PATH_CHALLENGE`, `PATH_RESPONSE`, `PATH_ABANDON`, `NEW_PATH`, `PING`,
   `ACK`, `CLOSE`, `ERROR`, and `SCHEDULE`/`SCHEDULE_ACK` (§4.4.2).
+
+  `ENROLLED` is on this list and my first version of it was wrong to
+  refuse it: `arc-client enroll` waits for `ENROLLED` before writing the
+  device name and ID into the profile and exiting, so refusing it would
+  leave an enrolled device with a working token and no record of what it
+  enrolled as. It is 10–41 B, one cell, and it is part of finishing a
+  handshake rather than payload — the distinction this section is drawing
+  is *control versus data*, not *small versus large*.
 - **Refused:** `IP_PACKET`, `IP_FRAGMENT`, `IP_DATAGRAM`, `STREAM_OPEN`,
   `STREAM`, `MAX_STREAM_DATA`, `MAX_DATA`, `STREAM_RESET`, `FEC_REPAIR`,
   `FEC`, `REDUNDANCY`, `DIAGNOSTICS_OPEN`. Refused at the **session**,
