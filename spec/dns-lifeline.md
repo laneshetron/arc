@@ -1447,23 +1447,25 @@ the budget that poll's query allows. Three properties matter:
   `RelayTransmitted(token)` when the answer leaves for the resolver.
   Otherwise the relay's PTO fires on answers the adapter is still holding,
   and its RTT samples poll latency, exactly as on the client side.
-- **The relay's ack timeout is `W × interval + RTT`, not `RTT` and not one
-  interval.** Two polls are in flight, so the client may already have sent
-  slot 1 before slot 0's answer returns; it cannot acknowledge slot 0 in a
-  poll that has left. The next opportunity is the *reuse* of slot 0, which
-  is `W × interval` after it was issued, with `W` and `interval` the
-  client's **declared** values (§4.4.2):
+- **The relay's ack timeout is `W × floor_ms + RTT`.** Two reasons, and
+  they multiply. First, two polls are in flight, so the client may already
+  have sent slot 1 before slot 0's answer returns and cannot acknowledge
+  slot 0 in a poll that has left; the next opportunity is slot 0's *reuse*,
+  `W` intervals away. Second — and this is the correction from the last
+  revision — the interval in that expression is **`floor_ms`, not
+  `interval_ms`**, because the relay cannot tell whether the poll it is
+  answering was the client's last active one (§4.4.2).
 
-  | rate | W | interval | timeout at RTT 0.5 s | vs PTO 0.69 s |
-  |---|---|---|---|---|
-  | 6/min | 2 | 10 s | 20.5 s | 30× too short |
-  | 30/min | 2 | 2 s | 4.5 s | 6.5× too short |
-  | 120/min | 2 | 0.5 s | 1.5 s | 2.2× too short |
-  | 300/min | 2 | 0.2 s | 0.9 s | 1.3× too short |
+  | floor_ms | W | timeout at RTT 0.5 s | vs PTO 0.69 s |
+  |---|---|---|---|
+  | 10 s (the default floor) | 2 | 20.5 s | 30× too short |
+  | 2 s (a floor set higher) | 2 | 4.5 s | 6.5× too short |
 
-  My previous revision said one interval, which is right for `W = 1` and
-  wrong by an interval once a second slot exists. At 6/min the relay would
-  have re-sent every multi-poll transfer long before its ack could arrive.
+  My second revision said one interval, right for `W = 1` and wrong by an
+  interval once a second slot exists; my third used the active interval,
+  right for a busy client and wrong for the moment it stops. Both errors
+  had the same shape — using the number that was true *while* the transfer
+  was happening, on a deadline that outlives it.
 
 **And one correction on `AUTH_RESULT`.** My earlier table said "the
 client's first `DATA` or `ACK`" proved it arrived. It does not:
@@ -1531,18 +1533,18 @@ multi-poll downlink unhealthy while it was working correctly.
 The client's deadline can be `3 × PTO` because a poll it sends is
 acknowledged in the answer to *that* poll. **The relay's cannot**: it
 transmits an answer immediately, but the ACK cannot arrive until the
-client's next poll, `W × interval` later. So for a packet the relay sent,
-the outstanding-age clause must be measured against
-`W × interval + 3 × PTO`:
+client's next poll — and since the relay cannot know whether that poll is
+the next one in a burst or ten seconds away, the bound uses `floor_ms`
+(§4.4.2). So for a packet the relay sent, the outstanding-age clause is
+`W × floor_ms + 3 × PTO`:
 
-| rate | W × interval | relay's limit at RTT 0.2 s | client's limit |
+| floor_ms | W × floor_ms | relay's limit at RTT 0.2 s | client's limit |
 |---|---|---|---|
-| 6/min | 20 s | 20.7 s | 0.68 s |
-| 30/min | 4 s | 4.7 s | 0.68 s |
-| 120/min | 1 s | 1.7 s | 0.68 s |
+| 10 s | 20 s | 20.7 s | 0.68 s |
+| 5 s | 10 s | 10.7 s | 0.68 s |
 
-Without that, a relay at 6/min would call its own answers lost 0.68 s after
-sending them, thirty times before an ACK was possible — the same error the
+Without that, a relay would call its own answers lost 0.68 s after sending
+them, thirty times before an ACK was possible — the same error the
 ack-timeout finding caught, in the health clock rather than the
 retransmission one.
 
@@ -1590,11 +1592,28 @@ fields are given below, once the staleness problem is stated):
   frame would have every packet carrying it *rejected*, including the
   packets that carry its own data. That would turn an optimisation into an
   outage.
-- **Sent reliably**, like `INVITE_REQUEST`: `Client.Tick` repeats it every
-  2 s until the relay has answered something that proves it arrived. The
-  session already has that machinery for request/response frames, and
-  using the `AUTH` path instead would have put a timing claim into an
-  authentication decision.
+- **Sent with a generation, and confirmed by it.** A frame in the
+  extension range is never acknowledged — ARC acknowledges *packets*, and
+  an ignorable frame gives the sender no evidence it was understood. So
+  `SCHEDULE` carries a `gen:u32` the client increments on every change, and
+  the relay echoes the highest `gen` it has applied in its own control
+  traffic:
+
+  ```text
+  0x80  SCHEDULE      uint32 gen; uint16 interval_ms; uint16 floor_ms; uint8 window
+  0x82  SCHEDULE_ACK  uint32 gen
+  ```
+
+  The client re-sends `SCHEDULE` every 2 s until it sees `SCHEDULE_ACK`
+  with `gen >= its own`, and stops. That is the smallest handshake that
+  answers "did the relay apply it?" — an ack of the *frame*, which the
+  packet-level ACK cannot express, and it is one extra 4-byte frame that
+  the relay sends only in response.
+
+  `SCHEDULE_ACK` is `0x82`, also in the extension range: a client that does
+  not know it ignores it, which is correct — a client that never sees an
+  ack keeps re-sending at 2 s, which is harmless because the relay applies
+  an idempotent declaration.
 - **Not part of authentication.** A relay that has not received a
   `SCHEDULE` uses the conservative `W = 1` at the floor; a relay that has
   uses what it was told. No client is refused, and an old relay ignoring
@@ -1620,27 +1639,52 @@ its time in, and both are states where a wrong deadline is fatal:
   expire answers that were merely slow.
 
 So `SCHEDULE` carries **two** intervals, and the relay uses whichever it
-can justify:
-
-```text
-0x80  SCHEDULE   uint16 interval_ms; uint16 floor_ms; uint8 window
-```
+can justify. The field layout is the one given above:
 
 | the relay holds | meaning | used for |
 |---|---|---|
-| `interval_ms` | what the client uses while active | answers to the client's own polls |
-| `floor_ms` | 60/6, the keepalive interval | anything waiting for the *next* poll |
+| `floor_ms` | 60/6, the keepalive interval | **every deadline on a relay-sent packet** |
+| `interval_ms` | what the client uses while active | the client's slot-reuse bound; a future refinement |
 
-- **An answer to a poll the client just made** is acked on the client's
-  active schedule, so `interval_ms` applies.
-- **An unsolicited downlink packet** — relay-initiated, or a queue drained
-  while the client is idle — waits for the next poll, which an idle client
-  makes at `floor_ms`. Using `interval_ms` there is what makes an idle
-  session look unhealthy.
+**The relay always uses `floor_ms`, for every packet it sends, and the
+`interval_ms` field is not what the relay's deadlines use.** My previous
+version said it picked per packet — `interval_ms` for an answer to a poll
+the client just made, `floor_ms` for anything waiting on the next one — and
+that is wrong in the case the review named.
+
+The relay cannot know which poll is the client's **last active one**. A
+client polling at 120/min may go idle one interval later, and the reply
+sitting in flight when it does will not be acknowledged for `floor_ms`, not
+`interval_ms`. The relay would call that answer lost 0.5 s after sending it,
+in the ordinary course of a client going quiet. Since the transition is
+invisible to the relay, the only bound that survives it is the larger one:
+`max(interval_ms, floor_ms)`, which is `floor_ms` at every rate above the
+floor.
+
+So:
+
+- **`floor_ms` is the relay's hold deadline**, always. That is 10 s at the
+  default floor, so a genuinely lost answer takes one keepalive to notice
+  rather than one active interval. On a path whose control has its own PTO
+  and whose IP is best-effort (§4.3.4), that delay is affordable; being
+  wrong about the common idle transition is not.
+- **`interval_ms` is still declared**, because it is what makes the *relay's
+  own* pacing and the client's slot-reuse deadline right, and because a
+  future refinement can use it once there is a signal for the transition.
+  It is not used for the hold deadline.
 - **A backoff is a fresh `SCHEDULE`**, sent when the client changes its
-  interval, so the relay follows it down rather than expiring against a
-  stale expectation. It is also re-sent at most once a minute regardless,
-  so a relay that restarted picks it up without a reconnect.
+  interval, and re-sent at most once a minute regardless so a relay that
+  restarted picks it up. A backoff only ever *lengthens* the client's
+  interval toward the floor, so it can never make the relay's conservative
+  bound too short — which is why `floor_ms` stays safe across backoff too.
+- **Only a newer `gen` is applied.** `SCHEDULE` travels on whichever path
+  is primary, and paths reorder; a frame from a backoff could therefore
+  arrive *after* the recovery that ended it. The relay applies a
+  declaration only when `gen` is greater than the last it applied, and
+  acknowledges the highest it holds — so an old backoff cannot roll the
+  pace back to the floor after the client has already recovered. Equal
+  `gen` is applied idempotently and re-acknowledged, which is what makes
+  the client's 2 s repeat safe.
 
 Three consequences, unchanged:
 
@@ -2028,7 +2072,9 @@ shrink its answer budget mid-transfer.
 | **The emission queue is bounded** | At most one admitted datagram's fragments, `⌊(5 s − RTT) / interval⌋ + 1` of them, and control always takes the next poll ahead of a datagram's remaining fragments (§4.3.2) |
 | **The dial raised mid-session** | The inner-MTU grows with it, so a datagram refused at 6/min is accepted at 120/min without a reconnect (§2.4.1) |
 | **The dial at its default leaves the zone unremarkable** | At 30/min the journal shows 0.5 q/s; a test asserts the configured rate is what is actually offered, so no code path quietly raises it |
-| Answer budget shrinks mid-transfer (EDNS → no EDNS) | The emission re-splits to the smaller budget and reaches the tail; no cell is stranded waiting for a larger poll |
+| **Answer budget shrinks mid-transfer, packet still divisible** | An `IP_PACKET` or a control frame re-seals at the smaller `max_packet` and completes; no cell is stranded waiting for a larger poll |
+| **Answer budget shrinks mid-transfer, frame is indivisible** | A control frame larger than the new `max_packet` takes the bounded path of §4.3.3: one re-seal attempt at the smaller size, then a counted drop and a reported degraded path. It must **not** sit queued forever, and the failure must appear once rather than per poll |
+| **A resolver that never restores EDNS(0)** | After the bounded retries, the path stays up as control-only at the smaller `max_packet`; the journal records the downgrade and the dropped frame count, and data admission shrinks to the new inner budget |
 | A client receives but rejects a cell (a middlebox rewrote it) | The packet fails to assemble, is dropped at the assembly window, and a whole fresh copy is sent after the PTO |
 | A control packet with its single cell lost | Recovers by PTO: the session re-seals the frames into a new packet with a new number, since replayed ciphertext would be dropped |
 | `AUTH_RESULT` lost, client sends another AUTH | The session still establishes; the relay does not treat the retried AUTH as a receipt for the missing result |
@@ -2105,8 +2151,9 @@ is the implementation checklist:
 - a **per-path allowance** admitted before sealing (§5.3.1);
 - a **synthetic peer address** per association, routed like
   `stream.IsStreamAddr` (§4.2.1);
-- a **`SCHEDULE` frame** declaring the polling schedule, re-sent when the
-  client's pacing changes (§4.4.2).
+- a **`SCHEDULE` frame** declaring the polling schedule with a `gen`, and
+  a **`SCHEDULE_ACK`** to confirm the relay applied it, both in the
+  ignorable extension range (§4.4.2).
 
 **Relay side:**
 
