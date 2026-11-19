@@ -732,8 +732,9 @@ what makes rotation work — a beacon that could only speak for one relay
 could not move a client off a dead one.
 
 Sizes, zone `example.net`, one relay with one `tls` and one `udp`
-endpoint, one cover name and one carrier zone: body 153 B, TXT content
-208 characters in one character-string, and an answer of 492 B against a
+endpoint, one cover name and one carrier zone: **153 B** of signed record
+(the 89-byte body plus its 64-byte signature), so **207 characters** of
+TXT content in one character-string, and an answer of **491 B** against a
 query of 271 B. That is the only shape that fits a 512-byte answer without
 EDNS(0) (§3.2).
 
