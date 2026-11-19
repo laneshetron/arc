@@ -293,6 +293,12 @@ func (w *Watermarks) Snapshot() map[string]time.Time {
 	return out
 }
 
+// ErrRollback reports a record older than the newest already accepted for
+// its beacon name. §3.4 makes it a refusal even when the record verifies and
+// has not expired, so a caller that cannot tell it from an invalid signature
+// would log the wrong thing.
+var ErrRollback = errors.New("beacon: older than the newest accepted for this name")
+
 // Verify runs §3.3's acceptance checks on one content string and, on
 // success, applies the rollback watermark for that beacon name. The order is
 // signature, then not_after, then watermark, matching §3.3, and the
@@ -304,12 +310,10 @@ func Verify(content, name, suffix string, key []byte, now time.Time, w *Watermar
 		return nil, err
 	}
 	if w != nil && !w.Accept(name, b.Published) {
-		return nil, fmt.Errorf("%w: %s published %s", errRollback, name, b.Published.UTC().Format(time.RFC3339))
+		return nil, fmt.Errorf("%w: %s published %s", ErrRollback, name, b.Published.UTC().Format(time.RFC3339))
 	}
 	return b, nil
 }
-
-var errRollback = errors.New("beacon: older than the newest accepted for this name")
 
 // SortedNames returns the beacon names in a stable order, so a candidate
 // list built from a map is reproducible.

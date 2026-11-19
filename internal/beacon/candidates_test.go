@@ -353,7 +353,7 @@ func TestVerifyRefusesARollback(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = Verify(olderContent, "b1", Suffix(testZone), pub, now, w)
-	if !errors.Is(err, errRollback) {
+	if !errors.Is(err, ErrRollback) {
 		t.Fatalf("got %v, want errRollback", err)
 	}
 }
