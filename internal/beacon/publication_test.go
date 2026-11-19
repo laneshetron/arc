@@ -52,12 +52,17 @@ func TestPublicationRows(t *testing.T) {
 		b     *Beacon
 		fits  bool
 	}{
+		// §3.2 (corrected): at the 155-byte bootstrap name the answer admits
+		// a 243-byte signed record, which covers every legal shape up to
+		// three relays with two endpoints and a cover name. Only the
+		// four-relay record exceeds it.
 		{"1 relay tls+udp, 1 name", base(), true},
-		{"1 relay tls+udp+front, 1 name", withFront(), false},
+		{"1 relay tls+udp+front, 1 name", withFront(), true},
 		{"2 relays tls only, no names, _arc.x.io", twoTLS("_arc.x.io"), true},
-		{"2 relays tls only, no names, _arc.example.net", twoTLS("_arc.example.net"), false},
-		{"2 relays tls+udp, 1 name", nRelays(2, true), false},
-		{"3 relays tls+udp, no names", nRelays(3, false), false},
+		{"2 relays tls only, no names, _arc.example.net", twoTLS("_arc.example.net"), true},
+		{"2 relays tls+udp, 1 name", nRelays(2, true), true},
+		{"3 relays tls+udp, no names", nRelays(3, false), true},
+		{"4 relays tls+udp, no names", nRelays(4, false), false},
 	}
 	for _, c := range cases {
 		t.Run(c.label, func(t *testing.T) {
@@ -65,12 +70,18 @@ func TestPublicationRows(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			// 12 header + 271-byte query (255-byte name) + 12 answer header
-			// + 1 RDATA length byte, then the content.
-			answer := 12 + 255 + 4 + 12 + 1 + len(content)
-			if got := answer <= 512; got != c.fits {
-				t.Fatalf("answer %d B: fits512=%v, spec §3.2 says %v (content %d)",
-					answer, got, c.fits, len(content))
+			// Measured on a real answer to a real bootstrap query, rather
+			// than assumed from the query's nominal length: the earlier
+			// version of this test computed 12+255+4+12+1+content, which
+			// both used the wrong query length and ignored name compression.
+			q, err := NewQuery(testZone, ProfileBootstrap, detRand(1))
+			if err != nil {
+				t.Fatal(err)
+			}
+			answer := len(answerFor(t, q, content))
+			if got := answer <= q.AnswerCap; got != c.fits {
+				t.Fatalf("answer %d B (cap %d): fits=%v, spec §3.2 says %v (signed %d)",
+					answer, q.AnswerCap, got, c.fits, len(content))
 			}
 		})
 	}
