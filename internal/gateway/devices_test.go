@@ -333,3 +333,63 @@ func TestAuthRevokedExpires(t *testing.T) {
 		t.Errorf("token past its tombstone: %v", err)
 	}
 }
+
+// TestRevokeSelf: a device may always revoke itself, young or not
+// (self-service-accounts.md §3.8). This is the one path where the
+// cooling-off must not apply, and the e2e exercises it on a laptop
+// enrolled seconds earlier.
+func TestRevokeSelf(t *testing.T) {
+	f := newManageFixture(t)
+	laptop := f.device("laptop")
+	req := wire.RevokeRequest{RequestID: [8]byte{1}, DeviceID: laptop.ID}
+
+	// The laptop revokes itself while still inside the cooling-off window,
+	// which is what makes this different from every other revoke test.
+	if a, ok := f.g.revokeDevice(f.addr, nil, req); ok {
+		if a.Status != 0 {
+			t.Fatalf("a device was refused revoking itself: %+v (within %v of enrolling)", a, accounts.CoolingOff)
+		}
+	}
+	f.waitRevoked()
+	if f.device("laptop") != nil {
+		t.Fatal("self-revoke left the device")
+	}
+}
+
+// TestRevokeSelfRepeatAfterCommit: the client repeats its request because
+// it never saw the answer. For a self-revoke the first call is left
+// unanswered while the commit runs, and by the time the repeat arrives the
+// device has revoked itself, so it no longer exists in the state to
+// identify itself with. The repeat must still be answered as done.
+func TestRevokeSelfRepeatAfterCommit(t *testing.T) {
+	f := newManageFixture(t)
+	laptop := f.device("laptop")
+	req := wire.RevokeRequest{RequestID: [8]byte{1}, DeviceID: laptop.ID}
+	if _, ok := f.g.revokeDevice(f.addr, nil, req); ok {
+		t.Fatal("answered before the commit")
+	}
+	f.waitRevoked()
+	if a, ok := f.g.revokeDevice(f.addr, nil, req); !ok || a.Status != 0 {
+		t.Fatalf("repeat after a committed self-revoke: %+v ok=%v", a, ok)
+	}
+}
+
+// TestRevokeSelfFixIsNotAGrant: a device revoked by another must not be
+// able to ride the self-revoke path to submit requests. Its tombstone
+// names the revoker, not itself, so the repeat is refused.
+func TestRevokeSelfFixIsNotAGrant(t *testing.T) {
+	f := newManageFixture(t)
+	f.advance(accounts.CoolingOff)
+	laptop := f.device("laptop")
+	if a := f.revoke(f.desktop, wire.RevokeRequest{RequestID: [8]byte{1}, DeviceID: laptop.ID}); a.Status != 0 {
+		t.Fatalf("revoke: %+v", a)
+	}
+	f.waitRevoked()
+	// The laptop's lease is revoked, and it is gone from the state. A
+	// request from it must not be answered as done by the new path: its
+	// tombstone's revoker is the desktop.
+	req := wire.RevokeRequest{RequestID: [8]byte{9}, DeviceID: laptop.ID}
+	if a, ok := f.g.revokeDevice(f.addr, nil, req); ok && a.Status == 0 {
+		t.Fatalf("a device revoked by another was answered 0: %+v", a)
+	}
+}
