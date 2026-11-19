@@ -445,11 +445,12 @@ are the poll counts.
 At 2 s per poll, the INIT phase takes **8 s of its 10**, leaving 2 s for
 resolver latency on the response. That fits but with almost no slack: one
 3-second resolver response anywhere in those four polls restarts the
-attempt. That is why the adapter polls at the dial's rate from the first
-INIT and gives up after three attempts rather than retrying inside a
-window it cannot meet — and why §2.5's earlier note about transmitting
-immediately matters, since the 2 s before poll 1 is otherwise spent
-before the first byte reaches the resolver.
+attempt. That is why the adapter establishes at the rate §5.1 permits —
+which is the configured dial when it is high enough, and nothing at all
+when it is not — and gives up after three attempts rather than retrying
+inside a window it cannot meet. §2.5's note about transmitting immediately
+matters too, since the time before poll 1 is otherwise spent before the
+first byte reaches the resolver.
 
 Without cookies, subtract two polls: the INIT phase is two polls (4 s),
 leaving 6 s.
@@ -471,9 +472,9 @@ slowest usable setting" — it is the rate an **already established** session
 falls back to. Concretely:
 
 - **The dial must be at least 19/min to bring a session up on this
-  carrier alone.** Below that the client polls faster than its dial during
-  establishment — the handshake is a bounded burst, not steady-state, and
-  `HandshakeTimeout` is the budget it spends.
+  carrier alone**, and the client does **not** exceed it to get there: the
+  ceiling is the operator's decision (§2.5), so a lower dial means the
+  carrier is unavailable on that configuration and is reported as such.
 - **An established session can idle at the floor indefinitely**, because a
   keepalive needs no response chain, only one answer (§4.4.1).
 - **A session whose path died re-enters establishment**, so it must raise
@@ -517,15 +518,17 @@ So the table above is a statement about what the *protocol* needs, and
 exceed a lower one.
 
 This was implicit in my last revision ("polls at the dial's rate from the
-first INIT") and wrong for any dial below 20/min, which includes the
-floor this document spends a section defending.
+first INIT") and wrong for any dial below 19/min, which includes the floor
+this document spends a section defending.
 
-The two-cell INIT is a constraint on the adapter: `sendInit` retransmits
-every 100 ms early and 1 s once quiet, while a poll is 2 s apart at the
-ceiling, so the adapter must carry **cell 0 of one attempt, then cell 1 of
-the same attempt**, on consecutive polls — the INIT bytes are stable
-across retransmissions (`TestInitIsStableAcrossRetransmissionsAndCookies`),
-so that works. It must not interleave two attempts' cells.
+The two-cell INIT is a constraint on the adapter, and §4.3.2 states the
+rule: `sendInit` retransmits every 100 ms early and 1 s once quiet while a
+poll is 2 s apart, so the adapter must **finish the packet it has begun**
+— cell 0 on one poll, cell 1 on the next — before adopting a newer one.
+The INIT bytes are stable across retransmissions
+(`TestInitIsStableAcrossRetransmissionsAndCookies`), so the cells it sends
+belong to one packet; the copies that arrive meanwhile are redundant and
+discarded. It must not interleave two attempts' cells.
 
 `HandshakeTimeout` is 10 s and applies to **each phase separately**: the
 client restarts the whole handshake if `HANDSHAKE_RESP` has not arrived
@@ -1206,12 +1209,26 @@ found the first two:
   needs, and here the answer is *not* a fresh packet: `HANDSHAKE_INIT`
   and `AUTH` are retransmitted by `Client.Tick` on their own schedule
   (§2.5), at 100 ms early and 1 s once quiet. The adapter drains them from
-  `PollTransmit` exactly as a UDP carrier does, one cell per poll, and
-  **coalesces**: if `Client.Tick` has queued two INITs for the same
-  attempt, only the newest is carried. That matters because the ceiling
-  is one poll per 2 s while the session's retransmit interval is 100 ms,
-  so without coalescing the adapter would queue twenty obsolete copies of
-  the same handshake packet per poll interval.
+  `PollTransmit` exactly as a UDP carrier does, one cell per poll.
+
+  **It coalesces between packets, never within one.** `sendAuth` seals a
+  *new* packet on every retry — `conn.transmit` assigns a fresh packet
+  number each call — so a two-cell enrollment `AUTH` spans two polls while
+  roughly twenty fresh copies arrive in between. Carrying only the newest,
+  as my previous revision said, means every poll carries cell 0 of a
+  different packet and cell 1 never goes out: the AUTH phase times out and
+  enrollment never completes.
+
+  So the rule is: **finish an in-flight multi-cell handshake packet before
+  adopting a newer one.** The adapter keeps the attempt it has begun until
+  its last cell is sent, then takes the newest queued packet and discards
+  the rest. The retries that fire meanwhile are redundant — the relay
+  answers any copy — so ignoring them loses nothing. Coalescing still
+  prevents the twentyfold queue; it just applies to *whole packets*.
+
+  This also means the cell count, not the retransmit interval, sets the
+  handshake's floor: a two-cell packet at 2 s intervals occupies one poll
+  per attempt, which §2.5's timing already budgets.
 - **Obsolete attempts are dropped, not queued.** A `Datagram` for a
   handshake attempt whose `HandshakeAttempt()` counter has advanced is
   discarded by the adapter; the session's own restart invalidates it, and
@@ -1797,7 +1814,7 @@ which must open:
 
 **And a configured rate that can establish.** §2.5 shows that a carrier
 needs a poll interval under 3.33 s to complete a handshake inside
-`HandshakeTimeout`, so `-dns-lifeline-rate` below 20/min means this carrier
+`HandshakeTimeout`, so `-dns-lifeline-rate` below 19/min means this carrier
 cannot be brought up at all on that configuration. The client says so at
 startup rather than trying and failing repeatedly, and it does **not** burst
 past the configured ceiling to make it work — the ceiling is the operator's
@@ -2123,7 +2140,7 @@ shrink its answer budget mid-transfer.
 | Resolver retries a query whose answer was lost | Harmless: the repeated name gets the same emission, and since identical ciphertext is dropped by `p.replay.Check`, nothing depends on it |
 | A downlink cell lost carrying control frames | Recovers by PTO re-seal into a new packet number (not by re-sending the old bytes) |
 | **The seal-to-transmit gap does not fire PTO** | A datagram held by the adapter for 10 s produces no PTO and no health dip until `Transmitted` is called (§4.3.3) |
-| **Relay-side allowance exhausted, keepalives flowing** | The relay sheds `PING`/`PATH_*`/`SCHEDULE` and never sheds `ACK`/`CLOSE`/handshake, exactly as the client does (§5.3.1). The path goes `SUSPECT` within one keepalive and the journal says the allowance, not the network, is why |
+| **Relay-side allowance exhausted, client keepalives flowing** | The relay sheds its own `PING`/`PATH_*`/`SCHEDULE` and never sheds `ACK`/`CLOSE`/handshake. What the client observes is narrower than "liveness": its polls are still **answered** (an `ACK` survives), so `lastRecv` keeps advancing and the path stays up — but the relay stops *initiating*, so a client waiting on relay-originated downlink sees nothing. The test asserts the ACK survives and the journal attributes the missing downlink to the allowance, not to the network |
 | **Client and relay shed the same classes** | One test drives both ends to exhaustion with the same traffic and asserts the same frames survive on each side — the property that makes "same rule on both ends" true rather than aspirational |
 | A `HANDSHAKE_INIT` split across two polls (long zone) | The adapter carries cell 0 then cell 1 of the *same* attempt, and the relay reassembles it; interleaving two attempts fails to reassemble and is a test in its own right |
 | **The rate dial at 120/min, two polls in flight** | Throughput reaches `min(rate, W/RTT)`: at 0.5 s RTT that is the full 120/min, where window 1 would give 120 too but a 2 s resolver gives 60/min instead of 30. The test asserts the *formula*, not a fixed number |
