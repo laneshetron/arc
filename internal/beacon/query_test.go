@@ -24,7 +24,8 @@ func detRand(seed byte) func([]byte) (int, error) {
 
 // answerFor renders the response to q carrying a record of n signed bytes,
 // the way an authoritative server must: the question echoed, compression
-// on, the content split into character-strings.
+// on, the content split into character-strings, and — for an EDNS(0)
+// query — the OPT record a real server answers with.
 func answerFor(t *testing.T, q Query, content string) []byte {
 	t.Helper()
 	var p dnsmessage.Parser
@@ -38,10 +39,10 @@ func answerFor(t *testing.T, q Query, content string) []byte {
 	}
 	hdr.Response = true
 	hdr.RecursionAvailable = true
-	return answerWith(t, hdr, qs[0].Name, content)
+	return answerWith(t, q, hdr, qs[0].Name, content)
 }
 
-func answerWith(t *testing.T, hdr dnsmessage.Header, name dnsmessage.Name, content string) []byte {
+func answerWith(t *testing.T, q Query, hdr dnsmessage.Header, name dnsmessage.Name, content string) []byte {
 	t.Helper()
 	b := dnsmessage.NewBuilder(nil, hdr)
 	// An answer must compress the question name to fit §3.2's caps at a
@@ -67,6 +68,21 @@ func answerWith(t *testing.T, hdr dnsmessage.Header, name dnsmessage.Name, conte
 		TTL:   300,
 	}, dnsmessage.TXTResource{TXT: chunk255(content)}); err != nil {
 		t.Fatal(err)
+	}
+	// A server answering an EDNS(0) query echoes an OPT record, 11 bytes of
+	// it (RFC 6891 §6.1.1: a root name, type, class, TTL and RDLEN). Leaving
+	// it out overstates the room a record has, and §3.2's EDNS figure was
+	// derived from an answer that omitted it.
+	if q.Profile == ProfileEDNS {
+		if err := b.StartAdditionals(); err != nil {
+			t.Fatal(err)
+		}
+		if err := b.OPTResource(dnsmessage.ResourceHeader{
+			Name:  dnsmessage.MustNewName("."),
+			Class: dnsmessage.Class(ednsUDPSize),
+		}, dnsmessage.OPTResource{}); err != nil {
+			t.Fatal(err)
+		}
 	}
 	msg, err := b.Finish()
 	if err != nil {
@@ -115,7 +131,7 @@ func TestQuerySizesToTheAnswerItAdmits(t *testing.T) {
 	// §3.2 states its limits in signed-record bytes: 168 for bootstrap, 408
 	// for EDNS. The bootstrap figure is wrong — it is what a 255-byte name
 	// admits, and padding to the limit loses 75 bytes of record for no gain.
-	// The verified maxima are 243 and 417; the test pins what the code
+	// The verified maxima are 243 and 409; the test pins what the code
 	// produces so a change to either constant shows up here.
 	for _, tc := range []struct {
 		p    Profile
@@ -125,7 +141,9 @@ func TestQuerySizesToTheAnswerItAdmits(t *testing.T) {
 		{ProfileBootstrap, "example.net", 243},
 		{ProfileBootstrap, "x.io", 243},
 		{ProfileBootstrap, "lifeline.example.org", 243},
-		{ProfileEDNS, "example.net", 417},
+		// 409, not 417: an EDNS answer carries an 11-byte OPT record of its
+		// own, and the earlier figure came from a fixture that left it out.
+		{ProfileEDNS, "example.net", 409},
 	} {
 		q, err := NewQuery(tc.zone, tc.p, detRand(7))
 		if err != nil {
@@ -483,7 +501,7 @@ func TestParseAnswerTruncated(t *testing.T) {
 	}
 	hdr.Response = true
 	hdr.Truncated = true
-	resp, err := ParseAnswer(q, answerWith(t, hdr, qs[0].Name, ""))
+	resp, err := ParseAnswer(q, answerWith(t, q, hdr, qs[0].Name, ""))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -520,7 +538,7 @@ func TestParseAnswerRcodes(t *testing.T) {
 		h := hdr
 		h.Response = true
 		h.RCode = tc.code
-		_, err := ParseAnswer(q, answerWith(t, h, qs[0].Name, "B1:ignored"))
+		_, err := ParseAnswer(q, answerWith(t, q, h, qs[0].Name, "B1:ignored"))
 		if err == nil {
 			t.Fatalf("%v: no error", tc.code)
 		}
@@ -646,5 +664,203 @@ func TestLargestBootstrapRecordFits(t *testing.T) {
 	}
 	if _, err := Decode(resp.Records[0], q.Suffix, priv.Public().(ed25519.PublicKey), now); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestParseAnswerMatchesBeforeHonoringStatus: a response is not evidence
+// about our question unless it answers our question. An off-path packet
+// carrying someone else's transaction ID must not be able to end the lookup
+// by claiming NXDOMAIN, SERVFAIL or REFUSED — which is what happens if the
+// RCODE is read before the match (RFC 5452 §9.2).
+func TestParseAnswerMatchesBeforeHonoringStatus(t *testing.T) {
+	q, err := NewQuery("example.net", ProfileBootstrap, detRand(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, code := range []dnsmessage.RCode{
+		dnsmessage.RCodeNameError,
+		dnsmessage.RCodeServerFailure,
+		dnsmessage.RCodeRefused,
+		dnsmessage.RCodeSuccess,
+	} {
+		var p dnsmessage.Parser
+		hdr, err := p.Start(q.Wire)
+		if err != nil {
+			t.Fatal(err)
+		}
+		qs, err := p.AllQuestions()
+		if err != nil {
+			t.Fatal(err)
+		}
+		hdr.Response = true
+		hdr.RCode = code
+		// An ID that is not ours.
+		hdr.ID = q.ID + 1
+		_, err = ParseAnswer(q, answerWith(t, q, hdr, qs[0].Name, "B1:forged"))
+		if !errors.Is(err, errForOther) {
+			t.Errorf("rcode %v with a foreign ID: got %v, want errForOther", code, err)
+		}
+	}
+}
+
+// TestParseAnswerMatchesQuestionTypeAndClass: the echoed name alone does
+// not make a response ours. A resolver that answered an A question at our
+// name did not answer our TXT question, and one that answered in another
+// class certainly did not.
+func TestParseAnswerMatchesQuestionTypeAndClass(t *testing.T) {
+	q, err := NewQuery("example.net", ProfileBootstrap, detRand(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name  string
+		typ   dnsmessage.Type
+		class dnsmessage.Class
+	}{
+		{"A instead of TXT", dnsmessage.TypeA, dnsmessage.ClassINET},
+		{"TXT in another class", dnsmessage.TypeTXT, dnsmessage.ClassCHAOS},
+	} {
+		var p dnsmessage.Parser
+		hdr, err := p.Start(q.Wire)
+		if err != nil {
+			t.Fatal(err)
+		}
+		qs, err := p.AllQuestions()
+		if err != nil {
+			t.Fatal(err)
+		}
+		hdr.Response = true
+		b := dnsmessage.NewBuilder(nil, hdr)
+		b.EnableCompression()
+		if err := b.StartQuestions(); err != nil {
+			t.Fatal(err)
+		}
+		if err := b.Question(dnsmessage.Question{
+			Name: qs[0].Name, Type: tc.typ, Class: tc.class,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := b.StartAnswers(); err != nil {
+			t.Fatal(err)
+		}
+		if err := b.TXTResource(dnsmessage.ResourceHeader{
+			Name: qs[0].Name, Class: dnsmessage.ClassINET, TTL: 60,
+		}, dnsmessage.TXTResource{TXT: []string{"B1:forged"}}); err != nil {
+			t.Fatal(err)
+		}
+		msg, err := b.Finish()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ParseAnswer(q, msg); !errors.Is(err, errForOther) {
+			t.Errorf("%s: got %v, want errForOther", tc.name, err)
+		}
+	}
+}
+
+// TestParseAnswerAcceptsAMatchingErrorRCODE: the guard must not be so broad
+// that a genuine NXDOMAIN from our resolver stops being recognised as one.
+func TestParseAnswerAcceptsAMatchingErrorRCODE(t *testing.T) {
+	q, err := NewQuery("example.net", ProfileBootstrap, detRand(3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var p dnsmessage.Parser
+	hdr, err := p.Start(q.Wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	qs, err := p.AllQuestions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	hdr.Response = true
+	hdr.RCode = dnsmessage.RCodeNameError
+	_, err = ParseAnswer(q, answerWith(t, q, hdr, qs[0].Name, ""))
+	if err == nil || !strings.Contains(err.Error(), "NXDOMAIN") {
+		t.Fatalf("got %v, want NXDOMAIN", err)
+	}
+}
+
+// TestNamedBeaconQueries: §3.2's rotation rule publishes `b1._arcb` and
+// `b2._arcb` so each can retire independently, which a client cannot use if
+// it can only ask for `_arcb` itself.
+func TestNamedBeaconQueries(t *testing.T) {
+	b1, err := NewNamedQuery("b1", "example.net", ProfileBootstrap, detRand(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := b1.Suffix, "b1._arcb.example.net"; got != want {
+		t.Errorf("suffix %q, want %q", got, want)
+	}
+	if !strings.HasSuffix(b1.Name, "."+b1.Suffix) {
+		t.Errorf("question %q does not end in %q", b1.Name, b1.Suffix)
+	}
+	// The question still fills the profile's name budget exactly, so the
+	// answer cap is unchanged; the name's own bytes come out of the padding.
+	if got := wireLen(b1.Name); got != 155 {
+		t.Errorf("name is %d wire bytes, want 155", got)
+	}
+	if b1.AnswerCap != 512 {
+		t.Errorf("cap %d, want 512", b1.AnswerCap)
+	}
+
+	b2, err := NewNamedQuery("b2", "example.net", ProfileBootstrap, detRand(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b1.Name == b2.Name {
+		t.Error("b1 and b2 produced the same question")
+	}
+	// A name is not cosmetic: the two suffixes differ, so the records are
+	// signed over different strings and neither verifies as the other.
+	if b1.Suffix == b2.Suffix {
+		t.Error("b1 and b2 share a suffix")
+	}
+}
+
+// TestNamedBeaconIsDomainSeparated: a record published for b1 must not
+// verify when the client asks for b2, which is what makes the two names
+// independently retirable rather than merely differently spelled.
+func TestNamedBeaconIsDomainSeparated(t *testing.T) {
+	now := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+	pub, priv := testKey(t)
+	b1 := NamedSuffix("b1", testZone)
+	b2 := NamedSuffix("b2", testZone)
+	content, err := Encode(oneRelay(t, now), b1, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Decode(content, b1, pub, now); err != nil {
+		t.Fatalf("b1's own record did not verify: %v", err)
+	}
+	if _, err := Decode(content, b2, pub, now); err == nil {
+		t.Fatal("b1's record verified as b2's")
+	}
+}
+
+// TestNamedQueryLeavesRoomForTheNonce: a zone long enough that the name plus
+// the nonce no longer fits the profile's budget is an error, not a silently
+// truncated or over-long name.
+func TestNamedQueryLeavesRoomForTheNonce(t *testing.T) {
+	long := strings.Repeat("a", 140) + ".example.net"
+	if _, err := NewNamedQuery("b1", long, ProfileBootstrap, detRand(1)); err == nil {
+		t.Error("a zone with no room for the nonce was accepted")
+	}
+}
+
+// TestNamedSuffixKeepsOneIdentity: the same string reaches the question, the
+// signature suffix and the watermark, so callers cannot derive three that
+// disagree.
+func TestNamedSuffixKeepsOneIdentity(t *testing.T) {
+	for _, tc := range []struct{ name, zone, want string }{
+		{"", "example.net", "_arcb.example.net"},
+		{"b1", "example.net", "b1._arcb.example.net"},
+		{"B1.", "Example.NET.", "b1._arcb.example.net"},
+		{"  b2  ", "example.net", "b2._arcb.example.net"},
+	} {
+		if got := NamedSuffix(tc.name, tc.zone); got != tc.want {
+			t.Errorf("NamedSuffix(%q, %q) = %q, want %q", tc.name, tc.zone, got, tc.want)
+		}
 	}
 }
