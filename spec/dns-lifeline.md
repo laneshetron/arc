@@ -365,13 +365,21 @@ That is simpler than my last two revisions made it: the slot label costs
 case that used to fit a one-cell INIT — no longer does, and there is a
 single establishment sequence rather than two.
 
-**The enrollment credential needs two cells, and that forces a mechanism
-the adapter cannot invent.** An enrollment `AUTH` carries the magic (12 B),
+**A credential can exceed one cell, and that forces a mechanism the
+adapter cannot invent.** An enrollment `AUTH` carries the magic (12 B),
 invite id (8), secret (16), a length-prefixed 43-byte token and a 32-byte
 device name — 113 B of credential, 116 B with its frame header, against a
 78-byte frame budget at `max_packet` 115. It does not fit one cell, and it
 cannot be shrunk: every field is load-bearing and the name is the
 operator's.
+
+**And it is not only enrollment.** `accounts.ValidToken` accepts any
+printable credential up to **256 bytes**, so a deployment using a long
+bearer token reaches the same place: a token over 75 bytes overflows the
+78-byte frame budget, and at 256 bytes the `AUTH` packet is 293. The rule
+therefore keys on the **credential length**, not on whether the credential
+is an enrollment — a distinction the next revision would otherwise have to
+rediscover.
 
 Saying "`AUTH` may span cells" is not enough, because **`sendAuth` calls
 `conn.transmit`, which seals one packet and emits one datagram.** Spreading
@@ -392,12 +400,21 @@ of frame room against a 116-byte enrollment `AUTH`, so the packet is not
 layer can split it is therefore a prerequisite for sealing, not a
 consequence of it:
 
-- **The enrollment `AUTH` is 150 bytes as one ARC packet** (18 header, 16
-  tag, 3 frame header, 113 credential). The path's `maxPacket` must be at
-  least that for `sendAuth` to seal it at all.
-- **So `sendAuth` raises the path's `maxPacket` to the packet size** when it
-  seals an enrollment, and the cell layer splits those 150 bytes into two
-  cells at every zone suffix in §2.1 (138, 133, 130 — all under 150).
+- **The `AUTH` packet is `37 + len(credential)` bytes** (18 header, 16 tag,
+  3 frame header). The path's `maxPacket` must be at least that for
+  `sendAuth` to seal it at all, whatever the credential is.
+- **So `sendAuth` raises the path's `maxPacket` to the packet size**, and
+  the cell layer splits it: an enrollment's 150 B takes two cells at every
+  zone suffix in §2.1 (all under 150), and a 43-byte token's 80 B still
+  takes one.
+- **The raise is bounded by the AUTH phase's budget, not by a guess.** A
+  packet of *n* cells occupies `n − 1` poll intervals, so the AUTH phase
+  must fit that inside its own 10 s: at 19/min that is **four cells**
+  (9.5 s), at 30/min five (8 s). So the bound is "as many cells as the
+  phase can carry", which at `_arc.example.net` is 460 B at 19/min — a
+  256-byte token's 293-byte packet needs three cells and fits; a credential
+  past the bound is reported as too large for this carrier rather than
+  growing `maxPacket` until something else breaks.
 - **The raise is scoped to the handshake and reverted on `AUTH_RESULT`.**
   Otherwise the path would claim a 150-byte maximum it cannot carry data at,
   and an inner-IP revision would fragment against the wrong number.
@@ -1942,10 +1959,14 @@ different rates. Four caps:
   is acceptable because the client enforces its own device-wide budget
   first (§5.3.1 meters before sealing); the relay's copy is a backstop for
   a misbehaving client, not the primary limit.
-- **The exhaustion test reconnects on a new association:** the same
-  authenticated device exhausts its allowance, closes the path, opens a
-  new association, and the relay still answers `A1:-` — which is the
-  assertion that the quota is keyed on the device.
+- **The exhaustion test reconnects on a new association, and the
+  handshake still completes.** The same authenticated device exhausts its
+  allowance, closes the path, and opens a new association; the relay runs
+  the full handshake (which the shed order never suppresses, §5.3.1) and
+  then applies the *persisted* allowance to the new session. That is the
+  assertion that the quota is keyed on the device rather than the
+  association — a test that instead expected `A1:-` during the handshake
+  would be asserting the opposite of the rule, since `AUTH` is exempt.
 
 #### 5.3.1 The budget must be enforced before sealing, not after
 
