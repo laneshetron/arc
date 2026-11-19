@@ -301,3 +301,63 @@ func TestSuffix(t *testing.T) {
 		}
 	}
 }
+
+// TestEncodeRefusesWhatDecodeRefuses: a publisher must not be able to sign
+// a record its own decoder rejects. The encoder used to write an endpoint
+// kind without checking it, so a kind added to a config — or a typo'd one —
+// produced a signature that verified and a body no client would accept.
+func TestEncodeRefusesWhatDecodeRefuses(t *testing.T) {
+	now := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+	_, priv := testKey(t)
+	for name, mutate := range map[string]func(*Beacon){
+		"unknown endpoint kind": func(b *Beacon) {
+			b.Relays[0].Endpoints = append(b.Relays[0].Endpoints, Endpoint{Kind: EndpointKind(9), Port: 1})
+		},
+		"uppercase cover name":           func(b *Beacon) { b.Names = []string{"CDN.Example.org"} },
+		"cover name with a trailing dot": func(b *Beacon) { b.Names = []string{"cdn.example.org."} },
+		"cover name with an empty label": func(b *Beacon) { b.Names = []string{"cdn..example.org"} },
+		"uppercase front domain": func(b *Beacon) {
+			b.Relays[0].Endpoints = []Endpoint{{Kind: KindFront, Port: 443, Domain: "Front.Example.org"}}
+		},
+		"front domain with a trailing dot": func(b *Beacon) {
+			b.Relays[0].Endpoints = []Endpoint{{Kind: KindFront, Port: 443, Domain: "front.example.org."}}
+		},
+		"uppercase carrier zone": func(b *Beacon) { b.Zones = []string{"Carrier.Example.NET"} },
+	} {
+		b := oneRelay(t, now)
+		mutate(b)
+		if _, err := Encode(b, Suffix(testZone), priv); err == nil {
+			t.Errorf("%s: encoded a record no decoder accepts", name)
+		}
+	}
+}
+
+// TestDecodeAppliesTheSameNameRules: the decoder checks the grammar too, so
+// a record from another publisher — or a future encoder — cannot smuggle in
+// a name the rest of ARC would reject.
+func TestDecodeAppliesTheSameNameRules(t *testing.T) {
+	for _, tc := range []struct {
+		s    string
+		max  int
+		US   bool
+		want bool
+	}{
+		{"cdn.example.org", 253, false, true},
+		{"a", 253, false, true},
+		{"a-b.example.org", 253, false, true},
+		{"_arc.example.net", 253, true, true},
+		{"_arc.example.net", 253, false, false},
+		{"", 253, false, false},
+		{"a.", 253, false, false},
+		{"a..b", 253, false, false},
+		{".a", 253, false, false},
+		{"A.example", 253, false, false},
+		{"a_b.example", 253, false, false},
+		{strings.Repeat("a", 254), 253, false, false},
+	} {
+		err := validName(tc.s, tc.max, tc.US)
+		if got := err == nil; got != tc.want {
+			t.Errorf("validName(%q, underscore=%v) = %v, want ok=%v", tc.s, tc.US, err, tc.want)
+		}
+	}
+}
