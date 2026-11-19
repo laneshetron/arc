@@ -1305,12 +1305,31 @@ fit a 150 B no-EDNS answer. Three rules, and they are ordered:
 
    The adapter therefore tracks the largest answer it has seen since the
    frame was queued. If the frame has not fitted any answer for
-   `2 × W × interval`, it is **failed** — requeued for re-sealing if the
-   session can (control, stream: the session re-fragments at the current
-   `max_packet`), or dropped and reported if it cannot (`IP_PACKET`, since
-   the fragment boundary is fixed at sealing). Either way the outcome is
-   terminal and the path is reported degraded, because the operator needs
-   to know the resolver changed shape.
+   `2 × W × interval`, it is **failed**, and the outcome is terminal:
+   requeued for re-sealing if the session can (control and stream frames,
+   re-fragmented at the *current* `max_packet`), or dropped and reported if
+   it cannot (`IP_PACKET`, whose fragment boundary is fixed at sealing).
+   Either way the path is reported degraded, because the operator needs to
+   know the resolver changed shape.
+
+   **The retry loop is bounded, and the bound is the point.** A frame that
+   was too large for every answer cannot become small enough by being
+   re-sealed at the same `max_packet` — so re-sealing alone would loop
+   forever. The rule is:
+
+   - A frame may be re-sealed **once**. If the re-sealed frame also fits no
+     answer for `2 × W × interval`, it is dropped and the failure counted.
+   - A frame that was already re-sealed at the smallest `max_packet` the
+     path has ever had is dropped immediately, with no second attempt —
+     re-sealing cannot shrink it further, and the size is the problem.
+   - Both cases are reported once, not once per attempt: the operator needs
+     "this path can no longer carry control frames of 391 B", not a
+     per-poll log line.
+
+   So a control frame that cannot fit ends in a counted drop and a
+   reported degraded path, never an indefinite queue. That is what makes
+   the earlier promise — a frame that does not fit *this* answer stays
+   queued — safe to make.
 
    Requeuing rather than dropping is what makes this recover: a control
    frame re-sealed at the *current* `max_packet` will fit the *current*
@@ -1547,50 +1566,109 @@ underestimate it by exactly the factor the deadline needs. A relay that
 measured spacing would be as wrong as one that assumed a constant.
 
 **Rule: the client declares its interval, and the relay uses the declared
-value for the whole session.** It travels in the **`AUTH` credential** —
-already authenticated, already per-session, and read before the relay seals
-anything that would need the deadline. The credential's existing envelope
-carries it as an optional trailing field, so a client that omits it is
-treated as `W = 1, interval = 60 / rate-floor` and simply gets a
-conservative deadline; no client is refused for not knowing about it.
+value for the whole session.**
 
-Three consequences:
+My previous revision put it in the `AUTH` credential and called it an
+optional trailing field. **That does not work**, and the review is right to
+block on it: `Gateway.authorizeLocked` hashes the credential *whole*
+(`accounts.TokenHash(token)`) and looks the hash up as an exact key, so a
+token with a suffix appended is simply an unknown credential. There is no
+optional-field envelope to extend — the credential is opaque bytes with an
+exact match. Making it parseable would mean changing token storage, token
+validation (`accounts.ValidToken` allows any printable bytes up to 256, so a
+suffixed token would be *stored* happily and never match), and the meaning
+of every existing token.
+
+So the declaration is a **frame**, sent once the session is active (its
+fields are given below, once the staleness problem is stated):
+
+- **An extension code point, deliberately.** Frames in `0x80`–`0xFF` are
+  ignorable by a peer that does not know them (§10.1); frames in `0x1F`–
+  `0x7F` require rejection of the whole packet. Since this declaration is a
+  timing optimisation rather than a correctness requirement, it must be
+  the former — otherwise a client that sends it to a relay predating the
+  frame would have every packet carrying it *rejected*, including the
+  packets that carry its own data. That would turn an optimisation into an
+  outage.
+- **Sent reliably**, like `INVITE_REQUEST`: `Client.Tick` repeats it every
+  2 s until the relay has answered something that proves it arrived. The
+  session already has that machinery for request/response frames, and
+  using the `AUTH` path instead would have put a timing claim into an
+  authentication decision.
+- **Not part of authentication.** A relay that has not received a
+  `SCHEDULE` uses the conservative `W = 1` at the floor; a relay that has
+  uses what it was told. No client is refused, and an old relay ignoring
+  the frame is the intended fallback rather than a failure.
+- **Re-sent when the declaration changes**, and at most once a minute
+  otherwise, so a relay that restarted mid-session picks it up again
+  without a reconnect.
+
+This is the first **new frame type** the design needs, which is a wire
+change. §8's header calls the format provisional until the first interop
+test, so it is available — but it must be listed with the other changes
+rather than appearing only in prose here.
+
+**A declared interval is only valid while the client polls at it.** A
+static declaration goes stale in the two states the client spends most of
+its time in, and both are states where a wrong deadline is fatal:
+
+- **Idle.** An idle client polls at the keepalive floor (6/min), not at the
+  dial. A relay holding a declared 120/min would expect an ACK every 0.5 s
+  when the next poll is 10 s away, so every idle session would look broken.
+- **Backing off.** After `SERVFAIL` the client stretches its interval,
+  never below the floor (§4.3). A relay using the pre-backoff value would
+  expire answers that were merely slow.
+
+So `SCHEDULE` carries **two** intervals, and the relay uses whichever it
+can justify:
+
+```text
+0x80  SCHEDULE   uint16 interval_ms; uint16 floor_ms; uint8 window
+```
+
+| the relay holds | meaning | used for |
+|---|---|---|
+| `interval_ms` | what the client uses while active | answers to the client's own polls |
+| `floor_ms` | 60/6, the keepalive interval | anything waiting for the *next* poll |
+
+- **An answer to a poll the client just made** is acked on the client's
+  active schedule, so `interval_ms` applies.
+- **An unsolicited downlink packet** — relay-initiated, or a queue drained
+  while the client is idle — waits for the next poll, which an idle client
+  makes at `floor_ms`. Using `interval_ms` there is what makes an idle
+  session look unhealthy.
+- **A backoff is a fresh `SCHEDULE`**, sent when the client changes its
+  interval, so the relay follows it down rather than expiring against a
+  stale expectation. It is also re-sent at most once a minute regardless,
+  so a relay that restarted picks it up without a reconnect.
+
+Three consequences, unchanged:
 
 - **It is a claim, not an observation.** A client that understates its
   interval makes the relay's deadlines shorter, which costs only spurious
   retransmissions for itself — a self-inflicted penalty, like misreporting
   a budget, so nothing needs policing.
-- **A rate change restates it.** Raising the dial mid-session is worth a
-  fresh `AUTH` (§9.4 already permits credential refresh), because the
-  declared interval is what the relay's timers are built on.
+- **A rate change restates it**, through `SCHEDULE` rather than a fresh
+  `AUTH`.
 - **The relay's own `W` is its own.** It answers one poll with one cell,
-  so its `W` is 1 and only the *client's* interval enters the sum. The
-  two directions do not share a window.
+  so its `W` is 1 and only the *client's* interval enters the sum.
 
 This is the one piece of the deadline story that had no mechanism behind
-it — I asserted the relay applies `W × interval` without saying where the
-number came from, and measuring it is not merely unreliable but wrong in
-the direction that hurts.
+it. I asserted the relay applies `W × interval`, then chose a mechanism —
+an `AUTH` suffix — that the credential lookup cannot accept, and then
+described the result as a constant when it changes with the client's own
+pacing.
 
-Two consequences:
+Two further consequences, for the health clock:
 
 - **One lost ACK is one unhealthy sample, not a dead path.** The clause
-  makes the path unhealthy immediately, but `healthy` is a *predicate*,
+  makes the path unhealthy immediately, but `healthy` is a *predicate*
   re-evaluated every tick, and the next answered poll makes it true again.
-  Nothing in §14.6 kills a path for one unhealthy interval; `SUSPECT` is
-  entered after repeated evidence, and the path returns to healthy on the
-  next packet. The spec should say this so an implementer does not turn a
-  single lost ACK into a path failure.
+  §14.6 needs repeated evidence before killing a path.
 - **The adapter must not batch polls to "save budget".** Polling every
-  10 s is what the keepalive requires; polling every 30 s to be frugal
-  would leave an outstanding packet for 30 s and the path unhealthy for
-  two thirds of that, which is not a saving.
-
-With one cell per packet and an ACK in every answer, both clocks stay
-satisfied: `lastRecv` ages by one interval and nothing stays outstanding
-past one round trip. The requirement on any future adapter is therefore
-two-part: **every poll must carry one whole packet, and every answer must
-carry the ACK it owes.**
+  floor interval is what the keepalive requires; polling less to be frugal
+  leaves an outstanding packet longer and the path unhealthy for most of
+  that, which is not a saving.
 
 **The window of §4.3.1 does not change this, and that is deliberate.** Two
 polls in flight means two outstanding packets, so `oldestOutstanding`
@@ -1930,8 +2008,9 @@ shrink its answer budget mid-transfer.
 | A legal two-relay record (167 B, `_arc.x.io`) | Accepted in the 512-byte profile even though the publication rule asks for one relay per record, so a client is not broken by an operator who packs two |
 | Full-length uplink cells against a 512-byte answer budget | The downlink cell is 168 B, not the 243 B a padded short query gets — a client that fills the name loses downlink — and no answer exceeds 3× its query |
 | A padded name carrying a cell | The padding labels reassemble away and exactly one cell is recovered; a `0`-led label is never read as cell data |
-| **A loss-free IP packet split into 2 fragments at 30/min, real engine timers** | Both arrive inside the 5 s reassembly window, and the path never goes `SUSPECT` (PTO counts from transmission, §4.3.3) |
-| **The same 2-fragment packet at 6/min** | Refused rather than half-delivered: the first fragment expires before the second is sent (§2.4.1), and the adapter reports the path control-only |
+| **A one-fragment 66-byte datagram at 30/min, real engine timers** | Accepted and delivered: the 30/min budget is one fragment *with interruptions* (§2.4.1), so admission and delivery agree |
+| **A two-fragment 150-byte datagram at 30/min** | **Refused at admission**, before emission: 150 B needs three fragments at 120/min or better. The gate must match §2.4.1's interrupted budget, not its ideal one |
+| **Any datagram at the 6/min floor** | Refused: the floor has no IP budget at all once control interruptions are counted (§2.4.1), and §5.4 says so |
 | **An IP packet whose single cell is lost** | ARC does **not** retransmit it; the loss shows up in the path's loss estimate and the inner protocol retries. Asserted explicitly so nobody assumes a repair that does not exist |
 | **An idle session's PING is answered with an ACK** | `lastRecv` advances every poll and `oldestOutstanding` clears, so the path stays healthy indefinitely with nothing else to send (§4.3.4, §4.4.1) |
 | **A lost ACK makes one unhealthy sample, then recovers** | The path is not declared dead: the next answered poll restores health (§4.4.1) |
@@ -1981,13 +2060,14 @@ no delegation, and no internet.
    *replies*, since `A1:-` cannot advance session liveness (§4.4). That is
    why this stage is bidirectional for control; application downlink is
    still stage 3.
-3. **Downlink data.** One cell per ARC packet (§2.4), the inner-IP limit
-   of §2.4.1, backlog polling with `demand`, and the best-effort
-   statement of §4.3.4 in the journal — an IP packet lost to a cell is not
-   repaired by ARC. Exit: a one-fragment datagram completes at the steady
-   rate with the path never `SUSPECT`, a two-fragment one completes at the
-   ceiling and is refused below it, and a downlink-only transfer drains at
-   the ceiling.
+3. **Downlink data and admission.** One cell per ARC packet (§2.4), the
+   inner-IP budget of §2.4.1 **with interruptions**, backlog polling with
+   `demand`, and the best-effort statement of §4.3.4 in the journal — an IP
+   packet lost to a cell is not repaired by ARC. Exit: the admission gate
+   and the delivered datagram size agree at every dial setting, so a
+   66-byte datagram completes at 30/min with the path never `SUSPECT` while
+   a 150-byte one is refused there and accepted at 120/min, and a
+   downlink-only transfer drains at the ceiling.
 4. **Rotation.** A second relay on the same store, a beacon naming only
    it, and an enrolled device establishing a new session there with no
    operator action (§3.5). Exit: that test passes, and a retired key is
@@ -1996,15 +2076,19 @@ no delegation, and no internet.
    behind the permission gate of §5.1, session-side budgets (§5.3.1), the
    status line, and `dns.sh` in CI.
 
-**No ARC wire change at any stage.** The carrier uses `CELL` (§12.1) and
-`TXT` unchanged, with no new frame type, no new feature bit, and no
-relay-side protocol negotiation. The beacon's record *is* a new format
-(§3.1), but it is not ARC wire traffic: it is an application-level record
-inside a TXT answer, read before any session exists.
+**One ARC wire change: the `SCHEDULE` frame.** The carrier itself uses
+`CELL` (§12.1) and `TXT` unchanged, with no new feature bit and no
+relay-side negotiation — but §4.4.2 adds frame type `0x80`, an ignorable
+extension carrying the client's declared polling schedule. It is in the
+extension range precisely so that a relay predating it ignores it rather
+than rejecting every packet that carries it.
 
-What the lifeline does need beyond the adapter is eight additions, all
-named where they are argued. They split into the four the client needs,
-three the relay needs, and one that is neither:
+The beacon's record is a second new format (§3.1), though not ARC wire
+traffic: it is an application-level record inside a TXT answer, read before
+any session exists.
+
+What the lifeline does need beyond the adapter is listed here, because it
+is the implementation checklist:
 
 **Client side:**
 
@@ -2020,22 +2104,26 @@ three the relay needs, and one that is neither:
   (§4.3.3);
 - a **per-path allowance** admitted before sealing (§5.3.1);
 - a **synthetic peer address** per association, routed like
-  `stream.IsStreamAddr` (§4.2.1).
+  `stream.IsStreamAddr` (§4.2.1);
+- a **`SCHEDULE` frame** declaring the polling schedule, re-sent when the
+  client's pacing changes (§4.4.2).
 
 **Relay side:**
 
-- **`AnswerFor(now, slot)`** so a poll's answer can be built when the poll
-  arrives rather than when the relay has something to say (§4.3.4);
-- **`RelayTransmitted(token)`** and a relay ack timeout of
-  `poll interval + RTT`, since the ACK of an answer cannot arrive before
-  the next poll (§4.3.4).
+- **`AnswerFor(now, slot, maxPacket)`** so a poll's answer is built when
+  the poll arrives, sized to that poll's budget (§4.3.4);
+- **`RelayTransmitted(token)`** and an ack/hold deadline of
+  `W × interval + RTT` from the declared schedule (§4.3.4, §4.4.2);
+- a **schedule table** keyed on the authenticated device, holding both
+  declared intervals (§4.4.2).
 
 **Neither, but required:** the answer to every poll carries the ACK it owes
 (§4.3.4), because `oldestOutstanding` would otherwise mark an idle path
 unhealthy between polls (§4.4.1).
 
-The window (§4.3.1) adds no further surface: it reuses `PollPacket` twice
-per interval and needs only the slot label in the name grammar (§2.2.1).
+The window (§4.3.1) adds no further surface of its own: it reuses
+`PollPacket` twice per interval and needs only the slot label in the name
+grammar (§2.2.1).
 
 ## 8. Deferred
 
