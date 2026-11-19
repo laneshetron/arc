@@ -65,19 +65,22 @@ the zone suffix:
 
 | zone | suffix bytes | payload chars | labels | cell | chunk |
 |---|---|---|---|---|---|
-| `_arc.x.io` | 11 | 225 | 5 | 140 | 122 |
-| `_arc.ex.net` | 13 | 223 | 5 | 139 | 121 |
-| `_arc.example.net` | 18 | 218 | 5 | 136 | 118 |
-| `_arc.relay.example.com` | 24 | 212 | 5 | 132 | 114 |
-| `_arc.lifeline.example.org` | 27 | 209 | 5 | 130 | 112 |
+| `_arc.x.io` | 11 | 221 | 5 | 138 | 120 |
+| `_arc.ex.net` | 13 | 219 | 5 | 136 | 118 |
+| `_arc.example.net` | 18 | 214 | 5 | 133 | 115 |
+| `_arc.relay.example.com` | 24 | 208 | 5 | 130 | 112 |
+| `_arc.lifeline.example.org` | 27 | 205 | 5 | 128 | 110 |
 
-A zone suffix of about 20 bytes therefore carries 118-byte chunks: a PING
+These are with the **slot label** of §4.3.1 (4 wire bytes), which every poll
+outside the handshake carries. Without it each cell would be 4 B larger —
+the figures this table had before the window was added.
+
+A zone suffix of about 20 bytes therefore carries 115-byte chunks: a PING
 (37 B), a `PATH_JOIN` (45 B), an `AUTH_RESULT` (65 B), an `AUTH` with a
-43-byte token (80 B) and a `HANDSHAKE_RESP` (81 B) each fit in one cell,
-and `HANDSHAKE_INIT` (122 B) takes 2. A full 1280-byte IP packet would
-take 12 cells, which is why it is never sent as one packet on this path:
-§2.4 caps the packet size so that every packet completes inside the
-reassembly window.
+43-byte token (80 B) and a `HANDSHAKE_RESP` (81 B) each fit one cell, and
+`HANDSHAKE_INIT` (122 B) takes two. Every control frame in this revision
+therefore fits a single cell at every zone suffix in the table except the
+handshake, which §2.5 covers.
 
 ### 2.2 Downlink: one cell per answer
 
@@ -149,15 +152,28 @@ carried in a cell of *n*+18:
 
 | cell | packet it carries | question name | query | answer ≤ 512 B | EDNS(0) 1232 |
 |---|---|---|---|---|---|
-| 26 B | 8 B | 75 B | 91 B | 124 B | 141 B |
-| 37 B | 19 B | 94 B | 110 B | 153 B | 169 B |
-| **55 B (+32 B pad)** | **37 B (a PING)** | **155 B** | **171 B** | **243 B** (512) | 260 B |
-| 55 B | 37 B | 122 B | 138 B | 194 B | 210 B |
-| 65 B | 47 B | 139 B | 155 B | 219 B | 236 B |
-| 81 B | 63 B | 165 B | 181 B | 235 B | 275 B |
-| 99 B | 81 B | 195 B | 211 B | 213 B | 320 B |
-| 122 B | 104 B | 232 B | 248 B | 186 B | 375 B |
-| 136 B | 118 B (full name) | 255 B | 271 B | 168 B (511) | 409 B (846) |
+| 26 B | 8 B | 79 B | 95 B | 130 B | 147 B |
+| 37 B | 19 B | 98 B | 114 B | 159 B | 175 B |
+| 55 B | 37 B | 126 B | 142 B | 200 B | 216 B |
+| 65 B | 47 B | 143 B | 159 B | 225 B | 242 B |
+| 81 B | 63 B | 169 B | 185 B | 232 B | 281 B |
+| 99 B | 81 B | 199 B | 215 B | 210 B | 326 B |
+| 122 B | 104 B | 236 B | 252 B | 183 B | 381 B |
+| 133 B (full name) | 115 B | 254 B | 270 B | 169 B | **408 B** (843)|
+
+These carry the **slot label** of §4.3.1 (4 wire bytes), because every poll
+outside the handshake has one. My previous revision of this table was
+computed without it and every row was therefore wrong once the window was
+added — the question is 4 B longer and each answer correspondingly shorter,
+by 6 B at the top and 7 B at the bottom of the range.
+
+The best downlink cell without EDNS(0) is still in the middle of the range
+rather than at the top, so §2.2.2's advice to pad a short name out to the
+sweet spot rather than fill it still holds — and the slot label moved both
+figures, so the numbers are restated here rather than left to the prose:
+**a 19-byte packet with the name padded to 155 B buys a 243 B cell**, where
+a full-length name carrying 115 B buys 169 B. Padding triples the payload
+for the same query size.
 
 Two different regimes, and the adapter has to know which it is in:
 
@@ -184,7 +200,7 @@ startup, for each answer budget, and uses it whenever it has nothing
 particular to send.
 
 Without EDNS(0), a full-name poll is a 271-byte query and a 511-byte
-answer carrying 136 B up and 168 B down. With EDNS(0) 1232, it is a
+answer carrying 136 B up and 169 B down. With EDNS(0) 1232, it is a
 282-byte query and an 846-byte answer carrying 409 B down.
 
 ### 2.3 Rates
@@ -231,7 +247,7 @@ At the floor a session costs about 47 KiB an hour of cell payload, all
 control when the user is idle (§5.3). At 300/min it is 2.3 MiB an hour,
 which is the sort of number a resolver notices.
 
-Without EDNS(0), the same questions move 168 B down per poll instead of
+Without EDNS(0), the same questions move 169 B down per poll instead of
 409 B, so every row above drops by 2.4×. That is a bigger swing than any
 choice of rate, and it is why §2.2.2 spends so much effort on the EDNS
 case.
@@ -425,7 +441,7 @@ Four polls at `W = 1` means three intervals must fit inside the 10 s
 |---|---|---|---|
 | 6/min (floor) | 10 s | 30 s | **no** |
 | 12/min | 5 s | 15 s | **no** |
-| 20/min | 3 s | 9 s | yes, tightly |
+| 19/min | 3.16 s | 9.5 s | yes, barely |
 | 30/min (default) | 2 s | 6 s | yes, 4 s slack |
 | 120/min | 0.5 s | 1.5 s | yes, ample |
 
@@ -433,7 +449,7 @@ So a path cannot be *established* at the floor, and the floor is not "the
 slowest usable setting" — it is the rate an **already established** session
 falls back to. Concretely:
 
-- **The dial must be at least ~20/min to bring a session up on this
+- **The dial must be at least 19/min to bring a session up on this
   carrier alone.** Below that the client polls faster than its dial during
   establishment — the handshake is a bounded burst, not steady-state, and
   `HandshakeTimeout` is the budget it spends.
@@ -505,10 +521,10 @@ name, the downlink by 3× the query.
 | direction | cell | `max_packet` |
 |---|---|---|
 | client → relay | 133 B (with a slot label) | 115 B |
-| relay → client, no EDNS(0) | 168 B | 150 B |
-| relay → client, EDNS(0) 1232 | 409 B | 391 B |
+| relay → client, no EDNS(0) | 169 B | 151 B |
+| relay → client, EDNS(0) 1232 | 408 B | 390 B |
 
-So the relay's `max_packet` is **391 B**, not 115 — the directions differ by
+So the relay's `max_packet` is **390 B**, not 115 — the directions differ by
 more than 3× because the uplink is capped by a 255-byte name and the
 downlink by 3× the query. Every control frame in this revision fits the
 *uplink* value comfortably (`AUTH_RESULT` 65 B, `HANDSHAKE_RESP` 81 B,
@@ -1253,7 +1269,7 @@ an inner-IP revision would need.
 
 **A queued frame that does not fit the current reply is progress, not a
 stall.** `AnswerFor(now, slot, maxPacket)` takes the arriving poll's
-budget, so a frame queued when the path was getting 391 B answers may not
+budget, so a frame queued when the path was getting 390 B answers may not
 fit a 150 B no-EDNS answer. Three rules, and they are ordered:
 
 1. **Send what fits.** `AnswerFor` packs as many whole frames as the
@@ -1383,8 +1399,8 @@ Called from the relay engine's loop when the adapter hands up a poll, with
 the budget that poll's query allows. Three properties matter:
 
 - **`maxPacket` comes from the poll, not from the session.** The answer
-  cell is `min(resolver buffer, 3 × query)`, which varies per query — 168 B
-  without EDNS(0), 409 B with it — so a session fixed at 391 B would seal
+  cell is `min(resolver buffer, 3 × query)`, which varies per query — 169 B
+  without EDNS(0), 408 B with it — so a session fixed at 390 B would seal
   packets that a no-EDNS poll cannot carry. The relay applies the same
   asymmetric rule as the client (§2.4) and it is the *arriving* query that
   sets it.
@@ -2060,7 +2076,7 @@ shrink its answer budget mid-transfer.
 | Beacon answer above 3× the query | The nameserver refuses it; a client that stops padding gets no beacon and says so |
 | Beacon too large for the bootstrap profile (a `front` endpoint, or a long zone) | No answer in the 512-byte profile; the client retries with EDNS(0) and succeeds there, and logs which profile it used |
 | A legal two-relay record (167 B, `_arc.x.io`) | Accepted in the 512-byte profile even though the publication rule asks for one relay per record, so a client is not broken by an operator who packs two |
-| Full-length uplink cells against a 512-byte answer budget | The downlink cell is 168 B, not the 243 B a padded short query gets — a client that fills the name loses downlink — and no answer exceeds 3× its query |
+| Full-length uplink cells against a 512-byte answer budget | The downlink cell is 169 B, not the 243 B a padded short query gets — a client that fills the name loses downlink — and no answer exceeds 3× its query |
 | A padded name carrying a cell | The padding labels reassemble away and exactly one cell is recovered; a `0`-led label is never read as cell data |
 | **An idle session's PING is answered with an ACK** | `lastRecv` advances every poll and `oldestOutstanding` clears, so the path stays healthy indefinitely with nothing else to send (§4.3.4, §4.4.1) |
 | **A lost ACK makes one unhealthy sample, then recovers** | The path is not declared dead: the next answered poll restores health (§4.4.1) |
@@ -2074,7 +2090,7 @@ shrink its answer budget mid-transfer.
 | **A stale answer whose slot has been reused** | Discarded, because its nonce is no longer outstanding — the failure the slot-only rule would have had |
 | **A slot reused before its answer returns** | Impossible at `W = 2`: slots are issued one per interval and the previous answer is back or declared lost first (§4.4.1) |
 | **The relay's ack timeout is `W × interval + RTT`** | At 6/min that is 20.5 s, not 10.5: the client may already have sent slot 1 before slot 0's answer returns, so slot 0's reuse is the next opportunity (§4.3.4) |
-| **A no-EDNS poll gets a no-EDNS answer** | `AnswerFor` is given the arriving poll's budget, so it never seals a 391 B packet into a 150 B answer (§4.3.4) |
+| **A no-EDNS poll gets a no-EDNS answer** | `AnswerFor` is given the arriving poll's budget, so it never seals a 390 B packet into a 151 B answer (§4.3.4) |
 | **The dial at its default leaves the zone unremarkable** | At 30/min the journal shows 0.5 q/s; a test asserts the configured rate is what is actually offered, so no code path quietly raises it |
 | A client receives but rejects a cell (a middlebox rewrote it) | The packet fails to assemble, is dropped at the assembly window, and a whole fresh copy is sent after the PTO |
 | A control packet with its single cell lost | Recovers by PTO: the session re-seals the frames into a new packet with a new number, since replayed ciphertext would be dropped |
