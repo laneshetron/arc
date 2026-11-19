@@ -15,9 +15,11 @@ path manager consumes when ranking carriers.
 
 The design driver is the censored national network (Russia's TSPU apparatus
 is the running example), with post-auth restricted local networks (hotel,
-airplane, corporate egress) as the second case. This document changes nothing
-about the scope limits in §2: the profiler *characterizes* networks; carrier
-policy decides what to do with the characterization. A camouflage carrier is
+airplane, corporate egress) as the second case — and their pre-auth state,
+the captive portal, is specified separately in `captive-portals.md`. This
+document changes nothing about the scope limits in §2: the profiler
+*characterizes* networks; carrier policy decides what to do with the
+characterization. A camouflage carrier is
 only ever used when the user has explicitly opted into a censorship profile.
 
 ## 2. Definitions
@@ -147,6 +149,11 @@ the probe client's fingerprint is itself a measured variable (§5.2).
 
 - Captive portal detection via the OS connectivity endpoints; an
   unexpected redirect or content mismatch identifies the portal state.
+  **Specified in full in `captive-portals.md`**, which defines the four
+  states (`none`, `unauthenticated`, `authenticated`, `unknown`), the
+  classification table, the expiry keepalive, and what the client does in
+  each state. That document's probe B is this one's `dns_integrity`
+  classification; they must read the same probe, not run two.
 - HTTP probe to a canary: detects transparent proxies (injected
   `Via`/similar headers) and portal redirects.
 - Egress identity: apparent IP/ASN/country from a canary (§3.2).
@@ -201,7 +208,7 @@ and check the relay persona canary (§7).
 
 | Feature | Values |
 |---|---|
-| `portal_state` | none / unauthenticated / authenticated / expiring |
+| `portal_state` | none / unauthenticated / authenticated / unknown (`captive-portals.md` §3; `unknown` replaces the earlier `expiring`, which is a transition rather than a state — expiry is observed, and it moves the state to `unauthenticated`) |
 | `http_proxy` | none / transparent / explicit-required |
 | `dns_integrity` | clean / poisoned / sinkholed / portal-hijacked |
 | `tcp_443` | open / sni-blocklist / sni+ip-blocklist / allowlist-only |
@@ -278,7 +285,7 @@ deterministically and in CI:
 | SNI-based RST injection | `tcp_443 = sni-blocklist` |
 | IP blackhole of canary range | `tcp_443 = sni+ip-blocklist` (or IP-block attribution) |
 | DNS poison / sinkhole of canary names | `dns_integrity = poisoned / sinkholed` |
-| Portal redirect + DNS hijack pre-"auth" | local `portal_state = unauthenticated`; upstream battery withheld |
+| Portal redirect + DNS hijack pre-"auth" | local `portal_state = unauthenticated`; upstream battery withheld (`captive-portals.md` §10 has the full matrix) |
 | UDP/443 drop; QUIC throttled after N bytes | `udp_443 = blocked / quic-throttled` |
 | Throughput cliff after N bytes on TLS | `bulk_throttle = after-N-bytes` |
 | ECH ClientHello killed | `ech = intolerant` |
