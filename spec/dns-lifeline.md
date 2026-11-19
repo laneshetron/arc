@@ -130,10 +130,10 @@ beginning with `0` **cannot** be cell data. That is the grammar:
 three label kinds unambiguous without a length prefix: `0` is padding,
 `1` is a slot, anything else is cell data.
 
-The sequence label costs **3 wire bytes** (a length byte plus `1` and two
+The sequence label costs **4 wire bytes** (a length byte plus `1` and two
 characters), which at `_arc.example.net` takes the room for payload from
-223 to 220 bytes and the cell from 136 to 134 B, so `max_packet` falls from
-118 to 116. That is the price of the window, and it is paid only when the
+223 to 219 bytes and the cell from 136 to 133 B, so `max_packet` falls from
+118 to 115. That is the price of the window, and it is paid only when the
 window is 2.
 
 The upstream direction therefore has a small vocabulary of names rather
@@ -282,20 +282,24 @@ IP payload  = max_packet − 37  (18 DATA header + 16 tag + 3 frame header)
 
 | zone | cell (with slot) | `max_packet` | IP payload up | `HANDSHAKE_INIT` |
 |---|---|---|---|---|
-| `_arc.io` | 140 B | 122 B | 85 B | 1 cell |
+| `_arc.io` | 139 B | 121 B | 84 B | 2 cells |
 | `_arc.x.io` | 138 B | 120 B | 83 B | 2 cells |
-| `_arc.ex.net` | 137 B | 119 B | 82 B | 2 cells |
-| `_arc.example.net` | 134 B | 116 B | 79 B | 2 cells |
+| `_arc.ex.net` | 136 B | 118 B | 81 B | 2 cells |
+| `_arc.example.net` | 133 B | 115 B | 78 B | 2 cells |
 | `_arc.relay.example.com` | 130 B | 112 B | 75 B | 2 cells |
 
-These are **with the slot label** of §4.3.1, which is 3 wire bytes and
-costs 2 B of cell. Without it — a window of 1, or no window at all — each
-cell is 2 B larger and `_arc.x.io` carries a one-cell `HANDSHAKE_INIT`.
+These are **with the slot label** of §4.3.1, which is 4 wire bytes (a
+length byte plus `1` and two characters) and costs 4 B of cell. Without it
+— a window of 1, or the handshake, which uses `W = 1` throughout (§2.5) —
+each cell is 4 B larger and `_arc.io` and `_arc.x.io` reach a one-cell
+`HANDSHAKE_INIT`.
 
-The last column is one cost of this rule: at a zone suffix longer than
-about 8 bytes, `HANDSHAKE_INIT` (122 B) needs two cells, so the cold start
-is one poll longer (§2.5). That is paid once per session; the alternative
-was a carrier that cannot carry anything at all.
+That is the real price of the window, and it is larger than my previous
+revision claimed: at 4 wire bytes it costs a poll at *every* zone suffix
+in the table, including the shortest, because `_arc.io` drops from 141 to
+139 B and 122 bytes no longer fits one cell. The window is worth that —
+§2.3.1 explains why it is a correctness fix rather than a throughput
+one — but it should be stated as the cost it is.
 
 **What this does to packet sizes.** A 1280-byte IP packet becomes 19
 fragments at `_arc.example.net` (`conn.sendOn` splits to
@@ -360,43 +364,57 @@ and **refuses** one that would not complete rather than sending fragments
 that expire: a half-delivered datagram wastes polls and delivers nothing.
 
 `max_packet` in each direction is that direction's own cell minus 18 —
-116 B up (with the slot label), 391 B down with EDNS(0) — because §14.4
+115 B up (with the slot label), 391 B down with EDNS(0) — because §14.4
 probes each direction independently. There is no single symmetric value.
 
 ### 2.5 Establishment
 
 Path 0 carries the handshake, and the session is active once `AUTH_RESULT`
-arrives (§14.2), so establishment is the handshake and nothing else:
+arrives (§14.2), so establishment is the handshake and nothing else. The
+handshake runs with **`W = 1`** (§4.3.1), so its packets carry a slot
+label of 0 and pay the 4-byte cost:
 
-| step | bytes | cells (`_arc.io`) | cells (≥ 8-byte suffix) | direction |
-|---|---|---|---|---|
-| `HANDSHAKE_INIT` | 122 | 1 | 2 | up |
-| `HANDSHAKE_RESP` | 81 | 1 | 1 | down |
-| `AUTH` (43-byte token) | 80 | 1 | 1 | up |
-| `AUTH_RESULT` | 65 | 1 | 1 | down |
+| step | bytes | cells (any zone, with the slot) | direction |
+|---|---|---|---|
+| `HANDSHAKE_INIT` | 122 | 2 | up |
+| `HANDSHAKE_RESP` | 81 | 1 | down |
+| `AUTH` (43-byte token) | 80 | 1 | up |
+| `AUTH_RESULT` | 65 | 1 | down |
 
-A poll carries one uplink cell and returns one downlink cell. Count the
-INIT phase exactly, since it has a hard deadline, and note that a
-one-cell INIT is complete on the first poll — so `COOKIE_REPLY` comes back
-on the *first* answer, not the second:
+That is simpler than my last two revisions made it: the slot label costs
+4 B of cell at every zone suffix in §2.4's table, so `_arc.io` — the one
+case that used to fit a one-cell INIT — no longer does, and there is a
+single establishment sequence rather than two.
 
-| poll | long-suffix zone (INIT = 2 cells) | `_arc.io` (INIT = 1 cell) |
+A poll carries one uplink cell and returns one downlink cell. The INIT
+needs two cells, so the relay cannot see a complete INIT until the second
+poll, and `COOKIE_REPLY` comes back on that answer:
+
+| poll | carries | answers with |
 |---|---|---|
-| 1 | INIT cell 0 → `A1:-` | INIT → `COOKIE_REPLY` |
-| 2 | INIT cell 1 → `COOKIE_REPLY` | INIT with cookie → `HANDSHAKE_RESP` |
-| 3 | INIT+cookie cell 0 → `A1:-` | `AUTH` → `AUTH_RESULT` |
-| 4 | INIT+cookie cell 1 → `HANDSHAKE_RESP` | — |
-| 5 | `AUTH` → `AUTH_RESULT` | — |
+| 1 | INIT, cell 0 | `A1:-` |
+| 2 | INIT, cell 1 | `COOKIE_REPLY` |
+| 3 | INIT with cookie, cell 0 | `A1:-` |
+| 4 | INIT with cookie, cell 1 | `HANDSHAKE_RESP` |
+| 5 | `AUTH` | `AUTH_RESULT` |
 
-At 2 s per poll, the INIT phase takes **8 s of its 10** for a long-suffix
-zone and **4 s** for `_arc.io`, leaving 2 s and 6 s for resolver latency
-on the response. The long-suffix case fits but with almost no slack: one
+The handshake uses **`W = 1`**, deliberately: it is a short exchange whose
+packets are two cells at most, and a window would only complicate the
+attempt/cell interleaving rule below. So the two-cell INIT's second cell
+goes out on the very next poll, not `W` polls later, and the counts above
+are the poll counts.
+
+At 2 s per poll, the INIT phase takes **8 s of its 10**, leaving 2 s for
+resolver latency on the response. That fits but with almost no slack: one
 3-second resolver response anywhere in those four polls restarts the
-attempt. That is why the adapter polls at the ceiling and gives up after
-three attempts rather than retrying inside a window it cannot meet.
+attempt. That is why the adapter polls at the dial's rate from the first
+INIT and gives up after three attempts rather than retrying inside a
+window it cannot meet — and why §2.5's earlier note about transmitting
+immediately matters, since the 2 s before poll 1 is otherwise spent
+before the first byte reaches the resolver.
 
-Without cookies, subtract two polls: the INIT phase is two polls (4 s) for
-a long suffix and one (2 s) for `_arc.io`.
+Without cookies, subtract two polls: the INIT phase is two polls (4 s),
+leaving 6 s.
 
 The two-cell INIT is a constraint on the adapter: `sendInit` retransmits
 every 100 ms early and 1 s once quiet, while a poll is 2 s apart at the
@@ -431,7 +449,7 @@ name, the downlink by 3× the query.
 
 | direction | cell | `max_packet` | inner IP per packet |
 |---|---|---|---|
-| client → relay | 134 B (with a slot label) | 116 B | 79 B |
+| client → relay | 133 B (with a slot label) | 115 B | 78 B |
 | relay → client, no EDNS(0) | 168 B | 150 B | 113 B |
 | relay → client, EDNS(0) 1232 | 409 B | 391 B | 354 B |
 
@@ -442,30 +460,30 @@ the two directions rather than sharing one column.
 
 ### 2.6 What an IP packet costs
 
-A full-name poll moves 134 B up and 409 B down with EDNS(0). Inner IP
+A full-name poll moves 133 B up and 409 B down with EDNS(0). Inner IP
 traffic needs **one poll per ARC packet** (§2.4), and because the two
 directions have different `max_packet` values they fragment differently:
-**67 B of IP per uplink fragment, 354 B per downlink packet.**
+**66 B of IP per uplink fragment, 354 B per downlink packet.**
 
 | inner IP | up: fragments | at 6/min | at 30/min | at 120/min | down: polls (EDNS) | down (no EDNS, 113 B) |
 |---|---|---|---|---|---|---|
 | 40 B | 1 | yes | yes | yes | 1 | 1 |
-| 67 B | 1 | yes | yes | yes | 1 | 1 |
+| 66 B | 1 | yes | yes | yes | 1 | 1 |
 | 150 B | 3 | **no** | yes | yes | 1 | 2 |
 | 300 B | 5 | **no** | **no** | yes | 1 | 3 |
-| 1,200 B | 18 | **no** | **no** | **no** | 4 | 11 |
+| 1,200 B | 19 | **no** | **no** | **no** | 4 | 11 |
 
 The "at N/min" columns are §2.4.1's 5 s window applied to the uplink: one
-67-byte fragment fits at 6/min, three (201 B) at 30, eleven (737 B) at
-120. The downlink is far more generous — 354 B per packet with EDNS(0), so
-a 300-byte answer is one poll and a 1,200-byte one four. Only a resolver
-that does not honour EDNS(0) fragments the downlink at all.
+66-byte fragment fits at 6/min, three (198 B) at 30, eleven (726 B) at 120.
+The downlink is far more generous — 354 B per packet with EDNS(0), so a
+300-byte answer is one poll and a 1,200-byte one four. Only a resolver that
+does not honour EDNS(0) fragments the downlink at all.
 
 That asymmetry is the practical argument for the rate dial: at 30/min the
 downlink already carries 354 B per poll, which is more than most DNS
-answers need, while the uplink is still limited to 201 B of datagram by
-the 5 s window. Raising the rate helps the uplink four times as much as
-the downlink.
+answers need, while the uplink is still limited to 198 B of datagram by
+the 5 s window. Raising the rate helps the uplink roughly four times as
+much as the downlink, and that gap is why the dial exists.
 
 The ratio is per *poll*, not per byte: on the wire both directions carry
 about 0.48 bytes of cell per byte of DNS message (0.482 up on base32,
@@ -480,7 +498,7 @@ not.
 So a name lookup — a 100-byte query up and a 300-byte answer down — is
 **three polls at 30/min and impossible at the 6/min floor**:
 
-- Up: the query is 137 B of ARC packet, so 3 fragments of 67 B (the 5 s
+- Up: the query is 137 B of ARC packet, so 3 fragments of 66 B (the 5 s
   window at 30/min admits 3). At 6/min they are 10 s apart, the first
   expires, and the datagram is lost before it ever leaves the tunnel
   (§2.4.1).
@@ -1033,10 +1051,22 @@ raised cap, and that pair is what becomes visible.
 - **Slot in the name.** Each poll carries a slot number in a `1`-led label
   (§2.2.1), 10 bits, so a slot is 0 or 1 here and the field leaves room for
   a deeper window later without a grammar change.
-- **Answers are matched by slot, not by order.** A resolver may return
-  answers out of order; the adapter routes each to the session by the slot
-  its query carried. The session therefore sees at most two outstanding
-  packets and needs no reordering buffer beyond that.
+- **The nonce identifies the query; the slot only routes it.** A slot is
+  reused every `W × interval`, and a delayed answer can outlive its slot:
+  poll *A* on slot 0 is delayed or lost, slot 0 is reused for poll *C*, and
+  *A*'s answer then arrives labelled slot 0. Matching on the slot alone
+  would deliver a stale answer to the wrong query — or, worse, hand the
+  session a cell it has already rejected.
+
+  The answer echoes the question (§16.5), so it carries the query's own
+  13-character nonce. **The adapter matches on nonce**, and treats the
+  slot as a routing hint for its per-slot reassembly state, not as
+  identity. An answer whose nonce is not outstanding is discarded, which
+  is the same rule §4.3 already applies to a rewritten or injected cell.
+- **Answers are matched by nonce, not by order.** A resolver may return
+  answers out of order; the adapter routes each by its nonce to the session,
+  so at most `W` packets are outstanding and no reordering buffer beyond
+  that is needed.
 - **One cell per poll, still.** The window multiplies *polls in flight*,
   never *cells in a poll* — so every emission remains one cell and the PTO
   problem §2.4 solves stays solved.
@@ -1087,13 +1117,21 @@ found the first two:
   reply}` on the engine's channel, the engine calls `PollPacket` on its
   own goroutine and returns the datagram on `reply`. The adapter's timer
   owns *when*; the engine owns *the call*.
-- **Backpressure.** When the session has more to send than the poll loop
-  can carry, the adapter does not buffer it: `PollTransmit` returning
-  datagrams faster than polls happen is a sign the path is overloaded, and
-  a DNS path that queues for a minute delivers a packet that will expire
-  anyway (§2.4). The adapter keeps at most one packet's cells in flight
-  and drops the rest with a counter, exactly as the stream carrier drops
-  into a full queue rather than blocking the event loop (§16.3).
+- **Backpressure, and the emission queue is bounded and explicit.** An
+  admitted inner datagram needs several polls to emit (§2.4.1), so it
+  cannot be "one packet in flight" — the queue holds the fragments of at
+  most **one admitted datagram**, in order, plus control. That is a bound
+  with a number: `max fragments per datagram` = `⌊5 s / interval⌋ + 1`,
+  which is 26 at 300/min and 1 at 6/min, so the queue is never unbounded
+  and never silently grows with the rate dial.
+
+  When the queue is full and more IP arrives, the adapter **drops new
+  datagrams** rather than evicting fragments of one already in emission —
+  evicting would waste the polls already spent. Control is never dropped
+  and never queued behind a datagram: it takes the next poll, and the
+  datagram's remaining fragments resume after. A dropped datagram is
+  counted and reported (§5.3.1), and because ARC does not retransmit IP
+  (§4.3.4) it is simply lost, which is the honest outcome.
 - **Before validation** the adapter polls with whatever the handshake
   needs, and here the answer is *not* a fresh packet: `HANDSHAKE_INIT`
   and `AUTH` are retransmitted by `Client.Tick` on their own schedule
@@ -1278,16 +1316,23 @@ So the relay side needs the same shape as the client's `PollPacket`:
 
 ```go
 // AnswerFor seals the reply to one poll: any due acknowledgement, then
-// one downlink cell's worth of frames, in one packet. It is called when
-// a poll arrives, not when the relay has something to say, so a poll's
-// answer always carries the ACK it owes. It reports false only when the
-// session is gone.
-func (s *RelaySession) AnswerFor(now time.Time, slot uint8) (RelayDatagram, bool)
+// one downlink cell's worth of frames, in one packet. maxPacket is the
+// answer budget for THIS poll (the resolver's declared buffer, capped at
+// 3x the query), so a cell is never sealed larger than the answer that
+// will carry it. It is called when a poll arrives, not when the relay has
+// something to say. It reports false only when the session is gone.
+func (s *RelaySession) AnswerFor(now time.Time, slot uint8, maxPacket int) (RelayDatagram, bool)
 ```
 
-Called from the relay engine's loop when the adapter hands up a poll.
-Two properties matter:
+Called from the relay engine's loop when the adapter hands up a poll, with
+the budget that poll's query allows. Three properties matter:
 
+- **`maxPacket` comes from the poll, not from the session.** The answer
+  cell is `min(resolver buffer, 3 × query)`, which varies per query — 168 B
+  without EDNS(0), 409 B with it — so a session fixed at 391 B would seal
+  packets that a no-EDNS poll cannot carry. The relay applies the same
+  asymmetric rule as the client (§2.4) and it is the *arriving* query that
+  sets it.
 - **The ACK is included even when nothing else is**, which is what makes
   an idle session's `lastRecv` advance (§4.4.1). Without this method the
   relay has no way to produce that packet.
@@ -1296,12 +1341,23 @@ Two properties matter:
   `RelayDatagram` gains a token, and the adapter calls
   `RelayTransmitted(token)` when the answer leaves for the resolver.
   Otherwise the relay's PTO fires on answers the adapter is still holding,
-  and its RTT samples poll latency, exactly as on the client side. The
-  relay's timer also has to allow for **the next poll**: an answer is
-  transmitted immediately, but the *ACK of it* cannot arrive until the
-  client polls again, which is `1/rate` later. So the relay's effective
-  ack timeout is `poll interval + RTT`, not `RTT`, or every multi-poll
-  transfer looks lost.
+  and its RTT samples poll latency, exactly as on the client side.
+- **The relay's ack timeout is `W × interval + RTT`, not `RTT` and not one
+  interval.** Two polls are in flight, so the client may already have sent
+  slot 1 before slot 0's answer returns; it cannot acknowledge slot 0 in a
+  poll that has left. The next opportunity is the *reuse* of slot 0, which
+  is `W × interval` after it was issued:
+
+  | rate | W | interval | timeout at RTT 0.5 s | vs PTO 0.69 s |
+  |---|---|---|---|---|
+  | 6/min | 2 | 10 s | 20.5 s | 30× too short |
+  | 30/min | 2 | 2 s | 4.5 s | 6.5× too short |
+  | 120/min | 2 | 0.5 s | 1.5 s | 2.2× too short |
+  | 300/min | 2 | 0.2 s | 0.9 s | 1.3× too short |
+
+  My previous revision said one interval, which is right for `W = 1` and
+  wrong by an interval once a second slot exists. At 6/min the relay would
+  have re-sent every multi-poll transfer long before its ack could arrive.
 
 **And one correction on `AUTH_RESULT`.** My earlier table said "the
 client's first `DATA` or `ACK`" proved it arrived. It does not:
@@ -1624,10 +1680,12 @@ to its limit it would reject the very polls that keep the session alive,
 and the session would die of budget instead of surviving on control.
 
 A class marker in the query name would fix it on the wire — the §2.2.1
-zero-label grammar has room for one — but it costs a byte of every cell
-(it drops `_arc.x.io` from a one-cell `HANDSHAKE_INIT` to two), and it
-would let a client lie about which class it is spending. The better place
-is where the frames are already visible:
+grammar has room for one — but it costs another label of every cell (and
+it would let a client lie about which class it is spending). Since the
+slot label already costs 4 wire bytes and has taken the handshake to two
+cells at every zone size (§2.5), a second label would start eating into
+payload at the shorter zones too. The better place is where the frames are
+already visible:
 
 - **The nameserver charges only what it can see:** queries per real source
   (§5.3.2) and the pre-auth per-association budget (§4.2.2). Both are
@@ -1725,9 +1783,13 @@ shrink its answer budget mid-transfer.
 | **The seal-to-transmit gap does not fire PTO** | A datagram held by the adapter for 10 s produces no PTO and no health dip until `Transmitted` is called (§4.3.3) |
 | **Relay-side application allowance exhausted, authenticated keepalives flowing** | The session survives to the next window: the relay meters in its decrypted session, so control is admitted by class and never charged to the application allowance |
 | A `HANDSHAKE_INIT` split across two polls (long zone) | The adapter carries cell 0 then cell 1 of the *same* attempt, and the relay reassembles it; interleaving two attempts fails to reassemble and is a test in its own right |
-| **The rate dial at 120/min, two polls in flight** | Throughput reaches the configured rate: `min(rate, W/RTT)` holds, so a 2 s-RTT resolver still does 120/min instead of 30 (§4.3.1) |
-| **Answers arriving out of order across the two slots** | Each answer is routed by the slot in its query name, so a late slot-0 answer does not corrupt slot 1's reassembly (§2.2.1, §4.3.1) |
+| **The rate dial at 120/min, two polls in flight** | Throughput reaches `min(rate, W/RTT)`: at 0.5 s RTT that is the full 120/min, where window 1 would give 120 too but a 2 s resolver gives 60/min instead of 30. The test asserts the *formula*, not a fixed number |
+| **Answers arriving out of order across the two slots** | Each answer is matched by the query's nonce, not its slot, so a delayed slot-0 answer cannot be delivered to a reused slot 0 (§4.3.1) |
+| **A stale answer whose slot has been reused** | Discarded, because its nonce is no longer outstanding — the failure the slot-only rule would have had |
 | **A slot reused before its answer returns** | Impossible at `W = 2`: slots are issued one per interval and the previous answer is back or declared lost first (§4.4.1) |
+| **The relay's ack timeout is `W × interval + RTT`** | At 6/min that is 20.5 s, not 10.5: the client may already have sent slot 1 before slot 0's answer returns, so slot 0's reuse is the next opportunity (§4.3.4) |
+| **A no-EDNS poll gets a no-EDNS answer** | `AnswerFor` is given the arriving poll's budget, so it never seals a 391 B packet into a 150 B answer (§4.3.4) |
+| **The emission queue is bounded** | At most one admitted datagram's fragments, `⌊5 s / interval⌋ + 1` of them, and control always takes the next poll ahead of a datagram's remaining fragments (§4.3.2) |
 | **The dial raised mid-session** | The inner-MTU grows with it, so a datagram refused at 6/min is accepted at 120/min without a reconnect (§2.4.1) |
 | **The dial at its default leaves the zone unremarkable** | At 30/min the journal shows 0.5 q/s; a test asserts the configured rate is what is actually offered, so no code path quietly raises it |
 | Answer budget shrinks mid-transfer (EDNS → no EDNS) | The emission re-splits to the smaller budget and reaches the tail; no cell is stranded waiting for a larger poll |
