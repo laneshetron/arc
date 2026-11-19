@@ -389,19 +389,40 @@ the cells of one sealed packet across two polls would mean the adapter
 splitting a `Datagram` — and the alternative, sealing two packets, produces
 two `AUTH` frames, two relay answers, and a doubled credential.
 
-So the handshake needs one explicit rule, stated where it belongs rather
-than implied: **a handshake packet may be emitted across as many polls as it
-has cells, and the adapter holds its remaining cells between them.** Its
-bytes are stable across retransmissions (`TestInitIsStableAcrossRetransmissionsAndCookies`),
-so the adapter can carry cell *n* of a given attempt on poll *n* and know
-the bytes are the ones it already started; it must not interleave two
-attempts' cells, which is the same rule the two-cell `INIT` already needs.
+**And the exception has to be applied *before* sealing, or the session
+panics.** `conn.transmitPacket` ends with
 
-That is safe for the reason §2.4 gives rather than a new one: handshake
-packets never enter `sentLog` (`sendInit` writes to `c.out`; `sendAuth`
-passes `AUTH` as `extra`), so no PTO can preempt a two-cell emission, and
-their own timers drive the retries. The exemption that allows the two-cell
-`INIT` covers the enrollment `AUTH` for the same reason.
+```go
+if len(pt) > budget { panic("session: frames exceed path budget") }
+```
+
+where `budget = maxPacket − 18 − 16`. At `max_packet` 115 that is 81 bytes
+of frame room against a 116-byte enrollment `AUTH`, so the packet is not
+"too big for one cell" — it is fatal. Raising the path's maximum so the cell
+layer can split it is therefore a prerequisite for sealing, not a
+consequence of it:
+
+- **The enrollment `AUTH` is 150 bytes as one ARC packet** (18 header, 16
+  tag, 3 frame header, 113 credential). The path's `maxPacket` must be at
+  least that for `sendAuth` to seal it at all.
+- **So `sendAuth` raises the path's `maxPacket` to the packet size** when it
+  seals an enrollment, and the cell layer splits those 150 bytes into two
+  cells at every zone suffix in §2.1 (138, 133, 130 — all under 150).
+- **The raise is scoped to the handshake and reverted on `AUTH_RESULT`.**
+  Otherwise the path would claim a 150-byte maximum it cannot carry data at,
+  and an inner-IP revision would fragment against the wrong number.
+
+With that in place the emission rule is what I wrote last round: **a
+handshake packet may be emitted across as many polls as it has cells**, the
+adapter holds its remaining cells between them, and it must not interleave
+two attempts' cells. Its bytes are stable
+(`TestInitIsStableAcrossRetransmissionsAndCookies`), so cell *n* is the
+attempt it already started.
+
+Safe for the reason §2.4 gives rather than a new one: handshake packets
+never enter `sentLog` (`sendInit` writes to `c.out`; `sendAuth` passes
+`AUTH` as `extra`), so no PTO preempts a two-cell emission, and their own
+timers drive the retries.
 
 A poll carries one uplink cell and returns one downlink cell. The INIT
 needs two cells, so the relay cannot see a complete INIT until the second
@@ -462,7 +483,7 @@ falls back to. Concretely:
 
 **The burst is bounded by the operator's ceiling, not by the minimum.**
 Those two sentences pull against each other, and the review is right to
-notice: if the operator configured 6/min, a client that polls at 20/min to
+notice: if the operator configured 6/min, a client that polls at 19/min to
 establish is doing three times what it was told, and every `SCHEDULE`
 bound in §4.4.2 was derived from the declared interval. Two rules resolve
 it:
@@ -472,15 +493,27 @@ it:
   configuration** — the client reports that and does not burst past it.
   Silently exceeding an operator's configured rate to make the design work
   would make the dial meaningless at the one moment it matters most.
-- **The burst, when permitted, is declared.** A client that establishes
-  above its steady dial sends a `SCHEDULE` carrying the establishment
-  interval before the first `INIT`, and a second one at the steady interval
-  once it is active. The relay's deadlines therefore track what the client
-  is actually doing, and §4.4.2's "declare when your pacing changes" covers
-  this case rather than being an exception to it.
+- **The burst cannot be declared in advance, and does not need to be.**
+  `SCHEDULE` is a frame inside the encryption, so it can only be sent once
+  Noise has completed — after the `INIT` phase it would have informed. My
+  previous revision said the client declares the establishment interval
+  "before the first `INIT`", which is not possible on this carrier.
+
+  It is also unnecessary, which is why the gap does not matter: **the
+  relay's deadlines are irrelevant during establishment.** The relay has no
+  packet in flight whose ack depends on the client's next poll — it is
+  answering polls, and each answer is acked by the poll that follows at
+  whatever pace the client is using. The relay's `W × floor_ms` bound only
+  starts to matter once the session is active and the relay initiates
+  downlink of its own.
+
+  So the first `SCHEDULE` is sent **immediately after `AUTH_RESULT`**, while
+  the client is still at the establishment rate, and a second at the steady
+  interval once it relaxes. The relay learns the burst rate one round trip
+  after it begins, which is soon enough for the only deadlines that use it.
 
 So the table above is a statement about what the *protocol* needs, and
-§5.1's floor for a usable configuration is 20/min — not a licence to
+§5.1's floor for a usable configuration is 19/min — not a licence to
 exceed a lower one.
 
 This was implicit in my last revision ("polls at the dial's rate from the
@@ -1990,10 +2023,17 @@ already visible:
   decryption, using exactly the frame classification §5.3.1 defines for
   the client. It is the same rule on both ends, so there is nothing to
   coordinate and nothing to lie about.
-- **Control is therefore uncapped on the relay side** by construction:
-  PINGs, ACKs and handshake frames are admitted by class before the
-  application allowance is consulted. The relay's cost is bounded by the
-  rate limits it already applies (§9.2, §9.3), not by the byte quota.
+- **The relay applies the *same* shed order as the client**, not a looser
+  one. My previous revision said control was "uncapped on the relay side",
+  which contradicts §5.3.1's ordered policy two paragraphs above. The
+  relay's session sheds `PING`, `PATH_*`, `NEW_PATH` and `SCHEDULE` when
+  the device's allowance is gone, and never sheds `ACK`, `CLOSE`, handshake
+  or `ERROR` — identical to the client's rule, because it is the same rule
+  applied to the same classification.
+- **What is genuinely uncapped is the *rate limit* interaction**, not the
+  byte allowance: a relay refusing a `PING` for want of allowance still
+  answers the packet, and the connection limits (§9.2, §9.3) bound the
+  relay's own cost independently of any device's quota.
 
 The cost of doing it here is that the relay decrypts a packet before it
 learns the device is over budget. That is bounded work — one cell, one
@@ -2083,7 +2123,8 @@ shrink its answer budget mid-transfer.
 | Resolver retries a query whose answer was lost | Harmless: the repeated name gets the same emission, and since identical ciphertext is dropped by `p.replay.Check`, nothing depends on it |
 | A downlink cell lost carrying control frames | Recovers by PTO re-seal into a new packet number (not by re-sending the old bytes) |
 | **The seal-to-transmit gap does not fire PTO** | A datagram held by the adapter for 10 s produces no PTO and no health dip until `Transmitted` is called (§4.3.3) |
-| **Relay-side application allowance exhausted, authenticated keepalives flowing** | The session survives to the next window: the relay meters in its decrypted session, so control is admitted by class and never charged to the application allowance |
+| **Relay-side allowance exhausted, keepalives flowing** | The relay sheds `PING`/`PATH_*`/`SCHEDULE` and never sheds `ACK`/`CLOSE`/handshake, exactly as the client does (§5.3.1). The path goes `SUSPECT` within one keepalive and the journal says the allowance, not the network, is why |
+| **Client and relay shed the same classes** | One test drives both ends to exhaustion with the same traffic and asserts the same frames survive on each side — the property that makes "same rule on both ends" true rather than aspirational |
 | A `HANDSHAKE_INIT` split across two polls (long zone) | The adapter carries cell 0 then cell 1 of the *same* attempt, and the relay reassembles it; interleaving two attempts fails to reassemble and is a test in its own right |
 | **The rate dial at 120/min, two polls in flight** | Throughput reaches `min(rate, W/RTT)`: at 0.5 s RTT that is the full 120/min, where window 1 would give 120 too but a 2 s resolver gives 60/min instead of 30. The test asserts the *formula*, not a fixed number |
 | **Answers arriving out of order across the two slots** | Each answer is matched by the query's nonce, not its slot, so a delayed slot-0 answer cannot be delivered to a reused slot 0 (§4.3.1) |
