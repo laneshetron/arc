@@ -732,11 +732,18 @@ what makes rotation work — a beacon that could only speak for one relay
 could not move a client off a dead one.
 
 Sizes, zone `example.net`, one relay with one `tls` and one `udp`
-endpoint, one cover name and one carrier zone: **153 B** of signed record
-(the 89-byte body plus its 64-byte signature), so **207 characters** of
-TXT content in one character-string, and an answer of **491 B** against a
-query of 271 B. That is the only shape that fits a 512-byte answer without
-EDNS(0) (§3.2).
+endpoint, one cover name and a 16-character carrier zone: **153 B** of
+signed record (the 89-byte body plus its 64-byte signature), so **207
+characters** of TXT content in one character-string. Answered against a
+bootstrap query that carries it, the answer is **391 B**; against a
+full-length EDNS(0) query, **491 B**.
+
+The 491 B figure is the one this section used to quote against a 271-byte
+query, and it was wrong twice over. It is an EDNS(0) answer, not a
+bootstrap one — a 271-byte query admits only a 168-byte signed record
+(§3.2) — and it requires the answer to compress the question name, which
+every resolver does and which the sizing in §3.2 now assumes. Uncompressed,
+the 271-byte name echoed in the answer leaves room for no record at all.
 
 ### 3.2 The cold-start query is fixed, and the 3× rule binds it
 
@@ -748,26 +755,58 @@ binding:
   bare OPT record. A 410-byte query does not exist; RFC 1035 §2.3.4 caps
   the name, and nothing the client sends can exceed it.
 - **The answer is at most 3× the query**, so the largest possible beacon
-  answer is 813 B without EDNS(0) and 846 B with it.
+  answer is 813 B without EDNS(0) and 846 B with it — but those are
+  ceilings on what the *authority* may send, not on what a client should
+  ask for. The two bullets pull in opposite directions, and the second
+  one is what decides the name length.
 
 A cold client also cannot size its query to a record it has not fetched,
 and a rotation can grow the record. So the beacon has exactly **two
 query profiles**, and the client tries them in order:
 
-| profile | name | query | answer cap | max body |
-|---|---|---|---|---|
-| bootstrap | padded to 255 bytes | 271 B | 512 B (≤ 3×) | **168 B** |
-| bootstrap + EDNS(0) | padded to 255 bytes | 282 B | 845 B (≤ 3×) | **408 B** |
+| profile | name | query | answer cap | max signed record | max body |
+|---|---|---|---|---|---|
+| bootstrap | padded to 155 bytes | 171 B | 512 B (≤ 3×) | **243 B** | 179 B |
+| bootstrap + EDNS(0) | padded to 255 bytes | 282 B | 846 B (≤ 3×) | **417 B** | 353 B |
 
-Padding is by the §2.2.1 grammar, with `0`-labelled labels: the beacon
-zone leaves 222 wire bytes of room under `_arcb.example.net`, which is
-four labels — 63 + 63 + 63 + 29, plus one length byte each. (A single
-label reaches only 63, so "a few labels" is 3–4 depending on the zone, and
-the adapter computes the split rather than assuming one.) The client
-always sends the *bootstrap* profile first with its longest name, because
-that maximizes the answer under any resolver's buffer; if the answer is
-truncated or the authority signals a larger record, it retries once with
-EDNS(0) 1232 and never sizes a query to the record it expects.
+**The bootstrap name is 155 bytes, not 255, and padding it further loses
+space.** This section previously said to pad to the 255-byte limit "because
+that maximizes the answer under any resolver's buffer", and that is
+backwards: an answer echoes the question name, so every name byte is an
+answer byte spent, while the 3× rule pays back only one and a half bytes
+of cap for each name byte. The two curves cross at a 171-byte query —
+below it the 3× rule binds and the answer cap grows with the name, above
+it the 512-byte buffer binds and the record shrinks. Measured on the
+encoder:
+
+| question name | query | answer cap | max signed record |
+|---|---|---|---|
+| 155 B | 171 B | 512 B | **243 B** |
+| 170 B | 186 B | 512 B | 231 B |
+| 255 B | 271 B | 512 B | 168 B |
+
+Filling the name costs 75 bytes of record, a third of the payload, for
+nothing. §2.2.2 already makes this point about the *carrier* — "padding a
+short name out to the sweet spot rather than fill it" — and §3.2
+contradicted it for the beacon.
+
+For EDNS(0) the 3× rule never catches the 1232-byte buffer: at a 282-byte
+query the cap is 846 B, still short of 1232, so a full-length name is
+right there and the record can be 417 bytes.
+
+Padding is by the §2.2.1 grammar, with `0`-labelled labels. Under
+`_arcb.example.net` the nonce and suffix cost 33 wire bytes, so a 155-byte
+name leaves 122 for padding, which is two labels — 63 and 57, plus a
+length byte each. (At the EDNS length of 255 the room is the 222 bytes
+this section used to describe: 63 + 63 + 63 + 29, four labels.) The zone
+suffix decides how much room there is, so the adapter computes the split
+from the zone rather than assuming a count.
+
+The client always sends the *bootstrap* profile first, because it is the
+one that fits any resolver's buffer; if the answer is truncated or the
+authority signals a larger record, it retries once with EDNS(0) 1232. It
+never sizes a query to the record it expects, since that is the record it
+has not read yet.
 
 The authority enforces the same bound: it refuses (`REFUSED`) any answer
 that would exceed 3× the query it received, measured on the wire. That
@@ -778,24 +817,36 @@ reject.
 relay entry is `ipv4 + key[32] + n_endpoints + endpoints`, and the 32-byte
 key is irreducible: it is what lets a device that has never enrolled pin a
 relay. Every row below has exactly one carrier zone, as the grammar
-requires — my earlier table listed "0 zones" rows, which are not legal
-records, and claimed a 177-byte row fitted a 168-byte limit.
+requires. Sizes are given both as the **body** — what §3.1's grammar calls
+the body, before the signature — and as the **signed record** the caps in
+the table above are stated in; earlier revisions of this table labelled a
+signed-record figure "body", which made every row look 64 bytes smaller
+than it was.
 
-| record | body | 512-byte profile | EDNS(0) |
-|---|---|---|---|
-| 1 relay, `tls`+`udp`, 1 cover name, 1 zone, `_arc.example.net` | 153 B | **yes** | yes |
-| 1 relay, `tls`+`udp`+`front`, 1 name, 1 zone | 172 B | no | yes |
-| 2 relays, `tls` only, no names, `_arc.x.io` | 167 B | **yes** | yes |
-| 2 relays, `tls` only, no names, `_arc.example.net` | 174 B | no | yes |
-| 2 relays, `tls`+`udp`, 1 cover name, 1 zone | 196 B | no | yes |
-| 3 relays, `tls`+`udp`, no cover names, 1 zone | 223 B | no | yes |
+| record | body | signed | bootstrap (243 B) | EDNS(0) (417 B) |
+|---|---|---|---|---|
+| 1 relay, `tls`+`udp`, 1 cover name, 1 zone, `_arc.example.net` | 89 B | 153 B | **yes** | yes |
+| 1 relay, `tls`+`udp`+`front`, 1 name, 1 zone | 110 B | 174 B | **yes** | yes |
+| 2 relays, `tls` only, no names, `_arc.x.io` | 103 B | 167 B | **yes** | yes |
+| 2 relays, `tls` only, no names, `_arc.example.net` | 110 B | 174 B | **yes** | yes |
+| 2 relays, `tls`+`udp`, 1 cover name, 1 zone | 132 B | 196 B | **yes** | yes |
+| 3 relays, `tls`+`udp`, no cover names, 1 zone | 159 B | 223 B | **yes** | yes |
+| 4 relays, `tls`+`udp`, no cover names, 1 zone | 202 B | 266 B | no | yes |
 
-**The limit is 168 body bytes, and what fits under it depends on the
-record.** A two-relay record does fit — 167 bytes — if the carrier zone is
-short (`_arc.x.io`), each relay has one endpoint, and there are no cover
-names. It is 174 bytes with `_arc.example.net` and does not fit. So "one
-relay per record" is not a property of the grammar, and my previous
-revision was wrong to state it as one: it is a **publication rule**.
+**The bootstrap limit is 243 signed bytes, and it fits more than this
+table used to say.** The previous revision put the limit at 168 and
+concluded that a two-relay record only fitted with a short zone and one
+endpoint each. Both numbers were consequences of padding the question to
+255 bytes; at the correct 155-byte name a bootstrap answer admits 243
+bytes, which covers every legal record up to three relays with two
+endpoints apiece and a cover name. Only four relays of any shape exceed
+it, and `4` is the grammar's ceiling, so the practical statement is that
+**bootstrap carries anything the grammar allows except the largest
+records**, and EDNS(0) carries those.
+
+That does not retire the publication rule below, which was never only
+about size, but it does change its justification: the rule is now about
+independent retirement, not about fitting 168 bytes.
 
 The rule is this, and it is a policy choice for a reason:
 
@@ -804,23 +855,29 @@ The rule is this, and it is a policy choice for a reason:
 > names are present. Deployments that must rotate publish several beacon
 > names instead of several relays in one record.
 
-That is chosen over packing relays in because the alternative is a record
-whose fit depends on a zone name a client cannot control, and because
-rotation needs **independent retirement**: `b1._arcb` can be republished
-or allowed to expire without touching `b2._arcb`, whereas a two-relay
-record requires rewriting both entries at once — during exactly the
-outage rotation exists to survive. With §3.3's candidate iteration the two
-names behave like a pool anyway.
+That is chosen over packing relays in because rotation needs **independent
+retirement**: `b1._arcb` can be republished or allowed to expire without
+touching `b2._arcb`, whereas a two-relay record requires rewriting both
+entries at once — during exactly the outage rotation exists to survive.
+With §3.3's candidate iteration the two names behave like a pool anyway.
+The fit argument that used to accompany this rule was the 168-byte limit,
+and it no longer holds at 243; the independent-retirement argument is the
+one that survives.
 
-A front endpoint costs 1 + 2 + 1 + len(domain) bytes per relay, which is
-why `front` usually pushes a record over 168. The front's domain is needed
-because the client must present it as the cover name, and it is not
+A front endpoint costs 1 + 2 + 1 + len(domain) bytes per relay: at 174
+signed bytes the one-relay `front` record fits bootstrap comfortably now,
+where the previous revision had it needing EDNS(0). The front's domain is
+needed because the client must present it as the cover name, and it is not
 derivable from the beacon's own name.
 
-**The padding example needs four labels, not one.** The beacon zone leaves
-222 wire bytes of padding under `_arcb.example.net`, and a label tops out
-at 63 bytes: 63 + 63 + 63 + 29, with their length bytes, is 222. My
-earlier "three labels of at most 63" could not reach it.
+**The padding split depends on the name length.** At the EDNS length of
+255, `_arcb.example.net` leaves 222 wire bytes of padding: 63 + 63 + 63 +
+29, four labels, with a length byte each. At the bootstrap length of 155
+the room is 122, which is two labels, 63 and 57 — and those figures are
+the labels' *total* sizes, marker included, as the encoder emits them. An
+earlier revision described only the 222-byte case and presented it as
+*the* split; it is the EDNS split, and the adapter computes whichever
+applies from the zone and the profile.
 
 ### 3.3 What the client does with it
 
