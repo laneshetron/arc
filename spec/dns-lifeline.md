@@ -409,42 +409,48 @@ consequence of it:
   the cell layer splits it: an enrollment's 150 B takes two cells at every
   zone suffix in §2.1 (all under 150), and a 43-byte token's 80 B still
   takes one.
-- **The raise is bounded by the whole AUTH phase, and the phase is serialized.**
-  The handshake runs at `W = 1` (§4.3.1), so each poll waits for its own
-  answer: the *n*-th AUTH cell cannot go out until the (*n*−1)-th has been
-  answered. The slot therefore turns over every `max(interval, RTT)`, not
-  every `interval`, and the phase is
+- **The raise is bounded by the whole AUTH phase, including the wait for
+  its first poll.** The phase's 10 s starts when `HANDSHAKE_RESP` is
+  *processed*, but the first AUTH cell cannot go out until the slot the
+  INIT occupied comes free — one interval after that INIT was sent, which
+  is `max(0, interval − RTT)` after the clock starts. Then each subsequent
+  cell waits for the previous answer, so turnover is
+  `max(interval, RTT)`. Admission therefore uses
 
   ```text
-  (n − 1) × max(interval, RTT) + RTT  ≤  10 s
+  max(0, interval − RTT) + (n − 1) × max(interval, RTT) + RTT  <  10 s
   ```
 
-  My previous version used `interval` for the turnover and charged the
-  reply once. That is right only while the configured interval exceeds
-  `RTT`; above that — and the whole point of a high dial is to exceed it —
-  the reply *is* the turnover, and the bound collapses:
+  with a **strict** inequality, because `Client.Tick` restarts an attempt
+  whose deadline has been reached rather than passed.
 
-  | rate | interval | turnover | cells | packet | max credential |
-  |---|---|---|---|---|---|
-  | 19/min | 3.16 s | 3.16 s | 3 | 345 B | 308 B |
-  | 30/min (default) | 2 s | 2 s | 5 | 575 B | 538 B |
-  | 60/min | 1 s | 1 s | 10 | 1,150 B | 1,113 B |
-  | 120/min | 0.5 s | **0.6 s (RTT)** | 16 | 1,840 B | 1,803 B |
-  | 300/min | 0.2 s | **0.6 s (RTT)** | 16 | 1,840 B | 1,803 B |
+  My two previous versions were each missing a term: the first divided by
+  `interval` and charged no reply, the second charged the reply but not the
+  wait. At 24/min with a 600 ms RTT the missing wait is 1.9 s, so a
+  four-cell AUTH that the last formula admitted lands at exactly 10.00 s —
+  on the deadline, not before it.
+
+  | rate | interval | wait | turnover | cells | packet | max credential |
+  |---|---|---|---|---|---|---|
+  | 19/min | 3.16 s | 2.56 s | 3.16 s | 3 | 345 B | 308 B |
+  | 24/min | 2.5 s | 1.90 s | 2.50 s | 3 | 345 B | 308 B |
+  | 30/min (default) | 2 s | 1.40 s | 2.00 s | 4 | 460 B | 423 B |
+  | 60/min | 1 s | 0.40 s | 1.00 s | 9 | 1,035 B | 998 B |
+  | 120/min+ | ≤ 0.5 s | 0 | **RTT** | 16 | 1,840 B | 1,803 B |
 
   **No rate buys more than 16 cells**, because turnover cannot fall below
-  the round trip: `⌊(10 − RTT)/RTT⌋ + 1`. At RTT 600 ms that is 1,840 B,
-  so the largest credential this carrier can authenticate is 1,803 bytes —
-  comfortably above `ValidToken`'s 256-byte ceiling, which is what matters.
-  Raising the dial past the point where `interval < RTT` buys nothing for
-  establishment at all.
+  the round trip: `⌊(10 − RTT)/RTT⌋ + 1`. At RTT 600 ms that is 1,840 B of
+  packet and 1,803 bytes of credential — far above `ValidToken`'s
+  256-byte cap, so nothing legitimate is refused. Raising the dial past
+  `interval < RTT` buys nothing for establishment at all.
 
-  A 256-byte token's 293-byte packet needs three cells and fits at 19/min;
-  one past the bound is reported as too large for this carrier rather than
-  growing `maxPacket` until something else breaks. The bound is computed
-  from `srtt`, so it is *best-effort by construction*: a resolver slower
-  than the estimate fails the attempt and is retried (§2.5's three
-  attempts), not silently truncated.
+  A 256-byte token's 293-byte packet needs three cells and fits from 19/min
+  upward; an enrollment's 150 B needs two and fits everywhere. One past the
+  bound is reported as too large for this carrier rather than growing
+  `maxPacket` until something else breaks. The bound is computed from
+  `srtt`, so it is *best-effort by construction*: a resolver slower than
+  the estimate fails the attempt and is retried (§2.5's three attempts),
+  not silently truncated.
 - **The raise is scoped to the handshake and reverted on `AUTH_RESULT`.**
   Otherwise the path would claim a credential-sized maximum it cannot carry
   data at, and an inner-IP revision would fragment against the wrong
@@ -483,7 +489,10 @@ finishes at poll 5; an enrollment's is two and finishes at poll 6; a
 256-byte token's is three and finishes at poll 7. The AUTH phase is
 therefore **one to five polls at the rates that can establish at all** —
 one for a 43-byte token, two for an enrollment, three for a 256-byte token
-at 19/min — and the bound above computes the maximum for each rate.
+at 19/min — and the bound above computes the maximum for each rate. The gap
+between the INIT's last answer and the first AUTH poll is not idle: the slot
+it occupied stays busy for `max(0, interval − RTT)`, which the bound charges
+(§2.5).
 
 The handshake uses **`W = 1`**, deliberately: it is a short exchange whose
 packets are two cells at most, and a window would only complicate the
@@ -585,8 +594,8 @@ client restarts the whole handshake if `HANDSHAKE_RESP` has not arrived
 10 s after that (`Client.Tick`). The AUTH phase is one to five polls
 depending on credential size and rate — a 43-byte token is one, an
 enrollment two, a 256-byte token three at 19/min — and the bound in the
-table above is "as many as still leave room for the last reply", computed
-with the slot turnover rather than the configured interval.
+table above is "as many as still leave room for the wait, the turnover and
+the last reply", all three of which are charged there.
 
 **The slack above is measured from transmission, and so is the deadline.**
 `Client.Tick` compares against `attemptStart`, which `startHandshake` sets
@@ -2143,7 +2152,9 @@ resolver became the bottleneck without correlating two logs.
 - **Carried:** handshake (`HANDSHAKE_INIT`, `COOKIE_REPLY`,
   `HANDSHAKE_RESP`, `AUTH`, `AUTH_RESULT`, and **`ENROLLED`**), `PATH_JOIN`,
   `PATH_CHALLENGE`, `PATH_RESPONSE`, `PATH_ABANDON`, `NEW_PATH`, `PING`,
-  `ACK`, `CLOSE`, `ERROR`, and `SCHEDULE`/`SCHEDULE_ACK` (§4.4.2).
+  `ACK`, `CLOSE`, `ERROR`, `SCHEDULE`/`SCHEDULE_ACK` (§4.4.2), and the
+  account requests `INVITE_REQUEST`/`INVITE`,
+  `DEVICES_REQUEST`, and `REVOKE_REQUEST`/`REVOKE_RESULT`.
 
   `ENROLLED` is on this list and my first version of it was wrong to
   refuse it: `arc-client enroll` waits for `ENROLLED` before writing the
@@ -2152,14 +2163,41 @@ resolver became the bottleneck without correlating two logs.
   enrolled as. It is 10–41 B, one cell, and it is part of finishing a
   handshake rather than payload — the distinction this section is drawing
   is *control versus data*, not *small versus large*.
+
+  The account requests are on it for the same reason: every frame in each
+  exchange except one is a single cell (`INVITE_REQUEST` 48 B as a packet,
+  `INVITE` 77, `REVOKE_REQUEST` 57, `REVOKE_RESULT` 49), and a device whose
+  only path is this one should not lose self-service account management for
+  want of a carrier. `arc-client devices` works over the lifeline; the
+  earlier revision left these frames unlisted, neither carried nor refused,
+  which is not a state an implementer can act on.
 - **Refused:** `IP_PACKET`, `IP_FRAGMENT`, `IP_DATAGRAM`, `STREAM_OPEN`,
   `STREAM`, `MAX_STREAM_DATA`, `MAX_DATA`, `STREAM_RESET`, `FEC_REPAIR`,
-  `FEC`, `REDUNDANCY`, `DIAGNOSTICS_OPEN`. Refused at the **session**,
-  where frames are classifiable (§5.3.1), and counted.
+  `FEC`, `REDUNDANCY`, `DIAGNOSTICS_OPEN`, and **`DEVICES`** — the one
+  frame in that exchange that cannot work here. Its reply is
+  `10 + n × (33 + len)` bytes: 99 B as a packet for one device with a short
+  name, 246 for four, and 1,090 at the server's 16-device maximum. At
+  `_arc.example.net`'s 115 B cell that is one to ten cells — so it happens
+  to fit a single device and fails from two upward, which is the wrong
+  shape for a frame that is meant to list a tree. §2.4 forbids a multi-cell
+  packet on this carrier, so `DEVICES` is refused and `DEVICES_REQUEST` is
+  answered with a refusal rather than a partial list. A device that needs
+  its account's device tree must use another carrier. Refused at the
+  **session**, where frames are classifiable (§5.3.1), and counted.
 - **Why refuse rather than drop silently:** a client that thinks it has a
   working tunnel and gets nothing is worse than one told it does not. A
   refused `IP_PACKET` closes the flow's connection, and the status line
   says the lifeline carries control only.
+- **Diagnostics are refused for a size reason, not a class one.**
+  `DIAGNOSTICS_OPEN` and the stream frames it needs are exactly the kind of
+  thing this carrier should carry — the relay's operator is the person who
+  most needs a journal from a client that cannot reach anything else. The
+  arithmetic is what rules it out: a journal is bounded at 4 MiB and the
+  downlink cell is 408 B, so a full one is **10,280 polls** — 5.7 hours at
+  the default rate. A typical 200 KiB journal is 502 polls, 17 minutes. So
+  a *digest* would fit and a journal does not. §8 records the small upload
+  as deferred work; it needs a payload shape this revision does not define,
+  not merely permission to send streams.
 - **The user is told.** `regime = allowlist` and `shutdown` both surface a
   status line ("lifeline only: control plane; full tunnel unavailable"),
   and the journal records the regime, the poll rate and the budget
@@ -2201,8 +2239,10 @@ shrink its answer budget mid-transfer.
 | **Relay-side allowance exhausted, client keepalives flowing** | The relay sheds its own `PING`/`PATH_*`/`SCHEDULE` and never sheds `ACK`/`CLOSE`/handshake. What the client observes is narrower than "liveness": its polls are still **answered** (an `ACK` survives), so `lastRecv` keeps advancing and the path stays up — but the relay stops *initiating*, so a client waiting on relay-originated downlink sees nothing. The test asserts the ACK survives and the journal attributes the missing downlink to the allowance, not to the network |
 | **Client and relay shed the same classes** | One test drives both ends to exhaustion with the same traffic and asserts the same frames survive on each side — the property that makes "same rule on both ends" true rather than aspirational |
 | A `HANDSHAKE_INIT` split across two polls (long zone) | The adapter carries cell 0 then cell 1 of the *same* attempt, and the relay reassembles it; interleaving two attempts fails to reassemble and is a test in its own right |
-| **A three-cell `AUTH` at 19/min** | Completes inside the phase — 2 × 3.16 s of turnover plus a 600 ms reply = 6.9 s — while a *four*-cell credential at the same rate is **refused at admission** (3 × 3.16 + 0.6 = 10.1 s) |
-| **A fast dial does not enlarge the AUTH** | At 120/min with a stable 600 ms RTT, admission caps at **16 cells**, not 19: the slot turns over every `max(interval, RTT)`, so 18 × 0.6 + 0.6 = 11.4 s exceeds the phase. The same cap holds at 300/min and 1200/min — the rate buys nothing for establishment once `interval < RTT` |
+| **A three-cell `AUTH` at 19/min** | Completes inside the phase — 2.56 s wait + 2 × 3.16 s turnover + 0.6 s reply = 9.47 s — while a *four*-cell credential at the same rate is **refused at admission** (2.56 + 3 × 3.16 + 0.6 = 12.63 s) |
+| **The 24/min boundary case** | Three cells fit and four do not: 1.9 s wait + 2 × 2.5 s + 0.6 s = 7.5 s, against 1.9 + 3 × 2.5 + 0.6 = 10.0 s, which is **on** the deadline and so restarts the handshake (`Client.Tick` tests `!before`) |
+| **A fast dial does not enlarge the AUTH** | At 120/min with a stable 600 ms RTT, admission caps at **16 cells**, not 19: turnover is `max(interval, RTT)` = RTT there, so 18 × 0.6 + 0.6 = 11.4 s exceeds the phase. The same cap holds at 300/min and 1200/min — the rate buys nothing for establishment once `interval < RTT` |
+| **`arc-client devices` over the lifeline** | `DEVICES_REQUEST` is carried and answered with a refusal, because `DEVICES` needs one cell per device and more than one for any account with two or more. The client says so rather than showing a partial tree |
 | **The AUTH bound tracks `srtt`** | With a slower resolver the cap shrinks; a credential accepted at 30/min with RTT 0.6 s is refused at the same rate with RTT 2 s |
 | **The rate dial at 120/min, two polls in flight** | Throughput reaches `min(rate, W/RTT)`: at 0.5 s RTT that is the full 120/min, where window 1 would give 120 too but a 2 s resolver gives 60/min instead of 30. The test asserts the *formula*, not a fixed number |
 | **Answers arriving out of order across the two slots** | Each answer is matched by the query's nonce, not its slot, so a delayed slot-0 answer cannot be delivered to a reused slot 0 (§4.3.1) |
@@ -2308,6 +2348,19 @@ grammar (§2.2.1).
 
 ## 8. Deferred
 
+- **A small diagnostics digest.** §5.4 refuses `DIAGNOSTICS_OPEN` because a
+  journal is far too large for this channel — 4 MiB is 10,280 downlink
+  polls, 5.7 hours at the default rate. But a *digest* is the one thing an
+  operator most wants from a client that cannot reach anything else, and it
+  fits: the regime, the poll statistics, the carrier failure counters and
+  the last few dozen journal lines come to a few kilobytes, which is
+  5–20 polls. Deferred because it needs a payload definition — a fixed
+  schema rather than a free-form journal — and a separate, much smaller
+  size bound. The frame to carry it already exists.
+- **Multi-cell `DEVICES`.** §5.4 refuses `DEVICES` because its reply is
+  `10 + n × 33+len` bytes and exceeds one cell from two devices upward.
+  Serving it needs the multi-cell downlink that inner IP would also want,
+  so it belongs with that work rather than here.
 - **Inner IP over this carrier.** Deliberately out of scope for this
   revision (§2.6). Everything it needs is understood and was specified for
   eleven review rounds — per-direction `max_packet`, `IP_FRAGMENT`
