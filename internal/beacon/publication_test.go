@@ -1,0 +1,77 @@
+package beacon
+
+import (
+	"testing"
+	"time"
+)
+
+// TestPublicationRows checks §3.2's table against encoded records: which
+// deployment shapes fit the 512-byte bootstrap profile and which need
+// EDNS(0). These are the limits that decide whether an operator's beacon
+// reaches a client behind a resolver that sends no OPT record, so they are
+// asserted from real encodings rather than recomputed by hand.
+func TestPublicationRows(t *testing.T) {
+	_, priv := testKey(t)
+	now := time.Unix(1_800_000_000, 0)
+
+	base := func() *Beacon { return oneRelay(t, now) }
+	withFront := func() *Beacon {
+		b := base()
+		b.Relays[0].Endpoints = []Endpoint{
+			{Kind: KindTLS, Port: 443},
+			{Kind: KindUDP, Port: 4433},
+			{Kind: KindFront, Port: 443, Domain: "cdn.example.net"},
+		}
+		return b
+	}
+	twoTLS := func(zone string) *Beacon {
+		b := base()
+		b.Names = nil
+		b.Zones = []string{zone}
+		b.Relays[0].Endpoints = []Endpoint{{Kind: KindTLS, Port: 443}}
+		r2 := b.Relays[0]
+		r2.Addr = r2.Addr.Next()
+		b.Relays = append(b.Relays, r2)
+		return b
+	}
+	nRelays := func(n int, names bool) *Beacon {
+		b := base()
+		if !names {
+			b.Names = nil
+		}
+		for i := 1; i < n; i++ {
+			r := b.Relays[0]
+			r.Addr = r.Addr.Next()
+			b.Relays = append(b.Relays, r)
+		}
+		return b
+	}
+
+	cases := []struct {
+		label string
+		b     *Beacon
+		fits  bool
+	}{
+		{"1 relay tls+udp, 1 name", base(), true},
+		{"1 relay tls+udp+front, 1 name", withFront(), false},
+		{"2 relays tls only, no names, _arc.x.io", twoTLS("_arc.x.io"), true},
+		{"2 relays tls only, no names, _arc.example.net", twoTLS("_arc.example.net"), false},
+		{"2 relays tls+udp, 1 name", nRelays(2, true), false},
+		{"3 relays tls+udp, no names", nRelays(3, false), false},
+	}
+	for _, c := range cases {
+		t.Run(c.label, func(t *testing.T) {
+			content, err := Encode(c.b, Suffix(testZone), priv)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// 12 header + 271-byte query (255-byte name) + 12 answer header
+			// + 1 RDATA length byte, then the content.
+			answer := 12 + 255 + 4 + 12 + 1 + len(content)
+			if got := answer <= 512; got != c.fits {
+				t.Fatalf("answer %d B: fits512=%v, spec §3.2 says %v (content %d)",
+					answer, got, c.fits, len(content))
+			}
+		})
+	}
+}
