@@ -407,17 +407,36 @@ consequence of it:
   the cell layer splits it: an enrollment's 150 B takes two cells at every
   zone suffix in §2.1 (all under 150), and a 43-byte token's 80 B still
   takes one.
-- **The raise is bounded by the AUTH phase's budget, not by a guess.** A
-  packet of *n* cells occupies `n − 1` poll intervals, so the AUTH phase
-  must fit that inside its own 10 s: at 19/min that is **four cells**
-  (9.5 s), at 30/min five (8 s). So the bound is "as many cells as the
-  phase can carry", which at `_arc.example.net` is 460 B at 19/min — a
-  256-byte token's 293-byte packet needs three cells and fits; a credential
-  past the bound is reported as too large for this carrier rather than
-  growing `maxPacket` until something else breaks.
+- **The raise is bounded by the whole AUTH phase, reply included.** The
+  phase's 10 s starts when `HANDSHAKE_RESP` is processed and ends when
+  `AUTH_RESULT` is *received*, so a packet of *n* cells costs
+  `(n − 1) × interval` to send **plus one round trip** for the result.
+  Admission therefore uses
+
+  ```text
+  n ≤ ⌊(10 s − RTT) / interval⌋ + 1
+  ```
+
+  and not the `n − 1` form I first wrote, which assumed the reply was
+  free. At 19/min that is **three** cells, not four — four cells take
+  9.47 s to send and a 600 ms reply lands at 10.07 s, past the deadline.
+
+  | rate | interval | cells | packet | max credential |
+  |---|---|---|---|---|
+  | 19/min | 3.16 s | 3 | 345 B | 308 B |
+  | 30/min (default) | 2 s | 5 | 575 B | 538 B |
+  | 120/min | 0.5 s | 19 | 2,185 B | 2,148 B |
+
+  So a 256-byte token's 293-byte packet needs three cells and fits at
+  19/min, and one that does not fit is reported as too large for this
+  carrier rather than growing `maxPacket` until something else breaks. The
+  bound is *best-effort by construction* — it is computed from `srtt`, and
+  a resolver slower than that estimate fails the attempt and is retried
+  (§2.5's three attempts), not silently truncated.
 - **The raise is scoped to the handshake and reverted on `AUTH_RESULT`.**
-  Otherwise the path would claim a 150-byte maximum it cannot carry data at,
-  and an inner-IP revision would fragment against the wrong number.
+  Otherwise the path would claim a credential-sized maximum it cannot carry
+  data at, and an inner-IP revision would fragment against the wrong
+  number.
 
 With that in place the emission rule is what I wrote last round: **a
 handshake packet may be emitted across as many polls as it has cells**, the
@@ -441,13 +460,17 @@ poll, and `COOKIE_REPLY` comes back on that answer:
 | 2 | INIT, cell 1 | `COOKIE_REPLY` |
 | 3 | INIT with cookie, cell 0 | `A1:-` |
 | 4 | INIT with cookie, cell 1 | `HANDSHAKE_RESP` |
-| 5 | `AUTH`, cell 0 (token: the whole frame) | `AUTH_RESULT` |
-| 6 | `AUTH`, cell 1 (enrollment only) | `AUTH_RESULT` |
+| 5 | `AUTH`, cell 0 | `A1:-` unless the credential fit one cell |
+| … | `AUTH`, cells 1..n−1 | `A1:-` |
+| 5 + n − 1 | `AUTH`, cell n−1 | **`AUTH_RESULT`** |
 
-A token `AUTH` finishes at poll 5; an enrollment `AUTH` needs poll 6 for its
-second cell. The AUTH phase is therefore **one or two polls**, and the
-`HandshakeTimeout` budget for that phase is 10 s either way — two polls at
-2 s is 2 s, leaving 8 s of slack.
+The relay can authorize only once the last cell has arrived, so
+`AUTH_RESULT` comes on the answer to the *final* AUTH cell — not the first,
+as my earlier trace showed. A 43-byte token's `AUTH` is one cell and
+finishes at poll 5; an enrollment's is two and finishes at poll 6; a
+256-byte token's is three and finishes at poll 7. The AUTH phase is
+therefore **one to five polls**, depending on credential size and rate,
+which is what the bound above computes.
 
 The handshake uses **`W = 1`**, deliberately: it is a short exchange whose
 packets are two cells at most, and a window would only complicate the
@@ -546,8 +569,10 @@ discarded. It must not interleave two attempts' cells.
 `HandshakeTimeout` is 10 s and applies to **each phase separately**: the
 client restarts the whole handshake if `HANDSHAKE_RESP` has not arrived
 10 s after the INIT phase started, and if `AUTH_RESULT` has not arrived
-10 s after that (`Client.Tick`). The AUTH phase is one or two polls, so it
-has at least 8 s of slack.
+10 s after that (`Client.Tick`). The AUTH phase is one to five polls
+depending on credential size and rate — a 43-byte token is one, an
+enrollment two, a 256-byte token three — and the bound in the table above is
+exactly "as many as still leave room for the reply".
 
 **The slack above is measured from transmission, and so is the deadline.**
 `Client.Tick` compares against `attemptStart`, which `startHandshake` sets
@@ -2162,6 +2187,8 @@ shrink its answer budget mid-transfer.
 | **Relay-side allowance exhausted, client keepalives flowing** | The relay sheds its own `PING`/`PATH_*`/`SCHEDULE` and never sheds `ACK`/`CLOSE`/handshake. What the client observes is narrower than "liveness": its polls are still **answered** (an `ACK` survives), so `lastRecv` keeps advancing and the path stays up — but the relay stops *initiating*, so a client waiting on relay-originated downlink sees nothing. The test asserts the ACK survives and the journal attributes the missing downlink to the allowance, not to the network |
 | **Client and relay shed the same classes** | One test drives both ends to exhaustion with the same traffic and asserts the same frames survive on each side — the property that makes "same rule on both ends" true rather than aspirational |
 | A `HANDSHAKE_INIT` split across two polls (long zone) | The adapter carries cell 0 then cell 1 of the *same* attempt, and the relay reassembles it; interleaving two attempts fails to reassemble and is a test in its own right |
+| **A three-cell `AUTH` at 19/min** | Sends within the phase and receives `AUTH_RESULT` before the 10 s deadline — 6.32 s of sending plus a 600 ms reply — and a *four*-cell credential at the same rate is **refused at admission**, because 9.47 s plus a reply is 10.07 s |
+| **The AUTH bound tracks `srtt`** | With a slower resolver the admitted credential size shrinks; a credential accepted at 30/min is refused at 19/min for the same reason |
 | **The rate dial at 120/min, two polls in flight** | Throughput reaches `min(rate, W/RTT)`: at 0.5 s RTT that is the full 120/min, where window 1 would give 120 too but a 2 s resolver gives 60/min instead of 30. The test asserts the *formula*, not a fixed number |
 | **Answers arriving out of order across the two slots** | Each answer is matched by the query's nonce, not its slot, so a delayed slot-0 answer cannot be delivered to a reused slot 0 (§4.3.1) |
 | **A stale answer whose slot has been reused** | Discarded, because its nonce is no longer outstanding — the failure the slot-only rule would have had |
