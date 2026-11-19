@@ -227,7 +227,7 @@ against a 15-second threshold, so the margin is 5 s: any poll whose answer
 takes longer than that eats into it, which is why a late answer counts as
 a pacing failure (§4.3) and not merely as latency.
 
-At the floor a session costs about 48 KiB an hour of cell payload, all
+At the floor a session costs about 47 KiB an hour of cell payload, all
 control when the user is idle (§5.3). At 300/min it is 2.3 MiB an hour,
 which is the sort of number a resolver notices.
 
@@ -350,13 +350,30 @@ label of 0 and pay the 4-byte cost:
 |---|---|---|---|
 | `HANDSHAKE_INIT` | 122 | 2 | up |
 | `HANDSHAKE_RESP` | 81 | 1 | down |
-| `AUTH` (43-byte token) | 80 | 1 | up |
+| `AUTH`, 43-byte token | 80 | 1 | up |
+| `AUTH`, enrollment credential | 116 | **2** | up |
 | `AUTH_RESULT` | 65 | 1 | down |
 
 That is simpler than my last two revisions made it: the slot label costs
 4 B of cell at every zone suffix in §2.4's table, so `_arc.io` — the one
 case that used to fit a one-cell INIT — no longer does, and there is a
 single establishment sequence rather than two.
+
+**The enrollment credential needs two cells, and that is why the handshake
+is exempt from the one-cell rule.** An enrollment `AUTH` carries the magic
+(12 B), invite id (8), secret (16), a length-prefixed 43-byte token and a
+32-byte device name — 113 B of credential, 116 B with its frame header,
+against a 78-byte frame budget at `max_packet` 115. It does not fit, and it
+cannot be shrunk: every field is load-bearing and the name is the
+operator's.
+
+So `AUTH` may span cells when it carries an enrollment, and §2.4's
+one-cell rule is stated as applying to **everything but the handshake**.
+That is safe for the reason §2.4 already gives: handshake packets never
+enter `sentLog` (`sendInit` writes to `c.out`; `sendAuth` passes `AUTH` as
+`extra`), so no PTO can preempt a two-cell emission, and their own timers
+drive the retries. The same exemption that makes the two-cell `INIT`
+possible covers this.
 
 A poll carries one uplink cell and returns one downlink cell. The INIT
 needs two cells, so the relay cannot see a complete INIT until the second
@@ -387,6 +404,37 @@ before the first byte reaches the resolver.
 
 Without cookies, subtract two polls: the INIT phase is two polls (4 s),
 leaving 6 s.
+
+**Establishment therefore has a minimum rate, and it is not the floor.**
+Four polls at `W = 1` means three intervals must fit inside the 10 s
+`HandshakeTimeout`, so the interval must be under 3.33 s:
+
+| dial | interval | INIT phase | establishes? |
+|---|---|---|---|
+| 6/min (floor) | 10 s | 30 s | **no** |
+| 12/min | 5 s | 15 s | **no** |
+| 20/min | 3 s | 9 s | yes, tightly |
+| 30/min (default) | 2 s | 6 s | yes, 4 s slack |
+| 120/min | 0.5 s | 1.5 s | yes, ample |
+
+So a path cannot be *established* at the floor, and the floor is not "the
+slowest usable setting" — it is the rate an **already established** session
+falls back to. Concretely:
+
+- **The dial must be at least ~20/min to bring a session up on this
+  carrier alone.** Below that the client polls faster than its dial during
+  establishment — the handshake is a bounded burst, not steady-state, and
+  `HandshakeTimeout` is the budget it spends.
+- **An established session can idle at the floor indefinitely**, because a
+  keepalive needs no response chain, only one answer (§4.4.1).
+- **A session whose path died re-enters establishment**, so it must raise
+  its rate again to reconnect. That is why §5.1's "open the lifeline"
+  sequence sets the rate to the establishment minimum before the first
+  `INIT` and only relaxes to the dial afterwards.
+
+This was implicit in my last revision ("polls at the dial's rate from the
+first INIT") and wrong for any dial below 20/min, which includes the
+floor this document spends a section defending.
 
 The two-cell INIT is a constraint on the adapter: `sendInit` retransmits
 every 100 ms early and 1 s once quiet, while a poll is 2 s apart at the
@@ -1474,6 +1522,26 @@ fields are given below, once the staleness problem is stated):
   packet-level ACK cannot express, and it is one extra 4-byte frame that
   the relay sends only in response.
 
+  **The retry is bounded, because the peer may simply not implement it.**
+  A relay predating `0x80` ignores the frame by design, and an unbounded
+  repeat would then poll the operator's zone every 2 s forever — a
+  control-only carrier turned into a tunnel by its own clock. So:
+
+  - **Five attempts, 2 s apart**, about one interval at the floor. If no
+    `SCHEDULE_ACK` arrives, the client stops and records that the relay
+    does not honour schedules.
+  - **It then falls back to `W = 1` at the floor forever**, which is the
+    conservative form §4.4.2 already specifies, and never sends `SCHEDULE`
+    again in that session — not on a rate change, not on a reconnect to
+    the same relay.
+  - **One retry burst per session**, not per rate change: a relay that
+    ignored the first is not going to answer the fifth, and the cost of
+    being wrong is a slower path rather than a broken one.
+
+  So the extension is genuinely optional in cost as well as in code point:
+  a peer that ignores it leaves the client on the conservative deadlines
+  and quiet.
+
   `SCHEDULE_ACK` is `0x82`, also in the extension range: a client that does
   not know it ignores it, which is correct — a client that never sees an
   ack keeps re-sending at 2 s, which is harmless because the relay applies
@@ -1788,17 +1856,25 @@ belongs where the frames are still visible.
   set when the path is created, from the carrier, alongside the
   `maxPacket` of §2.4.
 - **When assembling a packet for a constrained path, the session admits
-  frames by class:** unbound control (PING, ACK, `PATH_*`, `CLOSE`,
-  `ERROR`) always; `AUTH` and handshake frames always; `IP_PACKET`,
-  `IP_FRAGMENT` and `STREAM*` only while the allowance lasts, and
-  **dropped rather than queued** when it does not. The scheduler already
-  decides which path a flow goes to, so a flow placed elsewhere loses
-  nothing; a flow with nowhere else to go sees the packet drop, which is
-  the truthful outcome for a link that is out of budget.
-- **Exhaustion is reported, not silent.** The client counts drops per
-  class and says so in the journal and the status line; a dropped
-  `IP_PACKET` on the only path closes the flow's TCP connection rather
-  than letting it hang, matching what a full transmit queue does (§16.3).
+  frames by class:** unbound control (`PING`, `ACK`, `PATH_*`, `CLOSE`,
+  `ERROR`), handshake and `SCHEDULE` frames always; **everything else is
+  refused, unconditionally, because this revision carries no inner IP**
+  (§2.6, §5.4).
+
+  The refusal is not a budget decision and must not be implemented as one:
+  a carrier with a full allowance still carries no `IP_PACKET`, and one
+  with no allowance left still carries every control frame. Two separate
+  rules — a **class gate** that never opens for payload in this revision,
+  and a **byte allowance** that bounds the control traffic itself.
+- **The allowance therefore bounds control only**, and at the floor it
+  never binds: 6 polls/min of a 133-byte cell is 47 KiB an hour, well
+  inside any sane cap. It exists so that a client which raises the dial and
+  then misbehaves is still bounded, and so the relay's per-device copy has
+  something to count that is not frame-class-dependent.
+- **Exhaustion is reported, not silent.** The client counts control frames
+  shed by the allowance and says so in the journal and the status line.
+  With no payload admitted, exhaustion is a rare operator-policy event
+  rather than a normal consequence of use.
 - **The application-DNS slice is moot in this revision**, since no IP
   flows are admitted (§2.6). The rule is retained for the inner-IP
   revision: `flowTable` already keys flows, so the inner resolver's
