@@ -218,11 +218,13 @@ polls:
 | 300 | 0.2 s | 5 | 2.0 KiB/s | **visible to any zone-volume monitor** |
 | 1200 | 0.05 s | 20 | 8.0 KiB/s | textbook tunnel; expect the zone blocked |
 
-With no inner IP (§2.6), the dial buys **recovery speed and rendezvous
-promptness**, not datagrams: a faster dial means establishment inside the
-handshake window and quicker reconnection after a path dies, and the
-ceiling is where a control-only carrier stops being worth the attention it
-attracts.
+With no inner IP (§2.6), the dial buys **recovery speed**, not datagrams:
+a faster dial means a path that died rejoins sooner, because a PING and its
+answer are a round trip apart rather than an interval apart. It does *not*
+buy establishment speed above about 30/min — §2.5's AUTH bound turns over
+on `max(interval, RTT)`, so once `interval < RTT` the rate stops helping the
+handshake — and the ceiling is where a control-only carrier stops being
+worth the attention it attracts.
 
 **The default is 30/min and the operator raises it, because the cost is
 not ours to pay.** Every poll above the floor is a query to somebody
@@ -643,10 +645,10 @@ So:
   session can classify frames. A refused `IP_PACKET` is dropped and
   counted; the flow's TCP connection closes rather than hanging.
 - **The dial's purpose changes.** With no inner IP the rate is purely a
-  control rate: 6/min keeps an established session alive, and higher rates
-  make establishment and recovery faster — which is all they buy, since the
-  dial no longer sets datagram size. §2.3.1's argument about pipelining
-  stands and is now the whole argument.
+  control rate: 6/min keeps an established session alive, and a higher rate
+  makes a dead path rejoin sooner — it does *not* speed establishment above
+  about 30/min, since §2.5's AUTH bound turns over on `max(interval, RTT)`.
+  §2.3.1's argument about pipelining stands and is now the whole argument.
 - **Budget caps become control budgets**, which the floor already
   dominates. §5.3 is restated accordingly.
 
