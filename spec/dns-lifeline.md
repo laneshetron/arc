@@ -278,10 +278,48 @@ uses; it is not a pattern to copy for data. Any *data* packet large enough
 to span two polls would be preempted at 691 ms, which is the whole reason
 §2.4 exists.
 
-What remains is the *health* interaction, which §4.4 now covers: a packet
+What remains is the *health* interaction, which §4.4 covers: a packet
 that arrives whole every poll is what keeps `lastRecv` fresh, and a
 carrier that emits a fragment every poll but never a whole packet would
 starve the path to `SUSPECT`.
+
+#### 2.4.1 One cell per packet caps inner IP at one fragment
+
+One cell per ARC packet fixes the cell layer, and it exposes a second
+window underneath it: **IP datagram reassembly**. `reassembly.DefaultConfig`
+expires an incomplete datagram after **5 s**, and `conn.sendOn` turns an
+IP packet larger than `max_packet` into several `IP_FRAGMENT`s, sent one
+per poll. Those fragments are therefore 2 s apart at the ceiling and 10 s
+apart at the steady rate:
+
+| rate | fragments that fit in 5 s | largest inner IP datagram |
+|---|---|---|
+| 30/min | 3 | 207 B |
+| 12/min | 2 | 138 B |
+| 6/min | 1 | 69 B |
+
+So at the steady rate **only single-fragment datagrams survive**: anything
+larger needs a second poll 10 s later, by which time the first fragment
+has expired and the datagram is dropped. At the ceiling three fragments
+fit, 207 bytes.
+
+**Rule: `max_packet` is 118 B for the cell (§2.4) and the inner MTU is
+what one poll can carry end to end.** A 100-byte DNS query is 137 B of ARC
+packet, which is *two* fragments — legal at 30/min, dead at 6/min. The
+adapter therefore sizes what it accepts to the rate it is running at:
+
+- At the steady 6/min, the useful inner payload is one fragment: 69 B of
+  IP. A DNS query larger than that is **not carried** — the adapter
+  reports the path as control-only rather than dropping every other
+  fragment.
+- Once the path demonstrates it can hold the ceiling (no `SUSPECT`, no
+  loss for a minute), it may raise its inner MTU to 3 fragments and pace
+  the fragments within 5 s.
+
+This is the second place the lifeline reports a capability instead of
+pretending: a two-fragment query at 6/min is not a slow query, it is an
+impossible one, and §5.4's promise is narrower than "small IP traffic" —
+it is *one-fragment* IP traffic below the ceiling.
 
 ### 2.5 Establishment
 
@@ -295,65 +333,78 @@ arrives (§14.2), so establishment is the handshake and nothing else:
 | `AUTH` (43-byte token) | 80 | 1 | 1 | up |
 | `AUTH_RESULT` | 65 | 1 | 1 | down |
 
-A poll carries one uplink cell and returns one downlink cell, so
-establishment is **three polls** when the relay accepts the first INIT and
-`HANDSHAKE_INIT` fits one cell (`_arc.io`, `_arc.x.io`), and **five** when
-cookies are required (§4.2.2) — the case that matters, since a DNS
-listener should set `AlwaysRequireCookie`. With a longer zone suffix the
-INIT needs two cells, so add one poll in the no-cookie case and *two* in
-the cookie case (the INIT is sent twice, each over two cells), giving
-**seven**. No `PATH_CHALLENGE` is needed either way: `AUTH_RESULT` is what
-validates path 0 on the client side.
+A poll carries one uplink cell and returns one downlink cell. Count the
+INIT phase exactly, since it has a hard deadline, and note that a
+one-cell INIT is complete on the first poll — so `COOKIE_REPLY` comes back
+on the *first* answer, not the second:
 
-The two-cell INIT is a real constraint on the adapter: `sendInit`
-retransmits every 100 ms early and 1 s once quiet, while a poll is 2 s
-apart at the ceiling, so the adapter must carry **cell 0 of one attempt,
-then cell 1 of the same attempt**, on consecutive polls — and the INIT
-bytes are stable across retransmissions (`TestInitIsStableAcrossRetransmissionsAndCookies`),
+| poll | long-suffix zone (INIT = 2 cells) | short-suffix zone (INIT = 1 cell) |
+|---|---|---|
+| 1 | INIT cell 0 → `A1:-` | INIT → `COOKIE_REPLY` |
+| 2 | INIT cell 1 → `COOKIE_REPLY` | INIT with cookie → `HANDSHAKE_RESP` |
+| 3 | INIT+cookie cell 0 → `A1:-` | `AUTH` → `AUTH_RESULT` |
+| 4 | INIT+cookie cell 1 → `HANDSHAKE_RESP` | — |
+| 5 | `AUTH` → `AUTH_RESULT` | — |
+
+At 2 s per poll, the INIT phase takes **8 s of its 10** for a long-suffix
+zone and **4 s** for a short one, leaving 2 s and 6 s for resolver latency
+on the response. The long-suffix case fits but with almost no slack: one
+3-second resolver response anywhere in those four polls restarts the
+attempt. That is why the adapter polls at the ceiling and gives up after
+three attempts rather than retrying inside a window it cannot meet.
+
+Without cookies, subtract two polls: the INIT phase is two polls (4 s) for
+a long suffix and one (2 s) for a short one.
+
+The two-cell INIT is a constraint on the adapter: `sendInit` retransmits
+every 100 ms early and 1 s once quiet, while a poll is 2 s apart at the
+ceiling, so the adapter must carry **cell 0 of one attempt, then cell 1 of
+the same attempt**, on consecutive polls — the INIT bytes are stable
+across retransmissions (`TestInitIsStableAcrossRetransmissionsAndCookies`),
 so that works. It must not interleave two attempts' cells.
 
-The time budget is the real constraint. `HandshakeTimeout` is 10 s and
-applies to **each phase separately**: the client restarts the whole
-handshake if `HANDSHAKE_RESP` has not arrived 10 s after the INIT phase
-started, and if `AUTH_RESULT` has not arrived 10 s after that
-(`Client.Tick`). So the INIT-phase polls must fit in 10 s, on a path whose
-every step is a recursive lookup.
+`HandshakeTimeout` is 10 s and applies to **each phase separately**: the
+client restarts the whole handshake if `HANDSHAKE_RESP` has not arrived
+10 s after the INIT phase started, and if `AUTH_RESULT` has not arrived
+10 s after that (`Client.Tick`). The AUTH phase is one poll either way, so
+it has 8 s of slack.
 
-That makes the establishment poll rate a requirement, not a knob: at 30
-polls/min (2 s apart) four INIT polls cost 6 s of the 10 (six polls, 10 s,
-when the INIT needs two cells — which is at the edge, so a longer-suffix
-deployment should expect the first attempt to fail and the second to
-succeed within the same 10 s phase), leaving the remainder for resolver
-latency — enough for a slow ISP resolver, not enough for a congested one.
-The adapter therefore polls at the ceiling from the first INIT, and if
-establishment fails three times
-in a row it reports this path unusable on this network rather than
-retrying forever inside a 10-second window it cannot meet.
+**One relay-side consequence.** With one cell per ARC packet, the relay
+must size its own `max_packet` the same way — the smaller of its inbound
+cell and the current answer's cell, minus 18 — or it will seal a packet
+the answer cannot carry. In practice the **uplink cell always binds**: the
+client's cell is ≤ 141 B, so `max_packet` is ≤ 123, while the answer's
+cell is 168 B without EDNS(0) and 409 B with it (391 B of packet). A
+single `max_packet` of 118 B at `_arc.example.net` is therefore valid in
+both directions, and the relay only has to check it when a client uses a
+larger uplink cell than the answer budget it is currently getting.
 
 ### 2.6 What an IP packet costs
 
 A full-name poll moves 136 B up and 409 B down with EDNS(0), on 1128
-bytes of query and answer. Inner IP traffic pays base32, cell headers,
-IP-framing and query overhead together, and needs **one poll per ARC
+bytes of query and answer. Inner IP traffic needs **one poll per ARC
 packet** (§2.4), so a packet larger than `max_packet` first becomes
-several `IP_FRAGMENT`s:
+several `IP_FRAGMENT`s of 69 bytes each — and §2.4.1 shows those
+fragments only reassemble within 5 s, which at the steady rate means one
+fragment:
 
-| inner IP packet | `IP_FRAGMENT`s up | polls up | wire up | × | polls down | × |
-|---|---|---|---|---|---|---|
-| 40 B | 1 | 1 | 1128 | 28.2× | 1 | 28.2× |
-| 100 B | 2 | 2 | 2256 | 22.6× | 1 | 11.3× |
-| 300 B | 5 | 5 | 5640 | 18.8× | 1 | 3.8× |
-| 600 B | 9 | 9 | 10152 | 16.9× | 2 | 3.8× |
-| 1200 B | 18 | 18 | 20304 | 16.9× | 4 | 3.8× |
-| 1280 B | 19 | 19 | 21432 | 16.7× | 4 | 3.8× |
+| inner IP packet | `IP_FRAGMENT`s up | polls up | wire up | × | at 6/min? | polls down | × |
+|---|---|---|---|---|---|---|---|
+| 40 B | 1 | 1 | 1128 | 28.2× | yes | 1 | 28.2× |
+| 100 B | 2 | 2 | 2256 | 22.6× | **no** | 1 | 11.3× |
+| 300 B | 5 | 5 | 5640 | 18.8× | **no** | 1 | 3.8× |
+| 1200 B | 18 | 18 | 20304 | 16.9× | **no** | 4 | 3.8× |
 
 Uplink fragments carry 69 bytes of IP payload each (`max_packet − 18 −
-16 − 3 − 12`), which is why a 300-byte packet costs five polls. The
-overhead is ~17× for anything larger than a fragment and ~28× for a
-40-byte packet, and it gets *worse* as the packet shrinks — a whole poll
-for 40 bytes. That is the strongest argument for §5.4's rule that this
-path carries application DNS and little else: a lookup's answer is the
-only common payload whose size justifies the envelope.
+16 − 3 − 12`), so with the fragments at poll spacing only 69 bytes of IP
+survive the reassembly window at 6 polls/min. The "at 6/min" column is
+the one that matters: **everything above 69 bytes needs the ceiling, and
+even there caps at three fragments (207 B)** (§2.4.1). The overhead
+column is computed at the ceiling, since that is the only rate where
+those rows are reachable at all. It is ~17–28×, and it gets *worse* as the
+packet shrinks — a whole poll for 40 bytes. That is the strongest argument
+for §5.4's narrow claim: this path carries control, and application data
+only when it fits one fragment.
 
 The ratio is per *poll*, not per byte: on the wire both directions carry
 about 0.48 bytes of cell per byte of DNS message (0.482 up on base32,
@@ -366,13 +417,26 @@ base32 is worse, but because a DNS question is 255 bytes and an answer is
 not.
 
 So a name lookup — a 100-byte query up and a 300-byte answer down — is
-three polls: two up for the query (it exceeds `max_packet`), one down for
-the answer (354 bytes of IP fit one downlink cell). At the
-6-poll steady rate that is 30 s; at the 30-poll ceiling, but only if
-nothing else is competing, 6 s. Messaging, an API call, a status update:
-reachable. A web page: not. That is the honest ceiling, and §6.2 of the
-profiling design's promise to the user ("full tunnel unavailable") is what
-it should say.
+**three polls at the ceiling and impossible at the steady rate**:
+
+- Up: the query is 137 B of ARC packet, so 2 fragments of 69 B. At 30/min
+  they are 2 s apart and both land inside the 5 s reassembly window. At
+  6/min they are 10 s apart, the first expires, and the datagram is lost
+  before it ever leaves the tunnel (§2.4.1).
+- Down: 337 B of ARC packet against a 354 B one-cell budget, so one poll
+  with EDNS(0) — or two fragments without it, again needing the ceiling.
+
+At the 30-poll ceiling that is 6 s and it works. At the steady 6/min the
+lifeline carries **control and one-fragment datagrams only**, which means a
+DNS query to the client's own resolver is the one common flow that still
+fits (a 30-byte answer is 67 B of ARC packet, one fragment) while a query
+with a large response is not.
+
+That is a much narrower promise than my earlier revision made, and it
+follows directly from the 5 s reassembly window. Messaging that sends one
+small datagram at a time: reachable. A web page, or anything whose first
+exchange exceeds 69 bytes: not. §6.2 of the profiling design's promise to
+the user ("full tunnel unavailable") is what it should say.
 
 ## 3. The beacon
 
@@ -960,7 +1024,60 @@ a retransmission at a PTO, or — through `demand` — whenever the adapter
 has downlink waiting, and each is a question the adapter poses through the
 engine's loop rather than on its own goroutine.
 
-#### 4.3.2 What ARC does and does not repair
+#### 4.3.2 Timers must run from transmission, not from sealing
+
+This is the finding that decides whether the carrier works at all, and it
+is a change the session needs, not a rule the adapter can obey.
+
+`conn.sealPacket` sets `sentAt: now` when it seals a packet, and
+`flushTransmits` hands the datagram to `WriteBatch` immediately. On UDP
+those are the same instant, so `sentAt` is when the packet hits the wire.
+**On this carrier they are not:** the adapter holds the datagram until its
+next poll, which is up to 10 s at the steady rate. So with `sentAt` at
+seal time:
+
+- PTO (691 ms before any RTT sample) fires while the packet has not been
+  transmitted, `onPTO` retires it, the session re-seals a replacement, and
+  the adapter discards both as obsolete. The session burns its PTO budget
+  on packets it never sent.
+- `path.healthy` reads `oldestOutstanding` from the same clock, so a path
+  carrying traffic honestly looks stalled for the whole interval between
+  polls.
+- The RTT sample, when it finally arrives, measures poll latency plus
+  resolver latency as though it were network RTT — inflating PTO for every
+  later packet.
+
+**Rule: a request/response carrier reports when it transmitted.** The
+datagram handed to `WriteBatch` carries an opaque acknowledgment token,
+and the adapter calls back with it when the packet leaves for the
+resolver:
+
+```go
+// Datagram gains a token the carrier echoes when it transmits.
+type Datagram struct {
+    PathID   uint32
+    Data     []byte
+    AckEliciting bool
+    Token    uint64   // opaque to the session; see Client.Transmitted
+}
+
+// Transmitted starts the session's timers for a packet the carrier has
+// now actually put on the wire: PTO, the health clock and the RTT sample
+// all count from here, not from sealing.
+func (c *Client) Transmitted(now time.Time, id uint32, token uint64)
+```
+
+The session keeps a *sealed but untransmitted* packet in a pending list,
+outside `sentLog`, and moves it in when `Transmitted` arrives. That is
+where the 691 ms PTO belongs. A packet whose token never comes back —
+because the adapter dropped it for backpressure — is retired without
+charging PTO, because it was never a network loss.
+
+This is the second addition the carrier needs beyond `PollPacket` (§4.3.1),
+and unlike that one it cannot be worked around in the adapter: only the
+session knows what it sealed.
+
+#### 4.3.3 What ARC does and does not repair
 
 Two facts about the existing implementation bound this section, and my
 previous revisions got both wrong.
@@ -1009,14 +1126,27 @@ cell budget (§2.4), every packet is one cell, so:
 - **PTO cannot preempt an emission**, because an emission is never
   longer than one poll — which is the bug §2.4 exists to prevent.
 
-**Two smaller rules that remain:**
+**Two rules about who may be dropped, and the first one was wrong:**
 
-- **A non-ack-eliciting packet is never awaited.** An idle client's PING
-  can be answered by an ACK-only packet, and §10.2 forbids acknowledging a
-  packet of only non-ack-eliciting frames. Such a packet is retired on the
-  next successful poll; it carries nothing the session needs.
-- **An ACK-only packet never holds the queue**, and is dropped rather than
-  queued: a stale ACK is worse than a lost one, since a fresh one follows.
+- **An ACK owed to an ack-eliciting packet is never dropped.** My previous
+  revision said ACK-only packets are "dropped rather than queued", and
+  that makes liveness impossible on this carrier: an idle client polls with
+  `DATA`/`PING`, the relay owes it an ACK, and if the ACK-only answer is
+  dropped the client's `lastRecv` never advances — so the path goes
+  `SUSPECT` for the crime of being idle.
+
+  The rule is instead: **a poll's answer always carries the ACK it owes, if
+  any**, and it does so inside the *same* ARC packet as any other downlink
+  frames — `conn.transmitPacket` already piggybacks `p.acks.peek()` when it
+  fits, so an ACK costs 24 framed bytes of the packet rather than an extra
+  poll. At `max_packet` 118 that leaves 94 B for control frames, which is
+  everything this carrier ever has queued on an idle session. Only when
+  there is *nothing* else to send is the answer an ACK-only packet — and
+  that packet is the single most important one this carrier sends, because
+  it is what keeps an idle session alive.
+- **An answer with no ACK and no cell is `A1:-`**, unchanged. It is a fact
+  about the path, not the session (§4.4), and it is what an idle client
+  sees when the relay owes nothing.
 
 **And one correction on `AUTH_RESULT`.** My earlier table said "the
 client's first `DATA` or `ACK`" proved it arrived. It does not:
@@ -1024,11 +1154,13 @@ client's first `DATA` or `ACK`" proved it arrived. It does not:
 back. The relay retires that packet on one emission instead, and answers
 whatever AUTH arrives next.
 
-Tests: a loss-free 4-fragment IP packet at both rates completes with the
-path never `SUSPECT`; an IP packet with one cell lost is not repaired by
-ARC and its absence is visible in the path's loss estimate; a lost
-control packet recovers by PTO re-seal; an idle session receiving only
-ACK-only replies stays healthy.
+Tests: a loss-free IP packet within the reassembly window at both rates
+completes with the path never `SUSPECT`; an IP packet needing more
+fragments than the rate allows is refused rather than half-delivered
+(§2.4.1); an IP packet with one cell lost is not repaired by ARC and its
+absence shows in the path's loss estimate; a lost control packet recovers
+by PTO re-seal; and an idle session keeps `lastRecv` advancing because
+its PING is answered with an ACK.
 
 ### 4.4 Answers are not liveness
 
@@ -1045,36 +1177,52 @@ looking alive for the record's TTL. TTL 0 is requested for carrier zones
 
 #### 4.4.1 Liveness needs a whole packet, and one cell gives one
 
-`path.healthy` keys on `lastRecv`, which only a **fully reassembled and
-authenticated** packet updates (`conn.open` after decryption). The review
-is right that this interacts badly with multi-cell emission: at 6 polls a
-minute a 4-cell packet leaves the client hearing nothing legitimate for
-30 s, while the suspect threshold is `keepalive + max(3·PTO, keepalive/2)`
-≈ 15 s — so a loss-free, perfectly paced path would go `SUSPECT` in the
-middle of a transfer. That is a second, independent reason §2.4's
-one-cell rule is the right one, and it is worth stating separately
-because the fix would otherwise look like a performance choice.
+`path.healthy` has **two** clocks, and the one I had not accounted for
+binds first:
 
-With one cell per ARC packet:
+```go
+limit := suspectPTOs * p.rtt.pto()          // 3 × PTO
+if now.Sub(p.lastRecv) > idleLimit(...) { return false }
+t0, ok := p.sent.oldestOutstanding()
+return !ok || now.Sub(t0) < limit || silent < limit
+```
 
-| rate | interval | `lastRecv` age after a packet | threshold |
-|---|---|---|---|
-| 6/min | 10 s | 10 s | ~15 s |
-| 30/min | 2 s | 2 s | ~15 s |
+The second clause — an outstanding packet older than `3 × PTO` — is
+stricter than the silence threshold, and at a 10 s poll interval it
+dominates. With `sentAt` finally meaning transmission time (§4.3.2), a
+PING transmitted at poll *n* and **not** acknowledged stays outstanding
+for the whole 10 s to poll *n+1*, and `3 × PTO` is under 3.3 s for any RTT
+below about a second. So an unacknowledged poll marks the path unhealthy
+long before it is silent.
 
-Every poll delivers a whole authenticated packet, so `lastRecv` ages by
-exactly one poll interval and the 5 s margin at the steady rate is the
-same margin §2.3 already requires. No interleaving, no extra control
-reply, no adjustment to the health clock.
+That makes §4.3.3's rule that a poll's answer always carries its ACK not a
+courtesy but **the health mechanism**: it is the only thing that clears
+`oldestOutstanding` between polls.
 
-The rule that follows is a *requirement on the adapter*, not a change to
-the session: **every poll must be capable of yielding one whole packet.**
-An adapter that split a packet across polls would starve the path to
-`SUSPECT` for reasons the session cannot see, and §2.4 forbids it for
-that reason among others. A future adapter that wants multi-cell packets
-must add its own authenticated progress signal — a `PING` interleaved so
-that a whole packet still arrives inside the threshold — and the spec
-does not provide one.
+| rate | interval | `lastRecv` age | outstanding age if the ACK is lost | `3 × PTO` at RTT 0.2 s |
+|---|---|---|---|---|
+| 6/min | 10 s | 10 s | 10 s | 0.68 s |
+| 30/min | 2 s | 2 s | 2 s | 0.68 s |
+
+Two consequences:
+
+- **One lost ACK is one unhealthy sample, not a dead path.** The clause
+  makes the path unhealthy immediately, but `healthy` is a *predicate*,
+  re-evaluated every tick, and the next answered poll makes it true again.
+  Nothing in §14.6 kills a path for one unhealthy interval; `SUSPECT` is
+  entered after repeated evidence, and the path returns to healthy on the
+  next packet. The spec should say this so an implementer does not turn a
+  single lost ACK into a path failure.
+- **The adapter must not batch polls to "save budget".** Polling every
+  10 s is what the keepalive requires; polling every 30 s to be frugal
+  would leave an outstanding packet for 30 s and the path unhealthy for
+  two thirds of that, which is not a saving.
+
+With one cell per packet and an ACK in every answer, both clocks stay
+satisfied: `lastRecv` ages by one interval and nothing stays outstanding
+past one round trip. The requirement on any future adapter is therefore
+two-part: **every poll must carry one whole packet, and every answer must
+carry the ACK it owes.**
 
 ### 4.5 The path in the session
 
@@ -1345,18 +1493,22 @@ resolver became the bottleneck without correlating two logs.
 
 - **Control, always.** Handshake, AUTH, path validation, keepalives,
   ACKs, `CLOSE`, `PATH_ABANDON`.
-- **IP traffic, yes, under budget.** There is no protocol reason to
-  exclude it and one good reason to include it: the first thing a user
-  needs on a captive or allowlisted network is a name resolved to an
-  address, and if ARC will not carry that query, the tunnel is up and
-  useless. Application DNS therefore gets a reserved slice of the budget
-  (the first 4 KiB/hour of downlink, say) ahead of any other flow, marked
-  as a privileged flow by the session (§5.3.1), not guessed at by the
-  adapter.
+- **IP traffic, but only what one fragment carries below the ceiling.**
+  The narrowness is forced by numbers, not caution: at the steady 6
+  polls/min only a single 69-byte fragment reassembles inside the 5 s
+  window (§2.4.1), so a 100-byte DNS query is *impossible* there and a
+  30-byte answer is the largest comfortable datagram. At the ceiling three
+  fragments fit (207 B). Application DNS still gets a reserved slice of
+  the budget — the first 4 KiB/hour of downlink, marked as a privileged
+  flow by the session (§5.3.1) — but a query that does not fit one
+  fragment is **refused**, not slowly attempted: a half-delivered datagram
+  wastes a poll and delivers nothing.
 - **Everything else, subject to §15.2 item 6.** A flow is placed here
-  only when nothing else is validated. A `TCP_MSS`-shaped request to a
-  plain-HTTP endpoint is the largest thing that plausibly completes: it
-  costs 10× its bytes and a few seconds per round trip.
+  only when nothing else is validated, and only while its packets fit the
+  current fragment budget. Messaging that sends one small datagram at a
+  time: reachable. Anything whose first exchange exceeds 69 bytes needs
+  the path to be at its ceiling, and the adapter will say so rather than
+  stall.
 - **The user is told.** `regime = allowlist` and `shutdown` both surface
   a status line ("lifeline only: full tunnel unavailable") and the
   journal records the regime, the poll rate and the budget remaining.
@@ -1384,11 +1536,14 @@ shrink its answer budget mid-transfer.
 | A legal two-relay record (167 B, `_arc.x.io`) | Accepted in the 512-byte profile even though the publication rule asks for one relay per record, so a client is not broken by an operator who packs two |
 | Full-length uplink cells against a 512-byte answer budget | The downlink cell is 168 B, not the 243 B a padded short query gets — a client that fills the name loses downlink — and no answer exceeds 3× its query |
 | A padded name carrying a cell | The padding labels reassemble away and exactly one cell is recovered; a `0`-led label is never read as cell data |
-| **A loss-free 4-fragment IP packet at both rates, real engine timers** | Every fragment arrives as its own one-cell packet; the path never goes `SUSPECT` (no emission is ever longer than one poll, so PTO cannot preempt it) |
+| **A loss-free IP packet split into 2 fragments at 30/min, real engine timers** | Both arrive inside the 5 s reassembly window, and the path never goes `SUSPECT` (PTO counts from transmission, §4.3.2) |
+| **The same 2-fragment packet at 6/min** | Refused rather than half-delivered: the first fragment expires before the second is sent (§2.4.1), and the adapter reports the path control-only |
 | **An IP packet whose single cell is lost** | ARC does **not** retransmit it; the loss shows up in the path's loss estimate and the inner protocol retries. Asserted explicitly so nobody assumes a repair that does not exist |
+| **An idle session's PING is answered with an ACK** | `lastRecv` advances every poll and `oldestOutstanding` clears, so the path stays healthy indefinitely with nothing else to send (§4.3.3, §4.4.1) |
+| **A lost ACK makes one unhealthy sample, then recovers** | The path is not declared dead: the next answered poll restores health (§4.4.1) |
 | Resolver retries a query whose answer was lost | Harmless: the repeated name gets the same emission, and since identical ciphertext is dropped by `p.replay.Check`, nothing depends on it |
 | A downlink cell lost carrying control frames | Recovers by PTO re-seal into a new packet number (not by re-sending the old bytes) |
-| A loss-free 4-fragment IP packet at the steady rate | Completes; `lastRecv` ages by one poll interval throughout, so health never dips |
+| **The seal-to-transmit gap does not fire PTO** | A datagram held by the adapter for 10 s produces no PTO and no health dip until `Transmitted` is called (§4.3.2) |
 | **Relay-side application allowance exhausted, authenticated keepalives flowing** | The session survives to the next window: the relay meters in its decrypted session, so control is admitted by class and never charged to the application allowance |
 | A `HANDSHAKE_INIT` split across two polls (long zone) | The adapter carries cell 0 then cell 1 of the *same* attempt, and the relay reassembles it; interleaving two attempts fails to reassemble and is a test in its own right |
 | Answer budget shrinks mid-transfer (EDNS → no EDNS) | The emission re-splits to the smaller budget and reaches the tail; no cell is stranded waiting for a larger poll |
@@ -1423,12 +1578,13 @@ no delegation, and no internet.
    *replies*, since `A1:-` cannot advance session liveness (§4.4). That is
    why this stage is bidirectional for control; application downlink is
    still stage 3.
-3. **Downlink data.** One cell per ARC packet (§2.4), backlog polling with
-   `demand`, application DNS as the first IP flow, and the best-effort
-   statement of §4.3.2 in the journal — an IP packet lost to a cell is not
-   repaired by ARC. Exit: a name lookup completes in the expected number
-   of polls, a 4-fragment IP packet at the steady rate leaves the path
-   never `SUSPECT`, and a downlink-only transfer drains at the ceiling.
+3. **Downlink data.** One cell per ARC packet (§2.4), the inner-IP limit
+   of §2.4.1, backlog polling with `demand`, and the best-effort
+   statement of §4.3.3 in the journal — an IP packet lost to a cell is not
+   repaired by ARC. Exit: a one-fragment datagram completes at the steady
+   rate with the path never `SUSPECT`, a two-fragment one completes at the
+   ceiling and is refused below it, and a downlink-only transfer drains at
+   the ceiling.
 4. **Rotation.** A second relay on the same store, a beacon naming only
    it, and an enrolled device establishing a new session there with no
    operator action (§3.5). Exit: that test passes, and a retired key is
@@ -1443,15 +1599,23 @@ relay-side protocol negotiation. The beacon's record *is* a new format
 (§3.1), but it is not ARC wire traffic: it is an application-level record
 inside a TXT answer, read before any session exists.
 
-What the lifeline does need beyond the adapter is four additions, all
+What the lifeline does need beyond the adapter is five additions, all
 named where they are argued:
 
 - a **constrained** flag and a `max_packet` on the path (§2.4, §4.1);
 - a **`PollPacket(now, id, demand)`** query for request/response carriers,
   called from the engine loop rather than the adapter's timer (§4.3.1);
+- a **`Transmitted(now, id, token)`** call so a carrier that holds a
+  datagram until its next poll starts PTO and the health clock when the
+  packet actually leaves, not when it was sealed (§4.3.2). This is the one
+  addition the adapter cannot work around;
 - a **per-path allowance** admitted before sealing (§5.3.1);
 - a **synthetic peer address** per association, routed like
   `stream.IsStreamAddr` (§4.2.1).
+
+Plus one relay-side rule with no code of its own: the answer to every poll
+carries the ACK it owes (§4.3.3), because `oldestOutstanding` would
+otherwise mark an idle path unhealthy between polls (§4.4.1).
 
 ## 8. Deferred
 
