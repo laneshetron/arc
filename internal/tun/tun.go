@@ -37,6 +37,11 @@ func Create(name string, mtu int) (*Device, error) {
 	if err != nil {
 		return nil, err
 	}
+	return wrap(dev)
+}
+
+// wrap takes ownership of dev and allocates its batch buffers.
+func wrap(dev wgtun.Device) (*Device, error) {
 	actual, err := dev.Name()
 	if err != nil {
 		dev.Close()
