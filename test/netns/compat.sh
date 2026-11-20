@@ -39,7 +39,7 @@ dump_logs() {
 cleanup() {
   teardown_topology
   dump_logs
-  [[ -n $WORK ]] && rm -rf "$WORK"
+  if [[ -n $WORK ]]; then rm -rf "$WORK"; fi
 }
 trap cleanup EXIT
 
@@ -162,4 +162,7 @@ finish_round() { # finish_round FAILURES_BEFORE
 round "old relay, new client" "$OLD" "$NEW"
 round "new relay, old client" "$NEW" "$OLD"
 
-if [[ $failures -eq 0 ]]; then echo "compat: all checks passed"; else echo "compat: $failures check(s) failed"; exit 1; fi
+# Exit explicitly: otherwise the EXIT trap's last command sets the status.
+if [[ $failures -eq 0 ]]; then echo "compat: all checks passed"; exit 0; fi
+echo "compat: $failures check(s) failed"
+exit 1
