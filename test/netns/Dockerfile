@@ -5,6 +5,13 @@
 #   docker run --rm --privileged arc-e2e            # end-to-end checks
 #   docker run --rm --privileged arc-e2e bench      # ARC vs WireGuard throughput
 #   docker run --rm --privileged arc-e2e degraded   # loss, delay, jitter, failover
+#
+# compat needs an older build's binaries, for linux on the container's
+# architecture, mounted at /arc/old-bin:
+#
+#   git worktree add --detach /tmp/arc-old REF
+#   (cd /tmp/arc-old && GOOS=linux CGO_ENABLED=0 go build -o "$PWD/bin-old/" ./cmd/arc-client ./cmd/arc-relay)
+#   docker run --rm --privileged -v "$PWD/bin-old:/arc/old-bin:ro" arc-e2e compat
 FROM golang:1.26.11-bookworm AS build
 WORKDIR /src
 COPY go.mod go.sum ./

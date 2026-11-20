@@ -62,6 +62,48 @@ jobs:
         if: success() || failure()
         run: sudo ./test/netns/devices.sh bin
 
+  # A relay from one build with a client from another, both ways round:
+  # against the pull request's base (or the previous commit on main), and
+  # against COMPAT_FLOOR, the oldest build still supported in the field.
+  # Raise the floor deliberately, once no deployed relay or client runs
+  # anything older.
+  compat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      COMPAT_FLOOR: 390eb4dae1350fabb52a91187c45d65adfbaa0c6 # first self-service accounts relay deployed
+      BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: sudo apt-get update && sudo apt-get install -y iperf3
+      - run: go build -o bin/ ./cmd/arc-client ./cmd/arc-relay
+      - name: build the older refs
+        run: |
+          refs=("$COMPAT_FLOOR")
+          if [[ -n $BASE && $BASE != 0000000000000000000000000000000000000000 && $BASE != "$COMPAT_FLOOR" ]] &&
+            git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            refs+=("$BASE")
+          fi
+          for ref in "${refs[@]}"; do
+            git worktree add --detach "old-$ref" "$ref"
+            (cd "old-$ref" && go build -o "$PWD/../bin-$ref/" ./cmd/arc-client ./cmd/arc-relay)
+            echo "$ref" >>compat-refs
+          done
+      - name: cross-version compatibility in network namespaces
+        run: |
+          status=0
+          while read -r ref; do
+            echo "::group::against $ref"
+            sudo ./test/netns/compat.sh bin "bin-$ref" || status=1
+            echo "::endgroup::"
+          done <compat-refs
+          exit $status
+
   # arc through mini-tspu, a private model of Russia's TSPU
   # (spec/freeze-and-udp-ban.md). Checking it out needs a read-only token
   # for laneshetron/mini-tspu in the MINI_TSPU_TOKEN secret; without one
