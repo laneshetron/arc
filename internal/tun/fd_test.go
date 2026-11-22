@@ -5,8 +5,12 @@ package tun
 import (
 	"errors"
 	"os"
+	"runtime"
 	"syscall"
 	"testing"
+	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // A descriptor that is not a TUN device is refused, and FromFD still
@@ -30,5 +34,64 @@ func TestFromFDRejectsNonTUN(t *testing.T) {
 	if err := syscall.Fstat(fd, &st); !errors.Is(err, syscall.EBADF) {
 		syscall.Close(fd)
 		t.Fatalf("FromFD left the rejected descriptor open (fstat: %v)", err)
+	}
+}
+
+// FromFD wraps a real, configured TUN without changing its MTU, and Close
+// wakes a pending Read even when the owner handed over a blocking
+// descriptor. Creating the TUN needs root, so this skips otherwise; CI runs
+// it with sudo.
+func TestFromFDRealTUN(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root to create a TUN device")
+	}
+	const mtu = 1400
+	name := DefaultName
+	if runtime.GOOS == "linux" {
+		name = "arcfdtest0"
+	}
+	owner, err := Create(name, mtu)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Close()
+	ownerFile := owner.dev.(interface{ File() *os.File }).File()
+	fd, err := syscall.Dup(int(ownerFile.Fd()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Hand over a blocking descriptor, as a provider might. The flag is
+	// shared with the owner's descriptor, which is never read here.
+	if err := unix.SetNonblock(fd, false); err != nil {
+		t.Fatal(err)
+	}
+
+	d, err := FromFD(fd)
+	if err != nil {
+		t.Fatalf("FromFD on a configured TUN: %v", err)
+	}
+	if d.Name() != owner.Name() {
+		t.Errorf("name %q, want %q", d.Name(), owner.Name())
+	}
+	if got, err := d.dev.MTU(); err != nil || got != mtu {
+		t.Errorf("MTU after FromFD = %d (%v), want %d left as configured", got, err, mtu)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := d.Read()
+		done <- err
+	}()
+	time.Sleep(100 * time.Millisecond) // let the Read block
+	// With a blocking descriptor Close itself can block behind the Read,
+	// so it runs aside too, and the test fails rather than hangs.
+	go d.Close()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Error("Read returned no error after Close")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not wake a pending Read")
 	}
 }
