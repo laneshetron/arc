@@ -1,12 +1,20 @@
-package main
+// Package client sets up and runs an ARC tunnel client: it opens the
+// carriers, runs the session engine over a packet device the caller
+// provides, and reports the network the relay assigns, so that each
+// platform can apply it its own way (spec §17).
+package client
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/netip"
+	"os"
 	"time"
 
 	"github.com/laneshetron/arc/internal/carrier/sockopt"
@@ -16,8 +24,8 @@ import (
 	"github.com/laneshetron/arc/internal/tun"
 )
 
-// carrierOptions are the flags that choose a client's carriers.
-type carrierOptions struct {
+// CarrierOptions choose a client's carriers.
+type CarrierOptions struct {
 	Relay     netip.AddrPort
 	Binds     []string
 	NoOffload bool
@@ -36,10 +44,10 @@ type carrierOptions struct {
 	RotateBytes              int64 // stream connections rotate after this many bytes received; 0: learn
 }
 
-// openCarriers opens a UDP carrier per interface, unless NoUDP, and a TLS
+// OpenCarriers opens a UDP carrier per interface, unless NoUDP, and a TLS
 // or front carrier per interface when asked. The returned function closes
 // them.
-func openCarriers(log *slog.Logger, o carrierOptions) ([]engine.Carrier, func(), error) {
+func OpenCarriers(log *slog.Logger, o CarrierOptions) ([]engine.Carrier, func(), error) {
 	var closers []io.Closer
 	closeAll := func() {
 		for i := len(closers) - 1; i >= 0; i-- {
@@ -199,4 +207,28 @@ func sharesStreamAddr(log *slog.Logger, relay netip.AddrPort, resolved map[strin
 		}
 	}
 	return false
+}
+
+// clientTLS builds the TLS configuration for -tls: the system roots or the
+// -tls-ca file, and the server name from -tls-server-name or the -tls host.
+func clientTLS(addr, caFile, serverName string) (*tls.Config, error) {
+	if serverName == "" {
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, fmt.Errorf("-tls: %w", err)
+		}
+		serverName = host
+	}
+	cfg := &tls.Config{ServerName: serverName}
+	if caFile != "" {
+		pem, err := os.ReadFile(caFile)
+		if err != nil {
+			return nil, err
+		}
+		cfg.RootCAs = x509.NewCertPool()
+		if !cfg.RootCAs.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("-tls-ca: no certificates in %s", caFile)
+		}
+	}
+	return cfg, nil
 }
