@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/netip"
 	"testing"
+	"time"
 )
 
 // TestCensorshipHoldsUDPBack: under the censorship posture, no UDP
@@ -26,7 +27,7 @@ func TestCensorshipHoldsUDPBack(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			tc.o.Relay = relay
-			carriers, closeAll, err := OpenCarriers(slog.New(slog.DiscardHandler), tc.o)
+			carriers, closeAll, err := OpenCarriers(context.Background(), slog.New(slog.DiscardHandler), tc.o)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -59,7 +60,7 @@ func TestCensorshipUsesOneResolution(t *testing.T) {
 		calls++
 		return []netip.AddrPort{a}, nil
 	}
-	carriers, closeAll, err := OpenCarriers(slog.New(slog.DiscardHandler), CarrierOptions{
+	carriers, closeAll, err := OpenCarriers(context.Background(), slog.New(slog.DiscardHandler), CarrierOptions{
 		Relay: relay, Censorship: true, Front: "relay.example:443"})
 	if err != nil {
 		t.Fatal(err)
@@ -75,7 +76,7 @@ func TestCensorshipUsesOneResolution(t *testing.T) {
 	resolveEndpoints = func(context.Context, string) ([]netip.AddrPort, error) {
 		return nil, errors.New("no DNS")
 	}
-	carriers, closeAll, err = OpenCarriers(slog.New(slog.DiscardHandler), CarrierOptions{
+	carriers, closeAll, err = OpenCarriers(context.Background(), slog.New(slog.DiscardHandler), CarrierOptions{
 		Relay: relay, Censorship: true, Front: "relay.example:443"})
 	if err != nil {
 		t.Fatal(err)
@@ -85,5 +86,40 @@ func TestCensorshipUsesOneResolution(t *testing.T) {
 		if !c.Fallback {
 			t.Errorf("UDP carrier opened though the stream endpoint did not resolve")
 		}
+	}
+}
+
+// TestOpenCarriersStopsWhenCanceled: ending the context stops a stream
+// endpoint lookup at once, rather than after its own timeout, and setup
+// returns the context's error instead of opening the remaining carriers.
+func TestOpenCarriersStopsWhenCanceled(t *testing.T) {
+	old := resolveEndpoints
+	t.Cleanup(func() { resolveEndpoints = old })
+	started := make(chan struct{}, 2)
+	resolveEndpoints = func(ctx context.Context, _ string) ([]netip.AddrPort, error) {
+		started <- struct{}{}
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := OpenCarriers(ctx, slog.New(slog.DiscardHandler), CarrierOptions{
+			Relay: netip.MustParseAddrPort("203.0.113.7:4433"), NoUDP: true,
+			TLS: "a.example:443", Front: "b.example:443"})
+		done <- err
+	}()
+	<-started
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("OpenCarriers = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("OpenCarriers kept resolving after its context ended")
+	}
+	if len(started) != 0 {
+		t.Error("a second endpoint lookup started after the context ended")
 	}
 }

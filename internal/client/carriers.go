@@ -46,8 +46,8 @@ type CarrierOptions struct {
 
 // OpenCarriers opens a UDP carrier per interface, unless NoUDP, and a TLS
 // or front carrier per interface when asked. The returned function closes
-// them.
-func OpenCarriers(log *slog.Logger, o CarrierOptions) ([]engine.Carrier, func(), error) {
+// them. Ending ctx stops setup: OpenCarriers then returns ctx's error.
+func OpenCarriers(ctx context.Context, log *slog.Logger, o CarrierOptions) ([]engine.Carrier, func(), error) {
 	var closers []io.Closer
 	closeAll := func() {
 		for i := len(closers) - 1; i >= 0; i-- {
@@ -72,9 +72,12 @@ func OpenCarriers(log *slog.Logger, o CarrierOptions) ([]engine.Carrier, func(),
 	resolved := map[string]resolution{}
 	for _, addr := range []string{o.TLS, o.Front} {
 		if _, done := resolved[addr]; addr != "" && !done {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			eps, err := resolveEndpoints(ctx, addr)
+			lctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			eps, err := resolveEndpoints(lctx, addr)
 			cancel()
+			if ctx.Err() != nil {
+				return fail(ctx.Err())
+			}
 			resolved[addr] = resolution{eps, err}
 		}
 	}

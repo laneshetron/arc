@@ -71,9 +71,9 @@ func Run(ctx context.Context, cfg Config, dev engine.PacketDevice) error {
 	}
 	co := cfg.Carriers
 	co.Relay, co.FrontToken = cfg.Relay, string(cfg.Token)
-	carriers, closeCarriers, err := OpenCarriers(log, co)
+	carriers, closeCarriers, err := OpenCarriers(ctx, log, co)
 	if err != nil {
-		return err
+		return stopped(ctx, err)
 	}
 	defer closeCarriers()
 
@@ -94,8 +94,14 @@ func Run(ctx context.Context, cfg Config, dev engine.PacketDevice) error {
 			return nil
 		}
 	}
-	err = engine.RunClient(ctx, ecfg)
-	if errors.Is(err, context.Canceled) {
+	return stopped(ctx, engine.RunClient(ctx, ecfg))
+}
+
+// stopped is err, or nil if err is the cancellation of ctx itself. A
+// cancellation from elsewhere, such as an OnNetwork whose own operation
+// was canceled, is still a failure.
+func stopped(ctx context.Context, err error) error {
+	if errors.Is(err, context.Canceled) && errors.Is(ctx.Err(), context.Canceled) {
 		return nil
 	}
 	return err
