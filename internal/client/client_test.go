@@ -171,3 +171,70 @@ func TestRunReportsOnNetworkFailure(t *testing.T) {
 		t.Fatalf("Run = %v, want the OnNetwork error", err)
 	}
 }
+
+// TestRunReportsOnNetworkCancellation: an OnNetwork that fails with
+// context.Canceled while the run's own context is live is a failure, not
+// a clean stop.
+func TestRunReportsOnNetworkCancellation(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	quiet := slog.New(slog.DiscardHandler)
+	relayKey, _ := crypto.GenerateStaticKey(nil)
+	gw, _ := gateway.New(gateway.Config{
+		Network: netip.MustParsePrefix("10.77.0.1/24"), TunMTU: 1280, Tokens: [][]byte{[]byte("secret")},
+	})
+	relayConn, err := udp.Listen(netip.MustParseAddrPort("127.0.0.1:0"), udp.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer relayConn.Close()
+	relayDev := newChanDevice()
+	defer close(relayDev.closed)
+	go engine.RunRelay(ctx, engine.RelayConfig{
+		Session: session.RelayConfig{Static: relayKey}, Conn: relayConn, TUN: relayDev, Gateway: gw, Logger: quiet,
+	})
+	clientKey, _ := crypto.GenerateStaticKey(nil)
+	var pin [32]byte
+	copy(pin[:], relayKey.Public)
+	clientDev := newChanDevice()
+	defer close(clientDev.closed)
+	err = Run(ctx, Config{
+		Relay: relayConn.LocalAddr(), RelayKey: pin, Token: []byte("secret"), Static: clientKey, Logger: quiet,
+		OnNetwork: func(Network) error { return context.Canceled },
+	}, clientDev)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run = %v, want the OnNetwork cancellation as an error", err)
+	}
+}
+
+// TestRunStopsDuringCarrierSetup: canceling Run while a stream endpoint
+// is still resolving returns nil promptly.
+func TestRunStopsDuringCarrierSetup(t *testing.T) {
+	old := resolveEndpoints
+	t.Cleanup(func() { resolveEndpoints = old })
+	started := make(chan struct{}, 1)
+	resolveEndpoints = func(ctx context.Context, _ string) ([]netip.AddrPort, error) {
+		started <- struct{}{}
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	clientKey, _ := crypto.GenerateStaticKey(nil)
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, Config{
+			Relay: netip.MustParseAddrPort("203.0.113.7:4433"), Static: clientKey, Token: []byte("t"),
+			Carriers: CarrierOptions{NoUDP: true, TLS: "relay.example:443"},
+		}, newChanDevice())
+	}()
+	<-started
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Run = %v, want nil after cancel", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run kept setting up carriers after its context ended")
+	}
+}

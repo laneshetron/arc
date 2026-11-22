@@ -188,7 +188,7 @@ func connectOnce(ctx context.Context, log *slog.Logger, p *profile, binds []stri
 	if err != nil {
 		return fmt.Errorf("profile relay-key: %w", err)
 	}
-	carriers, closeCarriers, err := client.OpenCarriers(log, client.CarrierOptions{
+	carriers, closeCarriers, err := client.OpenCarriers(ctx, log, client.CarrierOptions{
 		Relay: relay, Binds: binds, NoUDP: p.settings["no-udp"] == "true", TLS: p.settings["tls"], TLSCover: p.settings["tls-cover"],
 		TLSFingerprint: p.settings["tls-fingerprint"],
 	})
