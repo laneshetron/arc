@@ -1,11 +1,8 @@
-//go:build linux || darwin
-
 package tun
 
 import (
 	"errors"
 	"os"
-	"runtime"
 	"syscall"
 	"testing"
 	"time"
@@ -37,20 +34,17 @@ func TestFromFDRejectsNonTUN(t *testing.T) {
 	}
 }
 
-// FromFD wraps a real, configured TUN without changing its MTU, keeps it
+// FromFD wraps a real, configured utun without changing its MTU, keeps it
 // close-on-exec, and Close wakes a pending Read, even when the owner handed
 // over a blocking descriptor without close-on-exec (syscall.Dup clears it).
-// Creating the TUN needs root, so this skips otherwise; CI runs it with sudo.
+// Creating the utun needs root, so this skips otherwise; CI runs it with
+// sudo on macOS.
 func TestFromFDRealTUN(t *testing.T) {
 	if os.Geteuid() != 0 {
-		t.Skip("needs root to create a TUN device")
+		t.Skip("needs root to create a utun")
 	}
 	const mtu = 1400
-	name := DefaultName
-	if runtime.GOOS == "linux" {
-		name = "arcfdtest0"
-	}
-	owner, err := Create(name, mtu)
+	owner, err := Create(DefaultName, mtu)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,7 +62,7 @@ func TestFromFDRealTUN(t *testing.T) {
 
 	d, err := FromFD(fd)
 	if err != nil {
-		t.Fatalf("FromFD on a configured TUN: %v", err)
+		t.Fatalf("FromFD on a configured utun: %v", err)
 	}
 	if d.Name() != owner.Name() {
 		t.Errorf("name %q, want %q", d.Name(), owner.Name())
