@@ -168,7 +168,11 @@ func TestEnrollFloodOneInvite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	release, calls := make(chan struct{}), 0
+	// The first commit hangs. The gateway runs each commit in its own
+	// goroutine, so which one calls first is up to the scheduler: wait
+	// for the flooded invite's to be held before anything else can
+	// commit, or the other invite's may be the one held.
+	release, held, calls := make(chan struct{}), make(chan struct{}), 0
 	var cmu sync.Mutex
 	f.g.cfg.Commit = func(ctx context.Context, fn func(*accounts.State) error) error {
 		cmu.Lock()
@@ -176,6 +180,7 @@ func TestEnrollFloodOneInvite(t *testing.T) {
 		first := calls == 1
 		cmu.Unlock()
 		if first {
+			close(held)
 			<-release // the flooded invite's commit hangs
 		}
 		return f.w.Commit(ctx, fn)
@@ -184,6 +189,11 @@ func TestEnrollFloodOneInvite(t *testing.T) {
 	first, firstCred := bytes.Repeat([]byte{1}, 32), f.credential(invite.NewToken(), "first")
 	if _, err := f.g.AuthorizeSession(firstCred, first, nil); !errors.Is(err, session.ErrAuthPending) {
 		t.Fatalf("first redemption: %v", err)
+	}
+	select {
+	case <-held:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the first redemption's commit never started")
 	}
 	for n := range 2 * maxEnrolling {
 		key := bytes.Repeat([]byte{byte(n + 2)}, 32)
