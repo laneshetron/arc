@@ -1,37 +1,12 @@
 name: ci
 
 on:
-  push:
-    branches: [main]
   pull_request:
 
+# Throwaway: checks that TestFromFDRealTUN fails on macOS when each FromFD
+# fix is removed. Not for merging.
 jobs:
-  go:
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-      - name: gofmt
-        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
-      - run: go vet ./...
-      - name: reachable vulnerability scan
-        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
-      - run: go test -race ./...
-      - name: benchmarks compile and run
-        run: go test -run='^$' -bench=. -benchtime=1x ./...
-      - name: fuzz smoke
-        run: |
-          for spec in wire:FuzzPacket wire:FuzzFrames session:FuzzHandlePacket; do
-            pkg=${spec%%:*} target=${spec##*:}
-            # A fixed count, not a duration: time-based runs can end with a
-            # spurious "context deadline exceeded" from the fuzzer's shutdown.
-            go test -run='^$' -fuzz="^${target}\$" -fuzztime=2000000x ./internal/$pkg
-          done
-
-  macos:
+  macos-regress:
     runs-on: macos-latest
     timeout-minutes: 10
     steps:
@@ -39,106 +14,23 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - run: go test -race ./internal/tun
-      - name: utun tests that need root
+      - name: each fix removed must fail the test
         run: |
+          set -u
+          check() {
+            local label=$1 pattern=$2
+            cp internal/tun/fd_darwin.go /tmp/fd_darwin.go.orig
+            sed -i '' "$pattern" internal/tun/fd_darwin.go
+            if cmp -s internal/tun/fd_darwin.go /tmp/fd_darwin.go.orig; then echo "::error::$label: sabotage did not apply"; exit 1; fi
+            go test -c -race -o bin/tun.test ./internal/tun
+            if sudo bin/tun.test -test.v -test.run 'FromFDRealTUN' -test.timeout 60s > /tmp/out.txt 2>&1; then
+              cat /tmp/out.txt; echo "::error::$label: test passed without the fix"; exit 1
+            fi
+            echo "== $label: failed as expected"; grep -E 'fd_darwin_test|--- ' /tmp/out.txt
+            cp /tmp/fd_darwin.go.orig internal/tun/fd_darwin.go
+          }
           go test -c -race -o bin/tun.test ./internal/tun
-          sudo bin/tun.test -test.v -test.run 'FromFD'
-
-  e2e:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-      - run: sudo apt-get update && sudo apt-get install -y iperf3
-      - run: go build -o bin/ ./cmd/arc-client ./cmd/arc-relay
-      - name: tunnel end to end in network namespaces
-        run: sudo KEEP_LOGS=1 ./test/netns/e2e.sh bin
-      - name: HTTPS front end to end in network namespaces
-        if: success() || failure() # independent of e2e.sh's result
-        run: sudo ./test/netns/front.sh bin
-      - name: account isolation end to end in network namespaces
-        if: success() || failure()
-        run: sudo ./test/netns/accounts.sh bin
-      - name: accounts store end to end in network namespaces
-        if: success() || failure()
-        run: sudo ./test/netns/store.sh bin
-      - name: enrollment end to end in network namespaces
-        if: success() || failure()
-        run: sudo ./test/netns/enroll.sh bin
-      - name: device-minted invites end to end in network namespaces
-        if: success() || failure()
-        run: sudo ./test/netns/invites.sh bin
-      - name: devices managing devices end to end in network namespaces
-        if: success() || failure()
-        run: sudo ./test/netns/devices.sh bin
-
-  # arc through mini-tspu, a private model of Russia's TSPU
-  # (spec/freeze-and-udp-ban.md). Checking it out needs a read-only token
-  # for laneshetron/mini-tspu in the MINI_TSPU_TOKEN secret; without one
-  # (forks, or before it is set) the job reports a skip and passes.
-  tspu:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    env:
-      MINI_TSPU_TOKEN: ${{ secrets.MINI_TSPU_TOKEN }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: mini-tspu available
-        id: tspu
-        run: |
-          if [[ -n $MINI_TSPU_TOKEN ]]; then echo "ok=1" >>"$GITHUB_OUTPUT"
-          else echo "::notice::MINI_TSPU_TOKEN not set; skipping the mini-tspu tests"; fi
-      - uses: actions/checkout@v4
-        if: steps.tspu.outputs.ok
-        with:
-          repository: laneshetron/mini-tspu
-          token: ${{ secrets.MINI_TSPU_TOKEN }}
-          path: mini-tspu
-      - uses: actions/setup-go@v5
-        if: steps.tspu.outputs.ok
-        with:
-          go-version-file: go.mod
-      - if: steps.tspu.outputs.ok
-        run: sudo apt-get update && sudo apt-get install -y iperf3
-      - if: steps.tspu.outputs.ok
-        run: |
-          go build -o bin/ ./cmd/arc-client ./cmd/arc-relay
-          (cd mini-tspu && go build -o ../bin/ ./cmd/mini-tspu)
-      - name: arc through mini-tspu in network namespaces
-        if: steps.tspu.outputs.ok
-        run: sudo ./test/netns/tspu.sh bin
-
-  degraded:
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-      - run: sudo apt-get update && sudo apt-get install -y iperf3 wireguard-tools
-      - name: load netem
-        run: |
-          sudo modprobe sch_netem ||
-            { sudo apt-get install -y "linux-modules-extra-$(uname -r)" && sudo modprobe sch_netem; } ||
-            echo "netem unavailable; degraded.sh will skip"
-      - run: go build -o bin/ ./cmd/arc-client ./cmd/arc-relay
-      - name: degraded networks in network namespaces
-        run: sudo ./test/netns/degraded.sh bin
-
-  fixtures:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: pip install -r spec/requirements.txt
-      - name: fixtures are up to date
-        run: python spec/generate_arc_fixtures.py --check
-
+          echo "== fixed"; sudo bin/tun.test -test.v -test.run 'FromFD' | grep -E -- '--- |^ok|FAIL'
+          check "no nonblocking" 's/if err := unix.SetNonblock(fd, true); err != nil {/if err := error(nil); err != nil {/'
+          check "no close-on-exec" 's/^	unix.CloseOnExec(fd)$/	_ = unix.CloseOnExec/'
+          check "MTU 1280 instead of 0" 's/wgtun.CreateTUNFromFile(f, 0)/wgtun.CreateTUNFromFile(f, 1280)/'
