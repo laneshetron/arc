@@ -1,4 +1,4 @@
-package main
+package client
 
 import (
 	"context"
@@ -15,18 +15,18 @@ func TestCensorshipHoldsUDPBack(t *testing.T) {
 	relay := netip.MustParseAddrPort("203.0.113.7:4433")
 	for _, tc := range []struct {
 		name    string
-		o       carrierOptions
+		o       CarrierOptions
 		wantUDP bool
 	}{
-		{"front on the relay's address", carrierOptions{Censorship: true, Front: "203.0.113.7:443"}, false},
-		{"tls on the relay's address", carrierOptions{Censorship: true, TLS: "203.0.113.7:443"}, false},
-		{"front elsewhere", carrierOptions{Censorship: true, Front: "198.51.100.9:443"}, true},
-		{"no stream carrier", carrierOptions{Censorship: true}, true},
-		{"no posture", carrierOptions{Front: "203.0.113.7:443"}, true},
+		{"front on the relay's address", CarrierOptions{Censorship: true, Front: "203.0.113.7:443"}, false},
+		{"tls on the relay's address", CarrierOptions{Censorship: true, TLS: "203.0.113.7:443"}, false},
+		{"front elsewhere", CarrierOptions{Censorship: true, Front: "198.51.100.9:443"}, true},
+		{"no stream carrier", CarrierOptions{Censorship: true}, true},
+		{"no posture", CarrierOptions{Front: "203.0.113.7:443"}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			tc.o.Relay = relay
-			carriers, closeAll, err := openCarriers(slog.New(slog.DiscardHandler), tc.o)
+			carriers, closeAll, err := OpenCarriers(slog.New(slog.DiscardHandler), tc.o)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -59,7 +59,7 @@ func TestCensorshipUsesOneResolution(t *testing.T) {
 		calls++
 		return []netip.AddrPort{a}, nil
 	}
-	carriers, closeAll, err := openCarriers(slog.New(slog.DiscardHandler), carrierOptions{
+	carriers, closeAll, err := OpenCarriers(slog.New(slog.DiscardHandler), CarrierOptions{
 		Relay: relay, Censorship: true, Front: "relay.example:443"})
 	if err != nil {
 		t.Fatal(err)
@@ -75,7 +75,7 @@ func TestCensorshipUsesOneResolution(t *testing.T) {
 	resolveEndpoints = func(context.Context, string) ([]netip.AddrPort, error) {
 		return nil, errors.New("no DNS")
 	}
-	carriers, closeAll, err = openCarriers(slog.New(slog.DiscardHandler), carrierOptions{
+	carriers, closeAll, err = OpenCarriers(slog.New(slog.DiscardHandler), CarrierOptions{
 		Relay: relay, Censorship: true, Front: "relay.example:443"})
 	if err != nil {
 		t.Fatal(err)

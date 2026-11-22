@@ -10,22 +10,18 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/base64"
 	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/netip"
 	"os"
 	"os/signal"
-	"runtime"
-	"runtime/debug"
 	"strings"
 	"syscall"
 
+	"github.com/laneshetron/arc/internal/client"
 	"github.com/laneshetron/arc/internal/crypto"
 	"github.com/laneshetron/arc/internal/diag"
 	"github.com/laneshetron/arc/internal/engine"
@@ -260,16 +256,6 @@ func run(args []string) error {
 		return fmt.Errorf("create TUN: %w", err)
 	}
 	defer dev.Close()
-	carriers, closeCarriers, err := openCarriers(log, carrierOptions{
-		Relay: relayAddr, Binds: binds, NoOffload: *noOffload, NoUDP: *noUDP, Censorship: *censorship, FullTunnel: *fullTunnel, Mark: uint32(*mark),
-		TLS: *tlsAddr, TLSCA: *tlsCA, TLSName: *tlsName, TLSCover: *tlsCover, TLSFingerprint: *tlsFingerprint,
-		TLSFragment: *tlsFragment, Front: *frontAddr, FrontToken: tokens[0], RotateBytes: *rotateBytes,
-	})
-	if err != nil {
-		return err
-	}
-	defer closeCarriers()
-
 	var cleanup func() error
 	var cleanupDNS func() error
 	defer func() {
@@ -284,18 +270,17 @@ func run(args []string) error {
 			}
 		}
 	}()
-	onEstablished := func(r wire.AuthResult) error {
+	onNetwork := func(n client.Network) error {
 		resolver := trustedDNS
 		if !resolver.IsValid() {
-			resolver = netip.AddrFrom4(r.DNSv4)
+			resolver = n.DNS
 		}
 		if *fullTunnel {
 			if err := tun.ValidateDNS(resolver); err != nil {
 				return fmt.Errorf("full tunnel requires -dns ADDRESS or an authenticated relay resolver: %w", err)
 			}
 		}
-		addr := netip.PrefixFrom(netip.AddrFrom4(r.IPv4), int(r.Prefix4))
-		if err := dev.Configure(addr, int(r.TunMTU)); err != nil {
+		if err := dev.Configure(n.Addr, n.MTU); err != nil {
 			return fmt.Errorf("configure %s: %w", dev.Name(), err)
 		}
 		for _, p := range routes {
@@ -324,75 +309,19 @@ func run(args []string) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	log.Info("starting", "relay", relayAddr, "tun", dev.Name(), "full_tunnel", *fullTunnel,
-		"routes", strings.Trim(routes.String(), "[]"), "version", version(), "os", runtime.GOOS, "arch", runtime.GOARCH,
-		"carriers", carrierNames(carriers), "split_tcp", splitMode, "share_diagnostics", *shareDiagnostics)
-	cfg := engine.ClientConfig{
-		Session: session.ClientConfig{
-			Static: static, RelayPublic: pin[:], Credential: []byte(tokens[0]), Redundancy: redundancy, FEC: fecMode,
+	log.Info("tunnel device", "tun", dev.Name(), "full_tunnel", *fullTunnel, "routes", strings.Trim(routes.String(), "[]"))
+	cfg := client.Config{
+		Relay: relayAddr, RelayKey: pin, Token: []byte(tokens[0]), Static: static,
+		Carriers: client.CarrierOptions{
+			Binds: binds, NoOffload: *noOffload, NoUDP: *noUDP, Censorship: *censorship, FullTunnel: *fullTunnel, Mark: uint32(*mark),
+			TLS: *tlsAddr, TLSCA: *tlsCA, TLSName: *tlsName, TLSCover: *tlsCover, TLSFingerprint: *tlsFingerprint,
+			TLSFragment: *tlsFragment, Front: *frontAddr, RotateBytes: *rotateBytes,
 		},
-		Relay: relayAddr, Carriers: carriers, TUN: dev, OnEstablished: onEstablished, Logger: log,
-		StatusInterval: *status, SplitTCP: splitMode,
+		Redundancy: redundancy, FEC: fecMode, SplitTCP: splitMode, StatusInterval: *status,
+		Logger: log, OnNetwork: onNetwork,
 	}
 	if *shareDiagnostics {
 		cfg.Diagnostics = journal
 	}
-	err = engine.RunClient(ctx, cfg)
-	if errors.Is(err, context.Canceled) {
-		return nil
-	}
-	return err
-}
-
-// clientTLS builds the TLS configuration for -tls: the system roots or the
-// -tls-ca file, and the server name from -tls-server-name or the -tls host.
-func clientTLS(addr, caFile, serverName string) (*tls.Config, error) {
-	if serverName == "" {
-		host, _, err := net.SplitHostPort(addr)
-		if err != nil {
-			return nil, fmt.Errorf("-tls: %w", err)
-		}
-		serverName = host
-	}
-	cfg := &tls.Config{ServerName: serverName}
-	if caFile != "" {
-		pem, err := os.ReadFile(caFile)
-		if err != nil {
-			return nil, err
-		}
-		cfg.RootCAs = x509.NewCertPool()
-		if !cfg.RootCAs.AppendCertsFromPEM(pem) {
-			return nil, fmt.Errorf("-tls-ca: no certificates in %s", caFile)
-		}
-	}
-	return cfg, nil
-}
-
-// version is the module version and VCS revision the binary was built
-// from, as far as the build recorded them.
-func version() string {
-	info, ok := debug.ReadBuildInfo()
-	if !ok {
-		return "unknown"
-	}
-	v := info.Main.Version
-	for _, s := range info.Settings {
-		switch s.Key {
-		case "vcs.revision":
-			v += " " + s.Value
-		case "vcs.modified":
-			if s.Value == "true" {
-				v += "+dirty"
-			}
-		}
-	}
-	return v
-}
-
-func carrierNames(carriers []engine.Carrier) string {
-	names := make([]string, len(carriers))
-	for i, c := range carriers {
-		names[i] = c.Name
-	}
-	return strings.Join(names, ",")
+	return client.Run(ctx, cfg, dev)
 }

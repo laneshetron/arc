@@ -12,6 +12,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/laneshetron/arc/internal/client"
 	"github.com/laneshetron/arc/internal/invite"
 )
 
@@ -78,7 +79,7 @@ func TestTLSOnlyInvite(t *testing.T) {
 	if p.settings["no-udp"] != "true" || p.settings["relay"] != "203.0.113.7:443" || p.settings["tls"] != "203.0.113.7:443" {
 		t.Fatalf("settings: %v", p.settings)
 	}
-	carriers, closeAll, err := openCarriers(slog.New(slog.DiscardHandler), carrierOptions{Relay: netip.MustParseAddrPort("203.0.113.7:443"), NoUDP: true,
+	carriers, closeAll, err := client.OpenCarriers(slog.New(slog.DiscardHandler), client.CarrierOptions{Relay: netip.MustParseAddrPort("203.0.113.7:443"), NoUDP: true,
 		TLS: p.settings["tls"], TLSCover: "example.com"})
 	if err != nil {
 		t.Fatal(err)
@@ -87,10 +88,10 @@ func TestTLSOnlyInvite(t *testing.T) {
 	if len(carriers) != 1 || !carriers[0].Fallback || carriers[0].Name != "default/tls" {
 		t.Fatalf("carriers: %+v", carriers)
 	}
-	if _, _, err := openCarriers(slog.New(slog.DiscardHandler), carrierOptions{Relay: netip.MustParseAddrPort("203.0.113.7:443"), NoUDP: true}); err == nil {
+	if _, _, err := client.OpenCarriers(slog.New(slog.DiscardHandler), client.CarrierOptions{Relay: netip.MustParseAddrPort("203.0.113.7:443"), NoUDP: true}); err == nil {
 		t.Error("-no-udp without a stream carrier")
 	}
-	if _, _, err := openCarriers(slog.New(slog.DiscardHandler), carrierOptions{Relay: netip.MustParseAddrPort("[2001:db8::1]:4433")}); err == nil {
+	if _, _, err := client.OpenCarriers(slog.New(slog.DiscardHandler), client.CarrierOptions{Relay: netip.MustParseAddrPort("[2001:db8::1]:4433")}); err == nil {
 		t.Error("an IPv6 relay")
 	}
 }
