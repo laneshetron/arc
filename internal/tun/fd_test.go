@@ -37,10 +37,10 @@ func TestFromFDRejectsNonTUN(t *testing.T) {
 	}
 }
 
-// FromFD wraps a real, configured TUN without changing its MTU, and Close
-// wakes a pending Read even when the owner handed over a blocking
-// descriptor. Creating the TUN needs root, so this skips otherwise; CI runs
-// it with sudo.
+// FromFD wraps a real, configured TUN without changing its MTU, keeps it
+// close-on-exec, and Close wakes a pending Read, even when the owner handed
+// over a blocking descriptor without close-on-exec (syscall.Dup clears it).
+// Creating the TUN needs root, so this skips otherwise; CI runs it with sudo.
 func TestFromFDRealTUN(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("needs root to create a TUN device")
@@ -75,6 +75,19 @@ func TestFromFDRealTUN(t *testing.T) {
 	}
 	if got, err := d.dev.MTU(); err != nil || got != mtu {
 		t.Errorf("MTU after FromFD = %d (%v), want %d left as configured", got, err, mtu)
+	}
+	// Not File().Fd(): that would put the descriptor back in blocking mode.
+	rc, err := d.dev.(interface{ File() *os.File }).File().SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fdFlags int
+	var fcntlErr error
+	if err := rc.Control(func(fd uintptr) { fdFlags, fcntlErr = unix.FcntlInt(fd, unix.F_GETFD, 0) }); err != nil {
+		t.Fatal(err)
+	}
+	if fcntlErr != nil || fdFlags&unix.FD_CLOEXEC == 0 {
+		t.Errorf("kept descriptor is not close-on-exec (flags %#x, %v)", fdFlags, fcntlErr)
 	}
 
 	done := make(chan error, 1)
