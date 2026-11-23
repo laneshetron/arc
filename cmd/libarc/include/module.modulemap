@@ -1,0 +1,7 @@
+module libarc {
+    header "arc.h"
+    link "resolv"
+    link framework "CoreFoundation"
+    link framework "Security"
+    export *
+}

@@ -92,18 +92,9 @@ func run(args []string) error {
 		return nil
 	})
 	redundancy := session.RedundancyOff
-	fs.Func("redundancy", "send traffic on two paths at once: off, auto (while the best path loses over 1%), or always; needs two -bind interfaces", func(v string) error {
-		switch v {
-		case "off":
-			redundancy = session.RedundancyOff
-		case "auto":
-			redundancy = session.RedundancyAuto
-		case "always":
-			redundancy = session.RedundancyAlways
-		default:
-			return errors.New("want off, auto, or always")
-		}
-		return nil
+	fs.Func("redundancy", "send traffic on two paths at once: off, auto (while the best path loses over 1%), or always; needs two -bind interfaces", func(v string) (err error) {
+		redundancy, err = client.ParseRedundancy(v)
+		return err
 	})
 	status := fs.Duration("status", 0, "log each path's state at this interval (0: off)")
 	tlsAddr := fs.String("tls", "", "relay TLS/TCP endpoint, host:port: adds a TLS carrier per interface, used only while no UDP path works")
@@ -118,33 +109,15 @@ func run(args []string) error {
 	noUDP := fs.Bool("no-udp", false, "open no UDP carriers: reach the relay only through -tls or -front (-relay is then the session's address, the -tls endpoint, say)")
 	censorship := fs.Bool("censorship", false, "censorship posture: presume the relay sits on foreign hosting behind a censor that bans an address for minutes after UDP to it (TSPU), so open no UDP carrier to an address a -tls or -front carrier uses (spec/freeze-and-udp-ban.md §4)")
 	fecMode := wire.FECAuto
-	fs.Func("fec", "forward error correction: auto (default; while loss is at least 0.5%), off, or always", func(v string) error {
-		switch v {
-		case "off":
-			fecMode = wire.FECOff
-		case "auto":
-			fecMode = wire.FECAuto
-		case "always":
-			fecMode = wire.FECAlways
-		default:
-			return errors.New("want off, auto, or always")
-		}
-		return nil
+	fs.Func("fec", "forward error correction: auto (default; while loss is at least 0.5%), off, or always", func(v string) (err error) {
+		fecMode, err = client.ParseFEC(v)
+		return err
 	})
 	splitMode := engine.SplitOff
 	fs.Func("split-tcp", "carry TCP connections as streams, ended here and opened by the relay (spec §11.3): "+
-		"off (default), auto (new connections while the link loses at least 10%), or always", func(v string) error {
-		switch v {
-		case "off":
-			splitMode = engine.SplitOff
-		case "auto":
-			splitMode = engine.SplitAuto
-		case "always":
-			splitMode = engine.SplitAlways
-		default:
-			return errors.New("want off, auto, or always")
-		}
-		return nil
+		"off (default), auto (new connections while the link loses at least 10%), or always", func(v string) (err error) {
+		splitMode, err = client.ParseSplitTCP(v)
+		return err
 	})
 	mark := fs.Uint("mark", 0x5243, "fwmark for carrier sockets, used by -full-tunnel (Linux)")
 	table := fs.Int("table", 5243, "routing table for -full-tunnel (Linux)")

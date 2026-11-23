@@ -33,17 +33,31 @@ jobs:
 
   macos:
     runs-on: macos-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - run: go test -race ./internal/tun
+      - run: go vet ./cmd/libarc ./internal/tun
+      - run: go test -race ./internal/tun ./cmd/libarc
       - name: utun tests that need root
         run: |
           go test -c -race -o bin/tun.test ./internal/tun
           sudo bin/tun.test -test.v -test.run 'FromFD'
+      - name: libarc for macOS and iOS
+        run: cmd/libarc/build.sh dist
+      - name: libarc through arc.h, as an app links it
+        run: |
+          cc -Wall -Wextra -Werror -I cmd/libarc/include cmd/libarc/smoke/smoke.c dist/macos/libarc.a \
+            -framework CoreFoundation -framework Security -lresolv -o bin/libarc-smoke
+          bin/libarc-smoke
+          sudo bin/libarc-smoke
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libarc
+          path: dist/
+          if-no-files-found: error
 
   e2e:
     runs-on: ubuntu-latest
