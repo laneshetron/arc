@@ -40,8 +40,10 @@ extern "C" {
  *
  * The callback runs on a thread libarc owns, never the one that called
  * arc_start, and one event at a time, so a slow callback delays the
- * tunnel. The first event comes only after arc_start has set *handle and
- * returned. The callback must not call arc_stop for its own tunnel, which
+ * tunnel. Events may begin as soon as arc_start has set *handle, possibly
+ * before arc_start returns, so whatever the callback reads through context
+ * must be ready before the call. The callback must not call arc_stop for
+ * its own tunnel, which
  * waits for the callback to return. No event arrives after arc_stop
  * returns. event_json is valid only during the call.
  */

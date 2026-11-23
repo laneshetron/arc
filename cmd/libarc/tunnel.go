@@ -213,8 +213,9 @@ func start(configJSON []byte, dev device, fn func(event []byte) int) (*tunnel, e
 	ctx, cancel := context.WithCancel(context.Background())
 	t := &tunnel{cancel: cancel, begun: make(chan struct{}), done: make(chan struct{}), events: events}
 	// Everything that can log runs here, and only after begin, so no
-	// event reaches the app before arc_start has set the handle and
-	// returned, or on the thread that called it.
+	// event reaches the app on the thread that called arc_start, or
+	// before arc_start has set the handle. Events can come before
+	// arc_start returns; arc.h asks the caller to be ready for them.
 	go func() {
 		defer close(t.done)
 		<-t.begun
