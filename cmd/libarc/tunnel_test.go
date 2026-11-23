@@ -380,9 +380,10 @@ func TestConcurrentStopsWaitForOneShutdown(t *testing.T) {
 }
 
 // TestNoEventBeforeBegin: no event reaches the app before begin, which
-// arc_start calls only once it has set the handle; that includes events
+// arc_start calls once it has set the handle, so the callback never runs
+// on arc_start's thread or before the handle is set. That includes events
 // start provokes itself, such as the warning for a journal that won't
-// open.
+// open. (Events may come before arc_start returns; arc.h says so.)
 func TestNoEventBeforeBegin(t *testing.T) {
 	relay, _, relayKey := startRelay(t)
 	var begun atomic.Bool

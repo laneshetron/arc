@@ -53,6 +53,8 @@ struct recorder {
 	pthread_cond_t cond;
 	int events, starting, stopped, after_stop;
 	int stop_returned;
+	int64_t *handle;  /* arc_start's handle, set before the first event */
+	int handle_unset; /* events that came while it was still unset */
 	char last[512];
 };
 
@@ -61,6 +63,7 @@ static int on_event(void *context, const char *event_json) {
 	pthread_mutex_lock(&r->mu);
 	r->events++;
 	if (r->stop_returned) r->after_stop++;
+	if (r->handle && *r->handle == 0) r->handle_unset++;
 	if (strstr(event_json, "\"msg\":\"starting\"")) r->starting = 1;
 	if (strstr(event_json, "\"event\":\"stopped\"")) r->stopped = 1;
 	snprintf(r->last, sizeof r->last, "%s", event_json);
@@ -100,8 +103,8 @@ static void tunnel_on_utun(const char *priv, const char *pub) {
 	char config[512];
 	snprintf(config, sizeof config,
 	         "{\"relay\":\"127.0.0.1:9\",\"relay_key\":\"%s\",\"token\":\"t\",\"private_key\":\"%s\"}", pub, priv);
-	struct recorder r = {.mu = PTHREAD_MUTEX_INITIALIZER, .cond = PTHREAD_COND_INITIALIZER};
 	int64_t h = 0;
+	struct recorder r = {.mu = PTHREAD_MUTEX_INITIALIZER, .cond = PTHREAD_COND_INITIALIZER, .handle = &h};
 	char *err = arc_start(config, fd, on_event, &r, &h);
 	CHECK(err == NULL, "arc_start on a utun: %s", err);
 	if (err) {
@@ -115,6 +118,7 @@ static void tunnel_on_utun(const char *priv, const char *pub) {
 	while (!r.starting && pthread_cond_timedwait(&r.cond, &r.mu, &deadline) == 0) {
 	}
 	CHECK(r.starting, "no \"starting\" log event within 5 s");
+	CHECK(r.handle_unset == 0, "%d events before arc_start set the handle", r.handle_unset);
 	pthread_mutex_unlock(&r.mu);
 
 	struct timespec t0, t1;
