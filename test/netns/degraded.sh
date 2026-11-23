@@ -52,7 +52,12 @@ setup_topology 10.77.0.0/16 10.88.0.0/24
 # UDP datagrams the kernel dropped because a socket's receive buffer was full.
 rcvbuf_errors() { $1 awk '/^Udp:/ && ++n == 2 { print $6 }' /proc/net/snmp; }
 $I ip route add 192.168.10.0/24 via 192.168.20.1 # return route for plain routing
-$I iperf3 -s -D --logfile "$WORK/iperf-server.log"
+restart_iperf_server() {
+  $I pkill -x iperf3 || true
+  wait_until 5 sh -c "! pgrep -x iperf3 >/dev/null"
+  $I iperf3 -s -D --logfile "$WORK/iperf-server.log"
+}
+restart_iperf_server
 
 # --- tunnels, all up at once; a route switch picks which one carries traffic
 "$BIN/arc-relay" genkey >"$WORK/relay.key"
@@ -96,13 +101,34 @@ use() { # use plain|arc|wireguard
   esac
 }
 
+# iperf_client LOG IPERF3_CMD...: runs an iperf3 client (perhaps under
+# timeout) in arc-c with its output in LOG. The server takes one test at a
+# time, and under loss it can spend seconds tearing down the last one,
+# refusing new tests as busy meanwhile; wait that out, for up to about 15 s.
+# A server still busy after that is stuck on a stranded run, so restart it
+# and try once more. Any other failure returns at once.
+iperf_client() {
+  local log=$1 delay
+  shift
+  for delay in 0.25 0.5 1 2 2 3 3 3 restart; do
+    if $C "$@" >"$log" 2>&1; then return 0; fi
+    grep -q "server is busy" "$log" || return 1
+    if [[ $delay == restart ]]; then
+      echo "  iperf3: server still busy after 15 s; restarting it" >&2
+      restart_iperf_server >&2
+    else
+      sleep "$delay"
+    fi
+  done
+  $C "$@" >"$log" 2>&1
+}
+
 tcp_up() { # tcp_up [IPERF_ARGS...]: prints TCP goodput in Mbit/s (uplink unless -R), or 0 if the run failed
   # Omit the first 2 s: at 100 ms RTT slow start otherwise dominates and
-  # single runs swing widely. Retry once, since the server can still be
-  # finishing the previous run.
+  # single runs swing widely. Retry a failed run once.
   local try
   for try in 1 2; do
-    if $C iperf3 -c "$TARGET" -t "$DURATION" -O 2 -f m "$@" >"$WORK/iperf.log" 2>&1; then
+    if iperf_client "$WORK/iperf.log" iperf3 -c "$TARGET" -t "$DURATION" -O 2 -f m "$@"; then
       grep receiver "$WORK/iperf.log" | tail -1 | awk '{print $(NF-2)}'
       return
     fi
@@ -174,11 +200,6 @@ kill "$ARC1"; wait "$ARC1" 2>/dev/null || true
 $C ip link del wg0
 # Deleting wg0 can strand the last run's control connection, leaving the
 # server waiting on it and refusing new tests as busy; start a fresh one.
-restart_iperf_server() {
-  $I pkill -x iperf3 || true
-  wait_until 5 sh -c "! pgrep -x iperf3 >/dev/null"
-  $I iperf3 -s -D --logfile "$WORK/iperf-server.log"
-}
 restart_iperf_server
 MP_CLIENT=
 start_multipath_client() { # start_multipath_client REDUNDANCY LOG
@@ -263,7 +284,7 @@ lossy_link() { # lossy_link LOSS
   # would still look lossy, and staying put would then be right.
   start_multipath_client off "client-lossy-$1.log"
   sleep 1
-  $C iperf3 -c "$TARGET" -t $((secs + 4)) -f m >"$WORK/iperf.log" 2>&1 &
+  iperf_client "$WORK/iperf.log" iperf3 -c "$TARGET" -t $((secs + 4)) -f m &
   iperf=$!
   sleep 2
   link=$(tcp_link)
@@ -451,7 +472,7 @@ extreme_loss() { # extreme_loss REDUNDANCY
   # ping fails when no reply arrives at all, which is a result here
   received=$({ $C timeout 60 ping -q -c 100 -i 0.2 -W 2 "$TARGET" 2>/dev/null || true; } | grep -oE '[0-9]+ received' | cut -d' ' -f1)
   t0=$(date +%s.%N)
-  if $C timeout 60 iperf3 -c "$TARGET" -n 100K -f k >"$WORK/iperf-extreme.log" 2>&1; then
+  if iperf_client "$WORK/iperf-extreme.log" timeout 60 iperf3 -c "$TARGET" -n 100K -f k; then
     xfer="$(awk -v a="$t0" -v b="$(date +%s.%N)" 'BEGIN { printf "%.1f s", b - a }')"
   else
     xfer="not done in 60 s"
@@ -536,8 +557,8 @@ start_split_client() { # start_split_client MODE
     { cat "$WORK/client4.log"; exit 1; }
 }
 tcp_bounded() { # tcp_bounded [IPERF_ARGS...]: like tcp_up, but 0 after DURATION+30 s
-  if $C timeout $((DURATION + 30)) iperf3 -c "$TARGET" -t "$DURATION" -O 2 -f m --connect-timeout 10000 "$@" \
-    >"$WORK/iperf.log" 2>&1; then
+  if iperf_client "$WORK/iperf.log" timeout $((DURATION + 30)) \
+    iperf3 -c "$TARGET" -t "$DURATION" -O 2 -f m --connect-timeout 10000 "$@"; then
     grep receiver "$WORK/iperf.log" | tail -1 | awk '{print $(NF-2)}'
   else
     echo 0
