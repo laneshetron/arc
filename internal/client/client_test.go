@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"log/slog"
+	"net"
 	"net/netip"
 	"testing"
 	"time"
@@ -236,5 +237,27 @@ func TestRunStopsDuringCarrierSetup(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run kept setting up carriers after its context ended")
+	}
+}
+
+// TestRunCanceledBeforeStartSendsNothing: a UDP-only Run whose context has
+// already ended returns nil without sending the relay a handshake.
+func TestRunCanceledBeforeStartSendsNothing(t *testing.T) {
+	relay, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer relay.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	clientKey, _ := crypto.GenerateStaticKey(nil)
+	if err := Run(ctx, Config{
+		Relay: relay.LocalAddr().(*net.UDPAddr).AddrPort(), Static: clientKey, Token: []byte("t"),
+	}, newChanDevice()); err != nil {
+		t.Errorf("Run = %v, want nil", err)
+	}
+	relay.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	if n, _, err := relay.ReadFromUDP(make([]byte, 2048)); err == nil {
+		t.Errorf("relay received a %d-byte datagram from a Run canceled before it started", n)
 	}
 }

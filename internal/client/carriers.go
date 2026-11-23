@@ -58,6 +58,9 @@ func OpenCarriers(ctx context.Context, log *slog.Logger, o CarrierOptions) ([]en
 		closeAll()
 		return nil, nil, err
 	}
+	if err := ctx.Err(); err != nil {
+		return fail(err)
+	}
 	if o.NoUDP && o.TLS == "" && o.Front == "" {
 		return fail(errors.New("-no-udp needs -tls or -front"))
 	}
