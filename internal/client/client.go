@@ -94,6 +94,11 @@ func Run(ctx context.Context, cfg Config, dev engine.PacketDevice) error {
 			return nil
 		}
 	}
+	// RunClient sends its first handshake before it looks at ctx, so a
+	// stop during setup must be caught here.
+	if err := ctx.Err(); err != nil {
+		return stopped(ctx, err)
+	}
 	return stopped(ctx, engine.RunClient(ctx, ecfg))
 }
 
