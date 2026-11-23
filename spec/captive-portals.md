@@ -65,7 +65,7 @@ one.
                        └────┬─────┘
                             │ endpoint's success criterion met, DNS honest
                             ▼
-   ┌──────────┐      ┌─────────────┐   redirect / wrong body / DNS hijack
+   ┌──────────┐      ┌─────────────┐   confirmed portal: redirect / login form
    │  none    │◄─────┤  classified ├──────────────────────┐
    └──────────┘      └─────────────┘                      ▼
         ▲                                          ┌────────────────┐
@@ -77,9 +77,12 @@ one.
         │                                          ┌────────────────┐
         └──────────────────────────────────────────┤ authenticated  │
               (portal_seen false -> none; true -> stays) └───────┬────────┘
-                                                           │ keepalive reverts
+                                                           │ keepalive confirms expiry
                                                            ▼
                                                    unauthenticated
+
+   anything else that is not the declared success response
+   (bad status, wrong body, uncorroborated DNS) goes to `unknown`.
 ```
 
 The state cannot be derived from one probe: `none` and `authenticated` are
@@ -210,7 +213,7 @@ things and must be stored separately:
 |---|---|---|
 | `portal_seen` | bool | a portal has been positively identified on this attachment at any time |
 | `portal_host` | string | the host of the last portal page, so a passing check can be attributed to *that* portal |
-| `dns_honest` | clean / hijacked / unmeasurable | the last probe-B verdict on the physical resolver |
+| `dns_honest` | clean / anomalous / unmeasurable | the last probe-B verdict on the physical resolver; `anomalous` is suspicious, not proof (§4.4) |
 | `state` | the four states | the **current** verdict, which is transient and recomputed every probe |
 
 `portal_seen` persists per network attachment — the profiler's cache key
@@ -227,12 +230,14 @@ the second:
 | **passing check, DNS honest** | **`true`** | **`authenticated`** — the portal was passed |
 | passing check, DNS honest | `true`, from DNS hijack only | `authenticated` — see below |
 | redirect / portal-like page | either | `unauthenticated`, sets `portal_seen` |
-| DNS hijacked | either | `unauthenticated`, sets `portal_seen` |
+| **confirmed portal** (redirect / login form / platform API) | either | `unauthenticated`, sets `portal_seen` |
+| **anomalous DNS, uncorroborated** | either | `unknown` — profiler evidence, not a portal verdict (§4.3.2) |
+| **anomalous DNS, corroborated by an HTTP signal** | either | `unauthenticated`, sets `portal_seen` |
 | **unexplained mismatch** (bad status, wrong body, 503) | either | **`unknown`** — not portal evidence (§4.3.2) |
 | three timeouts | either | `unknown`, and `portal_seen` is unchanged |
 
 **DNS-hijack-only detection still yields `authenticated` later.** If a
-portal was only ever detected by hijacked DNS — no `portal_host` — a
+portal was only ever confirmed by corroborated DNS — no `portal_host` — a
 subsequent passing check must still reach `authenticated`, because
 `portal_seen` is true. My previous revision routed that through a
 `sticky = unknown` row and produced `none`, discarding the history and the
@@ -284,9 +289,30 @@ of:
 - a `200` whose body is an HTML page containing a password, seat, room,
   terms-acceptance or voucher field — a cheap heuristic over the form
   elements, not a content match;
-- DNS categorically hijacked (§4.4), which is proof on its own;
 - a platform captive-portal API reporting a portal (`CaptiveNetwork`,
   NCSI).
+
+**Anomalous DNS is not on that list.** My previous revision made a
+categorically implausible answer proof of a portal, and the review is right
+that this is wrong: corporate split-horizon policy, a filtering resolver,
+and upstream sinkholing all produce private or reserved answers for public
+names without any login portal existing. `network-profiling.md` §6.1
+already distinguishes `poisoned`, `sinkholed` and `portal-hijacked`; I
+collapsed them into one, and the collapse is what made an ordinary
+corporate resolver look like a portal.
+
+DNS is therefore **suspicious evidence, never sufficient**:
+
+- A categorically implausible answer alone is `unknown` with **carriers
+  open** — it is `dns_integrity` evidence for the profiler, not a portal
+  verdict, and it never triggers the release (§7.1).
+- It escalates to `unauthenticated` only when an HTTP signal corroborates
+  it: a redirect, login content, or a platform API. That combination — the
+  resolver lying *and* the web check being interfered with — is much harder
+  to produce without a portal than either alone.
+- `portal-hijacked` is reserved for the corroborated case, and the journal
+  records which of the three DNS verdicts applied so a support report can
+  tell a corporate resolver from a portal.
 
 Everything else that is not the endpoint's declared success response is
 `unknown` with a warning, and **carriers open**. The client retries the
@@ -296,7 +322,8 @@ monitor once a session is up.
 
 The asymmetry is deliberate: a wrong `unknown` costs one failed handshake;
 a wrong `unauthenticated` costs the user all connectivity, indefinitely,
-with a message telling them to log in to something that is not there.
+with a message telling them to log in to something that is not there — and
+under `auto` release it would have taken their tunnel down with it.
 
 ### 4.4 Probe B must ask the physical link's resolver
 
@@ -319,11 +346,21 @@ boolean.
 
 **Comparison tolerates CDN variance.** Comparing one answer against one
 pinned IP is wrong for any name behind a CDN: the honest answer legitimately
-varies by geography and by resolver. `dns_honest` is therefore `hijacked`
+varies by geography and by resolver. `dns_honest` is therefore `anomalous`
 only when the answer is *categorically* implausible — a private, loopback,
 link-local or reserved address for a public name, or an answer identical to
 the portal host's own address — and `clean` otherwise. A different public
 address in the same AS is not evidence of anything.
+
+**`anomalous` is not `hijacked`, and it is not a portal verdict.** Corporate
+split-horizon policy, a filtering resolver, and an upstream sinkhole all
+produce private answers for public names with no portal in sight. So the
+verdict names the observation — the DNS equivalent of §4.6's
+`tls=verify_failed` over `tls_intercepted=true` — and §4.3.2 decides what it
+is worth: suspicious alone, evidence only when an HTTP signal corroborates
+it. `network-profiling.md` §6.1's `poisoned`/`sinkholed`/`portal-hijacked`
+distinction is the profiler's to make; this document only ever needs to know
+whether DNS *agrees* with what the web check saw.
 
 ### 4.5 The portal URL is evidence, separate from the state
 
@@ -482,9 +519,11 @@ portal forever. It does not affect any other state.
 |---|---|---|---|
 | the endpoint's declared success criterion, DNS honest | `authenticated` | `authenticated` | nothing |
 | passing check, DNS honest, `portal_seen` true | `unauthenticated` | `authenticated` | "portal passed, connecting" |
-| redirect / wrong body | `authenticated` | `unauthenticated` | "portal session expired; visit URL" |
+| **confirmed portal** (redirect / login form / platform API) | `authenticated` | `unauthenticated` | "portal session expired; visit URL" |
+| **uncorroborated mismatch or DNS anomaly** | any | `unknown` | warning; carriers stay up, tunnel not released |
 | three consecutive timeouts | any | `unknown` | "network unreachable" |
-| passing check, DNS hijacked | `authenticated` | `unauthenticated` | as above |
+| passing check, DNS anomalous **and** HTTP corroborating | `authenticated` | `unauthenticated` | as above |
+| passing check, DNS anomalous alone | `authenticated` | `authenticated` (journal warns) | nothing; carriers and tunnel stay up |
 | passing check, DNS honest | `unknown` | `authenticated` or `none` | nothing, per §4.3 |
 
 **Three timeouts, not one.** A single lost request is an aircraft handover
@@ -509,9 +548,9 @@ opening one spends a handshake attempt, logs a misleading failure at the
 relay, and on a metered link costs the user money. Instead:
 
 - It prints the portal URL and the instruction to authenticate (§7).
-- **If it arrived here from `authenticated` with the tunnel up, it releases
-  the tunnel route and resolver first** (§7.1), or the user's browser would
-  send the login through the relay and never reach the portal.
+- **If it arrived here from `authenticated` with the tunnel up, it tells the
+  user that the tunnel must be released and how** (§7.1) — it does not
+  release it, because the trigger is an on-path claim.
 - It runs the login poll (§5) at `-portal-poll`, so it notices when the
   user finishes.
 - It starts the moment the state reaches `authenticated` — no restart.
@@ -594,28 +633,54 @@ user cannot log in, cannot be told why, and the client polls a portal it
 cannot reach. Pre-auth startup does not have this problem because full-tunnel
 routing is not yet installed; it is the mid-session expiry case that breaks.
 
-**Rule: on `authenticated` → `unauthenticated` with the tunnel up, ARC
-releases the tunnel route and resolver before telling the user to log in.**
-Specifically:
+**Rule: ARC never releases the tunnel on its own.** The state transition to
+`unauthenticated` produces a *message and a command*, not a routing change:
+
+```text
+arc-client: the portal session expired
+            visit https://portal.example.net/login?ref=UA123
+            then run: arc-client portal login   (releases the tunnel so a browser can reach it)
+```
+
+`arc-client portal login` is what removes the full-tunnel rule and managed
+DNS, reinstalls them when the state returns to `authenticated`, and runs the
+login poll in the foreground so the user sees it succeed.
+
+**Why the release is a user action and not a consequence of detection.**
+A captive portal is, by construction, an on-path adversary that happens to
+be legitimate: it can forge a plaintext redirect and hijack DNS exactly as
+an attacker can. **Nothing in detection can distinguish a hostile redirect
+from a real portal**, so a design that releases the tunnel on
+`unauthenticated` hands the ability to force a user's traffic out of ARC
+into cleartext to anyone who can inject one HTTP response — which is the
+threat model inverted. With `-portal-wait 0` it is also indefinitely
+repeatable.
+
+Making it a user action removes the trigger without removing the remedy: a
+forged redirect now produces **a message the user can ignore**, and a user
+genuinely behind a portal sees the same message and acts on it. The
+capability stays in the product; it just stops being reachable by the
+network.
+
+If it *is* run, these hold:
 
 - The full-tunnel rule and the managed-DNS settings are **removed**, not
   merely bypassed — the same cleanup `OnEstablished` already holds a
   function for, invoked early. The TUN itself stays, so the session and its
   address survive, but the host's traffic returns to the physical link.
-- **This is a leak, and it is intentional and bounded.** Traffic leaves
-  unencrypted for as long as the client is `unauthenticated`, which is a
-  state in which ARC cannot carry it anyway. The boundary is stated to the
-  user (§7's message says the tunnel is released), and the route is
-  reinstalled the moment the state returns to `authenticated`.
-- Sessions are already not killed (§5.1), so the relay-side state survives
-  and the carrier sockets reconnect after reinstall — but the client must
-  **stop counting the gap as loss**; a path can be silent for the whole
-  login without becoming `DEAD`, because the route, not the link, was
-  missing. The client treats a deliberate release like the MTU-probe
-  exemption (§14.4): neither charges path health.
-- **`-portal-release-tunnel off`** exists for an operator who would rather
-  the user disconnect ARC by hand. It is not the default because leaving
-  it on produces a browser that hangs on a URL the client itself printed.
+- **The exposure is unbounded while it lasts** — not "bounded" as an
+  earlier revision said. It lasts until the state returns to
+  `authenticated` or the user gives up, and during that time every host and
+  agent on the machine is outside ARC. That is why it takes a deliberate
+  action, and why the command prints what it is about to do.
+- **Carrier paths keep being measured** (§7.2). Releasing the TUN route does
+  not idle the carrier sockets, so a real portal expiry may genuinely be
+  dropping them.
+- **`-portal-release-tunnel`** selects the policy: `ask` (default) as above,
+  `off` for a device that must never drop protection, and `auto` for an
+  unattended host that has nobody to run the command — an operator choosing
+  `auto` accepts that any on-path network can trigger the downgrade, which
+  is exactly why it is not the default.
 
 **The alternative — a narrowly scoped route to the portal host — is
 rejected.** It looks tidier, but the portal's login host is often on a CDN
@@ -624,13 +689,39 @@ post-login confirmation usually loads third-party assets. A `/32` to the
 login host is not a boundary that holds, and a set of them is just the
 release with extra failure modes.
 
-**Test:** a session up on a portal, grant expired, the browser must be able
-to reach the portal. The assertion is that a request from the *host* (not
-from a marked socket) arrives at the portal, which is exactly what the
-naive implementation fails.
-`sni`, `resolver`), so a report from a user contains what a maintainer
-needs. `-portal-message off` suppresses the status line for scripted use,
-but never suppresses the journal.
+**Test:** a session up on a portal, grant expired, the user runs
+`arc-client portal login`, and a request from the **host** — not from a
+marked socket — must arrive at the portal. That is exactly what the naive
+implementation fails, and what a forged-redirect test must *not* trigger.
+
+### 7.2 Only TUN traffic is idle, not the carrier paths
+
+An earlier revision said the intentional release should stop counting the
+gap as loss, and the review is right that this conflated two different
+things. Carrier sockets are marked and bound outside the TUN, so they **keep
+running through the release** — and a real portal expiry may genuinely be
+dropping them. Suspending path health wholesale would retain dead paths and
+stale session state, then fail to recover when authentication succeeds.
+
+So the exemption is narrow:
+
+- **What is exempt:** the absence of *application* traffic, which the
+  release caused. A flow that stops because the route went away does not
+  count against the path's loss or delivery estimate.
+- **What is not exempt:** carrier-level liveness. `PING`/`ACK` continue on
+  the marked sockets throughout, and a path that stops answering still goes
+  `SUSPECT` and then `DEAD` on the normal timers. The session does not
+  survive on a path that is actually gone.
+- **Recovery after login** is the ordinary one: the route is reinstalled,
+  `SUSPECT`/`DEAD` paths re-join by the §14.6 rules, and flows resume on
+  whatever validates. If every path died during the login, the session
+  re-handshakes — which is correct, because the portal may have changed the
+  network under it.
+
+This is the same distinction §14.4 draws for an MTU probe: the probe's loss
+says nothing about the path, but a path that cannot carry probes at all is
+dead. Here, the release's *idle application traffic* says nothing about the
+path; the carrier's own reachability still does.
 
 ## 8. Configuration
 
@@ -642,7 +733,7 @@ but never suppresses the journal.
 | `-portal-keepalive` | `60s` | cadence while `authenticated`, `none` and `unknown`; `0` disables those, never the login poll |
 | `-portal-poll` | `10s` | cadence while `unauthenticated`, backing off to 60 s; this is how a completed login is noticed |
 | `-portal-wait` | `0` | `0` waits indefinitely for the login; a duration exits after it, printing the URL |
-| `-portal-release-tunnel` | `true` | on expiry with the tunnel up, remove the full-tunnel route and managed DNS so the user's browser can reach the portal (§7.1); `false` leaves them and expects the user to disconnect ARC by hand |
+| `-portal-release-tunnel` | `ask` | `ask` (default): never releases on its own; prints the URL and the `arc-client portal login` command. `off`: never releases, not even on command. `auto`: releases automatically on `unauthenticated` — for unattended hosts, and it accepts that any on-path network can trigger the downgrade (§7.1) |
 
 **`-portal-check off` exists** because a network that blocks the
 connectivity endpoints would otherwise be classified `unknown` on every
@@ -688,7 +779,8 @@ per-MAC grant state and an expiry it can be told to trigger.
 | Portal: `3xx` to a login host | `unauthenticated`, **no carrier opened**, URL in the message |
 | Portal: `200` with the portal's HTML where the Success page was expected | `unauthenticated` — the common airline case |
 | Portal: `204` with trailing octets after the header | recorded as evidence of rewriting; state is `unknown` at most, never decided by it (§4.2) |
-| Portal: passing check but DNS hijacked | `unauthenticated`, because the DNS lie outranks the check |
+| **Portal: passing check but DNS anomalous, no HTTP signal** | `unknown` with carriers open and tunnel intact — a corporate resolver is not a portal (§4.3.2) |
+| **Portal: DNS anomalous AND a redirect** | `unauthenticated` — corroboration escalates it |
 | **Portal: redirect to a dead host** | `unauthenticated` still — the interception is proven — but no URL, and the message tells the user to open a browser (§4.5) |
 | **Portal: `200` login page served by the connectivity host itself** | `unauthenticated` with the probe host as the URL — no redirect needed |
 | **Endpoints's success text changed** (wrong body, no login form, no redirect) | `unknown` with carriers open — **not** `unauthenticated`. This is the fail-closed trap (§4.3.2) |
@@ -699,8 +791,11 @@ per-MAC grant state and an expiry it can be told to trigger.
 | **Portal detected by DNS hijack only, then passes** | `authenticated`, not `none` — `portal_seen` is what matters, not `portal_host` (§4.3) |
 | **Login completed while `unauthenticated`** | the 10 s login poll notices it, state reaches `authenticated`, carriers open, no restart |
 | Grant expires mid-session | state returns to `unauthenticated`, the message names the URL, **and the live session is not killed** |
-| **Grant expires mid-session, user opens the URL in a browser** | the browser reaches the portal: the tunnel route and resolver are released (§7.1). A request from the host, not from a marked socket, must arrive |
-| **The release is not counted as loss** | a path silent across the login does not become `DEAD`; the release is exempt like an MTU probe (§7.1) |
+| **A forged redirect after a passing check** | the state moves to `unauthenticated` but **nothing is released**: the tunnel stays up, and the message plus command are all that appear. This is the downgrade test — a hostile AP must not be able to route host traffic outside ARC (§7.1) |
+| **Grant expires mid-session, user runs `arc-client portal login`** | the tunnel route and resolver are released, and a request from the **host** — not a marked socket — arrives at the portal (§7.1) |
+| **After a release, the carrier dies** | the path still goes `SUSPECT` then `DEAD`: only TUN traffic is exempt, and carrier liveness keeps being measured (§7.2) |
+| **After a release, the paths are fine and the user logs in** | the route is reinstalled, `SUSPECT` paths re-join by §14.6, and flows resume without a new handshake |
+| **`-portal-release-tunnel auto` with a forged redirect** | documented to downgrade — the row exists so the trade is explicit rather than discovered |
 | **Three keepalive timeouts** | `unknown`, reported as unreachable rather than as expiry |
 | TLS failure, plaintext check also failing | `unknown`; carriers open and the journal records the actual failure (`verify_failed`, `timeout`, `reset`) |
 | **TLS intercepted, plaintext check passing** | state stays where plaintext put it; the journal records the interception and a later carrier failure is attributable (§4.6) |
