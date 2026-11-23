@@ -816,13 +816,13 @@ redaction row is invisible until someone reads an uploaded journal.
 
 ## 11. Deferred
 
-- **The escape techniques.** MAC rotation (for portals that key the grant
-  to the device's hardware address with no per-device credential), and
-  riding a "free tier" that permits only the provider's own services.
-  Both are capabilities rather than detections: they belong here, behind
-  explicit posture flags in the manner of `-censorship` and `-allowlist`,
-  but they need the state model above to know when they apply. Specified
-  separately.
+- **The escape techniques are specified in `portal-escape.md`** — MAC
+  rotation, for portals that key a grant to the hardware address with no
+  per-device credential, and permitted-service carriers, for tiers that
+  allow only the operator's own services. Both are capabilities rather than
+  detections, behind their own posture flags, and both consume the state
+  model above to know when they apply. What remains deferred here is only
+  the per-provider adapter work that document explains.
 - **Portal page rendering.** ARC does not embed a browser; it reports the
   URL and lets the OS handle it. A mini-browser is a large surface for a
   problem the platform already solves.
