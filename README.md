@@ -17,7 +17,9 @@ ARC is a multipath, carrier-agnostic overlay VPN. A TUN interface gives applicat
 | `internal/tun` | TUN device, and address, route and DNS setup on Linux and macOS |
 | `internal/gateway` | Relay address pool, token authorization, routing to sessions |
 | `internal/engine` | Event loops that run sessions on real sockets and TUN devices |
+| `internal/client` | Client setup shared by `arc-client` and libarc: carriers, config, run |
 | `cmd/arc-client`, `cmd/arc-relay` | The client and relay commands |
+| `cmd/libarc` | The client as a C library for a macOS or iOS packet tunnel provider; `include/arc.h` is its interface |
 | `test/netns` | End-to-end tunnel test in network namespaces |
 
 ## Development
@@ -33,6 +35,10 @@ go test -run='^$' -bench=. ./internal/...                           # benchmarks
 # Regenerate the wire fixtures after a spec change
 python3 -m venv .venv && .venv/bin/pip install -r spec/requirements.txt
 .venv/bin/python spec/generate_arc_fixtures.py
+
+# libarc for macOS and iOS (needs Xcode): static archives and an
+# xcframework in dist/; CI uploads the same as the libarc artifact
+cmd/libarc/build.sh dist
 ```
 
 ## Running a tunnel (Linux)
