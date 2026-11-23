@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -184,6 +185,7 @@ func TestTunnel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	tn.begin()
 	ev := rec.waitFor(t, "network")
 	addr, err := netip.ParseAddr(ev["address"].(string))
 	if err != nil || !netip.MustParsePrefix("10.77.0.0/24").Contains(addr) {
@@ -238,6 +240,7 @@ func TestTunnelAppRejectsNetwork(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	tn.begin()
 	defer tn.stop()
 	ev := rec.waitFor(t, "stopped")
 	if msg, _ := ev["error"].(string); !strings.Contains(msg, "code 7") {
@@ -308,5 +311,107 @@ func TestGenerateKey(t *testing.T) {
 	}
 	if keyfile.Encode(static.Public) != k.Public_key {
 		t.Errorf("public key %s is not the private key's (%s)", k.Public_key, keyfile.Encode(static.Public))
+	}
+}
+
+// TestConcurrentStopsWaitForOneShutdown: while one stop waits on a
+// callback that has not returned, a second stop of the same handle waits
+// for the same shutdown rather than returning early, and once both have
+// returned no event follows.
+func TestConcurrentStopsWaitForOneShutdown(t *testing.T) {
+	relay, _, relayKey := startRelay(t)
+	blocked, release := make(chan struct{}), make(chan struct{})
+	var mu sync.Mutex
+	var events []string
+	stopsReturned := false
+	fn := func(b []byte) int {
+		var ev struct{ Event string }
+		json.Unmarshal(b, &ev)
+		mu.Lock()
+		if stopsReturned {
+			t.Errorf("event after both stops returned: %s", b)
+		}
+		events = append(events, ev.Event)
+		mu.Unlock()
+		if ev.Event == "network" {
+			close(blocked)
+			<-release
+		}
+		return 0
+	}
+	var reg registry
+	tn, err := start(configFor(t, relay, relayKey, nil), newChanDevice(), fn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := reg.add(tn)
+	tn.begin()
+	select {
+	case <-blocked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no network event within 5 s")
+	}
+
+	var wg sync.WaitGroup
+	returned := make(chan int, 2)
+	for i := range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			reg.stop(h)
+			returned <- i
+		}()
+	}
+	select {
+	case i := <-returned:
+		t.Fatalf("stop %d returned while a callback was still running", i)
+	case <-time.After(300 * time.Millisecond):
+	}
+	close(release)
+	wg.Wait()
+	mu.Lock()
+	stopsReturned = true
+	if events[len(events)-1] != "stopped" {
+		t.Errorf("last event %q, want stopped", events[len(events)-1])
+	}
+	mu.Unlock()
+	time.Sleep(100 * time.Millisecond)
+	reg.stop(h) // freed: ignored
+}
+
+// TestNoEventBeforeBegin: no event reaches the app before begin, which
+// arc_start calls only once it has set the handle; that includes events
+// start provokes itself, such as the warning for a journal that won't
+// open.
+func TestNoEventBeforeBegin(t *testing.T) {
+	relay, _, relayKey := startRelay(t)
+	var begun atomic.Bool
+	warned := make(chan struct{}, 1)
+	fn := func(b []byte) int {
+		if !begun.Load() {
+			t.Errorf("event before begin: %s", b)
+		}
+		if strings.Contains(string(b), "running without a diagnostics journal") {
+			select {
+			case warned <- struct{}{}:
+			default:
+			}
+		}
+		return 0
+	}
+	tn, err := start(configFor(t, relay, relayKey, map[string]any{
+		"journal": t.TempDir() + "/missing/journal.jsonl", "share_diagnostics": true,
+	}), newChanDevice(), fn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	begun.Store(true)
+	tn.begin()
+	defer tn.stop()
+	select {
+	case <-warned:
+	case <-time.After(5 * time.Second):
+		t.Error("no warning for the journal that would not open")
 	}
 }

@@ -38,9 +38,11 @@ extern "C" {
  *              {"event":"stopped","error":"..."} when it failed on its own.
  *              It is the last event. The return value is ignored.
  *
- * The callback runs on a thread libarc owns, one event at a time, so a slow
- * callback delays the tunnel. It must not call arc_stop for its own tunnel,
- * which waits for the callback to return. No event arrives after arc_stop
+ * The callback runs on a thread libarc owns, never the one that called
+ * arc_start, and one event at a time, so a slow callback delays the
+ * tunnel. The first event comes only after arc_start has set *handle and
+ * returned. The callback must not call arc_stop for its own tunnel, which
+ * waits for the callback to return. No event arrives after arc_stop
  * returns. event_json is valid only during the call.
  */
 typedef int (*arc_event_fn)(void *context, const char *event_json);
@@ -86,8 +88,10 @@ char *arc_start(const char *config_json, int tun_fd, arc_event_fn callback, void
 /*
  * arc_stop stops the tunnel, waits until it has, and frees the handle. The
  * "stopped" event is delivered before it returns, unless the tunnel had
- * already stopped on its own. Call it for every handle arc_start set, even
- * after a "stopped" event. An unknown handle is ignored.
+ * already stopped on its own. Calls for the same handle from several
+ * threads all wait for that one shutdown. Call it for every handle
+ * arc_start set, even after a "stopped" event. An unknown handle is
+ * ignored.
  */
 void arc_stop(int64_t handle);
 

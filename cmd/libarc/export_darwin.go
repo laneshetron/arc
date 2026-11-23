@@ -13,7 +13,6 @@ static int arc_call(arc_event_fn fn, void *context, const char *event_json) {
 import "C"
 
 import (
-	"sync"
 	"syscall"
 	"unsafe"
 
@@ -21,11 +20,7 @@ import (
 	"github.com/laneshetron/arc/internal/tun"
 )
 
-var (
-	tunnelsMu  sync.Mutex
-	tunnels    = map[int64]*tunnel{}
-	lastHandle int64
-)
+var tunnels registry
 
 //export arc_start
 func arc_start(configJSON *C.char, tunFD C.int, callback C.arc_event_fn, context unsafe.Pointer, handle *C.int64_t) *C.char {
@@ -48,24 +43,14 @@ func arc_start(configJSON *C.char, tunFD C.int, callback C.arc_event_fn, context
 	if err != nil {
 		return C.CString(err.Error())
 	}
-	tunnelsMu.Lock()
-	lastHandle++
-	h := lastHandle
-	tunnels[h] = t
-	tunnelsMu.Unlock()
-	*handle = C.int64_t(h)
+	*handle = C.int64_t(tunnels.add(t))
+	t.begin()
 	return nil
 }
 
 //export arc_stop
 func arc_stop(handle C.int64_t) {
-	tunnelsMu.Lock()
-	t := tunnels[int64(handle)]
-	delete(tunnels, int64(handle))
-	tunnelsMu.Unlock()
-	if t != nil {
-		t.stop()
-	}
+	tunnels.stop(int64(handle))
 }
 
 //export arc_generate_key

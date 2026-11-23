@@ -187,12 +187,14 @@ type device interface {
 // tunnel is a running client.
 type tunnel struct {
 	cancel context.CancelFunc
+	begun  chan struct{} // closed by begin
 	done   chan struct{} // closed once the run has ended and the stopped event is out
 	events *emitter
 }
 
-// start runs a client from config_json over dev, sending its events to fn.
-// The tunnel closes dev when it stops, and start closes it when it fails.
+// start sets up a client from config_json over dev, sending its events to
+// fn; it runs once begin is called. The tunnel closes dev when it stops,
+// and start closes it when it fails.
 func start(configJSON []byte, dev device, fn func(event []byte) int) (*tunnel, error) {
 	cfg, err := parseConfig(configJSON)
 	var cc client.Config
@@ -208,25 +210,49 @@ func start(configJSON []byte, dev device, fn func(event []byte) int) (*tunnel, e
 		return nil, err
 	}
 	events := &emitter{fn: fn}
+	ctx, cancel := context.WithCancel(context.Background())
+	t := &tunnel{cancel: cancel, begun: make(chan struct{}), done: make(chan struct{}), events: events}
+	// Everything that can log runs here, and only after begin, so no
+	// event reaches the app before arc_start has set the handle and
+	// returned, or on the thread that called it.
+	go func() {
+		defer close(t.done)
+		<-t.begun
+		err := t.run(ctx, cfg, cc, level, dev)
+		dev.Close()
+		ev := stoppedEvent{Event: "stopped"}
+		if err != nil {
+			ev.Error = err.Error()
+		}
+		events.closeWith(ev)
+	}()
+	return t, nil
+}
+
+// begin lets the tunnel run. Call it once, after the handle is set.
+func (t *tunnel) begin() { close(t.begun) }
+
+// run runs the client until ctx ends or it fails for good.
+func (t *tunnel) run(ctx context.Context, cfg config, cc client.Config, level slog.Level, dev device) error {
+	events := t.events
 	log := slog.New(slog.NewJSONHandler(events, &slog.HandlerOptions{Level: level}).
 		WithAttrs([]slog.Attr{slog.String("event", "log")}))
-	var journal *diag.Journal
 	if cfg.Journal != "" {
 		// As in arc-client: the journal is bound to this relay, and a
 		// journal that won't open never keeps the tunnel down.
-		journal, err = diag.OpenJournal(cfg.Journal, base64.StdEncoding.EncodeToString(cc.RelayKey[:]), 0)
+		journal, err := diag.OpenJournal(cfg.Journal, base64.StdEncoding.EncodeToString(cc.RelayKey[:]), 0)
 		if err != nil {
 			log.Warn("running without a diagnostics journal", "journal", cfg.Journal, "err", err)
-			journal = nil
 		} else {
+			defer journal.Close()
 			log = diag.Tee(log.Handler(), journal.Handler())
 			if n := journal.Discarded(); n > 0 {
 				log.Warn("journal held another relay's diagnostics; discarded them", "journal", cfg.Journal, "bytes", n)
 			}
+			if cfg.ShareDiagnostics {
+				cc.Diagnostics = journal
+			}
 		}
-	}
-	if cfg.ShareDiagnostics {
-		cc.Diagnostics = journal
 	}
 	cc.Logger = log
 	cc.OnNetwork = func(n client.Network) error {
@@ -239,29 +265,50 @@ func start(configJSON []byte, dev device, fn func(event []byte) int) (*tunnel, e
 		}
 		return nil
 	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	t := &tunnel{cancel: cancel, done: make(chan struct{}), events: events}
-	go func() {
-		defer close(t.done)
-		err := client.Run(ctx, cc, dev)
-		dev.Close()
-		if journal != nil {
-			journal.Close()
-		}
-		ev := stoppedEvent{Event: "stopped"}
-		if err != nil {
-			ev.Error = err.Error()
-		}
-		events.closeWith(ev)
-	}()
-	return t, nil
+	return client.Run(ctx, cc, dev)
 }
 
 // stop ends the tunnel and waits until it has, its stopped event included.
+// The tunnel must have begun.
 func (t *tunnel) stop() {
 	t.cancel()
 	<-t.done
+}
+
+// registry holds the running tunnels by handle.
+type registry struct {
+	mu      sync.Mutex
+	tunnels map[int64]*tunnel
+	last    int64
+}
+
+func (r *registry) add(t *tunnel) int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.tunnels == nil {
+		r.tunnels = map[int64]*tunnel{}
+	}
+	r.last++
+	r.tunnels[r.last] = t
+	return r.last
+}
+
+// stop stops the tunnel h names and waits until it has, then frees h. A
+// caller that comes while another is stopping the same tunnel waits for
+// that same shutdown. An unknown handle is ignored.
+func (r *registry) stop(h int64) {
+	r.mu.Lock()
+	t := r.tunnels[h]
+	r.mu.Unlock()
+	if t == nil {
+		return
+	}
+	t.stop()
+	r.mu.Lock()
+	if r.tunnels[h] == t {
+		delete(r.tunnels, h)
+	}
+	r.mu.Unlock()
 }
 
 // generateKey is arc_generate_key's answer.
