@@ -18,14 +18,18 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	"slices"
+	"sort"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/laneshetron/arc/internal/client"
 	"github.com/laneshetron/arc/internal/crypto"
 	"github.com/laneshetron/arc/internal/diag"
 	"github.com/laneshetron/arc/internal/engine"
 	"github.com/laneshetron/arc/internal/keyfile"
+	"github.com/laneshetron/arc/internal/portal"
 	"github.com/laneshetron/arc/internal/profiling"
 	"github.com/laneshetron/arc/internal/session"
 	"github.com/laneshetron/arc/internal/tun"
@@ -108,6 +112,12 @@ func run(args []string) error {
 	rotateBytes := fs.Int64("stream-rotate-bytes", 0, "move each -tls or -front carrier to a fresh TCP connection after it has received this many bytes, dialed ahead of time, to stay under a censor's per-connection cap (the TSPU freeze to foreign hosting); 0: learn the cap from stalled connections")
 	noUDP := fs.Bool("no-udp", false, "open no UDP carriers: reach the relay only through -tls or -front (-relay is then the session's address, the -tls endpoint, say)")
 	censorship := fs.Bool("censorship", false, "censorship posture: presume the relay sits on foreign hosting behind a censor that bans an address for minutes after UDP to it (TSPU), so open no UDP carrier to an address a -tls or -front carrier uses (spec/freeze-and-udp-ban.md §4)")
+	portalCheck := fs.String("portal-check", "auto", "detect a captive portal before connecting (spec/captive-portals.md): auto, off, or force (also detect without -full-tunnel). Under a detected portal the client opens no carriers and prints the login URL instead of retrying forever")
+	portalProbe := fs.String("portal-probe", "", "connectivity-check URL, for networks that block the standard endpoints; requires -portal-probe-expect")
+	portalProbeExpect := fs.String("portal-probe-expect", "", "success criterion for -portal-probe, as STATUS[:SUBSTRING], e.g. 204 or 200:Microsoft Connect Test")
+	portalKeepalive := fs.Duration("portal-keepalive", 60*time.Second, "how often to re-check the portal while connected; 0 disables the steady check but never the login poll (spec/captive-portals.md §5)")
+	portalPoll := fs.Duration("portal-poll", 10*time.Second, "how often to poll for a completed portal login while one is blocking; backs off to 60s")
+	portalWait := fs.Duration("portal-wait", 0, "with -full-tunnel: exit after this long behind a portal instead of waiting for the login (0 waits indefinitely)")
 	fecMode := wire.FECAuto
 	fs.Func("fec", "forward error correction: auto (default; while loss is at least 0.5%), off, or always", func(v string) (err error) {
 		fecMode, err = client.ParseFEC(v)
@@ -123,6 +133,25 @@ func run(args []string) error {
 	table := fs.Int("table", 5243, "routing table for -full-tunnel (Linux)")
 	prof := profiling.Register(fs)
 	fs.Parse(args)
+
+	// A custom probe without a success criterion is a configuration error, not
+	// a default: guessing one is how the built-in endpoints went wrong
+	// (spec/captive-portals.md §4.1).
+	portalMode, err := portal.ParseCheckMode(*portalCheck)
+	if err != nil {
+		return err
+	}
+	var portalCfg portal.Config
+	portalCfg.Mode, portalCfg.ProbeURL = portalMode, *portalProbe
+	portalCfg.Steady, portalCfg.Login, portalCfg.Wait = *portalKeepalive, *portalPoll, *portalWait
+	if *portalProbeExpect != "" {
+		if portalCfg.Expect, err = portal.ParseExpectation(*portalProbeExpect); err != nil {
+			return err
+		}
+	}
+	if err := portalCfg.Validate(); err != nil {
+		return err
+	}
 	if *profileDir != "" {
 		p, err := loadProfile(*profileDir)
 		if err != nil {
@@ -224,6 +253,71 @@ func run(args []string) error {
 		log.Warn("no -route or -full-tunnel given; only the tunnel network is reachable")
 	}
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// Detect a captive portal per attachment before creating the TUN or opening
+	// any carrier (spec/captive-portals.md §6.1). A handshake through a portal
+	// cannot succeed, so opening one spends an attempt, logs a misleading
+	// failure at the relay, and on a metered link costs the user money.
+	//
+	// Per attachment, not one global verdict: captive Wi-Fi must not suppress
+	// healthy cellular, and reversing the bind order must not change the
+	// answer.
+	detectors, eligible, atts, err := checkPortal(ctx, log, portalCfg, *fullTunnel, binds, uint32(*mark))
+	if err != nil {
+		return err
+	}
+	// excluded is the set that stays out of this session: captive at startup,
+	// and with no re-open path, because carriers are opened once below. The
+	// watch keeps probing them anyway so the user hears about them — a portal's
+	// URL, or a link that came back and needs a restart to be used.
+	var excluded []string
+	if len(eligible) == 0 && len(detectors) > 0 {
+		// Every attachment is captive. Wait for one to recover; the default is
+		// to wait indefinitely, because a user who reads "log in, then
+		// reconnect" and reruns by hand is doing what the client could have
+		// done.
+		for iface := range detectors {
+			excluded = append(excluded, iface)
+		}
+		sort.Strings(excluded)
+		eligible, err = portalWaitMessage(ctx, detectors, excluded, portalCfg, log)
+		if err != nil {
+			return err
+		}
+		// Whatever did not recover stays excluded and stays watched.
+		recovered := make(map[string]bool, len(eligible))
+		for _, iface := range eligible {
+			recovered[iface] = true
+		}
+		excluded = slices.DeleteFunc(excluded, func(iface string) bool { return recovered[iface] })
+	} else {
+		// Some attachment is usable, so the session starts. The captive ones are
+		// excluded from bind but not from watching: their URL may be the only
+		// way the user learns what the network wants.
+		for iface, d := range detectors {
+			if d.BlocksCarriers() {
+				excluded = append(excluded, iface)
+			}
+		}
+		sort.Strings(excluded)
+		// The URLs, not just the names: a link left out of the session is one
+		// the user asked for, and its login page is what they need to get it.
+		announceExcluded(detectors, excluded)
+	}
+	if len(detectors) > 0 {
+		// Bind only the attachments that are not captive, in the order the
+		// user gave, and in the form the carriers were given them — a default
+		// attachment stays unnamed unless the carriers need its name.
+		binds = carrierBinds(atts, eligible, *fullTunnel)
+		log.Info("carrying traffic on the attachments that passed detection", "interfaces", eligible)
+		if len(excluded) > 0 {
+			log.Warn("these attachments are behind a portal and will carry nothing until the client restarts",
+				"interfaces", excluded)
+		}
+	}
+
 	dev, err := tun.Create(*tunName, 1280)
 	if err != nil {
 		return fmt.Errorf("create TUN: %w", err)
@@ -265,6 +359,9 @@ func run(args []string) error {
 			if cleanup, err = dev.FullTunnel(uint32(*mark), *table); err != nil {
 				return err
 			}
+			// From here the system resolver answers through ARC, so detection
+			// must never consult it again (§4.4).
+			disableSystemFallback(detectors)
 		}
 		if *fullTunnel && *dnsMode == tun.DNSManager {
 			nextCleanup, err := dev.ConfigureDNS(resolver)
@@ -280,9 +377,23 @@ func run(args []string) error {
 		return nil
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	log.Info("tunnel device", "tun", dev.Name(), "full_tunnel", *fullTunnel, "routes", strings.Trim(routes.String(), "[]"))
+
+	// Keep watching the portal while the tunnel runs (§5). Without this the
+	// expiry of a grant is indistinguishable from the network dying, and
+	// -portal-keepalive is inert. The loop only observes: on expiry it reports
+	// the state and never releases the tunnel by itself, which is §7.1's
+	// security rule — the network does not get to lower protection.
+	//
+	// An excluded attachment is watched on the login cadence whatever
+	// -portal-keepalive says: zero disables the expiry check on links that are
+	// carrying traffic, not the client's account of a link the user asked for
+	// and did not get. When every attachment is excluded and the steady cadence
+	// is zero, that is the only watching there is.
+	if len(detectors) > 0 && (portalCfg.Steady > 0 || len(excluded) > 0) {
+		go runPortalWatch(ctx, log, detectors, eligible, excluded, portalCfg)
+	}
+
 	cfg := client.Config{
 		Relay: relayAddr, RelayKey: pin, Token: []byte(tokens[0]), Static: static,
 		Carriers: client.CarrierOptions{
