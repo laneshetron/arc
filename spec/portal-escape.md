@@ -8,13 +8,26 @@ document's state model and neither is implemented.
 
 ## 1. Scope and posture
 
-Both capabilities are for the case where the portal has *already classified
-`unauthenticated`* and the user has no credential, no voucher, or no
-intention of supplying one. They are not detection, they are not
+Both capabilities exist for the case where the **portal will not be passed on
+the user's terms** — the grant is spent, there is no credential to give, or
+the tier admits only certain services. They are not detection, they are not
 authentication, and they do not make a network carry traffic it refuses to
-carry — they change *which device the network believes it is talking to*
-(MAC rotation) or *which service the traffic appears to be* (permitted
-service).
+carry: MAC rotation changes *which device the network believes it is talking
+to*, and a permitted-service carrier changes *what the traffic looks like*.
+
+They apply at **different states**, and my earlier revision wrongly put both
+under `unauthenticated`:
+
+| capability | state it runs in | why |
+|---|---|---|
+| MAC rotation | `unauthenticated` | the portal is blocking everything; a new identity is the only lever |
+| permitted-service carrier | `authenticated` or `unknown` | the tier *is* passing the permitted service, so a path exists; under `unauthenticated` nothing passes, so there is no carrier to build |
+
+That is the §1/§4 conflict the review found. A permitted-service carrier
+under `unauthenticated` would be a carrier over a service the portal is
+refusing — which is just a worse version of the tunnel the portal already
+blocked. The tier case is `authenticated`: the network lets some traffic
+through, and this carrier uses only that.
 
 They are opt-in, and the posture flags follow the existing pattern
 (`-censorship`, `-allowlist`): nothing here runs unless asked for, and each
@@ -27,28 +40,40 @@ design premise (`network-profiling.md` §5). Whether a given use is
 appropriate — a paid tier, a corporate device, a network whose operator
 counts sessions — is the user's judgement, not the client's. What the client
 owes the user is accurate information about what it did and what traces it
-left (§5.6), which is what most of this document is.
+left (§2.6, §3.5), which is what much of this document is.
 
 ## 2. MAC rotation
 
 ### 2.1 What it defeats, precisely
 
-A portal that keys a grant to the device's hardware address and nothing else
-will pass any previously-unseen address without a credential. That is a
-narrower class than it sounds:
+My earlier revision claimed a MAC-keyed portal "will pass any
+previously-unseen address", and the review is right that this conflates two
+things: a network can **identify** a device by its hardware address and
+still **require every new device to pay or authenticate**. Tracking a grant
+by MAC is not the same as granting access to new MACs.
 
-| portal keys the grant on | rotation helps? |
-|---|---|
-| MAC alone (hotel captive portals, some airline tiers) | **yes** |
-| MAC + room number / voucher / surname | no — the credential is checked |
-| MAC + a per-session cookie and an IP binding | no — the IP changes with the MAC and the grant is voided |
-| 802.1X / EAP credentials | no — the identity is the credential, and EAP binds it to the association |
-| a portal that rate-limits or fingerprints new devices | partially, and visibly (§2.6) |
+The thing rotation actually defeats is narrower and worth naming exactly:
+a portal that gives **every previously-unseen device an automatic grant** —
+a free window, a trial, an introductory session — and tracks that grant by
+hardware address so it does not have to give it twice. That is a real and
+common configuration on hotel and venue captive portals, and it is the only
+one where a new address buys anything.
 
-So rotation is a *device-identity* trick for a *device-identity* control. It
-cannot manufacture a credential, and the client must not pretend otherwise:
-if rotation three times in a row leaves the portal asking for a login, this
-portal is not MAC-keyed, and §2.5 stops.
+| portal's admission policy | identifies by MAC? | rotation helps? |
+|---|---|---|
+| **automatic per-new-device grant** (free window/trial) | yes | **yes** — a new address is a new grant |
+| per-device purchase, one grant | yes | no — the new address still has to pay |
+| per-device authentication, one session | yes | no — the credential is checked |
+| MAC + voucher / room number / surname | yes | no |
+| MAC + session cookie + IP binding | yes | no — the IP changes with the MAC and the grant is voided |
+| 802.1X / EAP credentials | n/a | no — the identity *is* the credential |
+| rate-limits or fingerprints new devices | yes | partially, and visibly (§2.6) |
+
+So rotation is a *device-identity* trick for a *device-identity* control
+that happens to be paired with a free grant. It cannot manufacture a
+credential, and it cannot conjure a grant the operator never gives. The
+client must not pretend otherwise, and §2.5's stopping rule exists because
+it usually cannot tell which row it is in.
 
 ### 2.2 Platform mechanics
 
@@ -138,11 +163,31 @@ Then:
 2. **If the portal now passes**, the rotation worked; the state reaches
    `authenticated` through the ordinary path (`captive-portals.md` §4.3) and
    nothing else happens.
-3. **If the portal still demands a credential**, this is not a MAC-keyed
-   portal. Rotate once more — some portals key on *freshness within a
-   window* rather than uniqueness — and if that also fails, **stop and say
-   so**: `-portal-mac-rotate` reports that the portal is credential-bound
-   and leaves the device on its original address.
+3. **If the portal still demands a credential**, rotate once more — some
+   portals key on *freshness within a window* rather than uniqueness — and
+   if that also fails, **stop**.
+
+**The stop reports what was observed, not a diagnosis.** My earlier revision
+said the client would report `credential_bound`, and the review is right
+that two failed rotations do not establish that: a MAC-only portal with no
+free grant, an exhausted shared quota, a MAC+IP binding, a failed DHCP lease,
+a failed reassociation, or the OS rolling the address back (§2.3) all
+produce the same observation. So the client reports
+**`rotation_ineffective`** and the evidence behind it:
+
+| field | meaning |
+|---|---|
+| `reason` | `rotation_ineffective` — never a verdict about the portal |
+| `attempts` | how many rotations were tried |
+| `address_applied` | whether the address actually took, verified (§2.3) |
+| `link_recovered` | whether the interface came back with a lease, route and DNS (§2.7.1) |
+| `probe_verdict` | what probe A said after the last attempt |
+
+A maintainer reading that can tell "the portal wants a credential" from
+"DHCP never gave us a lease", which the single word `credential_bound`
+could not. If the link never recovered, the client says so and stops
+rotating entirely — a rotation that breaks the interface is not evidence
+about the portal at all.
 
 **Two attempts, then a stop**, because each attempt costs a reassociation, a
 new DHCP lease and a visible change to the Wi-Fi infrastructure. An earlier
@@ -180,11 +225,26 @@ one who bears them:
 - **Nothing here hides that traffic is a tunnel.** Rotation changes who the
   network thinks is connected, not what the connection carries.
 
-The client therefore **journals every rotation** with the old and new
-address — the addresses are not secrets, and a user who cannot see what
-their client did to their device's identity has been badly served. This is
-the one place the journal records something the operator did not ask for,
-and it is recorded for the user, not for the operator.
+**The rotation audit is local-only, and this contradicts the rule I already
+wrote.** My earlier revision said the journal records both addresses because
+"they are not secrets" and it is "for the user, not for the operator" — but
+`-share-diagnostics` uploads the journal to the relay operator, so a
+persistent local-network identifier would reach a third party that nobody
+asked to share it with. That is exactly the mistake
+`captive-portals.md` §4.7 exists to prevent, and I applied the rule there
+and forgot it here.
+
+So there are two records with different audiences:
+
+| record | where | contents |
+|---|---|---|
+| **rotation audit** | local only, beside the profile, never uploaded | the attachment, both addresses, the timestamps, the outcome |
+| **journal line** | the shared journal | `mac rotated` / `mac rotation failed`, with the *count* and the outcome, and **no address** |
+
+The user sees the full audit (`arc-client portal audit`); an operator
+receiving a shared journal learns that a rotation happened and whether it
+worked, not what any address was. Both are what their audience needs, and
+neither leaks.
 
 ### 2.7 Restoring, and never being left spoofed
 
@@ -201,6 +261,75 @@ changed may fail to authenticate next week.
   address, the user is on another network — the client **says so loudly** and
   prints the exact command to restore it, rather than exiting quietly and
   leaving the device spoofed.
+
+#### 2.7.1 The record is crash-safe and attachment-scoped
+
+"Restore at next start" only works if the record is durable *before* the
+mutation, and the review is right that I left both halves unspecified.
+
+**Write order.** The record is written, `fsync`ed and renamed into place
+**before** the address is changed. A crash at any point in the mutation
+therefore leaves a record that says "this attachment's original address is
+X, a rotation to Y was in progress" — the worst case is a redundant restore
+of an address that was never changed, which is harmless. A crash *after* the
+address change but before a record would be the unrecoverable case, and the
+write order precludes it.
+
+**Identity.** The record is keyed on `(interface name, network identity)`,
+where the network identity is the SSID on Wi-Fi and the gateway MAC plus
+subnet on wired — the same key `network-profiling.md` §3.1 uses for the
+local profile cache. That is what stops a restore from applying another
+network's address, or from overwriting an address the OS chose for a network
+this run has never seen:
+
+- **Same interface, same network** → restore, verify, clear the record.
+- **Same interface, different network** → the OS may have set a private
+  address for *that* network, so the record does not apply; the client
+  clears it and journals that it declined to restore.
+- **Interface absent** (a USB adapter unplugged) → keep the record, wait for
+  the interface to return, and never write another interface's address.
+
+**A record that is unreadable or malformed never causes a write.** The
+client reports it and asks the user, because a corrupt record is exactly the
+case where guessing could set a wrong address.
+
+#### 2.7.2 Bringing the network back
+
+"Restore the link and re-run probe A" was what my earlier revision said, and
+the review is right that it is nowhere near enough: changing the address
+takes the interface down and can change the DHCP lease, the address, the
+gateway, the DNS servers, and every carrier socket's binding — and on Linux
+it can move the interface index out from under a route.
+
+The client runs one **sequenced lifecycle** for a rotation, and only then
+resumes:
+
+1. **Pause.** Stop the reconnect attempts, mark every path `DRAINING`, and
+   keep the session alive on the relay side (`captive-portals.md` §5.1's
+   "expiry does not kill sessions" applies for the same reason).
+2. **Mutate.** Write the record (§2.7.1), bring the link down, set the
+   address, bring it up, and **verify the address took** — a silent rollback
+   (§2.3) ends the lifecycle here.
+3. **Reassociate and acquire.** Wait for association, then for DHCP or RA,
+   then for a default route, then for resolvable DNS — each with its own
+   timeout, and each failure reported distinctly. A link that comes up with
+   no lease is not a recovered link.
+4. **Invalidate what the address owned.** The attachment's cached local
+   profile and any per-attachment probe results keyed on the old identity
+   are discarded (`network-profiling.md` §3.1). The upstream profile is
+   *not* invalidated, because the upstream did not change.
+5. **Rebind the carriers.** Every carrier socket is recreated on the new
+   interface address and re-bound (§17.1's marks and `-bind`), because the
+   old ones are bound to an address that no longer exists.
+6. **Re-probe, then revalidate.** Probe A and B run once (§4 of
+   `captive-portals.md`); if the portal now passes, paths rejoin by the
+   ordinary §14.6 rules and may re-handshake, which is expected since the
+   client's source address changed.
+
+**Every step reports, and the lifecycle is journalled as a sequence**, so a
+`rotation_ineffective` (§2.5) can be told apart from "the address changed
+and DHCP never answered". The end-to-end test is that ARC carries traffic
+after the rotation, not that the link came back.
 
 ## 3. Permitted-service carriers
 
@@ -220,15 +349,31 @@ rendezvous and small payloads rather than throughput.
 
 ### 3.2 The carrier contract
 
-A permitted-service carrier is any transport that can, on demand:
+My earlier revision defined a permitted-service carrier as anything that can
+"send a small payload to a destination the network permits and receive one
+back", and said the destination would be operator-controlled infrastructure.
+The review is right that this **assumes the hard part away**: a network
+permitting a named service means the *service* is reachable, not that
+arbitrary payloads can be delivered through it to infrastructure the
+operator controls and returned to this client. A generic framing contract
+cannot manufacture a return path the service does not expose.
 
-1. **send** a small payload to a destination the network permits, and
-2. **receive** a small payload back, addressed to this client,
+So the return path is a **precondition of the adapter, established per
+provider**, and an adapter that has not established it is not a carrier:
 
-with the same properties a constrained carrier already has: it is
-request/response or slow, its payloads are tiny and metered, and the
-destination side is infrastructure the *operator* controls — not the
-service the network permits.
+| precondition | what must be true, per provider |
+|---|---|
+| **an operator-controlled endpoint** | there is a concrete destination in that service that the operator owns or controls — an account, a bot, a channel, a mailbox, a hosted app — and it is named in the adapter's configuration, not inferred |
+| **authenticated addressing** | the adapter can address *this client's* traffic distinctly, through that endpoint, on that service's own authentication |
+| **a delivery path** | the service will carry a payload from the client to that endpoint, with a size and rate the adapter has measured rather than assumed |
+| **a return path** | the service will expose the endpoint's response to the client — by push, by a subscription the client can hold, or by polling an API the client is authorised to call |
+| **a correlation** | the client can tell *its* response from anyone else's, which is the nonce requirement below |
+
+A service that fails any row is not usable as a carrier, whatever its
+payload limits. **That is the common case**, and the document says so
+instead of implying otherwise: most "free tiers" permit a service's own
+clients to talk to the service's own servers, and expose neither an
+operator-controlled endpoint nor a client-addressable return path.
 
 **What it carries is cells, unchanged.** A permitted-service carrier is a
 framing adapter over `CELL` (`ARC-v1-…-Handoff.md` §12.1), exactly as the DNS
@@ -246,7 +391,8 @@ of inner IP, before fragmentation.
 **The envelope is the permitted service's protocol.** That is the whole
 difference from DNS: the DNS adapter encodes cells in query names and
 answers, and this one encodes them in whatever the permitted service will
-carry to the operator's own infrastructure. The contract is therefore:
+carry to the operator's endpoint — and the permitted service is the one that
+decides what that payload can look like. The contract is therefore:
 
 | the adapter must | the adapter must not |
 |---|---|
@@ -268,13 +414,18 @@ Three caps, and the tightest is not the one ARC sets:
 - **The path's own pacing**, which follows from both.
 
 Expected throughput is **lower than the DNS lifeline**, which is already
-0.04–2 KiB/s by rate dial. A messaging service with a 1/second send limit
-and a 300-byte payload is about 600 B/s of downlink at best, and typically a
-fraction of it once the receive path requires polling. That is enough for
-rendezvous — learning a relay address, reporting state, keeping a session's
-control plane alive — and not enough for anything a user would call
-connectivity. `network-profiling.md` §10's "rendezvous-only role, never data
-plane" is the right description and this document keeps it.
+0.04–2 KiB/s by rate dial. A messaging service with a 1-per-second send
+limit and a 300-byte payload carries **at most 300 B/s in that direction** —
+600 B/s only as the aggregate of both directions, and only before the
+service's own envelope, the adapter's encoding, and the polling overhead
+the receive path imposes. In practice it is a fraction of that, and the
+receive path usually sets the figure rather than the send path.
+
+That is enough for rendezvous — learning a relay address, reporting state,
+keeping a session's control plane alive — and not enough for anything a
+user would call connectivity. `network-profiling.md` §10's "rendezvous-only
+role, never data plane" is the right description and this document keeps
+it.
 
 ### 3.4 No provider is specified here, deliberately
 
@@ -320,19 +471,44 @@ state:
 | capability | when it runs | effect on state |
 |---|---|---|
 | MAC rotation | `unauthenticated`, `portal_seen`, credential demanded | none directly — it succeeds or fails, and the state machine observes the result through probe A |
-| permitted-service carrier | `authenticated` (the tier passes some traffic) or `unknown` | none — it is a carrier, so it participates as a path (§14.4 validates it) |
+| permitted-service carrier | `authenticated` (the tier passes the service) or `unknown`; **never `unauthenticated`**, where nothing passes | none — it is a carrier, so it participates as a path (§14.4 validates it) |
 
 **Neither runs under `unknown` as an escape.** A MAC rotation triggered by
 an unconfirmed guess about the network is a device-identity change with no
 evidence it will help, and the state model exists precisely to avoid acting
 on guesses.
 
-**Rotation and the tunnel release are independent**, and the ordering
-matters: rotation takes the interface down, which kills the carrier sockets;
-`captive-portals.md` §7.1's release is about the *host's* routes. A rotation
-while the tunnel is up therefore needs §7.1's release to have happened first
-or the route to be reinstalled afterwards, and the client sequences them
-explicitly rather than relying on which timer fires first.
+**Rotation never authorizes a tunnel release.** My earlier revision said a
+rotation "needs `captive-portals.md` §7.1's release to have happened first
+*or* the route to be reinstalled afterwards", without saying who may trigger
+the release — and that would have made enabling `-portal-mac-rotate` an
+implicit permission to drop VPN protection, which is precisely what §7.1's
+`ask` default exists to prevent.
+
+The rule is therefore:
+
+- **A rotation does not itself release anything.** It takes the interface
+  down, which kills the carrier sockets, but the host's routes stay as they
+  are — so the machine keeps whatever protection it had, and traffic does
+  not start flowing outside the tunnel because a device changed its address.
+- **If a release is needed** for the user to reach the portal, it happens
+  through §7.1's own path: `ask` requires the user to run
+  `arc-client portal login`, `off` forbids it entirely, and `auto` releases
+  only on the portal state machine's own evidence. Rotation is not evidence.
+- **With `-portal-release-tunnel off`**, rotation still runs — the two
+  capabilities are orthogonal — but the route stays installed throughout, so
+  the user reaches the portal however they otherwise would.
+- **Reinstall is unconditional.** If a release happened at any point, the
+  route is reinstalled when the state returns to `authenticated` or the
+  rotation lifecycle completes, whichever comes first, and the reinstall is
+  verified rather than assumed.
+
+**Sequencing with `ask`.** A rotation under the default is a user-initiated
+action already (`-portal-mac-rotate` is opt-in), so the natural order is:
+user sees the portal message, runs `arc-client portal login`, and the client
+then rotates if `-portal-mac-rotate` allows it — release first, rotation
+second, and the route stays released only as long as `ask` would have left
+it. Under `off`, the rotation proceeds with the route intact.
 
 ## 5. Testing
 
@@ -341,22 +517,33 @@ be told to key its grant on MAC alone, on MAC plus a voucher, or on nothing.
 
 | scenario | assertion |
 |---|---|
-| **MAC-keyed portal, grant spent** | one rotation passes the portal; state reaches `authenticated`; the address is LAA and unicast |
-| **Credential-keyed portal** | two rotations fail, the client **stops** and reports `credential_bound`; **the original address is restored** |
-| **Address chosen** | first octet has U/I set and LAA bit set; never the previous address; never one in the neighbour table |
-| **Rotation with the tunnel up** | §7.1's release happens first, or the route is reinstalled after; the interface comes back with a working route either way |
+| **MAC-keyed *with a free per-device grant*, grant spent** | one rotation passes the portal; state reaches `authenticated`; the address is LAA and unicast |
+| **MAC-keyed but per-device purchase** | two rotations fail and the ledger is unchanged: no free grant is invented (§2.1) |
+| **Credential-keyed portal** | two rotations fail; the client stops and reports **`rotation_ineffective` with its evidence**, never `credential_bound`; **the original address is restored** |
+| **Rotation where DHCP never answers** | reported as `link_recovered=false`, distinguished from a portal refusal (§2.5) |
+| **Address chosen** | first octet has I/G clear and U/L set; never the previous address; never one in the neighbour table |
+| **The OS rolls the address back** | the rotation counts as failed and the lifecycle stops, rather than reporting a success that did not happen (§2.3) |
+| **End-to-end recovery after a rotation** | not just "the link is up": association, DHCP, default route, DNS, carrier rebind, and ARC **carrying traffic** (§2.7.2) |
+| **Local profile cache** | the attachment's local profile is invalidated by a rotation; the **upstream** profile is not (§2.7.2) |
 | **Clean exit after a rotation** | the original address is restored and verified |
-| **`SIGKILL` after a rotation** | the next start restores it from the persisted record and says it did |
+| **`SIGKILL` at each mutation boundary** | the record is durable before the address changes, so the next start restores correctly from every crash point (§2.7.1) |
+| **A rotation record for a different SSID** | the client declines to restore and journals why, rather than writing another network's address (§2.7.1) |
+| **A corrupt rotation record** | reported and queried with the user; **no address is written** (§2.7.1) |
 | **Restore fails** | the client prints the exact restore command and exits non-zero, rather than leaving the device spoofed |
+| **`-portal-release-tunnel off` + rotation** | the rotation runs and **the full-tunnel route stays installed throughout** — a rotation cannot downgrade protection (§4) |
+| **`ask` + rotation** | the release happens only through `arc-client portal login`, as it would without rotation, and the route is reinstalled when the state returns to `authenticated` |
 | **Rate caps** | the 5th rotation in an hour is refused; nothing rotates while `authenticated` |
-| **Journal** | every rotation logged with both addresses; no credential, voucher or portal URL path |
-| **Permitted-service carrier** | a cell round-trips through a stub service adapter; one cell per request; a `rate_limited` failure is reported as such and not retried past the limit |
+| **Journal vs audit** | the shared journal records the count and outcome with **no address**; the local audit has both addresses and is never uploaded (§2.6) |
+| **Permitted-service carrier round-trip** | a cell goes to an operator-controlled endpoint through a stub service adapter and comes back; one cell per request; a `rate_limited` failure is reported as such and not retried past the limit |
+| **A service with no return path** | rejected as a carrier at configuration time, not attempted and failed at runtime (§3.2) |
+| **A service carrier in `unauthenticated`** | refused: the portal is not passing the service, so there is nothing to build (§1, §4) |
 | **Service adapter on a one-cell budget** | a packet larger than one cell is refused before emission, since a request/response carrier cannot finish a multi-cell packet inside ARC's PTO (§3.2) |
 
-The rows that matter most are the two that leave the device in a bad state:
-**restore after a crash**, and **restore failure being loud**. Those are the
-ones a happy-path implementation gets wrong, and they are the reason §2.7 is
-as long as it is.
+The rows that matter most are the ones that leave the device or the user in a
+bad state: **restore after a crash at each boundary**, **restore failure
+being loud**, **a rotation that cannot downgrade the tunnel**, and **no
+address in the shared journal**. Those are what a happy-path implementation
+gets wrong, and they are why §2.6–§2.7 are as long as they are.
 
 ## 6. Deferred
 
