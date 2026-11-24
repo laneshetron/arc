@@ -93,7 +93,8 @@ down**, so every connection on it dies — carrier sockets included.
 | platform | mechanism | privilege | notes |
 |---|---|---|---|
 | Linux | `netlink.LinkSetHardwareAddr` (`ip link set DEV address MAC`) | `CAP_NET_ADMIN` — ARC already holds it for the TUN | needs the link down on most drivers; re-association follows |
-| macOS | `ifconfig DEV ether MAC` | root | **conflicts with the OS's own private address (§2.3)** |
+| Linux, candidate scoring | `iw dev DEV interface add mon0 type monitor` | `CAP_NET_ADMIN` | concurrent monitor and managed works on many chipsets; `iw list` reports which, and some drop the association — §2.4.4 |
+| macOS | `ifconfig DEV ether MAC` | root | **conflicts with the OS's own private address (§2.3)**; no supported monitor mode since the `airport` utility was removed in 14.4, so policy B's scoring is Linux-only |
 | iOS, Android | — | — | no API exists; an app cannot change the hardware address |
 
 **Rotation is therefore desktop-only, and the client says so** rather than
@@ -203,6 +204,91 @@ Either way, **the original address is recorded before the first rotation**,
 persisted with the attachment's profile, and restored on exit and at the next
 start (§2.7).
 
+#### 2.4.4 Scoring candidates by whether they are past the portal
+
+Activity alone is a poor proxy for *admitted* (§2.4.1): a pre-auth station
+reloading the portal looks busy, while an admitted one holding a quiet TCP
+connection looks dead. Where a monitor-mode interface is available, the
+client can read every frame's shape and rank candidates on evidence rather
+than volume.
+
+**What is observable, and why it settles the question.** In monitor mode the
+client sees all frames on the channel, including frames not addressed to it.
+What can be read from them depends on the link-layer security:
+
+| network | readable | admitted-vs-not is |
+|---|---|---|
+| open SSID | payloads in the clear | **conclusive**: DNS to a resolver other than the portal's, TLS SNI to non-portal hosts |
+| WPA2-PSK | headers; unicast encrypted | **conclusive if decrypted** — the PMK derives from the passphrase the client already holds, and a captured four-way handshake yields each station's PTK. No cracking needed. |
+| WPA3-SAE, 802.1X | headers only | **inferred from shape** (§2.4.4.1) |
+| any | radiotap + 802.11 headers, EAPOL | association state, retry counts, RSSI |
+
+**The client uses shape, not decryption.** Reading payloads would settle it
+exactly, but that is interception of another passenger's communications
+rather than link-layer metadata, and it is a different class of act from
+what this capability is. Shape is enough to rank:
+
+| signal | admission implies | pre-auth implies |
+|---|---|---|
+| **per-station byte rate**, 10 s window | often kbit/s and up | bytes per second |
+| **frame size distribution** | a data-frame tail near the MTU | small control-plane frames |
+| **temporal pattern** | sustained | periodic retry bursts |
+| **RSSI** | tiebreak only — whose session it is, by proximity |
+
+A station moving more than `-portal-mac-busy-bytes` (default 10 KB in the
+window) is scored **admitted**; one below `-portal-mac-idle-bytes` (default
+512 B) is scored **unadmitted**; between the two it is **uncertain** and
+ranked after both, because a wrong guess costs an attempt from §2.6's
+budget.
+
+**Ranking is admitted-first, then RSSI.** A busy station is highly likely to
+be admitted, which is what saves attempts; the cost is that the disruption to
+that device is immediate and visible to it (§2.6.1). Ranking by idleness
+would be gentler and frequently wrong, since a quiet station may simply have
+expired — and a failed attempt spends a fourth of the hourly budget.
+
+**Requirements and fallback.** Scoring needs a monitor interface on the same
+channel:
+
+```sh
+iw dev wlan0 interface add mon0 type monitor
+ip link set mon0 up
+# ... capture with radiotap headers, then:
+iw dev mon0 del
+```
+
+Concurrent monitor and managed operation works on many chipsets and drops the
+association on others — `iw list` reports support under "valid interface
+combinations". So:
+
+- **Where it works**, scoring runs before the observed attempts and orders
+  the candidate list.
+- **Where it does not, or on macOS** (no supported monitor mode since 14.4),
+  the client falls back to the activity ranking of §2.4.1 and journals that
+  scoring was unavailable. That is the current behaviour, not a failure.
+- **`-portal-mac-score`** selects `auto` (default: try monitor, fall back),
+  `off` (never monitor), or `require` (fail the observed path rather than
+  fall back, for an operator who wants no unranked attempts).
+
+**The capture is bounded and temporary.** One monitor interface, created for
+the scoring window (`-portal-mac-score-window`, default 10 s), removed
+afterwards, capturing headers only. The station table is scored, the
+candidates retained, and everything else discarded — no per-frame record
+survives the window.
+
+#### 2.4.4.1 What shape cannot tell you
+
+Two stations can look identical in shape and differ in admission: a
+pre-auth station streaming a captive-portal video is busy and *not* admitted,
+and an admitted station polling for mail every minute is quiet and *is*. The
+scoring reduces the number of wrong attempts; it does not eliminate them, and
+the attempt budget of §2.6 is what bounds the cost of being wrong.
+
+Ranking by *admitted status* rather than by *observed shape* would need a
+position on the path with more state than a client has — seeing which side
+of the portal's enforcement point a station's traffic lands on. That is
+deferred (§6) rather than approximated.
+
 ### 2.5 When to rotate, and when to stop
 
 Rotation is driven by the state model, and the trigger is narrow:
@@ -221,14 +307,19 @@ client cannot tell from outside which one the portal implements (§2.1):
    policy A and the rotation worked; the state reaches `authenticated`
    through the ordinary path (`captive-portals.md` §4.3).
 2. **Observed second** (§2.4.1), only if a candidate exists and only when
-   `-portal-mac-observe` is on. One attempt per candidate up to the cap. If
-   one passes, the portal is policy B and the admission is inherited.
+   `-portal-mac-observe` is on. Candidates are **scored and ordered first**
+   where §2.4.4 can run, so admitted-looking stations are tried before
+   uncertain ones and both before unadmitted ones. One attempt per candidate
+   up to the cap. If one passes, the portal is policy B and the admission is
+   inherited.
 3. **Stop** when the synthetic attempt and every candidate have failed.
 
 Synthetic goes first because it is self-contained: no capture, no
 interference with another station, and it settles policy A without touching
 anyone's address. Observed runs only after it fails, which is also what keeps
-the common case free of the complications in §2.6.
+the common case free of the complications in §2.6. Scoring orders the
+observed attempts; it does not create candidates and does not change when the
+observed path runs.
 
 **The stop reports what was observed, not a diagnosis.** My earlier revision
 said the client would report `credential_bound`, and the review is right
@@ -364,19 +455,40 @@ of an address that was never changed, which is harmless. A crash *after* the
 address change but before a record would be the unrecoverable case, and the
 write order precludes it.
 
-**Identity.** The record is keyed on `(interface name, network identity)`,
-where the network identity is the SSID on Wi-Fi and the gateway MAC plus
-subnet on wired — the same key `network-profiling.md` §3.1 uses for the
-local profile cache. That is what stops a restore from applying another
-network's address, or from overwriting an address the OS chose for a network
-this run has never seen:
+**Identity.** The record is keyed on `(physical device identity, network
+identity)`, where the physical identity is the adapter's permanent address
+(reported by the driver, not the current one, so it survives a rotation) and
+the network identity is the SSID on Wi-Fi and the gateway MAC plus subnet on
+wired — the same key `network-profiling.md` §3.1 uses for the local profile
+cache.
 
-- **Same interface, same network** → restore, verify, clear the record.
-- **Same interface, different network** → the OS may have set a private
-  address for *that* network, so the record does not apply; the client
-  clears it and journals that it declined to restore.
-- **Interface absent** (a USB adapter unplugged) → keep the record, wait for
-  the interface to return, and never write another interface's address.
+**A record for another network is retained, never discarded.** My earlier
+revision said the client "clears it and journals that it declined", and the
+review is right that this loses the only durable copy of the pre-rotation
+address. The failure is concrete: rotate `wlan0` on SSID A, crash, associate
+with SSID B before restart — B's startup discards A's record, and on return
+to A there is nothing left to restore, while on Linux the spoofed address
+has been sitting on the interface the whole time because the address is a
+property of the interface and not of the network.
+
+So the rules are:
+
+- **Same device, same network** → restore, verify, clear the record.
+- **Same device, different network** → **keep the record**, do not apply it,
+  and restore it the next time that network is seen. The interface is left
+  as it is, because the OS may have set a private address for the current
+  network and that is the correct state for it.
+- **Device absent** (a USB adapter unplugged) → keep the record and restore
+  when the device returns.
+- **Startup while unassociated, or before the SSID is readable** → do not
+  guess. The client treats it as "network identity not yet known", leaves
+  records alone, and evaluates them once association completes. A rotation
+  record is acted on only when both halves of the key are known.
+
+Records are retained until they are applied or the user discards them
+(`arc-client portal restore --discard`), and their presence is reported at
+startup so a device is never left quietly spoofed because a restore was
+pending and unnoticed.
 
 **A record that is unreadable or malformed never causes a write.** The
 client reports it and asks the user, because a corrupt record is exactly the
@@ -393,9 +505,22 @@ it can move the interface index out from under a route.
 The client runs one **sequenced lifecycle** for a rotation, and only then
 resumes:
 
-1. **Pause.** Stop the reconnect attempts, mark every path `DRAINING`, and
-   keep the session alive on the relay side (`captive-portals.md` §5.1's
-   "expiry does not kill sessions" applies for the same reason).
+1. **Pause the transport, without draining paths.** Stop the reconnect
+   attempts and suspend carrier I/O, but **do not mark paths `DRAINING`**:
+   `ARC-v1-…-Handoff.md` §14.1 makes `DRAINING` a one-way state whose only
+   successor is `DEAD`, and §14.3 forbids reusing a retired path ID. Draining
+   every path would therefore retire the whole session during an
+   association or DHCP delay, with no way back.
+
+   The pause is instead a **transport suspend** that keeps each path's
+   identity — path ID, CIDs, reset token, nonce space — while its socket is
+   gone, exactly as §9.4's suspend grace already allows a session to outlive
+   its paths for up to 120 s. Paths stay `VALIDATED` but not usable, and the
+   keepalive clock for each path restarts when its socket is rebound, so the
+   rotation interval is not charged as loss (the same exemption §14.4 gives
+   an MTU probe). If the rotation exceeds the suspend grace, the session ends
+   and re-handshakes on the new address, which is the correct outcome and is
+   reported as `session_reestablished` rather than as a rotation failure.
 2. **Mutate.** Write the record (§2.7.1), bring the link down, set the
    address, bring it up, and **verify the address took** — a silent rollback
    (§2.3) ends the lifecycle here.
@@ -403,22 +528,30 @@ resumes:
    then for a default route, then for resolvable DNS — each with its own
    timeout, and each failure reported distinctly. A link that comes up with
    no lease is not a recovered link.
-4. **Invalidate what the address owned.** The attachment's cached local
+4. **Verify the address again, after association** (§2.3): the Wi-Fi daemon
+   can restore the OS's own address during association or a subsequent roam,
+   so the effective address is read back here and compared with the intended
+   one. A mismatch is an **OS rollback**, reported as a rotation failure
+   *before* any portal result is attributed to the new identity — otherwise
+   the client would credit a portal pass it did not earn.
+5. **Invalidate what the address owned.** The attachment's cached local
    profile and any per-attachment probe results keyed on the old identity
    are discarded (`network-profiling.md` §3.1). The upstream profile is
    *not* invalidated, because the upstream did not change.
-5. **Rebind the carriers.** Every carrier socket is recreated on the new
+6. **Rebind the carriers.** Every carrier socket is recreated on the new
    interface address and re-bound (§17.1's marks and `-bind`), because the
    old ones are bound to an address that no longer exists.
-6. **Re-probe, then revalidate.** Probe A and B run once (§4 of
-   `captive-portals.md`); if the portal now passes, paths rejoin by the
-   ordinary §14.6 rules and may re-handshake, which is expected since the
-   client's source address changed.
+7. **Re-probe, then revalidate.** Probe A and B run once (§4 of
+   `captive-portals.md`); if the portal now passes, each suspended path
+   resumes with its identity intact and is re-validated by `PATH_CHALLENGE`
+   on its new address (§14.5, an address change on an existing path), not by
+   joining a new path.
 
 **Every step reports, and the lifecycle is journalled as a sequence**, so a
 `rotation_ineffective` (§2.5) can be told apart from "the address changed
-and DHCP never answered". The end-to-end test is that ARC carries traffic
-after the rotation, not that the link came back.
+and DHCP never answered", and both from an OS rollback. The end-to-end test
+is that ARC carries traffic after the rotation on the *same* path IDs, not
+that the link came back.
 
 ### 2.8 Configuration
 
@@ -429,6 +562,10 @@ after the rotation, not that the link came back.
 | `-portal-mac-observe-count` | `500` | frames captured per attempt; the capture closes when reached or when the interface goes down |
 | `-portal-mac-observe-window` | `5m` | how recent an observed address must be to count as a candidate |
 | `-portal-mac-candidates` | `4` | most observed addresses tried per attempt, most-recently-active first |
+| `-portal-mac-score` | `auto` | candidate scoring (§2.4.4): `auto` tries a monitor interface and falls back, `off` never monitors, `require` fails the observed path rather than falling back |
+| `-portal-mac-score-window` | `10s` | how long the monitor interface exists before it is removed |
+| `-portal-mac-busy-bytes` | `10000` | bytes in the scoring window above which a station is scored admitted |
+| `-portal-mac-idle-bytes` | `512` | bytes below which a station is scored unadmitted; between the two is uncertain |
 | `-portal-mac-restore` | `on` | restore the original address on exit and at the next start (§2.7). `off` exists only for a device whose address is managed by something else, and the client says so at startup |
 
 **`-portal-mac-observe` is on by default, given `-portal-mac-rotate` is
@@ -492,9 +629,56 @@ retransmission timer. `dns-lifeline.md` §2.4 derives that from
 `rtt.pto()` = 691 ms against a poll interval of seconds; the derivation is
 identical here and the rule is not optional for the same reason.
 
-That also fixes this carrier's maximum packet size at its own cell minus 18,
-which for a 300-byte service payload is about 282 B of ARC packet and 245 B
-of inner IP, before fragmentation.
+#### 3.2.1 It joins an established session; it does not bootstrap one
+
+One cell per packet puts a hard ceiling on what this carrier can carry, and
+the review is right that I claimed a capability the arithmetic does not
+support. The handshake is the problem:
+
+| packet | size | fits a 282 B budget? | fits a 114 B budget? |
+|---|---|---|---|
+| `HANDSHAKE_INIT` | 122 B | yes | **no** |
+| `AUTH`, 43-byte token | 80 B | yes | yes |
+| `AUTH`, 256-byte token | 293 B | **no** | **no** |
+| `AUTH`, `MaxCredentialLen` 4,096 | 4,133 B | **no** | **no** |
+
+And those are bare frame sizes: the 282 B figure is the packet budget *before*
+the service's own envelope and the adapter's encoding, so the real ceiling is
+lower in every case. A device holding a long token — or enrolled with the
+112-byte enrollment credential — **cannot establish a session over this
+carrier at all**, and on a small-payload service even `HANDSHAKE_INIT` does
+not fit.
+
+**Rule: a permitted-service carrier joins an already-established ARC
+session. It never bootstraps one.** That means:
+
+- The session is established on another carrier — any UDP, TLS or front path
+  — and this carrier's path is added with `PATH_JOIN` (§14.4), which is 45 B
+  and fits.
+- If no session exists, the client does not offer this carrier and says so.
+  Offering it would produce a handshake that fails at the first packet with
+  no diagnostic a user could act on.
+- Where a service's payload budget is at least 300 B **after** envelope and
+  encoding, a deployment *may* additionally allow it to carry the handshake;
+  that is a per-provider property measured by the adapter, not a default, and
+  §3.2.2's sizing rule below is what makes it decidable.
+
+**This also bounds what the carrier is for.** `network-profiling.md` §10
+describes its role as rendezvous and small payloads; joining an established
+session is consistent with that, and bootstrapping a session over a chat
+service was never plausible. The correction is to say so rather than let the
+generic contract imply otherwise.
+
+#### 3.2.2 Sizing is measured, and the adapter reports it
+
+The maximum ARC packet this carrier can carry is
+`service_payload − envelope − encoding − 18`, not `cell − 18` — the cell is
+this adapter's own framing, and there may be several layers of it. The
+adapter therefore **reports the resulting `max_packet` to the session** as a
+constrained carrier does (`dns-lifeline.md` §4.1), and the session applies
+its one-cell rule against that value. An adapter that cannot state its
+payload budget is not usable, because nothing downstream can size a packet
+against a guess.
 
 **The envelope is the permitted service's protocol.** That is the whole
 difference from DNS: the DNS adapter encodes cells in query names and
@@ -639,13 +823,21 @@ be told to key its grant on MAC alone, on MAC plus a voucher, or on nothing.
 | **Rotation where DHCP never answers** | reported as `link_recovered=false`, distinguished from a portal refusal (§2.5) |
 | **Address chosen** | first octet has I/G clear and U/L set; never the previous address; never one in the neighbour table |
 | **The OS rolls the address back** | the rotation counts as failed and the lifecycle stops, rather than reporting a success that did not happen (§2.3) |
-| **End-to-end recovery after a rotation** | not just "the link is up": association, DHCP, default route, DNS, carrier rebind, and ARC **carrying traffic** (§2.7.2) |
+| **End-to-end recovery after a rotation** | not just "the link is up": association, DHCP, default route, DNS, carrier rebind, and ARC **carrying traffic on the same path IDs** (§2.7.2) |
+| **A rotation longer than the suspend grace** | the session ends and re-handshakes; reported as `session_reestablished`, not as a rotation failure (§2.7.2) |
+| **A rotation in which the OS restores its address during association** | read back **after** association, reported as an OS rollback **before** any portal result is attributed to the new identity (§2.7.2 step 4) |
 | **Local profile cache** | the attachment's local profile is invalidated by a rotation; the **upstream** profile is not (§2.7.2) |
 | **Clean exit after a rotation** | the original address is restored and verified |
 | **`SIGKILL` at each mutation boundary** | the record is durable before the address changes, so the next start restores correctly from every crash point (§2.7.1) |
-| **A rotation record for a different SSID** | the client declines to restore and journals why, rather than writing another network's address (§2.7.1) |
+| **Rotate on SSID A, crash, start on SSID B, then return to A** | B retains A's record without applying it; on return to A the address is restored. **The record is never discarded for being the wrong network** (§2.7.1) |
+| **Startup while unassociated, SSID unreadable** | no record is applied or discarded; evaluation waits for association (§2.7.1) |
 | **A corrupt rotation record** | reported and queried with the user; **no address is written** (§2.7.1) |
 | **Restore fails** | the client prints the exact restore command and exits non-zero, rather than leaving the device spoofed |
+| **Scoring ranks a busy station above an idle one** | in a seeded capture, a station at 50 KB/10 s scores admitted and is tried first; a 100 B/10 s station scores unadmitted and last (§2.4.4) |
+| **Scoring unavailable (no monitor interface, or macOS)** | falls back to activity ranking and journals that scoring was unavailable; the observed path still runs (§2.4.4) |
+| **`-portal-mac-score require` without monitor support** | the observed path fails with a stated reason rather than attempting unranked candidates |
+| **Monitor interface cleanup** | the interface exists only for the scoring window and is removed; the association survives, or is re-established if the chipset dropped it |
+| **Scoring reads no payloads** | on a WPA2 network the capture yields headers only; no decryption is attempted and no PTK is derived (§2.4.4) |
 | **`-portal-release-tunnel off` + rotation** | the rotation runs and **the full-tunnel route stays installed throughout** — a rotation cannot downgrade protection (§4) |
 | **`ask` + rotation** | the release happens only through `arc-client portal login`, as it would without rotation, and the route is reinstalled when the state returns to `authenticated` |
 | **Rate caps** | the 5th rotation in an hour is refused; nothing rotates while `authenticated` |
@@ -653,7 +845,10 @@ be told to key its grant on MAC alone, on MAC plus a voucher, or on nothing.
 | **Permitted-service carrier round-trip** | a cell goes to an operator-controlled endpoint through a stub service adapter and comes back; one cell per request; a `rate_limited` failure is reported as such and not retried past the limit |
 | **A service with no return path** | rejected as a carrier at configuration time, not attempted and failed at runtime (§3.2) |
 | **A service carrier in `unauthenticated`** | refused: the portal is not passing the service, so there is nothing to build (§1, §4) |
-| **Service adapter on a one-cell budget** | a packet larger than one cell is refused before emission, since a request/response carrier cannot finish a multi-cell packet inside ARC's PTO (§3.2) |
+| **`HANDSHAKE_INIT` over a small-payload service** | never attempted: a carrier that cannot carry the handshake joins an established session only, so the client does not offer it without one (§3.2.1) |
+| **A 256-byte-token `AUTH` (293 B) on a 282 B carrier** | not attempted for establishment; the session is established elsewhere and the carrier joins by `PATH_JOIN` (§3.2.1) |
+| **An adapter that cannot state its payload budget** | refused as unusable, since nothing downstream can size a packet against a guess (§3.2.2) |
+| **Service adapter on a one-cell budget** | a packet larger than `max_packet` is refused before emission, and `max_packet` is the *measured* budget after envelope and encoding, not the cell minus 18 (§3.2.2) |
 
 The rows that matter most are the ones that leave the device or the user in a
 bad state: **restore after a crash at each boundary**, **restore failure
@@ -674,12 +869,18 @@ gets wrong, and they are why §2.6–§2.7 are as long as they are.
   information element in a probe could ask the portal to describe its own
   policy; no portal does, and §2.5's synthetic-then-observed attempt order is
   cheaper than a protocol.
-- **Selecting candidates by *admitted* status rather than by activity.** An
-  address that is active is the best available proxy for "still admitted",
-  but the client cannot tell an admitted station from an unadmitted one
-  without trying. Observing a station's traffic *after* the portal's
-  admission point would distinguish them, which needs a position on the path
-  with more state than a client has.
+- **Selecting candidates by *admitted* status rather than by inferred shape.**
+  §2.4.4 ranks on traffic shape, which reduces wrong attempts but cannot
+  eliminate them: a pre-auth station streaming portal video looks busy, and an
+  admitted station polling mail looks quiet. Observing which side of the
+  portal's enforcement point a station's traffic lands on would settle it,
+  which needs a position on the path with more state than a client has.
+- **Decrypting WPA2 unicast to read a candidate's payloads.** Possible — the
+  PMK comes from the passphrase the client already holds, and a captured
+  four-way handshake yields each station's PTK, so no cracking is involved.
+  Deliberately not used: it is interception of another station's
+  communications rather than link-layer metadata, and shape is enough to rank
+  (§2.4.4). WPA3-SAE and 802.1X defeat it anyway.
 - **A permitted-service carrier over a *paid* tier's included services.**
   Same contract, different budget accounting; nothing structural is missing.
 - **Restoring a *vendor* address deliberately** (presenting as a known device
