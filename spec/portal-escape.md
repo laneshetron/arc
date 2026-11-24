@@ -94,8 +94,30 @@ down**, so every connection on it dies — carrier sockets included.
 |---|---|---|---|
 | Linux | `netlink.LinkSetHardwareAddr` (`ip link set DEV address MAC`) | `CAP_NET_ADMIN` — ARC already holds it for the TUN | needs the link down on most drivers; re-association follows |
 | Linux, candidate scoring | `iw dev DEV interface add mon0 type monitor` | `CAP_NET_ADMIN` | concurrent monitor and managed works on many chipsets; `iw list` reports which, and some drop the association — §2.4.4 |
-| macOS | `ifconfig DEV ether MAC` | root | **conflicts with the OS's own private address (§2.3)**; no supported monitor mode since the `airport` utility was removed in 14.4, so policy B's scoring is Linux-only |
+| macOS | **no supported mechanism** — see below | — | `ifconfig DEV ether MAC` fails with `SIOCAIFADDR: Can't assign requested address`; the Wi-Fi daemon owns the address |
 | iOS, Android | — | — | no API exists; an app cannot change the hardware address |
+
+**Correction: `ifconfig DEV ether MAC` does not work on current macOS.**
+Earlier revisions of this document claimed it did, and it does not. Verified
+on macOS 26.5.2:
+
+```
+$ sudo ifconfig en0 ether 02:00:00:00:00:01
+ifconfig: ioctl (SIOCAIFADDR): Can't assign requested address
+```
+
+The interface's address is owned by the Wi-Fi daemon rather than by
+`ifconfig`, so the ioctl is refused outright — this is not a durability
+problem as §2.3 previously suggested, but a refusal. Tools that wrap the
+same ioctl (`spoof-mac` and its equivalents) fail identically, which reads
+as a broken tool and is not one.
+
+What remains on macOS is the OS's own per-network private address (§2.3),
+which is not attacker-chosen and not scriptable. **So policy B's observed
+path — presenting someone else's address — is not implementable on macOS at
+all**, and the client must report it as unavailable rather than attempting a
+rotation that cannot take. `-portal-mac-rotate` on macOS is the case §2.3
+describes: the OS already rotates, and ARC has nothing to add.
 
 **Rotation is therefore desktop-only, and the client says so** rather than
 offering a flag that silently does nothing on a phone. On mobile the
@@ -118,16 +140,19 @@ Two consequences, both of which the spec has to face:
   user has not joined that network before*. Rotating again only helps when
   the portal has *already* granted that private address and the grant has
   expired.
-- **`ifconfig en0 ether` is not durable.** The Wi-Fi daemon owns the
-  interface's address on modern macOS and may restore it on the next
-  association or roam. So a rotation that appears to succeed can silently
-  revert, and the client would report a rotation that did not happen.
+- **`ifconfig en0 ether` is not merely non-durable — it is refused.** The
+  Wi-Fi daemon owns the interface's address on modern macOS, so the ioctl
+  fails outright (`Can't assign requested address`, verified on 26.5.2)
+  rather than succeeding and later reverting. An earlier revision said the
+  address could be set and might be restored on the next association; that
+  was wrong, and it is why `spoof-mac` looks broken on current macOS.
 
-The client therefore **verifies** (§2.4) rather than trusting the command's
-exit status, and treats a reverted address as a failed rotation rather than
-retrying forever. Where private Wi-Fi is **disabled** for the network, ARC
-may rotate and the address is durable; `-portal-mac-rotate` reports which
-case it found.
+The client therefore cannot set the address at all on macOS, and there is
+nothing to verify there: §2.4's verification still applies on Linux, where
+the address does change, and treats a reverted address as a failed rotation
+rather than retrying forever. `-portal-mac-rotate` on macOS reports that
+the OS's private address is what is in use and that ARC cannot add to it,
+rather than offering a rotation that cannot take.
 
 ### 2.4 Choosing an address
 
@@ -263,9 +288,12 @@ combinations". So:
 
 - **Where it works**, scoring runs before the observed attempts and orders
   the candidate list.
-- **Where it does not, or on macOS** (no supported monitor mode since 14.4),
-  the client falls back to the activity ranking of §2.4.1 and journals that
-  scoring was unavailable. That is the current behaviour, not a failure.
+- **Where it does not**, the client falls back to the activity ranking of
+  §2.4.1 and journals that scoring was unavailable. That is the current
+  behaviour, not a failure. (On macOS this distinction is moot: there is no
+  monitor mode since the `airport` utility was removed in 14.4, *and* no way
+  to set the address at all (§2.2), so the observed path does not run there
+  regardless of scoring.)
 - **`-portal-mac-score`** selects `auto` (default: try monitor, fall back),
   `off` (never monitor), or `require` (fail the observed path rather than
   fall back, for an operator who wants no unranked attempts).
@@ -834,7 +862,7 @@ be told to key its grant on MAC alone, on MAC plus a voucher, or on nothing.
 | **A corrupt rotation record** | reported and queried with the user; **no address is written** (§2.7.1) |
 | **Restore fails** | the client prints the exact restore command and exits non-zero, rather than leaving the device spoofed |
 | **Scoring ranks a busy station above an idle one** | in a seeded capture, a station at 50 KB/10 s scores admitted and is tried first; a 100 B/10 s station scores unadmitted and last (§2.4.4) |
-| **Scoring unavailable (no monitor interface, or macOS)** | falls back to activity ranking and journals that scoring was unavailable; the observed path still runs (§2.4.4) |
+| **Scoring unavailable (no monitor interface, or macOS)** | falls back to activity ranking and journals that scoring was unavailable. On Linux the observed path still runs; **on macOS it stops here** — §2.2 has no mechanism to set the address, so the client reports the observed path unavailable rather than attempting it (§2.2) |
 | **`-portal-mac-score require` without monitor support** | the observed path fails with a stated reason rather than attempting unranked candidates |
 | **Monitor interface cleanup** | the interface exists only for the scoring window and is removed; the association survives, or is re-established if the chipset dropped it |
 | **Scoring reads no payloads** | on a WPA2 network the capture yields headers only; no decryption is attempted and no PTK is derived (§2.4.4) |
@@ -855,6 +883,66 @@ bad state: **restore after a crash at each boundary**, **restore failure
 being loud**, **a rotation that cannot downgrade the tunnel**, and **no
 address in the shared journal**. Those are what a happy-path implementation
 gets wrong, and they are why §2.6–§2.7 are as long as they are.
+
+### 5.1 An observed case, recorded because it contradicts an assumption
+
+One real network — a US domestic airline's in-flight Wi-Fi, measured from
+macOS on an open SSID, before authentication — is worth writing down because
+three things happened that a reader of §2.4 would not predict.
+
+**Broadcasts leak addresses on an isolated segment; that is all they leak.**
+The capture in §2.4.1 yielded ten candidate addresses. A first reading of
+that is "client isolation is off", which is wrong: every protocol the filter
+selects (ARP, DHCP, ICMPv6, mDNS) is broadcast or multicast, and broadcast is
+flooded to every station on an isolated segment too. The discriminating test
+is unicast to a peer, and here it failed — `ping` to another station's
+address got nothing while the gateway answered normally. **Isolation was
+on.** §2.4.1's premise therefore holds only in its broadcast half: enough to
+enumerate addresses, not enough to see who is passing traffic.
+
+This is worth a caution in the implementation: *a capture full of other
+stations' addresses is not evidence that isolation is off*, and the client
+must not draw that conclusion, because §2.4.4's scoring depends on the
+answer. Where scoring is available it should test unicast explicitly rather
+than infer from frame counts.
+
+**Two addresses appeared for one IP.** `arp -an` showed a single neighbour
+address owned by two different link-layer addresses within one capture — a
+station that rotated its own private address, or an AP proxying ARP. Either
+way §2.4.1's "seen in at least two frames" test passes it and the assumption
+behind that test — one address, one device — does not hold. The capture
+tooling now reports addresses that share an IP, so this is visible rather
+than silently ranked.
+
+**A gateway-adjacent address nearly passed the filter.** The default gateway
+was `74:24:9f:64:17:39`, and a second address from the same OUI,
+`74:24:9f:63:ff:5c`, appeared in the capture but not in the neighbour table.
+§2.4.1's exclusion is by exact address, so this variant was excluded only by
+the vendor-address rule — a fragile accident rather than a decision. On
+networks where the AP and gateway are the same appliance with several
+addresses, the safer test is a /24 OUI match against the gateway, not
+equality.
+
+None of this changes §2.4's design; the candidate path worked, and it worked
+on a network whose isolation would have defeated a naive implementation. It
+tightens three details, and it is the first evidence we have that §2.4.1's
+fallback is worth having where monitor mode is unavailable.
+
+It also demonstrated why §2.2 matters more than it looks: the capture and
+the candidate list were obtained on a Mac, and **no address in that list
+could then have been applied**. `ifconfig en0 ether` is refused on current
+macOS (§2.2), so the observation path terminates at the observation and the
+client has to say so. A tool that offered to "use" a candidate on that
+platform would be offering something it cannot do — and the failure would
+surface as a broken rotation rather than as an unavailable capability,
+which is the worse of the two.
+
+**One thing the case did not establish, and could not.** Which candidate was
+admitted. Activity ranking put one station far ahead of the rest — 217
+captured frames against a next-highest 93 — and that is exactly the
+ambiguity §2.4.4.1 warns about: a pre-auth passenger streaming video looks
+identical. §2.5's answer is to try, and the cost of trying is that
+passenger's session.
 
 ## 6. Deferred
 
