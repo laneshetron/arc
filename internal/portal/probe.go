@@ -41,8 +41,9 @@ type Endpoint struct {
 	// that injects its own page into a 200 is not passing the check, so this
 	// is an equality test rather than a substring one.
 	Body string
-	// Substr, when set, must appear in the body. It exists only for a
-	// -portal-probe the operator wrote an expectation for: an operator-written
+	// Substr, when set, must appear in the body — or, when Status is a 3xx, in
+	// the Location header. It exists only for a -portal-probe the operator
+	// wrote an expectation for: an operator-written
 	// expectation is the one place a fuzzy match is what was asked for, and
 	// the built-in endpoints never use it.
 	//
@@ -315,7 +316,14 @@ func (p *Prober) oneEndpoint(ctx context.Context, ep Endpoint, client *http.Clie
 	// markers of §4.3.2. Read it before classifying, but only as far as the
 	// criterion could need it.
 	switch {
-	case resp.StatusCode >= 300 && resp.StatusCode < 400:
+	case isRedirect(ep.Status) && meetsRedirectCriterion(ep, resp.StatusCode, resp.Header.Get("Location")):
+		// An operator's -portal-probe may declare a redirect as its healthy
+		// answer. It has to be tested before the redirect branch below, which
+		// would otherwise read every 3xx as a portal and hold the client behind
+		// one that does not exist.
+		c.Check = CheckPass
+
+	case isRedirect(resp.StatusCode):
 		// §4.3.2: a redirect is portal evidence only when its Location
 		// qualifies — a different host, or a same-host login path. A 304 has
 		// no Location at all, and a same-host redirect to somewhere that is
@@ -463,6 +471,21 @@ func meetsCriterion(ep Endpoint, status int, body []byte) bool {
 	return true
 }
 
+// isRedirect reports whether status is a 3xx.
+func isRedirect(status int) bool { return status >= 300 && status < 400 }
+
+// meetsRedirectCriterion is meetsCriterion for an endpoint whose healthy answer
+// is a redirect. The substring is matched against the Location, not the body:
+// a redirect's body is decoration, and "-portal-probe-expect 302:/welcome" is
+// naming where the redirect goes. A body criterion cannot apply, so an
+// endpoint that declares one never passes this way.
+func meetsRedirectCriterion(ep Endpoint, status int, location string) bool {
+	if status != ep.Status || ep.Body != "" {
+		return false
+	}
+	return ep.Substr == "" || strings.Contains(location, ep.Substr)
+}
+
 // fetchPage is probe C: fetch a redirect target once, without following
 // further redirects, and report whether it serves a page, the body (bounded)
 // and its content type.
@@ -533,43 +556,45 @@ func looksLikeLogin(body []byte) bool {
 	if err != nil {
 		return false
 	}
-	var (
-		form   bool
-		secret bool
-	)
-	var walk func(*html.Node)
-	walk = func(n *html.Node) {
-		if form && secret {
+	// A portal field counts only inside the form that would submit it.
+	// Two global flags — "a form exists" and "a password input exists" — let an
+	// unrelated search form and a password widget elsewhere on the page add up
+	// to a login page that is not there.
+	var found bool
+	var walk func(n *html.Node, inForm bool)
+	walk = func(n *html.Node, inForm bool) {
+		if found {
 			return
 		}
 		if n.Type == html.ElementNode {
 			switch n.Data {
+			case "script", "style":
+				// Not markup a user interacts with.
+				return
 			case "form":
-				form = true
+				inForm = true
 			case "input":
-				if looksLikePortalField(attr(n, "type"), attr(n, "name"), attr(n, "id")) {
-					secret = true
+				if inForm && looksLikePortalField(attr(n, "type"), attr(n, "name"), attr(n, "id")) {
+					found = true
+					return
 				}
 			case "select", "textarea":
-				if looksLikePortalField("", attr(n, "name"), attr(n, "id")) {
-					secret = true
+				if inForm && looksLikePortalField("", attr(n, "name"), attr(n, "id")) {
+					found = true
+					return
 				}
-			}
-			// A script or style body is not markup a user interacts with.
-			if n.Data == "script" || n.Data == "style" {
-				return
 			}
 		}
 		for c := n.FirstChild; c != nil; c = c.NextSibling {
-			walk(c)
+			walk(c, inForm)
 		}
 	}
-	walk(doc)
+	walk(doc, false)
 
 	// §4.3.2 asks for a form with login fields, and both halves matter: a bare
 	// password input outside any form is a widget, and an empty form is a
 	// search box.
-	return form && secret
+	return found
 }
 
 // looksLikePortalField reports whether one form control asks for a credential
@@ -729,9 +754,10 @@ type roundResolver struct {
 	u     *UpstreamResolver
 	mu    sync.Mutex
 	cache map[string]lookupResult
-	// down records that a lookup failed, so the remaining endpoints in this
-	// round fall back immediately instead of each paying the timeout again.
-	down bool
+	// downErr records the first lookup failure, so the remaining endpoints in
+	// this round fail the same way immediately instead of each paying the
+	// timeout again.
+	downErr error
 }
 
 type lookupResult struct {
@@ -746,54 +772,34 @@ func (r *roundResolver) Dialer(timeout time.Duration) func(ctx context.Context, 
 
 // rounded is the shared implementation. When round is non-nil its cache is
 // consulted, so every endpoint in one round shares a single lookup per host —
-// and one failed lookup disables the rest, because a resolver that cannot answer
-// for one host cannot answer for the next.
+// and one failed lookup ends the round's asking, because a resolver that cannot
+// answer for one host cannot answer for the next.
 func (u *UpstreamResolver) rounded(timeout time.Duration, round *roundResolver) func(ctx context.Context, network, addr string) (net.Conn, error) {
-	d := &net.Dialer{Timeout: timeout, Control: sockopt.Control(u.Sockopt)}
+	connect := u.connect
+	if connect == nil {
+		d := &net.Dialer{Timeout: timeout, Control: sockopt.Control(u.Sockopt)}
+		connect = d.DialContext
+	}
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		host, port, err := net.SplitHostPort(addr)
 		if err != nil {
-			return d.DialContext(ctx, network, addr)
+			return nil, fmt.Errorf("portal: probe address %q: %w", addr, err)
 		}
 		if _, err := netip.ParseAddr(host); err == nil {
-			return d.DialContext(ctx, network, addr) // already an address
+			return connect(ctx, network, addr) // already an address
 		}
 
-		r, cached := lookupResult{}, false
-		if round != nil {
-			round.mu.Lock()
-			r, cached = round.cache[host]
-			down := round.down
-			round.mu.Unlock()
-			if down && !cached {
-				// The resolver did not answer for an earlier host this round.
-				// Asking again costs its full timeout for every remaining
-				// endpoint, which is what made a round take fifteen seconds on a
-				// link whose upstream had gone away — the exact situation
-				// detection exists for.
-				return d.DialContext(ctx, network, addr)
-			}
-		}
-		if !cached {
-			r.addrs, r.err = u.lookup(ctx, host)
-			if round != nil {
-				round.mu.Lock()
-				round.cache[host] = r
-				if r.err != nil {
-					round.down = true
-				}
-				round.mu.Unlock()
-			}
-		}
+		r := u.roundLookup(ctx, round, host)
 		if r.err != nil || len(r.addrs) == 0 {
 			// Falling back to the system resolver is only honest when the link
-			// has none of its own. A link whose upstream failed is the case
-			// §4.4 exists for, and asking the system there means asking the
-			// tunnel — which reports the relay's DNS as if it were the
-			// network's, and costs another full timeout per endpoint besides.
-			// So: no upstream, fall back; upstream broken, report unreachable.
-			if errors.Is(r.err, ErrNoUpstream) {
-				return d.DialContext(ctx, network, addr)
+			// has none of its own *and* the system resolver is not yet the
+			// tunnel's. A link whose upstream failed is the case §4.4 exists
+			// for: asking the system there means asking the tunnel, which
+			// reports the relay's DNS as if it were the network's. So: no
+			// upstream before the tunnel, fall back; anything else, report the
+			// link's own failure.
+			if errors.Is(r.err, ErrNoUpstream) && !u.noSystemFallback.Load() {
+				return connect(ctx, network, addr)
 			}
 			if r.err != nil {
 				return nil, r.err
@@ -802,7 +808,7 @@ func (u *UpstreamResolver) rounded(timeout time.Duration, round *roundResolver) 
 		}
 		var lastErr error
 		for _, a := range r.addrs {
-			conn, err := d.DialContext(ctx, network, net.JoinHostPort(a.String(), port))
+			conn, err := connect(ctx, network, net.JoinHostPort(a.String(), port))
 			if err == nil {
 				return conn, nil
 			}
@@ -810,6 +816,40 @@ func (u *UpstreamResolver) rounded(timeout time.Duration, round *roundResolver) 
 		}
 		return nil, lastErr
 	}
+}
+
+// roundLookup resolves host on the link, sharing the answer across the round.
+//
+// Once one lookup has failed, the rest of the round gets that same failure
+// rather than a fresh attempt: a dead upstream would otherwise cost its full
+// timeout per endpoint. The failure is returned, not converted into "try
+// something else" — what the caller does with it is decided in one place, and
+// an earlier revision that dialed the hostname here sent every later endpoint
+// to the system resolver, which after full-tunnel routing is the tunnel's.
+func (u *UpstreamResolver) roundLookup(ctx context.Context, round *roundResolver, host string) lookupResult {
+	if round != nil {
+		round.mu.Lock()
+		r, cached := round.cache[host]
+		downErr := round.downErr
+		round.mu.Unlock()
+		if cached {
+			return r
+		}
+		if downErr != nil {
+			return lookupResult{err: downErr}
+		}
+	}
+	var r lookupResult
+	r.addrs, r.err = u.lookup(ctx, host)
+	if round != nil {
+		round.mu.Lock()
+		round.cache[host] = r
+		if r.err != nil && round.downErr == nil {
+			round.downErr = r.err
+		}
+		round.mu.Unlock()
+	}
+	return r
 }
 
 // lookup is resolve, with a hook the tests use to answer without a resolver.

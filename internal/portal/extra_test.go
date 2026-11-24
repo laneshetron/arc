@@ -462,3 +462,110 @@ func TestQueryFirstFallsThrough(t *testing.T) {
 		t.Logf("both upstreams failed, as expected: %v", err)
 	}
 }
+
+// TestRoundFailureNeverDialsAHostname is the review's multi-endpoint P1: once
+// one lookup in a round fails, the later endpoints must get that failure, not a
+// dial of the bare hostname — which the system resolver would answer, and after
+// full-tunnel routing the system resolver is the tunnel's.
+func TestRoundFailureNeverDialsAHostname(t *testing.T) {
+	var (
+		mu     sync.Mutex
+		dialed []string
+	)
+	u := &UpstreamResolver{
+		Interface: "wlan0",
+		Resolve: func(context.Context, string) ([]netip.Addr, error) {
+			return nil, errors.New("upstream timed out")
+		},
+		connect: func(_ context.Context, _, addr string) (net.Conn, error) {
+			mu.Lock()
+			dialed = append(dialed, addr)
+			mu.Unlock()
+			return nil, errors.New("unreachable")
+		},
+	}
+	p := NewProber(nil)
+	p.Endpoints = []Endpoint{
+		{Name: "a", URL: "http://a.invalid/check", Status: http.StatusNoContent},
+		{Name: "b", URL: "http://b.invalid/check", Status: http.StatusOK},
+		{Name: "c", URL: "http://c.invalid/check", Status: http.StatusOK},
+	}
+	p.Rounds = u
+
+	if got := p.Probe(context.Background()).Check; got != CheckNoAnswer {
+		t.Errorf("Check = %v, want no answer on a link whose resolver is down", got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(dialed) != 0 {
+		t.Errorf("dialed %v: a failed physical lookup fell through to the system resolver", dialed)
+	}
+}
+
+// TestNoSystemFallbackAfterTheTunnel covers the deliberate ErrNoUpstream
+// fallback: it is honest before the tunnel exists and not after, when the system
+// resolver answers through ARC.
+func TestNoSystemFallbackAfterTheTunnel(t *testing.T) {
+	var dialed []string
+	u := &UpstreamResolver{
+		Resolve: func(context.Context, string) ([]netip.Addr, error) { return nil, ErrNoUpstream },
+		connect: func(_ context.Context, _, addr string) (net.Conn, error) {
+			dialed = append(dialed, addr)
+			return nil, errors.New("unreachable")
+		},
+	}
+	dial := u.Dialer(time.Second)
+
+	_, _ = dial(context.Background(), "tcp", "captive.apple.com:80")
+	if len(dialed) != 1 || dialed[0] != "captive.apple.com:80" {
+		t.Fatalf("dialed %v before the tunnel, want the system fallback for a link with no upstream", dialed)
+	}
+
+	dialed = nil
+	u.DisableSystemFallback()
+	_, err := dial(context.Background(), "tcp", "captive.apple.com:80")
+	if len(dialed) != 0 {
+		t.Errorf("dialed %v after the tunnel: the system resolver is the tunnel's now", dialed)
+	}
+	if !errors.Is(err, ErrNoUpstream) {
+		t.Errorf("err = %v, want the link's own ErrNoUpstream", err)
+	}
+}
+
+// TestDiscoverNamesThePhysicalLink is the review's Linux P1: an unnamed
+// attachment asks for the link the marked route leaves by, never for "every
+// link" — which would include ARC's TUN — and never for "", which resolvectl
+// rejects.
+func TestDiscoverNamesThePhysicalLink(t *testing.T) {
+	origLink, origDiscover := physicalLink, discoverUpstream
+	defer func() { physicalLink, discoverUpstream = origLink, origDiscover }()
+
+	var gotMark uint32
+	physicalLink = func(_ context.Context, mark uint32) (string, error) {
+		gotMark = mark
+		return "wlan0", nil
+	}
+	var asked []string
+	discoverUpstream = func(_ context.Context, iface string) ([]netip.Addr, error) {
+		asked = append(asked, iface)
+		return []netip.Addr{netip.MustParseAddr("192.168.1.1")}, nil
+	}
+
+	u := &UpstreamResolver{Sockopt: sockopt.Options{Mark: 0x5243}}
+	if _, err := u.discover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(asked) != 1 || asked[0] != "wlan0" {
+		t.Errorf("discovery asked for %q, want the routed physical link", asked)
+	}
+	if gotMark != 0x5243 {
+		t.Errorf("route lookup used mark %#x, want the probe's: the mark is what selects the physical table", gotMark)
+	}
+
+	// No physical link is no upstream, not an error the HTTP probes treat as a
+	// broken resolver.
+	physicalLink = func(context.Context, uint32) (string, error) { return "", errors.New("no route") }
+	if _, err := u.discover(context.Background()); !errors.Is(err, ErrNoUpstream) {
+		t.Errorf("err = %v, want ErrNoUpstream", err)
+	}
+}

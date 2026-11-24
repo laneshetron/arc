@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"os/exec"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/laneshetron/arc/internal/carrier/sockopt"
@@ -45,16 +46,32 @@ type UpstreamResolver struct {
 	// not fall back to the system resolver (§4.1). Nil uses the link's
 	// upstreams through resolve.
 	Resolve func(ctx context.Context, name string) ([]netip.Addr, error)
+
+	// noSystemFallback, once set, withdraws the one case where the HTTP
+	// probes' dialer may ask the system resolver: a link with no discoverable
+	// upstream. Before the tunnel exists the system resolver is the network's;
+	// once full-tunnel routing is up it is the tunnel's, and asking it would
+	// report relay-side DNS as the network's (§4.4). See DisableSystemFallback.
+	noSystemFallback atomic.Bool
+
+	// connect dials a resolved endpoint for the HTTP probes. Nil uses a
+	// net.Dialer applying Sockopt; tests set it to see which address — or which
+	// unresolved hostname — a probe would have dialed.
+	connect func(ctx context.Context, network, addr string) (net.Conn, error)
 }
+
+// DisableSystemFallback stops the HTTP probes from ever consulting the system
+// resolver, including on a link with no upstream of its own. The client calls
+// it once the full tunnel is installed: from then on the system resolver
+// answers through ARC, so a probe that used it would be measuring the tunnel it
+// is meant to look beneath. A link with no upstream then reports no answer,
+// which is the honest outcome — nothing physical could resolve the name.
+func (u *UpstreamResolver) DisableSystemFallback() { u.noSystemFallback.Store(true) }
 
 // Honesty resolves name through the link's upstream and reports whether the
 // answer is categorically implausible (§4.4).
 func (u *UpstreamResolver) Honesty(ctx context.Context, name string) (DNSVerdict, error) {
-	discover := u.Discover
-	if discover == nil {
-		discover = discoverUpstream
-	}
-	servers, err := discover(ctx, u.Interface)
+	servers, err := u.discover(ctx)
 	if err != nil {
 		return DNSUnmeasured, err
 	}
@@ -88,11 +105,7 @@ var ErrNoUpstream = errors.New("portal: no upstream on this link")
 // The first upstream that answers wins. An error means nothing on the link
 // could resolve it, and the caller decides whether to fall back.
 func (u *UpstreamResolver) resolve(ctx context.Context, name string) ([]netip.Addr, error) {
-	discover := u.Discover
-	if discover == nil {
-		discover = discoverUpstream
-	}
-	servers, err := discover(ctx, u.Interface)
+	servers, err := u.discover(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -105,6 +118,39 @@ func (u *UpstreamResolver) resolve(ctx context.Context, name string) ([]netip.Ad
 		timeout = 3 * time.Second
 	}
 	return queryFirst(ctx, servers, name, timeout, u.Sockopt, u.Dial)
+}
+
+// discover finds this link's upstreams.
+//
+// An attachment with no interface name — Linux with policy routing, where the
+// mark rather than a binding keeps traffic physical — still has exactly one
+// link under it: the one the marked route leaves by. Discovery asks for that
+// link by name. Taking every link's resolvers instead would include ARC's own
+// TUN once managed DNS installs a resolver there, and a query to it sent
+// outside the tunnel either fails after its full timeout or answers for the
+// wrong network.
+func (u *UpstreamResolver) discover(ctx context.Context) ([]netip.Addr, error) {
+	if u.Discover != nil {
+		return u.Discover(ctx, u.Interface)
+	}
+	iface := u.Interface
+	if iface == "" {
+		link, err := physicalLink(ctx, u.Sockopt.Mark)
+		if err != nil {
+			return nil, fmt.Errorf("%w: finding the physical link: %v", ErrNoUpstream, err)
+		}
+		if link == "" {
+			return nil, fmt.Errorf("%w: no route names a physical link", ErrNoUpstream)
+		}
+		iface = link
+	}
+	return discoverUpstream(ctx, iface)
+}
+
+// physicalLink names the interface a marked packet to the public internet
+// leaves by. It is the platform's; the default has no way to tell.
+var physicalLink = func(ctx context.Context, mark uint32) (string, error) {
+	return "", errors.New("portal: physical link discovery not implemented on this platform")
 }
 
 // judgeAnswer applies §4.4's rule: an address is anomalous only when it is
@@ -226,14 +272,13 @@ var discoverUpstream = func(ctx context.Context, iface string) ([]netip.Addr, er
 //
 // Only the named link's servers are taken: the global list belongs to
 // systemd-resolved and is reached through the stub, which is what this probe
-// must avoid.
+// must avoid. An empty name matches nothing — every other link's servers, ARC's
+// TUN among them, are not this attachment's (see UpstreamResolver.discover).
 func parseResolvectlDNS(out []byte, iface string) []netip.Addr {
 	var addrs []netip.Addr
-	// An unnamed attachment (Linux with policy routing, where no interface is
-	// bound) has no single link to ask. Every link's upstreams are then
-	// candidates: the mark keeps the query on the physical link whichever one
-	// it goes to, and a per-link upstream is still not the stub.
-	anyLink := iface == ""
+	if iface == "" {
+		return nil
+	}
 	inLink := false
 	sc := bufio.NewScanner(bytes.NewReader(out))
 	for sc.Scan() {
@@ -243,7 +288,7 @@ func parseResolvectlDNS(out []byte, iface string) []netip.Addr {
 		}
 		if strings.HasPrefix(line, "Link ") {
 			// "Link 3 (wlan0): 1.1.1.1 ..."
-			inLink = anyLink || strings.Contains(line, "("+iface+")")
+			inLink = strings.Contains(line, "("+iface+")")
 			if i := strings.Index(line, "):"); i >= 0 && inLink {
 				addrs = append(addrs, parseAddrList(line[i+2:])...)
 			}

@@ -35,24 +35,26 @@ const probeGrace = 250 * time.Millisecond
 // would change the answer — so each attachment gets its own detector and its
 // own state, and only an attachment that is confirmed captive is gated.
 //
-// It returns the detectors keyed by interface, and the attachments a caller may
-// still use. An empty result with no error means every attachment is captive.
-func checkPortal(ctx context.Context, log *slog.Logger, cfg portal.Config, fullTunnel bool, binds []string, mark uint32) (map[string]*portal.Detector, []string, error) {
+// It returns the detectors keyed by interface, the attachments a caller may
+// still use (in -bind order), and every attachment as resolved, which is what
+// carrierBinds needs to hand the carriers what the user asked for. An empty
+// eligible list with no error means every attachment is captive.
+func checkPortal(ctx context.Context, log *slog.Logger, cfg portal.Config, fullTunnel bool, binds []string, mark uint32) (map[string]*portal.Detector, []string, []attachment, error) {
 	if !cfg.Mode.Enabled(fullTunnel) {
 		// §8: -portal-check off sends no probes, and says so, because a client
 		// that starts silently behind a portal looks broken.
 		if cfg.Mode == portal.CheckOff {
 			log.Info("captive portal detection is off (-portal-check off)")
 		}
-		return nil, binds, nil
+		return nil, binds, nil, nil
 	}
 
-	binds, err := attachments(fullTunnel, binds, log)
+	atts, err := attachments(fullTunnel, binds, log)
 	if err != nil {
-		return nil, binds, err
+		return nil, nil, nil, err
 	}
 
-	detectors := make(map[string]*portal.Detector, len(binds))
+	detectors := make(map[string]*portal.Detector, len(atts))
 
 	// Concurrently, not one after another: the probes are independent and each
 	// can wait out a timeout, so serial detection would make startup cost the
@@ -68,10 +70,10 @@ func checkPortal(ctx context.Context, log *slog.Logger, cfg portal.Config, fullT
 		d     *portal.Detector
 		state portal.State
 	}
-	results := make(chan outcome, len(binds))
-	for _, iface := range binds {
+	results := make(chan outcome, len(atts))
+	for _, a := range atts {
 		go func(iface string) {
-			opts := probeSocketOptions(fullTunnel, binds, mark, iface)
+			opts := probeSocketOptions(fullTunnel, mark, iface)
 			// One resolver per attachment answers both probe B and probe A's
 			// hostname lookups: the HTTP checks must not consult the system
 			// resolver once managed DNS points it at the tunnel (§4.1, §4.4).
@@ -101,12 +103,12 @@ func checkPortal(ctx context.Context, log *slog.Logger, cfg portal.Config, fullT
 			checkCtx, cancel := context.WithTimeout(ctx, startupCheckTimeout)
 			defer cancel()
 			results <- outcome{iface: iface, d: d, state: d.Check(checkCtx)}
-		}(iface)
+		}(a.iface)
 	}
 
-	eligible := make([]string, 0, len(binds))
+	ok := make(map[string]bool, len(atts))
 	var blocked []string
-	for range binds {
+	for range atts {
 		r := <-results
 		detectors[r.iface] = r.d
 		if ctx.Err() != nil {
@@ -119,16 +121,69 @@ func checkPortal(ctx context.Context, log *slog.Logger, cfg portal.Config, fullT
 			blocked = append(blocked, r.iface)
 			continue
 		}
-		eligible = append(eligible, r.iface)
+		ok[r.iface] = true
 	}
 	if err := ctx.Err(); err != nil {
-		return detectors, nil, err
+		return detectors, nil, atts, err
+	}
+	// In -bind order, not the order the concurrent checks happened to finish:
+	// the first bind is the first carrier, and a run-to-run reshuffle would
+	// change which link leads.
+	eligible := make([]string, 0, len(atts))
+	for _, a := range atts {
+		if ok[a.iface] {
+			eligible = append(eligible, a.iface)
+		}
 	}
 	sort.Strings(blocked)
 	for _, iface := range blocked {
 		log.Info("attachment is behind a captive portal", "interface", label(iface))
 	}
-	return detectors, eligible, nil
+	return detectors, eligible, atts, nil
+}
+
+// attachment is one carrier attachment: what the user asked to bind, and the
+// interface detection probes for it. They differ only for the default
+// attachment (an empty bind), which detection must name so its probes stay off
+// the TUN, but which carriers must keep unnamed where unnamed is what they were
+// given — see carrierBinds.
+type attachment struct {
+	bind  string
+	iface string
+}
+
+// carrierBinds turns the eligible attachments back into the binds the carriers
+// should open, in the user's order.
+//
+// A default attachment is handed back as "" unless the carriers themselves need
+// a name (full tunnel without policy routing, where client.OpenCarriers
+// resolves the underlay the same way). Otherwise the name detection resolved
+// would pin carriers that used to follow the default route to the interface it
+// happened to be at startup, and a move from Wi-Fi to Ethernet would leave them
+// behind.
+func carrierBinds(atts []attachment, eligible []string, fullTunnel bool) []string {
+	needName := fullTunnel && !tun.PolicyRouting
+	ok := make(map[string]bool, len(eligible))
+	for _, iface := range eligible {
+		ok[iface] = true
+	}
+	out := make([]string, 0, len(eligible))
+	seen := make(map[string]bool, len(atts))
+	for _, a := range atts {
+		if !ok[a.iface] {
+			continue
+		}
+		b := a.iface
+		if a.bind == "" && !needName {
+			b = ""
+		}
+		if seen[b] {
+			continue
+		}
+		seen[b] = true
+		out = append(out, b)
+	}
+	return out
 }
 
 // attachments resolves the carrier attachments to physical interfaces. An empty
@@ -144,7 +199,11 @@ func checkPortal(ctx context.Context, log *slog.Logger, cfg portal.Config, fullT
 // Only where nothing else identifies the link is "" the right answer, which is
 // Linux with policy routing: the mark keeps traffic on the physical link
 // regardless of routing, and `tun.Underlay` returns "" there for that reason.
-func attachments(fullTunnel bool, binds []string, log *slog.Logger) ([]string, error) {
+//
+// Two entries that resolve to the same interface are one attachment: the
+// default route's interface named again explicitly is still one link, and two
+// detectors for it would race each other's verdicts.
+func attachments(fullTunnel bool, binds []string, log *slog.Logger) ([]attachment, error) {
 	if len(binds) == 0 {
 		binds = []string{""}
 	}
@@ -154,20 +213,25 @@ func attachments(fullTunnel bool, binds []string, log *slog.Logger) ([]string, e
 	// requirement.
 	needName := fullTunnel && !tun.PolicyRouting
 
-	out := make([]string, len(binds))
-	for i, iface := range binds {
-		if iface != "" {
-			out[i] = iface
+	out := make([]attachment, 0, len(binds))
+	seen := make(map[string]bool, len(binds))
+	for _, bind := range binds {
+		iface := bind
+		if bind == "" {
+			underlay, err := underlayInterface()
+			switch {
+			case err != nil && needName:
+				return nil, err
+			case err == nil && underlay != "":
+				iface = underlay
+				log.Info("probing from the default route's interface", "interface", underlay)
+			}
+		}
+		if seen[iface] {
 			continue
 		}
-		underlay, err := underlayInterface()
-		switch {
-		case err != nil && needName:
-			return nil, err
-		case err == nil && underlay != "":
-			out[i] = underlay
-			log.Info("probing from the default route's interface", "interface", underlay)
-		}
+		seen[iface] = true
+		out = append(out, attachment{bind: bind, iface: iface})
 	}
 	return out, nil
 }
@@ -193,7 +257,12 @@ func label(iface string) string {
 // detection matters most, since that is where the private-address behaviour
 // lives. This mirrors `client.OpenCarriers`: the mark when the platform has
 // policy routing, an interface binding otherwise.
-func probeSocketOptions(fullTunnel bool, binds []string, mark uint32, iface string) sockopt.Options {
+//
+// iface is the attachment's own resolved name, and it is "" only where the mark
+// already keeps the probe on the physical link (see attachments). It never
+// borrows another attachment's name: probing the default link out of the first
+// explicit bind would give the default link that bind's verdict.
+func probeSocketOptions(fullTunnel bool, mark uint32, iface string) sockopt.Options {
 	var opts sockopt.Options
 	if fullTunnel && tun.PolicyRouting {
 		opts.Mark = mark
@@ -201,12 +270,20 @@ func probeSocketOptions(fullTunnel bool, binds []string, mark uint32, iface stri
 	// Bound to the link either way: without policy routing, an unbound probe
 	// would follow the default route into the tunnel it is meant to test
 	// (§4.1).
-	if iface != "" {
-		opts.Device = iface
-	} else if len(binds) > 0 {
-		opts.Device = binds[0]
-	}
+	opts.Device = iface
 	return opts
+}
+
+// disableSystemFallback tells every detector's resolver that the system
+// resolver now answers through ARC. The client calls it as soon as full-tunnel
+// routing is installed; from then on a link without an upstream of its own
+// reports no answer rather than measuring the tunnel (§4.4).
+func disableSystemFallback(detectors map[string]*portal.Detector) {
+	for _, d := range detectors {
+		if r, ok := d.Prober.Rounds.(*portal.UpstreamResolver); ok {
+			r.DisableSystemFallback()
+		}
+	}
 }
 
 // runPortalWatch keeps checking every attachment for the life of the tunnel
@@ -229,26 +306,10 @@ func probeSocketOptions(fullTunnel bool, binds []string, mark uint32, iface stri
 //
 // It returns when ctx does, which is when the tunnel is closing anyway.
 func runPortalWatch(ctx context.Context, log *slog.Logger, detectors map[string]*portal.Detector, eligible, blocked []string, cfg portal.Config) {
-	// The gate has just checked every attachment, so the first watch check must
-	// wait a cadence. Detector.Run checks immediately (which is right at
-	// startup), and without this wait the client would probe twice in the same
-	// instant — once at the gate and once as the watch begins.
-	first := cfg.Steady
-	if first <= 0 || len(eligible) == 0 {
-		// Nothing is on the steady cadence: either -portal-keepalive 0 or every
-		// attachment excluded. The watch then runs at the login cadence, which
-		// is what paces both jobs of §5's single loop.
-		first = cfg.Login
-		if first <= 0 {
-			first = 10 * time.Second
-		}
+	login := cfg.Login
+	if login <= 0 {
+		login = 10 * time.Second
 	}
-	select {
-	case <-ctx.Done():
-		return
-	case <-time.After(first):
-	}
-
 	open := make(map[string]bool, len(eligible))
 	for _, iface := range eligible {
 		open[iface] = true
@@ -262,30 +323,44 @@ func runPortalWatch(ctx context.Context, log *slog.Logger, detectors map[string]
 		if d == nil {
 			continue
 		}
-		// §5: the watch runs on the steady cadence — carriers are open on the
-		// eligible attachments, so what is left to look for is a grant lapsing
-		// or being reinstated. With -portal-keepalive 0 there is no steady
-		// cadence, so this does not start at all.
+		// §5: an admitted attachment is watched on the steady cadence — its
+		// carriers are open, so what is left to look for is a grant lapsing or
+		// being reinstated. With -portal-keepalive 0 there is no steady cadence
+		// and nothing to watch it for, so it gets no watcher at all.
 		//
-		// The watcher seeds itself from the detector's current state: OnChange
-		// fires only on a change, and that seed is what makes the first real
-		// transition legible rather than a repeat of the startup verdict.
+		// An excluded attachment is watched on the login cadence whatever
+		// -portal-keepalive says: zero disables the expiry check on links
+		// carrying traffic, not the account of a link the user did not get.
 		steady := cfg.Steady
 		if !open[iface] {
-			// An excluded attachment is watched on the login cadence whatever
-			// -portal-keepalive says: zero disables the expiry check on links
-			// carrying traffic, not the account of a link the user did not get.
-			steady = cfg.Login
+			steady = login
+		} else if steady <= 0 {
+			continue
 		}
-		d.OnChange = portalWatcher(log, label(iface), d, open[iface])
+		// The gate has just checked every attachment, so each watcher's first
+		// check waits one of its own cadences. Detector.Run checks immediately
+		// (which is right at startup); without this the client would probe
+		// twice in the same instant. Per attachment, because an excluded link
+		// is on the faster login cadence and must not inherit the steady one.
+		first := steady
+		if d.BlocksCarriers() {
+			first = login
+		}
+		w := newPortalWatcher(log, iface, d, open[iface])
+		d.OnChange, d.OnURL = w.onChange, w.onURL
 		wg.Add(1)
-		go func(d *portal.Detector, steady time.Duration) {
+		go func(d *portal.Detector, steady, first time.Duration) {
 			defer wg.Done()
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(first):
+			}
 			// -portal-poll is passed through, not left to Run's default: a
 			// client configured for a slower login poll must behave the same
 			// mid-session as at the gate, and §5 gives one loop two roles.
-			d.Run(ctx, steady, cfg.Login)
-		}(d, steady)
+			d.Run(ctx, steady, login)
+		}(d, steady, first)
 	}
 	wg.Wait()
 }
@@ -305,45 +380,106 @@ func runPortalWatch(ctx context.Context, log *slog.Logger, detectors map[string]
 // tunnel stays up, so a browser cannot reach the portal through ARC's routes
 // until the user does something about it. Printing the link is the most this
 // layer can usefully do, and the journal keeps the host only (§4.7).
-func portalWatcher(log *slog.Logger, iface string, d *portal.Detector, admitted bool) func(portal.State, portal.Check) {
-	last := d.State()
-	return func(state portal.State, _ portal.Check) {
-		prev := last
-		last = state
-		if prev == state {
-			return
+//
+// The URL is reported on its own too. A portal can hand out a new login link —
+// a fresh session token, another host — without the state changing, and the
+// link printed at startup is then the wrong one.
+type portalWatcher struct {
+	log      *slog.Logger
+	iface    string
+	d        *portal.Detector
+	admitted bool
+	last     portal.State
+	shown    string // the login URL the user was last given
+}
+
+func newPortalWatcher(log *slog.Logger, iface string, d *portal.Detector, admitted bool) *portalWatcher {
+	w := &portalWatcher{log: log, iface: label(iface), d: d, admitted: admitted, last: d.State()}
+	if w.last.BlocksCarriers() {
+		// Startup has already printed this attachment's URL (printPortalMessage
+		// or announceExcluded); repeating it would be noise.
+		w.shown = d.PortalURL()
+	}
+	return w
+}
+
+func (w *portalWatcher) onChange(state portal.State, _ portal.Check) {
+	prev := w.last
+	w.last = state
+	if prev == state {
+		return
+	}
+	if state.BlocksCarriers() {
+		// §7.1: not a routing change. A portal is an on-path adversary that can
+		// forge exactly the evidence that produced this state, so the network
+		// does not get to move the user's traffic out of ARC.
+		w.log.Warn("network now requires a login; the tunnel stays up", "interface", w.iface, "was", prev.String())
+		url := w.d.PortalURL()
+		w.shown = url
+		switch {
+		case !w.admitted && url != "":
+			fmt.Fprintf(os.Stderr, "arc-client: %s requires a login at %s\n", w.iface, url)
+		case !w.admitted:
+			fmt.Fprintf(os.Stderr, "arc-client: %s requires a login ARC cannot locate\n", w.iface)
+		case url != "":
+			fmt.Fprintf(os.Stderr, "arc-client: %s expired; log in at %s\n", w.iface, url)
+		default:
+			fmt.Fprintf(os.Stderr, "arc-client: %s requires a login ARC cannot locate\n", w.iface)
 		}
-		if state.BlocksCarriers() {
-			// §7.1: not a routing change. A portal is an on-path adversary that
-			// can forge exactly the evidence that produced this state, so the
-			// network does not get to move the user's traffic out of ARC.
-			log.Warn("network now requires a login; the tunnel stays up", "interface", iface, "was", prev.String())
-			if url := d.PortalURL(); url != "" {
-				fmt.Fprintf(os.Stderr, "arc-client: %s expired; log in at %s\n", label(iface), url)
-			} else {
-				fmt.Fprintf(os.Stderr, "arc-client: %s requires a login ARC cannot locate\n", label(iface))
-			}
-			return
+		return
+	}
+	w.shown = ""
+	if !state.Usable() {
+		// §6.3: inconclusive is not recovery. Saying "portal check passed" here
+		// would tell the user their login worked when nothing was proven — the
+		// same conflation the startup wait avoids.
+		w.log.Warn("portal state inconclusive; the tunnel stays up", "interface", w.iface, "was", prev.String())
+		return
+	}
+	if !w.admitted {
+		// Excluded at startup and healthy now. There is no carrier to admit it
+		// to — carriers are opened once, before the watch runs — so say that
+		// plainly instead of implying the path is in use.
+		w.log.Info("excluded attachment is usable again, but this session is not carrying traffic on it",
+			"interface", w.iface, "was", prev.String(), "state", state.String())
+		fmt.Fprintf(os.Stderr, "arc-client: %s is usable again; restart arc-client to carry traffic on it\n", w.iface)
+		return
+	}
+	// Recovery toward none/authenticated. Logged at info because it is the
+	// answer to the warning above.
+	w.log.Info("portal check passed", "interface", w.iface, "was", prev.String(), "state", state.String())
+}
+
+// onURL reports a login URL that changed while the attachment is still behind
+// the portal. A cleared URL is not news — the state change that cleared it, if
+// any, has already spoken — and neither is the URL the user already has.
+func (w *portalWatcher) onURL(url string) {
+	if url == "" || url == w.shown || !w.last.BlocksCarriers() {
+		return
+	}
+	w.shown = url
+	w.log.Info("portal login page changed", "interface", w.iface, "portal_host", w.d.Host())
+	fmt.Fprintf(os.Stderr, "arc-client: %s requires a login at %s\n", w.iface, url)
+}
+
+// announceExcluded tells the user about attachments left out of a session that
+// is starting anyway. The journal line that lists them is for an operator; the
+// user needs each one's login URL, because without it the network they meant
+// to use has asked them for something they cannot see.
+func announceExcluded(detectors map[string]*portal.Detector, excluded []string) {
+	for _, iface := range excluded {
+		d := detectors[iface]
+		if d == nil {
+			continue
 		}
-		if !state.Usable() {
-			// §6.3: inconclusive is not recovery. Saying "portal check passed"
-			// here would tell the user their login worked when nothing was
-			// proven — the same conflation the startup wait avoids.
-			log.Warn("portal state inconclusive; the tunnel stays up", "interface", iface, "was", prev.String())
-			return
+		if url := d.PortalURL(); url != "" {
+			fmt.Fprintf(os.Stderr, "arc-client: %s requires a login at %s; connecting without it\n", label(iface), url)
+		} else {
+			fmt.Fprintf(os.Stderr, "arc-client: %s requires a login ARC cannot locate; connecting without it\n", label(iface))
 		}
-		if !admitted {
-			// Excluded at startup and healthy now. There is no carrier to
-			// admit it to — carriers are opened once, before the watch runs —
-			// so say that plainly instead of implying the path is in use.
-			log.Info("excluded attachment is usable again, but this session is not carrying traffic on it",
-				"interface", iface, "was", prev.String(), "state", state.String())
-			fmt.Fprintf(os.Stderr, "arc-client: %s is usable again; restart arc-client to carry traffic on it\n", label(iface))
-			return
-		}
-		// Recovery toward none/authenticated. Logged at info because it is
-		// the answer to the warning above.
-		log.Info("portal check passed", "interface", iface, "was", prev.String(), "state", state.String())
+	}
+	if len(excluded) > 0 {
+		fmt.Fprintf(os.Stderr, "            restart arc-client after logging in to carry traffic on it\n")
 	}
 }
 
@@ -366,9 +502,12 @@ func portalWatcher(log *slog.Logger, iface string, d *portal.Detector, admitted 
 func portalWaitMessage(ctx context.Context, detectors map[string]*portal.Detector, blocked []string, cfg portal.Config, log *slog.Logger) ([]string, error) {
 	printPortalMessage(detectors, blocked)
 
-	// A deadline from -portal-wait gets its own message; the caller's own
-	// context expiring (Ctrl-C, or the parent's deadline) does not, because
-	// "giving up after 0s" explains nothing.
+	// The caller's context is kept apart from the wait's. Ctrl-C ends the
+	// process: it never authorizes startup, gets no grace period, and is
+	// reported as itself rather than as "log in, then rerun". Only the
+	// -portal-wait deadline gets the grace below, because only there can a
+	// login that landed at the same instant be a real pass.
+	parent := ctx
 	bounded := cfg.Wait > 0
 	if bounded {
 		var cancel context.CancelFunc
@@ -399,11 +538,19 @@ func portalWaitMessage(ctx context.Context, detectors map[string]*portal.Detecto
 	if remaining == 0 {
 		return nil, errPortalBlocked(detectors, blocked)
 	}
-
 	var (
 		passed  []string
 		unclear []string
 	)
+	succeed := func() ([]string, error) {
+		// A result that arrived together with Ctrl-C is not a reason to start.
+		if err := parent.Err(); err != nil {
+			return nil, err
+		}
+		reportRecovered(log, passed, unclear)
+		return append(passed, unclear...), nil
+	}
+
 	accept := func(r result) {
 		// Only a completed round counts. A Wait cancelled by the deadline
 		// returns the state it had, and applying that as a verdict is how a
@@ -424,6 +571,9 @@ func portalWaitMessage(ctx context.Context, detectors map[string]*portal.Detecto
 	for {
 		select {
 		case <-ctx.Done():
+			if err := parent.Err(); err != nil {
+				return nil, err
+			}
 			// A recovery may have landed at the same instant the deadline did,
 			// and select picks between ready cases at random. A cancelled Wait
 			// returns promptly — its round is cancelled with it — so give the
@@ -441,11 +591,10 @@ func portalWaitMessage(ctx context.Context, detectors map[string]*portal.Detecto
 			}
 			grace.Stop()
 			if len(passed)+len(unclear) > 0 {
-				reportRecovered(log, passed, unclear)
-				return append(passed, unclear...), nil
+				return succeed()
 			}
-			// Deadline or Ctrl-C with nothing recovered: this is the
-			// portal-blocked exit, not a login.
+			// The deadline with nothing recovered: this is the portal-blocked
+			// exit, not a login.
 			if bounded && errors.Is(ctx.Err(), context.DeadlineExceeded) {
 				fmt.Fprintf(os.Stderr, "arc-client: giving up after %s\n", cfg.Wait)
 			}
@@ -455,10 +604,12 @@ func portalWaitMessage(ctx context.Context, detectors map[string]*portal.Detecto
 			accept(r)
 		}
 		if len(passed)+len(unclear) > 0 {
-			reportRecovered(log, passed, unclear)
-			return append(passed, unclear...), nil
+			return succeed()
 		}
 		if remaining == 0 {
+			if err := parent.Err(); err != nil {
+				return nil, err
+			}
 			return nil, errPortalBlocked(detectors, blocked)
 		}
 	}

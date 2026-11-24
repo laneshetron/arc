@@ -2,15 +2,19 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/laneshetron/arc/internal/portal"
+	"github.com/laneshetron/arc/internal/tun"
 )
 
 // portalDetector returns a detector whose endpoint is the given handler, with
@@ -197,7 +201,7 @@ func TestAttachmentsResolveTheUnderlay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("attachments = %v", err)
 	}
-	if len(got) != 1 || got[0] != "en0" {
+	if len(got) != 1 || got[0] != (attachment{bind: "", iface: "en0"}) {
 		t.Errorf("attachments = %v, want the resolved underlay", got)
 	}
 	if asked != 1 {
@@ -209,7 +213,7 @@ func TestAttachmentsResolveTheUnderlay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("attachments = %v", err)
 	}
-	if len(got) != 1 || got[0] != "wlan0" {
+	if len(got) != 1 || got[0] != (attachment{bind: "wlan0", iface: "wlan0"}) {
 		t.Errorf("attachments = %v, want the explicit bind untouched", got)
 	}
 }
@@ -225,9 +229,19 @@ func TestAttachmentsResolveAnEmptyEntry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("attachments = %v", err)
 	}
-	want := []string{"en0", "wwan0"}
+	want := []attachment{{bind: "", iface: "en0"}, {bind: "wwan0", iface: "wwan0"}}
 	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
 		t.Errorf("attachments = %v, want %v", got, want)
+	}
+
+	// The default route's interface named again is one attachment, not two
+	// detectors racing each other's verdicts.
+	got, err = attachments(false, []string{"", "en0"}, testLogger())
+	if err != nil {
+		t.Fatalf("attachments = %v", err)
+	}
+	if len(got) != 1 || got[0].iface != "en0" {
+		t.Errorf("attachments = %v, want one en0 attachment", got)
 	}
 }
 
@@ -243,7 +257,7 @@ func TestAttachmentsToleratesAMissingUnderlay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("attachments = %v", err)
 	}
-	if len(got) != 1 || got[0] != "" {
+	if len(got) != 1 || got[0] != (attachment{}) {
 		t.Errorf("attachments = %v, want the unnamed default attachment", got)
 	}
 }
@@ -262,7 +276,7 @@ func TestPortalDetectorsNameTheirInterface(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	detectors, _, err := checkPortal(context.Background(), log, portal.Config{
+	detectors, _, _, err := checkPortal(context.Background(), log, portal.Config{
 		Mode:     portal.CheckForce,
 		ProbeURL: srv.URL,
 		Expect:   portal.Expectation{Status: http.StatusNoContent},
@@ -452,8 +466,9 @@ func TestPortalGateGivesUpAfterWait(t *testing.T) {
 	}
 }
 
-// TestPortalGateHonoursCancellation means Ctrl-C during the wait exits cleanly
-// rather than sitting until the timeout.
+// TestPortalGateHonoursCancellation means Ctrl-C during the wait exits promptly
+// rather than sitting until the timeout, and says it was interrupted: "log in,
+// then rerun" describes a deadline, not a user who chose to stop.
 func TestPortalGateHonoursCancellation(t *testing.T) {
 	d := portalDetector(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "http://127.0.0.1:1/login", http.StatusFound)
@@ -468,8 +483,8 @@ func TestPortalGateHonoursCancellation(t *testing.T) {
 	detectors, blocked := oneAttachment(d)
 	cfg := portal.Config{Login: 50 * time.Millisecond}
 	_, err := portalWaitMessage(ctx, detectors, blocked, cfg, testLogger())
-	if !isPortalBlocked(err) {
-		t.Fatalf("err = %v, want a portal-blocked error on cancellation", err)
+	if !errors.Is(err, context.Canceled) || isPortalBlocked(err) {
+		t.Fatalf("err = %v, want the cancellation, not a portal-blocked error", err)
 	}
 }
 
@@ -520,7 +535,7 @@ func TestCheckPortalRespectsMode(t *testing.T) {
 		{portal.CheckOff, false, true},
 		{portal.CheckAuto, false, true},
 	} {
-		d, eligible, err := checkPortal(context.Background(), testLogger(), portal.Config{Mode: tc.mode}, tc.fullTunnel, nil, 0)
+		d, eligible, _, err := checkPortal(context.Background(), testLogger(), portal.Config{Mode: tc.mode}, tc.fullTunnel, nil, 0)
 		if err != nil {
 			t.Fatalf("%v: %v", tc.mode, err)
 		}
@@ -539,7 +554,7 @@ func TestCheckPortalRespectsMode(t *testing.T) {
 // substring must survive — without it, `200:Success` would accept a login page
 // that also answered 200.
 func TestCheckPortalUsesTheCustomEndpoint(t *testing.T) {
-	detectors, _, err := checkPortal(context.Background(), testLogger(), portal.Config{
+	detectors, _, _, err := checkPortal(context.Background(), testLogger(), portal.Config{
 		Mode:     portal.CheckForce,
 		ProbeURL: "http://portal.example/check",
 		Expect:   portal.Expectation{Status: 200, Substr: "Success"},
@@ -572,7 +587,7 @@ func TestProbeSocketOptionsMatchCarriers(t *testing.T) {
 
 	// Without policy routing (macOS, and Linux before the tunnel) there must be
 	// no mark at all.
-	got := probeSocketOptions(false, []string{"en0"}, mark, "en0")
+	got := probeSocketOptions(false, mark, "en0")
 	if got.Mark != 0 {
 		t.Errorf("Mark = %#x without policy routing, want 0: Darwin rejects it", got.Mark)
 	}
@@ -582,17 +597,161 @@ func TestProbeSocketOptionsMatchCarriers(t *testing.T) {
 
 	// With policy routing (Linux full tunnel) the mark is what keeps the probe
 	// out of the tunnel.
-	got = probeSocketOptions(true, []string{"wlan0"}, mark, "wlan0")
+	got = probeSocketOptions(true, mark, "wlan0")
 	if got.Device == "" {
 		t.Error("Device empty: an unbound probe would follow the default route into the tunnel")
 	}
 }
 
-// TestProbeSocketOptionsFallBackToTheFirstBind covers a caller that names no
-// interface for the attachment.
-func TestProbeSocketOptionsFallBackToTheFirstBind(t *testing.T) {
-	got := probeSocketOptions(false, []string{"en7", "en0"}, 0, "")
-	if got.Device != "en7" {
-		t.Errorf("Device = %q, want the first bind", got.Device)
+// TestProbeSocketOptionsNeverBorrowABind is the review's binds[0] finding: the
+// unnamed default attachment must not be probed out of another attachment's
+// interface, which would give the default link that interface's verdict. ""
+// survives only where the mark keeps the probe physical.
+func TestProbeSocketOptionsNeverBorrowABind(t *testing.T) {
+	if got := probeSocketOptions(true, 0x5243, ""); got.Device != "" {
+		t.Errorf("Device = %q, want unbound: the default attachment has no interface of its own", got.Device)
+	}
+}
+
+// TestCarrierBinds covers the two binding regressions: carriers open in the
+// user's -bind order whatever order detection finished in, and a default
+// attachment stays unnamed for the carriers unless they need its name — so
+// split-tunnel carriers keep following the default route.
+func TestCarrierBinds(t *testing.T) {
+	atts := []attachment{{bind: "eth0", iface: "eth0"}, {bind: "", iface: "en0"}, {bind: "wlan0", iface: "wlan0"}}
+
+	// Detection finished wlan0 first; the carriers must still lead with eth0.
+	got := carrierBinds(atts, []string{"wlan0", "en0", "eth0"}, false)
+	if want := []string{"eth0", "", "wlan0"}; !slices.Equal(got, want) {
+		t.Errorf("carrierBinds = %q, want %q", got, want)
+	}
+
+	// Captive attachments are left out.
+	got = carrierBinds(atts, []string{"wlan0"}, false)
+	if want := []string{"wlan0"}; !slices.Equal(got, want) {
+		t.Errorf("carrierBinds = %q, want %q", got, want)
+	}
+
+	// Where the carriers resolve the name themselves (full tunnel without
+	// policy routing), the resolved name is what they would have used anyway.
+	if !tun.PolicyRouting {
+		got = carrierBinds(atts, []string{"en0"}, true)
+		if want := []string{"en0"}; !slices.Equal(got, want) {
+			t.Errorf("full tunnel: carrierBinds = %q, want %q", got, want)
+		}
+	}
+}
+
+// TestPortalWaitCtrlCIsNotAPass is the review's parent-cancellation finding: a
+// round that completes as the user presses Ctrl-C must not start the client, and
+// the exit must say it was interrupted rather than "log in, then rerun".
+func TestPortalWaitCtrlCIsNotAPass(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d := portalDetector(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cancel() // Ctrl-C lands while this round is answering
+		w.WriteHeader(http.StatusNoContent)
+	}), portal.StateUnauthenticated)
+	detectors, blocked := oneAttachment(d)
+
+	passed, err := portalWaitMessage(ctx, detectors, blocked, portal.Config{Login: 10 * time.Millisecond}, testLogger())
+	if len(passed) != 0 {
+		t.Fatalf("passed = %v: a cancelled process started anyway", passed)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("err = %v, want the cancellation itself", err)
+	}
+	if isPortalBlocked(err) {
+		t.Error("Ctrl-C reported as a portal block")
+	}
+}
+
+// countingDetector is a portal detector that counts its probes.
+func countingDetector(t *testing.T, state portal.State, status int) (*portal.Detector, func() int) {
+	var (
+		mu sync.Mutex
+		n  int
+	)
+	d := portalDetector(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		n++
+		mu.Unlock()
+		if status == http.StatusFound {
+			http.Redirect(w, r, "http://127.0.0.1:1/login", http.StatusFound)
+			return
+		}
+		w.WriteHeader(status)
+	}), state)
+	return d, func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return n
+	}
+}
+
+// TestRunPortalWatchCadencePerAttachment covers both P3s on the watch: with
+// -portal-keepalive 0 an admitted attachment gets no watcher at all, and an
+// excluded one starts on the login cadence rather than inheriting the steady
+// one.
+func TestRunPortalWatchCadencePerAttachment(t *testing.T) {
+	admitted, admittedProbes := countingDetector(t, portal.StateNone, http.StatusNoContent)
+	excluded, excludedProbes := countingDetector(t, portal.StateUnauthenticated, http.StatusFound)
+	detectors := map[string]*portal.Detector{"eth0": admitted, "wlan0": excluded}
+
+	for _, steady := range []time.Duration{0, time.Hour} {
+		ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+		runPortalWatch(ctx, testLogger(), detectors, []string{"eth0"}, []string{"wlan0"},
+			portal.Config{Steady: steady, Login: 20 * time.Millisecond})
+		cancel()
+	}
+	if n := admittedProbes(); n != 0 {
+		t.Errorf("admitted attachment probed %d times; keepalive 0 and an hour's cadence both mean none here", n)
+	}
+	if n := excludedProbes(); n < 2 {
+		t.Errorf("excluded attachment probed %d times, want it on the 20ms login cadence", n)
+	}
+}
+
+// TestRunPortalWatchReportsANewLoginURL is the review's URL finding: a portal
+// that moves its login page without the state changing must still get its new
+// address in front of the user.
+func TestRunPortalWatchReportsANewLoginURL(t *testing.T) {
+	login := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, `<html><form><input type="password"></form></html>`)
+	}))
+	defer login.Close()
+
+	var (
+		mu   sync.Mutex
+		sid  int
+		logs strings.Builder
+	)
+	d := portalDetector(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		sid++
+		n := sid
+		mu.Unlock()
+		http.Redirect(w, r, fmt.Sprintf("%s/login?sid=%d", login.URL, n), http.StatusFound)
+	}), portal.StateUnauthenticated)
+	d.Check(context.Background()) // the URL startup would have printed
+
+	log := slog.New(slog.NewTextHandler(writerFunc(func(p []byte) (int, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		return logs.Write(p)
+	}), nil))
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	detectors, excluded := oneAttachment(d)
+	runPortalWatch(ctx, log, detectors, nil, excluded, portal.Config{Login: 20 * time.Millisecond})
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !strings.Contains(logs.String(), "portal login page changed") {
+		t.Errorf("a new login URL was not reported:\n%s", logs.String())
+	}
+	if strings.Contains(logs.String(), "sid=") {
+		t.Error("the journal carries the URL's query; it must keep the host only (§4.7)")
 	}
 }

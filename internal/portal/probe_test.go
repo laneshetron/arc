@@ -463,6 +463,10 @@ func TestLooksLikeLogin(t *testing.T) {
 			`<html><body><form action="/search"><input name="q"></form></body></html>`, false},
 		{"ordinary sign-in page with only an email field",
 			`<html><body><form><input name="email"></form></body></html>`, false},
+		{"a search form and an unrelated password widget",
+			`<html><body><form action="/search"><input name="q"></form><div><input type="password" name="pw"></div></body></html>`, false},
+		{"a portal field in one form, another form elsewhere",
+			`<html><body><form action="/search"><input name="q"></form><form action="/go"><input name="voucher"></form></body></html>`, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := looksLikeLogin([]byte(tc.body)); got != tc.want {
@@ -515,5 +519,43 @@ func TestDefaultClientDoesNotFollowRedirects(t *testing.T) {
 	}
 	if c.Redirect == "" {
 		t.Error("probe C did not find the live redirect target")
+	}
+}
+
+// TestProbeCustomRedirectExpectation is the review's 3xx finding: an operator
+// whose healthy endpoint answers with a redirect must be able to say so. Every
+// 3xx used to go to the redirect branch first, so the client waited behind a
+// portal that did not exist.
+func TestProbeCustomRedirectExpectation(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "http://elsewhere.example/welcome", http.StatusFound)
+	}))
+	defer srv.Close()
+
+	for _, tc := range []struct {
+		name   string
+		expect string
+		want   CheckKind
+	}{
+		{"declared status, Location matches", "302:/welcome", CheckPass},
+		{"declared status, no substring", "302", CheckPass},
+		// A mismatch falls through to ordinary classification, where a redirect
+		// to another host is portal evidence.
+		{"declared status, Location differs", "302:/home", CheckRedirect},
+		{"different status declared", "301", CheckRedirect},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			exp, err := ParseExpectation(tc.expect)
+			if err != nil {
+				t.Fatal(err)
+			}
+			p := NewProber(nil)
+			p.Client = srv.Client()
+			p.Client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+			p.Endpoints = []Endpoint{exp.Endpoint(srv.URL + "/check")}
+			if got := p.Probe(context.Background()).Check; got != tc.want {
+				t.Errorf("Check = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

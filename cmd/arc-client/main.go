@@ -264,7 +264,7 @@ func run(args []string) error {
 	// Per attachment, not one global verdict: captive Wi-Fi must not suppress
 	// healthy cellular, and reversing the bind order must not change the
 	// answer.
-	detectors, eligible, err := checkPortal(ctx, log, portalCfg, *fullTunnel, binds, uint32(*mark))
+	detectors, eligible, atts, err := checkPortal(ctx, log, portalCfg, *fullTunnel, binds, uint32(*mark))
 	if err != nil {
 		return err
 	}
@@ -302,12 +302,16 @@ func run(args []string) error {
 			}
 		}
 		sort.Strings(excluded)
+		// The URLs, not just the names: a link left out of the session is one
+		// the user asked for, and its login page is what they need to get it.
+		announceExcluded(detectors, excluded)
 	}
 	if len(detectors) > 0 {
-		// Bind only the attachments that are not captive. An empty binds list
-		// would mean every interface, so it becomes the explicit eligible set.
-		binds = eligible
-		log.Info("carrying traffic on the attachments that passed detection", "interfaces", binds)
+		// Bind only the attachments that are not captive, in the order the
+		// user gave, and in the form the carriers were given them — a default
+		// attachment stays unnamed unless the carriers need its name.
+		binds = carrierBinds(atts, eligible, *fullTunnel)
+		log.Info("carrying traffic on the attachments that passed detection", "interfaces", eligible)
 		if len(excluded) > 0 {
 			log.Warn("these attachments are behind a portal and will carry nothing until the client restarts",
 				"interfaces", excluded)
@@ -355,6 +359,9 @@ func run(args []string) error {
 			if cleanup, err = dev.FullTunnel(uint32(*mark), *table); err != nil {
 				return err
 			}
+			// From here the system resolver answers through ARC, so detection
+			// must never consult it again (§4.4).
+			disableSystemFallback(detectors)
 		}
 		if *fullTunnel && *dnsMode == tun.DNSManager {
 			nextCleanup, err := dev.ConfigureDNS(resolver)

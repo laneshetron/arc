@@ -23,6 +23,13 @@ type Detector struct {
 	// new state and the evidence. It must not block.
 	OnChange func(State, Check)
 
+	// OnURL is called after a probe that changes the login URL, with the new
+	// URL ("" when it was cleared), after OnChange. It is separate from
+	// OnChange because a portal can move its login page — a new session token,
+	// a different host — without the state changing, and the user still needs
+	// the address that works now. It must not block.
+	OnURL func(string)
+
 	// RoundTimeout bounds one detection round; 0 uses DefaultRoundTimeout.
 	RoundTimeout time.Duration
 
@@ -75,33 +82,39 @@ const DefaultRoundTimeout = 15 * time.Second
 
 // Observation is the result of one detection round.
 //
-// Completed says the round ran to its own conclusion rather than being cut off.
-// The distinction matters because a probe's evidence *is* its failure mode: a
-// request cancelled at a deadline looks exactly like one that timed out on its
-// own, and treating the first as the second lets a deadline decide the verdict
-// (§5.1).
+// Completed says the round's evidence was applied. A round ends one of three
+// ways, and only the caller's cancellation leaves the state alone:
 //
-// Cancelled says the *caller's* context ended, as opposed to the round's own
-// timeout. The scheduler stops on the first and carries on after the second —
-// one slow probe must not end the mid-session watch.
+//   - it finishes: the evidence is applied.
+//   - it exhausts its own budget (TimedOut): the evidence it gathered is applied
+//     as it stands. Whatever probe A concluded before the budget ran out still
+//     counts, and an endpoint that never answered within it is a no-answer —
+//     which is what a link that silently drops everything looks like, and what
+//     §5.1's three-timeouts rule needs to see. Discarding these rounds instead
+//     left such a link in whatever state it was last in, indefinitely.
+//   - the caller cancels it (Cancelled): nothing is applied. A request cut off
+//     by Ctrl-C or the -portal-wait deadline looks exactly like one that timed
+//     out on its own, and applying it would let the caller's deadline decide the
+//     verdict (§5.1).
 type Observation struct {
 	State     State
 	Check     Check
 	Completed bool
+	TimedOut  bool
 	Cancelled bool
 }
 
 // Check runs one round and applies its evidence, returning the state afterwards.
 //
-// A round cut off by cancellation applies nothing: the state is whatever it was,
-// and Observe's Completed reports why. Callers that care — the scheduler and the
+// A round the caller cancels applies nothing: the state is whatever it was, and
+// Observe's Cancelled reports why. Callers that care — the scheduler and the
 // startup wait do — use Observe.
 func (d *Detector) Check(ctx context.Context) State {
 	return d.Observe(ctx).State
 }
 
-// Observe runs one round and applies its evidence unless the round was
-// cancelled.
+// Observe runs one round and applies its evidence unless the caller cancelled
+// it.
 //
 // The round is bounded here rather than left to the HTTP client: its timeouts
 // cover the response headers and the TLS handshake, but not a body that stalls
@@ -115,23 +128,22 @@ func (d *Detector) Observe(ctx context.Context) Observation {
 
 	ev := d.Prober.Probe(ctx)
 
-	// A cancelled round is not an observation. Its evidence is
+	// The caller ending the round is not an observation. Its evidence is
 	// indistinguishable from a real timeout, so applying it would let a
 	// deadline or a Ctrl-C move the state — including toward `unknown`, which
 	// opens carriers (§6.3).
-	if ctx.Err() != nil {
-		return Observation{
-			State: d.State(),
-			Check: ev,
-			// The round's own timeout is not the caller ending: the scheduler
-			// resumes after it and stops only for the caller.
-			Cancelled: outer.Err() != nil,
-		}
+	if outer.Err() != nil {
+		return Observation{State: d.State(), Check: ev, Cancelled: true}
 	}
+	// The round's own budget running out is: the measurement had its full
+	// allowance and this is what it found. See Observation.
+	timedOut := ctx.Err() != nil
 
 	d.mu.Lock()
 	before := d.Classifier.State()
+	urlBefore := d.Classifier.PortalURL
 	after := d.Classifier.Observe(ev.Evidence)
+	urlAfter := d.Classifier.PortalURL
 	host := d.Classifier.Host()
 
 	// The exception to "log only changes" is an inconclusive verdict, which
@@ -166,6 +178,9 @@ func (d *Detector) Observe(ctx context.Context) Observation {
 			"body_bytes", ev.BodyBytes,
 			"dns", ev.DNS.String(),
 		}
+		if timedOut {
+			args = append(args, "round", "exhausted its budget")
+		}
 		if ev.TLS != "" {
 			args = append(args, "tls", ev.TLS)
 		}
@@ -191,7 +206,10 @@ func (d *Detector) Observe(ctx context.Context) Observation {
 	if before != after && d.OnChange != nil {
 		d.OnChange(after, ev)
 	}
-	return Observation{State: after, Check: ev, Completed: true}
+	if urlBefore != urlAfter && d.OnURL != nil {
+		d.OnURL(urlAfter)
+	}
+	return Observation{State: after, Check: ev, Completed: true, TimedOut: timedOut}
 }
 
 // Interval returns how long to wait before the next check, per §5's table:
@@ -295,12 +313,13 @@ func (d *Detector) run(ctx context.Context, c cadence, done func(State) bool) Ob
 
 	next := d.Interval(c.steady, c.login)
 	// The backoff stretches from the login cadence toward loginPollMax, one
-	// doubling per full minute *of the current episode*. It therefore has to be
+	// doubling per full minute *of the current episode* — the first a minute in,
+	// the next a minute after that. It therefore has to be
 	// measured from when this unauthenticated episode began, not from the last
 	// non-captive observation — an episode that starts after a long authenticated
 	// stretch must still begin at the fast cadence.
 	backoff := c.login
-	var episodeStart time.Time
+	var episodeStart, lastStep time.Time
 
 	t := time.NewTimer(0) // check immediately: §5 runs at startup
 	defer t.Stop()
@@ -313,25 +332,25 @@ func (d *Detector) run(ctx context.Context, c cadence, done func(State) bool) Ob
 
 		obs := d.Observe(ctx)
 
-		// A round's own timeout is not a verdict, but it is also not a reason to
-		// stop: the next cadence tries again, and §6.3's fail-open behaviour
-		// comes from a *completed* inconclusive round, not from a slow one.
-		if !obs.Completed && !obs.Cancelled {
-			t.Reset(d.Interval(c.steady, c.login))
-			continue
-		}
-		// The caller ending is: its evidence is indistinguishable from a real
-		// timeout, so it must not move the state or be read as a pass.
+		// The caller ending the round stops the loop: its evidence is
+		// indistinguishable from a real timeout, so it must not move the state
+		// or be read as a pass. A round that exhausted its own budget is a
+		// completed observation and is treated like any other.
 		if !obs.Completed || done(obs.State) {
 			return obs
 		}
 
 		switch obs.State {
 		case StateUnauthenticated:
-			if episodeStart.IsZero() {
-				episodeStart, backoff = time.Now(), c.login
-			} else if time.Since(episodeStart) > time.Minute {
-				backoff = min(backoff*2, loginPollMax)
+			now := time.Now()
+			switch {
+			case episodeStart.IsZero():
+				episodeStart, lastStep, backoff = now, now, c.login
+			case now.Sub(lastStep) >= time.Minute:
+				// One doubling per full minute, measured from the previous
+				// doubling. Measuring each step from the episode's start would
+				// double on every round once the first minute had passed.
+				lastStep, backoff = now, min(backoff*2, loginPollMax)
 			}
 			next = backoff
 		default:

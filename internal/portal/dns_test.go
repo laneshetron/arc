@@ -64,19 +64,12 @@ func TestParseResolvectlUnknownLink(t *testing.T) {
 	}
 }
 
-// TestParseResolvectlUnnamedAttachment is the Linux-with-policy-routing case: no
-// interface is bound, and the mark keeps the query on the physical link, so any
-// link's upstream is a usable answer — and better than the stub, which would
-// route through the daemon and into the tunnel.
+// TestParseResolvectlUnnamedAttachment: an empty name matches no link. Taking
+// every link's servers would include ARC's own TUN once managed DNS puts a
+// resolver there; UpstreamResolver.discover names the physical link instead.
 func TestParseResolvectlUnnamedAttachment(t *testing.T) {
-	got := parseResolvectlDNS([]byte(resolvectlOutput), "")
-	if len(got) == 0 {
-		t.Fatal("no upstreams for an unnamed attachment: probe B would be unmeasurable on a host that has one")
-	}
-	for _, a := range got {
-		if a.IsLoopback() {
-			t.Errorf("%v: a stub address reached the query list", a)
-		}
+	if got := parseResolvectlDNS([]byte(resolvectlOutput), ""); len(got) != 0 {
+		t.Fatalf("got %v for an unnamed link, want nothing", got)
 	}
 }
 

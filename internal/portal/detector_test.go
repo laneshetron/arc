@@ -168,19 +168,20 @@ func TestDetectorRoundHasADeadline(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Fatalf("Observe took %s: the round has no deadline", elapsed)
 	}
-	if obs.Completed {
-		t.Error("a round cut off by its own deadline reported as completed")
+	if !obs.Completed || !obs.TimedOut {
+		t.Errorf("Completed = %v, TimedOut = %v: a round that exhausts its own budget is a completed observation", obs.Completed, obs.TimedOut)
 	}
 	if obs.Cancelled {
 		t.Error("a round's own timeout reported as caller cancellation: one slow probe must not end the watch")
 	}
 }
 
-// TestDetectorRoundDeadlineIsNotAVerdict: the deadline must leave the state
-// alone, because a cut-off round's evidence looks exactly like a timeout and
-// three of those would otherwise open carriers by declaring the network
-// unreachable.
-func TestDetectorRoundDeadlineIsNotAVerdict(t *testing.T) {
+// TestDetectorRepeatedRoundDeadlinesFailOpen is the review's stale-verdict
+// finding: a link that silently drops everything never finishes a round inside
+// its budget, and discarding those rounds left a captive attachment blocked
+// forever after the user logged in. A round that exhausts its own budget is a
+// no-answer, and three of them are §5.1's fail-open.
+func TestDetectorRepeatedRoundDeadlinesFailOpen(t *testing.T) {
 	release := make(chan struct{})
 	defer close(release)
 
@@ -199,14 +200,45 @@ func TestDetectorRoundDeadlineIsNotAVerdict(t *testing.T) {
 	p.Endpoints = []Endpoint{{Name: "e", URL: srv.URL, Status: http.StatusNoContent}}
 
 	c := new(Classifier)
-	c.Resume(StateAuthenticated, true)
+	c.Resume(StateUnauthenticated, true)
 	d := &Detector{Prober: p, Classifier: c, RoundTimeout: 60 * time.Millisecond}
 
-	for i := 0; i < 4; i++ { // more than timeoutsToUnknown
+	for i := 0; i < 2; i++ {
 		d.Observe(context.Background())
 	}
-	if got := d.State(); got != StateAuthenticated {
-		t.Errorf("state = %v after four cut-off rounds, want it unchanged", got)
+	if got := d.State(); got != StateUnauthenticated {
+		t.Fatalf("state = %v after two stalled rounds, want unchanged: one or two lost rounds are not evidence", got)
+	}
+	d.Observe(context.Background())
+	if got := d.State(); got != StateUnknown {
+		t.Errorf("state = %v after three stalled rounds, want unknown (§5.1's three timeouts)", got)
+	}
+}
+
+// stallingDNS is a probe B that never answers before the round ends.
+type stallingDNS struct{}
+
+func (stallingDNS) Honesty(ctx context.Context, _ string) (DNSVerdict, error) {
+	<-ctx.Done()
+	return DNSUnmeasured, ctx.Err()
+}
+
+// TestDetectorKeepsEvidenceFromATimedOutRound is the other half: conclusive
+// evidence probe A already has is not thrown away because an auxiliary probe
+// ran the round out.
+func TestDetectorKeepsEvidenceFromATimedOutRound(t *testing.T) {
+	d := newDetector(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "http://127.0.0.1:1/login", http.StatusFound)
+	}), StateNone, false)
+	d.Prober.Resolver = stallingDNS{}
+	d.RoundTimeout = 60 * time.Millisecond
+
+	obs := d.Observe(context.Background())
+	if !obs.TimedOut {
+		t.Fatal("the round did not run out its budget; the test is not exercising the case")
+	}
+	if got := d.State(); got != StateUnauthenticated {
+		t.Errorf("state = %v, want unauthenticated: probe A's redirect was conclusive before DNS stalled", got)
 	}
 }
 

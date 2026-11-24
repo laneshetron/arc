@@ -70,7 +70,9 @@ type Expectation struct {
 	Substr string
 }
 
-// ParseExpectation parses "204" or "200:Microsoft Connect Test".
+// ParseExpectation parses "204" or "200:Microsoft Connect Test". For a 3xx
+// status the substring is matched against the Location header — "302:/welcome"
+// — since a redirect's body says nothing.
 func ParseExpectation(s string) (Expectation, error) {
 	if s == "" {
 		return Expectation{}, errors.New("portal: -portal-probe needs -portal-probe-expect STATUS[:SUBSTRING]")
