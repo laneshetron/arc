@@ -670,13 +670,31 @@ preserved on a local branch rather than in this document.
 ### 3.1 Name and record
 
 ```
-<nonce>._arcb.<beacon-zone>   TXT   "B1:" + base64url(body ‖ signature)
+<nonce>._arcb.<beacon-zone>       TXT   "B1:" + base64url(body ‖ signature)
+<nonce>.<name>._arcb.<beacon-zone>  TXT   "B1:" + base64url(body ‖ signature)
 ```
 
 `<nonce>` is 13 lowercase no-padding base32 characters over 8 random
 bytes, fresh for every query, so no answer is ever served from a cache
 and no response can be correlated with another. Any recursive resolver
 may relay it; the operator's authoritative server answers it.
+
+`<name>` is an optional **beacon name**, and §3.2's rotation rule depends
+on it: a deployment rotates by publishing `b1._arcb` and `b2._arcb` under
+one delegated zone and flipping which is current, so a client must be able
+to ask for each by name. With no name the record is the zone's own
+`_arcb` entry, which is the single-beacon case.
+
+The name is part of the **signature's domain separation**, exactly as the
+zone is: a `b1` record must not verify when served for `b2`, or the
+independent retirement the rotation rule exists for would be cosmetic.
+One string therefore identifies a beacon throughout — the DNS question,
+the signature's suffix, and the per-name rollback watermark (§3.4) — and
+it is the string this grammar spells.
+
+Both forms cost the same answer budget, because the name's bytes come out
+of the padding rather than out of the record: a named query is still
+padded to the profile's name length (§3.2).
 
 `<beacon-zone>` is a zone of its own, not a carrier zone (§3.6); the
 sizing examples below use `_arcb.example.net` for brevity, standing for
@@ -767,7 +785,7 @@ query profiles**, and the client tries them in order:
 | profile | name | query | answer cap | max signed record | max body |
 |---|---|---|---|---|---|
 | bootstrap | padded to 155 bytes | 171 B | 512 B (≤ 3×) | **243 B** | 179 B |
-| bootstrap + EDNS(0) | padded to 255 bytes | 282 B | 846 B (≤ 3×) | **417 B** | 353 B |
+| bootstrap + EDNS(0) | padded to 255 bytes | 282 B | 846 B (≤ 3×) | **409 B** | 345 B |
 
 **The bootstrap name is 155 bytes, not 255, and padding it further loses
 space.** This section previously said to pad to the 255-byte limit "because
@@ -792,7 +810,16 @@ contradicted it for the beacon.
 
 For EDNS(0) the 3× rule never catches the 1232-byte buffer: at a 282-byte
 query the cap is 846 B, still short of 1232, so a full-length name is
-right there and the record can be 417 bytes.
+right there and the record can be 409 bytes.
+
+**The EDNS figure was 417 and is 409.** The difference is the response's
+own OPT record: a server answering an EDNS(0) query echoes one, and it
+costs 11 bytes (RFC 6891 §6.1.1 — a root name, type, the class carrying its
+buffer size, TTL and RDLEN). An earlier revision sized the answer from a
+fixture that carried OPT in the *query* and omitted it from the *response*,
+which overstated the room a record has by exactly those 11 bytes. The
+bootstrap figure is unaffected, since a bootstrap answer has no OPT record
+in either direction.
 
 Padding is by the §2.2.1 grammar, with `0`-labelled labels. Under
 `_arcb.example.net` the nonce and suffix cost 33 wire bytes, so a 155-byte
@@ -813,6 +840,20 @@ that would exceed 3× the query it received, measured on the wire. That
 survives a client that forgets to pad, and costs a reflector nothing to
 reject.
 
+**A response is matched before anything in it is believed.** The client
+checks the transaction ID, the question name, its type and its class
+against the query it sent, and only then reads the `RCODE` or the `TC`
+bit. An answer that fails to match is not evidence about the question —
+so a `NXDOMAIN`, `SERVFAIL` or `REFUSED` arriving with someone else's ID
+must not end the lookup, or any off-path packet becomes a way to deny
+service with one spoofed header (RFC 5452 §9.2).
+
+The name check is what makes the match worth more than a 16-bit ID: an
+attacker can guess an ID, but cannot invent a nonce it never saw. Both are
+checked, because the ID is free and a resolver's echo of it costs nothing
+to verify — and because a resolver is entitled to rewrite it, which is why
+the nonce and not the ID is the load-bearing half.
+
 **Publication limits, derived from the frozen grammar of §3.1.** Each
 relay entry is `ipv4 + key[32] + n_endpoints + endpoints`, and the 32-byte
 key is irreducible: it is what lets a device that has never enrolled pin a
@@ -823,7 +864,7 @@ the table above are stated in; earlier revisions of this table labelled a
 signed-record figure "body", which made every row look 64 bytes smaller
 than it was.
 
-| record | body | signed | bootstrap (243 B) | EDNS(0) (417 B) |
+| record | body | signed | bootstrap (243 B) | EDNS(0) (409 B) |
 |---|---|---|---|---|
 | 1 relay, `tls`+`udp`, 1 cover name, 1 zone, `_arc.example.net` | 89 B | 153 B | **yes** | yes |
 | 1 relay, `tls`+`udp`+`front`, 1 name, 1 zone | 110 B | 174 B | **yes** | yes |

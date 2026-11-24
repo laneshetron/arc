@@ -7,6 +7,7 @@ package beacon
 import (
 	"crypto/rand"
 	"encoding/base32"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"strings"
@@ -78,8 +79,27 @@ type Query struct {
 	// authority refuses anything above 3×, so a query that underran its
 	// padding would be asking for a REFUSED.
 	AnswerCap int
-	// Suffix is what Decode verifies the signature against.
+	// Suffix is what Decode verifies the signature against. For a named
+	// beacon it includes the name — `b1._arcb.example.net` — so the question,
+	// the signature and the rollback watermark all key on one string.
 	Suffix string
+	// ID is the transaction ID the question was sent with. A response that
+	// carries another ID is not an answer to this question, and ParseAnswer
+	// refuses it before reading the RCODE (RFC 5452 §9.2).
+	ID uint16
+}
+
+// id returns the transaction ID, deriving it from Wire for a Query built by
+// hand rather than by NewQuery — a test fixture, say, or a caller that
+// re-parsed a stored message.
+func (q Query) id() uint16 {
+	if q.ID != 0 {
+		return q.ID
+	}
+	if len(q.Wire) >= 2 {
+		return binary.BigEndian.Uint16(q.Wire[:2])
+	}
+	return 0
 }
 
 // NewQuery builds the question for a beacon zone in the given profile, with
@@ -95,33 +115,58 @@ type Query struct {
 // and §3.2's table is wrong to pad to the 255-byte limit: at 255 a
 // bootstrap answer carries a 168-byte signed record, at 155 a 243-byte one.
 // For EDNS the 3× rule never catches the 1232-byte buffer, so a full name
-// stays best and the record can be 417 bytes.
+// stays best and the record can be 409 bytes — 417 less the 11-byte OPT
+// record a server answering an EDNS query echoes back (RFC 6891 §6.1.1).
 func NewQuery(zone string, p Profile, randRead func([]byte) (int, error)) (Query, error) {
+	return NewNamedQuery("", zone, p, randRead)
+}
+
+// NewNamedQuery builds the question for the beacon published at `name` under
+// `zone` — the `b1`/`b2` of §3.2's rotation rule — with an empty name meaning
+// the zone's own `_arcb` record.
+//
+// The name reaches three places that must agree: the DNS question, the
+// suffix the signature is verified over, and the per-name rollback watermark
+// (§3.4). Returning it on the Query is what lets a caller carry one identity
+// through all three instead of re-deriving a string at each step and
+// eventually disagreeing with itself.
+//
+// A name lengthens the fixed part of the question, which comes out of the
+// answer: `b1._arcb.example.net` leaves twelve fewer bytes of padding than
+// `_arcb.example.net`, and the record budget shrinks by the same twelve.
+func NewNamedQuery(name, zone string, p Profile, randRead func([]byte) (int, error)) (Query, error) {
 	if randRead == nil {
 		randRead = rand.Read
 	}
 	if p != ProfileBootstrap && p != ProfileEDNS {
 		return Query{}, fmt.Errorf("beacon: unknown profile %v", p)
 	}
-	suffix := Suffix(zone)
+	suffix := NamedSuffix(name, zone)
+	if err := validName(suffix, MaxName, true); err != nil {
+		return Query{}, fmt.Errorf("beacon: suffix %q: %w", suffix, err)
+	}
 	nonce, err := nonce13(randRead)
 	if err != nil {
 		return Query{}, err
 	}
-	name, err := padName(nonce, suffix, p.nameLen())
+	if wireLen(nonce+"."+suffix) > p.nameLen() {
+		return Query{}, fmt.Errorf("beacon: zone %q leaves no room for a nonce", suffix)
+	}
+	qname, err := padName(nonce, suffix, p.nameLen())
 	if err != nil {
 		return Query{}, err
 	}
-	wire, err := buildQuery(name, p, randRead)
+	wire, err := buildQuery(qname, p, randRead)
 	if err != nil {
 		return Query{}, err
 	}
 	return Query{
-		Name:      name,
+		Name:      qname,
 		Wire:      wire,
 		Profile:   p,
 		AnswerCap: min(p.cap(), 3*len(wire)),
 		Suffix:    suffix,
+		ID:        binary.BigEndian.Uint16(wire[:2]),
 	}, nil
 }
 
@@ -295,9 +340,18 @@ var (
 // because an unsigned or tampered record is a different outcome from a
 // malformed response and the two are logged differently.
 //
-// A response echoing a different question is refused, which is §3.1's nonce
-// rule doing the work a transaction ID cannot: resolvers and the paths to
-// them may rewrite the ID, but they cannot invent a nonce.
+// The response must answer *this* query before anything in it is believed.
+// That means the transaction ID, the question name, its type and its class,
+// and it is checked before the RCODE and the TC bit are read — a response
+// that fails to match is not evidence about the question that was asked, so
+// taking its REFUSED or SERVFAIL as this resolver's answer would let any
+// off-path packet end the lookup. RFC 5452 §9.2 makes this the whole point
+// of matching a response to a query.
+//
+// The name check is §3.1's nonce rule, which is what makes a match mean
+// something a 16-bit ID cannot: an attacker can guess an ID, but it cannot
+// invent a nonce it never saw. Both are checked anyway, because the ones
+// that are cheap to check are worth checking.
 func ParseAnswer(q Query, msg []byte) (Response, error) {
 	var p dnsmessage.Parser
 	h, err := p.Start(msg)
@@ -307,6 +361,31 @@ func ParseAnswer(q Query, msg []byte) (Response, error) {
 	if !h.Response {
 		return Response{}, errNotResponse
 	}
+	// Match before believing: an ID that is not ours means this datagram is
+	// not an answer to our question, whatever its RCODE says.
+	if h.ID != q.id() {
+		return Response{}, fmt.Errorf("%w: id %#04x, not %#04x", errForOther, h.ID, q.id())
+	}
+	qs, err := p.AllQuestions()
+	if err != nil {
+		return Response{}, fmt.Errorf("beacon: %w", err)
+	}
+	if len(qs) == 0 {
+		return Response{}, errNoQuestion
+	}
+	want := strings.ToLower(q.Name)
+	got := strings.TrimSuffix(strings.ToLower(qs[0].Name.String()), ".")
+	if got != want {
+		return Response{}, fmt.Errorf("%w: %q, not %q", errForOther, got, q.Name)
+	}
+	// The type and class are what makes the echoed name a question about a
+	// TXT record rather than about something else at the same name; a
+	// resolver that answered an A query with our name did not answer us.
+	if qs[0].Type != dnsmessage.TypeTXT || qs[0].Class != dnsmessage.ClassINET {
+		return Response{}, fmt.Errorf("%w: question is %v/%v, not TXT/IN",
+			errForOther, qs[0].Type, qs[0].Class)
+	}
+	// Only now is the RCODE this resolver's answer to this question.
 	resp := Response{Truncated: h.Truncated}
 	if h.RCode != dnsmessage.RCodeSuccess {
 		// Truncation only means "retry larger" when the answer was cut
@@ -315,17 +394,6 @@ func ParseAnswer(q Query, msg []byte) (Response, error) {
 		// spend a poll to be told the same thing.
 		resp.Truncated = false
 		return resp, fmt.Errorf("beacon: %s", rcode(h.RCode))
-	}
-	qs, err := p.AllQuestions()
-	if err != nil {
-		return resp, fmt.Errorf("beacon: %w", err)
-	}
-	if len(qs) == 0 {
-		return resp, errNoQuestion
-	}
-	want := strings.ToLower(q.Name)
-	if got := strings.TrimSuffix(strings.ToLower(qs[0].Name.String()), "."); got != want {
-		return resp, fmt.Errorf("%w: %q, not %q", errForOther, got, q.Name)
 	}
 	answers, err := p.AllAnswers()
 	if err != nil {

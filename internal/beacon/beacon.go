@@ -111,6 +111,69 @@ func Suffix(zone string) string {
 	return "_arcb." + strings.TrimSuffix(strings.ToLower(strings.TrimSpace(zone)), ".")
 }
 
+// NamedSuffix is the suffix for a beacon name under a zone: "<name>._arcb."
+// plus the zone. §3.2's rotation rule publishes several beacon names —
+// `b1._arcb`, `b2._arcb` — so a client must be able to ask for each, and the
+// name has to be part of the signature's domain separation for the same
+// reason the zone is: otherwise `b1`'s record would verify when served for
+// `b2`, and the independent retirement the rule exists for would be a
+// formality.
+func NamedSuffix(name, zone string) string {
+	base := Suffix(zone)
+	if name == "" {
+		return base
+	}
+	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(name)), ".") + "." + base
+}
+
+// validEndpointKind reports whether k is a kind §3.1 defines. Both the
+// encoder and the decoder call this: the encoder writing a kind the decoder
+// rejects would let an operator publish a record no client can read.
+func validEndpointKind(k EndpointKind) bool {
+	return k == KindUDP || k == KindTLS || k == KindFront
+}
+
+// validName reports whether s is a name §3.1 permits in a record: lowercase
+// ASCII, no trailing dot, non-empty, at most max bytes.
+//
+// The grammar says exactly this for cover names ("lowercase ASCII, no
+// trailing dot") and for a front's domain ("1..253, lowercase"), and it is
+// enforced on decode as well as encode so the two cannot disagree about
+// what a legal record is.
+//
+// underscore is permitted only where the grammar's own examples need it: a
+// carrier zone is written `_arc.example.net` throughout the spec, so the
+// leading `_` of a service label is legal there. Cover names are presented
+// to a TLS peer as SNI and a front's domain is a cover name, so neither is
+// allowed one.
+func validName(s string, max int, underscore bool) error {
+	switch {
+	case s == "":
+		return fmt.Errorf("%w: empty name", errEndpoint)
+	case len(s) > max:
+		return fmt.Errorf("%w: %q is %d bytes, over %d", errEndpoint, s, len(s), max)
+	case strings.HasSuffix(s, "."):
+		return fmt.Errorf("%w: %q has a trailing dot", errEndpoint, s)
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= '0' && c <= '9', c == '-':
+		case c == '_' && underscore:
+		case c == '.':
+			// No empty label, and none at the start: "a..b" and ".ab" are
+			// not names, and a leading dot would make the label grammar
+			// ambiguous against the padding markers of §2.2.1.
+			if i == 0 || s[i-1] == '.' {
+				return fmt.Errorf("%w: %q has an empty label", errEndpoint, s)
+			}
+		default:
+			return fmt.Errorf("%w: %q is not lowercase ASCII", errEndpoint, s)
+		}
+	}
+	return nil
+}
+
 // signedMessage is the domain-separated input to the signature:
 // "ARC/1 beacon" ‖ u8(len) ‖ suffix ‖ body.
 func signedMessage(suffix string, body []byte) []byte {
@@ -194,11 +257,14 @@ func (b *Beacon) appendBody(dst []byte) ([]byte, error) {
 		dst = append(dst, r.Key...)
 		dst = append(dst, byte(len(r.Endpoints)))
 		for _, e := range r.Endpoints {
+			if !validEndpointKind(e.Kind) {
+				return nil, fmt.Errorf("%w: %v", errEndpoint, e.Kind)
+			}
 			dst = append(dst, byte(e.Kind))
 			dst = binary.BigEndian.AppendUint16(dst, e.Port)
 			if e.Kind == KindFront {
-				if e.Domain == "" || len(e.Domain) > MaxName {
-					return nil, fmt.Errorf("%w: front domain %q", errEndpoint, e.Domain)
+				if err := validName(e.Domain, MaxName, false); err != nil {
+					return nil, fmt.Errorf("front domain: %w", err)
 				}
 				dst = append(dst, byte(len(e.Domain)))
 				dst = append(dst, e.Domain...)
@@ -207,16 +273,19 @@ func (b *Beacon) appendBody(dst []byte) ([]byte, error) {
 	}
 	dst = append(dst, byte(len(b.Names)))
 	for _, n := range b.Names {
-		if n == "" || len(n) > MaxName {
-			return nil, fmt.Errorf("%w: cover name %q", errEndpoint, n)
+		if err := validName(n, MaxName, false); err != nil {
+			return nil, fmt.Errorf("cover name: %w", err)
 		}
 		dst = append(dst, byte(len(n)))
 		dst = append(dst, n...)
 	}
 	dst = append(dst, byte(len(b.Zones)))
 	for _, z := range b.Zones {
-		if z == "" || len(z) > MaxName {
-			return nil, fmt.Errorf("%w: zone %q", errEndpoint, z)
+		// A carrier zone is a name of the same shape; §3.1 writes "the zone
+		// a DNS carrier may use" without restating the rules, so it gets
+		// them.
+		if err := validName(z, MaxName, true); err != nil {
+			return nil, fmt.Errorf("carrier zone: %w", err)
 		}
 		dst = append(dst, byte(len(z)))
 		dst = append(dst, z...)
@@ -251,16 +320,15 @@ func parseBody(body []byte) (*Beacon, error) {
 		rel := Relay{Addr: addr, Key: key}
 		for range ne {
 			kind := EndpointKind(r.u8())
-			e := Endpoint{Kind: kind, Port: r.u16()}
-			switch kind {
-			case KindUDP, KindTLS:
-			case KindFront:
-				e.Domain = string(r.bytes(int(r.u8())))
-				if e.Domain == "" {
-					return nil, errEndpoint
-				}
-			default:
+			if !validEndpointKind(kind) {
 				return nil, errEndpoint
+			}
+			e := Endpoint{Kind: kind, Port: r.u16()}
+			if kind == KindFront {
+				e.Domain = string(r.bytes(int(r.u8())))
+				if err := validName(e.Domain, MaxName, false); err != nil {
+					return nil, err
+				}
 			}
 			rel.Endpoints = append(rel.Endpoints, e)
 		}
@@ -272,8 +340,8 @@ func parseBody(body []byte) (*Beacon, error) {
 	}
 	for range nn {
 		n := string(r.bytes(int(r.u8())))
-		if n == "" {
-			return nil, errEndpoint
+		if err := validName(n, MaxName, false); err != nil {
+			return nil, err
 		}
 		b.Names = append(b.Names, n)
 	}
@@ -283,8 +351,8 @@ func parseBody(body []byte) (*Beacon, error) {
 	}
 	for range nz {
 		z := string(r.bytes(int(r.u8())))
-		if z == "" {
-			return nil, errEndpoint
+		if err := validName(z, MaxName, true); err != nil {
+			return nil, err
 		}
 		b.Zones = append(b.Zones, z)
 	}
