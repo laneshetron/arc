@@ -20,12 +20,14 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/laneshetron/arc/internal/client"
 	"github.com/laneshetron/arc/internal/crypto"
 	"github.com/laneshetron/arc/internal/diag"
 	"github.com/laneshetron/arc/internal/engine"
 	"github.com/laneshetron/arc/internal/keyfile"
+	"github.com/laneshetron/arc/internal/portal"
 	"github.com/laneshetron/arc/internal/profiling"
 	"github.com/laneshetron/arc/internal/session"
 	"github.com/laneshetron/arc/internal/tun"
@@ -108,6 +110,12 @@ func run(args []string) error {
 	rotateBytes := fs.Int64("stream-rotate-bytes", 0, "move each -tls or -front carrier to a fresh TCP connection after it has received this many bytes, dialed ahead of time, to stay under a censor's per-connection cap (the TSPU freeze to foreign hosting); 0: learn the cap from stalled connections")
 	noUDP := fs.Bool("no-udp", false, "open no UDP carriers: reach the relay only through -tls or -front (-relay is then the session's address, the -tls endpoint, say)")
 	censorship := fs.Bool("censorship", false, "censorship posture: presume the relay sits on foreign hosting behind a censor that bans an address for minutes after UDP to it (TSPU), so open no UDP carrier to an address a -tls or -front carrier uses (spec/freeze-and-udp-ban.md §4)")
+	portalCheck := fs.String("portal-check", "auto", "detect a captive portal before connecting (spec/captive-portals.md): auto, off, or force (also detect without -full-tunnel). Under a detected portal the client opens no carriers and prints the login URL instead of retrying forever")
+	portalProbe := fs.String("portal-probe", "", "connectivity-check URL, for networks that block the standard endpoints; requires -portal-probe-expect")
+	portalProbeExpect := fs.String("portal-probe-expect", "", "success criterion for -portal-probe, as STATUS[:SUBSTRING], e.g. 204 or 200:Microsoft Connect Test")
+	portalKeepalive := fs.Duration("portal-keepalive", 60*time.Second, "how often to re-check the portal while connected; 0 disables the steady check but never the login poll (spec/captive-portals.md §5)")
+	portalPoll := fs.Duration("portal-poll", 10*time.Second, "how often to poll for a completed portal login while one is blocking; backs off to 60s")
+	portalWait := fs.Duration("portal-wait", 0, "with -full-tunnel: exit after this long behind a portal instead of waiting for the login (0 waits indefinitely)")
 	fecMode := wire.FECAuto
 	fs.Func("fec", "forward error correction: auto (default; while loss is at least 0.5%), off, or always", func(v string) (err error) {
 		fecMode, err = client.ParseFEC(v)
@@ -123,6 +131,25 @@ func run(args []string) error {
 	table := fs.Int("table", 5243, "routing table for -full-tunnel (Linux)")
 	prof := profiling.Register(fs)
 	fs.Parse(args)
+
+	// A custom probe without a success criterion is a configuration error, not
+	// a default: guessing one is how the built-in endpoints went wrong
+	// (spec/captive-portals.md §4.1).
+	portalMode, err := portal.ParseCheckMode(*portalCheck)
+	if err != nil {
+		return err
+	}
+	var portalCfg portal.Config
+	portalCfg.Mode, portalCfg.ProbeURL = portalMode, *portalProbe
+	portalCfg.Steady, portalCfg.Login, portalCfg.Wait = *portalKeepalive, *portalPoll, *portalWait
+	if *portalProbeExpect != "" {
+		if portalCfg.Expect, err = portal.ParseExpectation(*portalProbeExpect); err != nil {
+			return err
+		}
+	}
+	if err := portalCfg.Validate(); err != nil {
+		return err
+	}
 	if *profileDir != "" {
 		p, err := loadProfile(*profileDir)
 		if err != nil {
@@ -224,6 +251,31 @@ func run(args []string) error {
 		log.Warn("no -route or -full-tunnel given; only the tunnel network is reachable")
 	}
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// Detect a captive portal before creating the TUN or opening any carrier
+	// (spec/captive-portals.md §6.1). A handshake through a portal cannot
+	// succeed, so opening one spends an attempt, logs a misleading failure at
+	// the relay, and on a metered link costs the user money.
+	detector, err := checkPortal(log, portalCfg, *fullTunnel, binds, uint32(*mark), *noOffload)
+	if err != nil {
+		return err
+	}
+	if detector != nil {
+		portalCtx, cancelPortal := context.WithTimeout(ctx, 20*time.Second)
+		state := detector.Check(portalCtx)
+		cancelPortal()
+		if state.BlocksCarriers() {
+			// Waiting is the default: a user who reads "log in, then
+			// reconnect" and reruns by hand is doing what the client could
+			// have done for them.
+			if err := portalWaitMessage(ctx, detector, portalCfg, log); err != nil {
+				return err
+			}
+		}
+	}
+
 	dev, err := tun.Create(*tunName, 1280)
 	if err != nil {
 		return fmt.Errorf("create TUN: %w", err)
@@ -280,8 +332,6 @@ func run(args []string) error {
 		return nil
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	log.Info("tunnel device", "tun", dev.Name(), "full_tunnel", *fullTunnel, "routes", strings.Trim(routes.String(), "[]"))
 	cfg := client.Config{
 		Relay: relayAddr, RelayKey: pin, Token: []byte(tokens[0]), Static: static,
