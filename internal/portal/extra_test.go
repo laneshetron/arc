@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"net/url"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -67,7 +68,7 @@ func TestCheckTLSWithSelfSignedEndpoint(t *testing.T) {
 		TLSClientConfig: &tls.Config{},
 	}}
 
-	got := p.checkTLS(context.Background(), srv.URL)
+	got := p.checkTLS(context.Background(), p.Client, srv.URL)
 	if got != "verify_failed" {
 		t.Errorf("checkTLS = %q, want verify_failed for an untrusted certificate", got)
 	}
@@ -84,7 +85,7 @@ func TestCheckTLSHealthyEndpoint(t *testing.T) {
 	p := NewProber(nil)
 	p.Client = srv.Client() // trusts the test certificate
 
-	if got := p.checkTLS(context.Background(), srv.URL); got != "" {
+	if got := p.checkTLS(context.Background(), p.Client, srv.URL); got != "" {
 		t.Errorf("checkTLS = %q, want empty for a healthy endpoint", got)
 	}
 }
@@ -196,24 +197,110 @@ func TestResolveWithoutAnUpstreamFails(t *testing.T) {
 	}
 }
 
-// TestDialerFallsBackWhenTheLinkCannotResolve keeps a stub-only host working:
-// the system resolver is the only option there, and failing the probe outright
-// would invent a network fault.
-func TestDialerFallsBackWhenTheLinkCannotResolve(t *testing.T) {
-	var asked []string
+// TestDialerFallsBackOnlyWithoutAnUpstream is the line §4.4 draws: no upstream
+// is a reason to use the system resolver, a broken upstream is not. Falling back
+// on a broken link resolver asks the tunnel — after FullTunnel that is what the
+// system resolver is — and reports the relay's DNS as though it were the
+// network's.
+func TestDialerFallsBackOnlyWithoutAnUpstream(t *testing.T) {
+	t.Run("no upstream falls back", func(t *testing.T) {
+		var asked []string
+		u := &UpstreamResolver{
+			Resolve: func(_ context.Context, name string) ([]netip.Addr, error) {
+				asked = append(asked, name)
+				return nil, ErrNoUpstream
+			},
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		// The system resolver will fail for this name, but the point is that it
+		// was tried: the error must not be the link's.
+		_, err := u.Dialer(time.Second)(ctx, "tcp", "no-such-host.invalid:80")
+		if len(asked) != 1 {
+			t.Fatalf("asked the link's resolver %d times, want once", len(asked))
+		}
+		if err != nil && errors.Is(err, ErrNoUpstream) {
+			t.Error("the link's error escaped instead of the system lookup being tried")
+		}
+	})
+
+	t.Run("a broken upstream does not fall back", func(t *testing.T) {
+		u := &UpstreamResolver{
+			Resolve: func(context.Context, string) ([]netip.Addr, error) {
+				return nil, errors.New("upstream timed out")
+			},
+		}
+		start := time.Now()
+		_, err := u.Dialer(time.Second)(context.Background(), "tcp", "captive.apple.com:80")
+		if err == nil {
+			t.Fatal("want an error: a broken link resolver must not silently use the tunnel's")
+		}
+		if strings.Contains(err.Error(), "no such host") {
+			t.Error("the system resolver answered: a broken upstream fell through to the tunnel")
+		}
+		// And it failed fast: no second full timeout for the system lookup.
+		if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+			t.Errorf("took %s: the failed lookup was retried against the system resolver", elapsed)
+		}
+	})
+}
+
+// TestProbeRoundResolvesEachHostOnce is the e2e regression: probe A falls back
+// across three endpoints, and a per-dial lookup made a link with a dead upstream
+// pay its full DNS timeout once per endpoint before any HTTP was attempted —
+// enough to blow a startup budget on exactly the network detection exists for.
+func TestProbeRoundResolvesEachHostOnce(t *testing.T) {
+	// Three endpoints on three hosts, all failing to connect.
+	var (
+		mu      sync.Mutex
+		lookups []string
+	)
 	u := &UpstreamResolver{
+		Interface: "c0",
 		Resolve: func(_ context.Context, name string) ([]netip.Addr, error) {
-			asked = append(asked, name)
-			return nil, errors.New("no upstream")
+			mu.Lock()
+			lookups = append(lookups, name)
+			mu.Unlock()
+			// Slow and failing, like an upstream that has gone away.
+			time.Sleep(80 * time.Millisecond)
+			return nil, errors.New("upstream gone")
 		},
 	}
-	// The fallback resolves through the system, which will not know this name,
-	// so the call fails — the assertion is that the link's resolver was tried
-	// first and the probe was not abandoned for it.
-	d := u.Dialer(50 * time.Millisecond)
-	_, _ = d(context.Background(), "tcp", "no-such-host.invalid:80")
-	if len(asked) != 1 {
-		t.Errorf("asked the link's resolver %d times, want once", len(asked))
+
+	p := NewProber(nil)
+	p.Client = &http.Client{Transport: &http.Transport{
+		// A dialer that never connects, so every endpoint is a no-answer.
+		DialContext: func(context.Context, string, string) (net.Conn, error) {
+			return nil, errors.New("unreachable")
+		},
+	}}
+	p.Endpoints = []Endpoint{
+		{Name: "a", URL: "http://a.invalid/check", Status: http.StatusNoContent},
+		{Name: "b", URL: "http://a.invalid/check2", Status: http.StatusOK},
+		{Name: "c", URL: "http://c.invalid/check", Status: http.StatusOK},
+	}
+	p.Rounds = u
+
+	start := time.Now()
+	p.Probe(context.Background())
+	elapsed := time.Since(start)
+
+	mu.Lock()
+	defer mu.Unlock()
+	hosts := map[string]int{}
+	for _, name := range lookups {
+		hosts[name]++
+	}
+	// Two distinct hosts, so two lookups at most — and only one once the
+	// resolver has shown it is not answering.
+	if hosts["a.invalid"] != 1 {
+		t.Errorf("looked up a.invalid %d times, want once per round", hosts["a.invalid"])
+	}
+	if hosts["c.invalid"] != 0 {
+		t.Errorf("looked up c.invalid %d times after the resolver failed; the round should stop asking", hosts["c.invalid"])
+	}
+	if elapsed > 2*80*time.Millisecond {
+		t.Errorf("round took %s; a dead resolver is being retried per endpoint", elapsed)
 	}
 }
 

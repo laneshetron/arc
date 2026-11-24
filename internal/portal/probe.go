@@ -6,12 +6,14 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/net/html"
@@ -101,6 +103,11 @@ type Prober struct {
 	// Resolver, when set, answers probe B (§4.4). Nil leaves DNS unmeasured,
 	// which is a legitimate outcome on a stub-only or DoH-only host.
 	Resolver DNSProber
+	// Rounds, when set, supplies a per-round dialer for the HTTP checks so
+	// endpoint hostnames resolve on the link once per round rather than once
+	// per dial (§4.1). Nil falls back to the client's own dialer, which uses
+	// whichever resolver the caller configured there.
+	Rounds RoundDialers
 	// DNSName is the canary resolved for probe B. Defaults to canaryName.
 	DNSName string
 	// Now is the clock, for tests. Defaults to time.Now.
@@ -152,6 +159,40 @@ func NewProber(dial func(ctx context.Context, network, addr string) (net.Conn, e
 	}
 }
 
+// RoundDialers supplies a dial function for one detection round. It exists so
+// the HTTP checks can reuse a single hostname lookup across the endpoints they
+// try, without keeping that answer for the next round.
+type RoundDialers interface {
+	// RoundDialer returns the dial function to use for one round, or nil to use
+	// the Prober's client as configured.
+	RoundDialer() func(ctx context.Context, network, addr string) (net.Conn, error)
+}
+
+// clientWith returns a client that behaves like p.Client but dials with dial.
+// The transport is fresh because http.Transport's fields must not change once
+// it is in use, and a previous round's connections may still be closing.
+func (p *Prober) clientWith(dial func(ctx context.Context, network, addr string) (net.Conn, error)) *http.Client {
+	base, _ := p.Client.Transport.(*http.Transport)
+	t := &http.Transport{
+		DialContext:           dial,
+		DisableKeepAlives:     true,
+		ResponseHeaderTimeout: 5 * time.Second,
+		TLSHandshakeTimeout:   5 * time.Second,
+	}
+	if base != nil {
+		// Copy what decides what the probe can see, not what decides where it
+		// goes: the TLS config (so tests' certificates still verify) and the
+		// proxy setting (a probe must not be sent through a proxy the user
+		// configured for ordinary traffic).
+		t.TLSClientConfig = base.TLSClientConfig
+		t.Proxy = base.Proxy
+	}
+	return &http.Client{
+		Transport:     t,
+		CheckRedirect: p.Client.CheckRedirect,
+	}
+}
+
 // Check is one round of detection: the classification evidence plus the
 // details the journal records (§4.7: evidence, never the URL).
 type Check struct {
@@ -183,8 +224,39 @@ type Check struct {
 // a refused connection and a rewritten body are different findings, and §4's
 // P3 rule is that they must not collapse into "unreachable".
 func (p *Prober) Probe(ctx context.Context) Check {
-	c, ep := p.checkEndpoint(ctx)
-	c.DNS, c.DNSErr = p.checkDNS(ctx)
+	// One dial function for the whole round, so probe A's fallback across
+	// endpoints shares one hostname lookup per host (§4.1). Without this a link
+	// whose upstream is dead pays its DNS timeout once per endpoint before any
+	// HTTP is even attempted.
+	//
+	// The transport is rebuilt rather than mutated: http.Transport documents
+	// that its fields must not change once it is in use, and a previous round's
+	// connections may still be closing.
+	client := p.Client
+	if p.Rounds != nil {
+		if dial := p.Rounds.RoundDialer(); dial != nil {
+			client = p.clientWith(dial)
+		}
+	}
+	// Probe A and probe B are independent measurements, so they run together:
+	// in series a link where both are slow costs their sum, and on a captive
+	// network both are exactly the ones that time out. §4.3 orders the
+	// *verdicts*, not the measurements, so concurrency changes nothing about
+	// what is evidence.
+	type dnsResult struct {
+		verdict DNSVerdict
+		err     error
+	}
+	dnsCh := make(chan dnsResult, 1)
+	go func() {
+		v, err := p.checkDNS(ctx)
+		dnsCh <- dnsResult{v, err}
+	}()
+
+	c, ep := p.checkEndpoint(ctx, client)
+
+	d := <-dnsCh
+	c.DNS, c.DNSErr = d.verdict, d.err
 
 	// §4.6: the HTTPS check runs only when plaintext passed, and it runs
 	// against the endpoint that passed. Checking a different endpoint's TLS
@@ -192,7 +264,7 @@ func (p *Prober) Probe(ctx context.Context) Check {
 	// while leaving Gstatic's alone would show a clean Gstatic TLS result and
 	// bury the interception.
 	if c.Check == CheckPass && ep != nil && ep.HTTPSURL != "" {
-		c.TLS = p.checkTLS(ctx, ep.HTTPSURL)
+		c.TLS = p.checkTLS(ctx, client, ep.HTTPSURL)
 	}
 	return c
 }
@@ -201,11 +273,11 @@ func (p *Prober) Probe(ctx context.Context) Check {
 // first that answers usefully, because the first that answers is also the one
 // whose declared criterion applies. It returns that endpoint too, so the TLS
 // check can be matched to it (§4.6).
-func (p *Prober) checkEndpoint(ctx context.Context) (Check, *Endpoint) {
+func (p *Prober) checkEndpoint(ctx context.Context, client *http.Client) (Check, *Endpoint) {
 	var last Check
 	for i := range p.Endpoints {
 		ep := &p.Endpoints[i]
-		c := p.oneEndpoint(ctx, *ep)
+		c := p.oneEndpoint(ctx, *ep, client)
 		if c.Check != CheckNoAnswer {
 			return c, ep
 		}
@@ -216,14 +288,14 @@ func (p *Prober) checkEndpoint(ctx context.Context) (Check, *Endpoint) {
 
 // oneEndpoint runs probe A against a single endpoint, plus probe C when it
 // redirected (§4.5).
-func (p *Prober) oneEndpoint(ctx context.Context, ep Endpoint) Check {
+func (p *Prober) oneEndpoint(ctx context.Context, ep Endpoint, client *http.Client) Check {
 	c := Check{Endpoint: ep.Name}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ep.URL, nil)
 	if err != nil {
 		return c
 	}
-	resp, err := p.Client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return c // CheckNoAnswer: a transport failure is not an HTTP finding
 	}
@@ -249,7 +321,7 @@ func (p *Prober) oneEndpoint(ctx context.Context, ep Endpoint) Check {
 		// no Location at all, and a same-host redirect to somewhere that is
 		// not a login is ordinary web behaviour, so neither is evidence.
 		loc := resp.Header.Get("Location")
-		if v := p.classifyRedirect(ctx, ep.URL, loc); v.evidence {
+		if v := p.classifyRedirect(ctx, client, ep.URL, loc); v.evidence {
 			c.Check = CheckRedirect
 			c.Redirect, c.LoginPage = v.url, v.loginForm
 			return c
@@ -300,7 +372,7 @@ type redirectVerdict struct {
 // host to a path that names a login or to a page that really is one. Anything
 // else — a 304 with no Location, a same-host redirect to "/" — is ordinary web
 // behaviour and must not suppress the user's carriers.
-func (p *Prober) classifyRedirect(ctx context.Context, base, loc string) redirectVerdict {
+func (p *Prober) classifyRedirect(ctx context.Context, client *http.Client, base, loc string) redirectVerdict {
 	if loc == "" {
 		return redirectVerdict{}
 	}
@@ -319,7 +391,7 @@ func (p *Prober) classifyRedirect(ctx context.Context, base, loc string) redirec
 	differentHost := !strings.EqualFold(b.Host, t.Host)
 
 	// Probe C: does the target serve a page, and is it a login page?
-	served, page, contentType := p.fetchPage(ctx, target)
+	served, page, contentType := p.fetchPage(ctx, client, target)
 	pageIsLogin := served && isHTML(contentType, page) && looksLikeLogin(page)
 	// A page that loaded can be shown. Whether it is a *login* page decides the
 	// journal and, for a same-host redirect, whether this is evidence at all.
@@ -397,12 +469,12 @@ func meetsCriterion(ep Endpoint, status int, body []byte) bool {
 //
 // A portal that redirects to a dead host is still a portal, but there is no URL
 // to show — which is why this reports both facts rather than one.
-func (p *Prober) fetchPage(ctx context.Context, target string) (served bool, body []byte, contentType string) {
+func (p *Prober) fetchPage(ctx context.Context, client *http.Client, target string) (served bool, body []byte, contentType string) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
 		return false, nil, ""
 	}
-	resp, err := p.Client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return false, nil, ""
 	}
@@ -553,12 +625,12 @@ func (p *Prober) checkDNS(ctx context.Context) (DNSVerdict, error) {
 // broken middlebox, an expired certificate on the endpoint and a genuine
 // interception are indistinguishable from here — so the journal says
 // "tls=verify_failed", not "tls_intercepted".
-func (p *Prober) checkTLS(ctx context.Context, httpsURL string) string {
+func (p *Prober) checkTLS(ctx context.Context, client *http.Client, httpsURL string) string {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, httpsURL, nil)
 	if err != nil {
 		return "request_failed"
 	}
-	resp, err := p.Client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return classifyTLSError(err)
 	}
@@ -620,11 +692,63 @@ func Dialer(opts sockopt.Options, timeout time.Duration) func(ctx context.Contex
 // here, so the Host header and the TLS server name stay the endpoint's, and
 // certificate verification is unchanged.
 //
-// When the link cannot resolve the name — no discoverable upstream, a stub-only
-// or DoH-only host — the lookup falls back to the system resolver. That is not
-// better than before, but it is the only resolution available, and failing the
-// probe outright would invent a network fault.
+// When the link has no discoverable upstream at all — a stub-only or DoH-only
+// host — the lookup falls back to the system resolver, because there is nothing
+// else to ask. A link that *has* an upstream which fails is different: asking
+// the system then means asking the tunnel, which is what §4.4 forbids, so that
+// case fails rather than measuring the wrong resolver.
+//
+// One lookup serves a whole round. Probe A tries each endpoint in turn, so a
+// per-dial lookup would make a link with a dead resolver pay its full timeout
+// once per endpoint before any HTTP was attempted — 3 s × 3 on a link whose
+// upstream had gone away, which is the situation detection exists for. Caching
+// per Dialer is not enough on its own, because a Dialer lives as long as the
+// detector; see Round.Dialer.
 func (u *UpstreamResolver) Dialer(timeout time.Duration) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	return u.rounded(timeout, nil)
+}
+
+// Round returns a view of this resolver whose lookups are cached for one round.
+// The cache belongs to the round, so a new address or a recovered resolver is
+// picked up by the next check rather than held for the process's life.
+//
+// Its Dialer should be installed on the Prober's client for the duration of
+// that round; NewPerRoundClient is the convenient form.
+func (u *UpstreamResolver) Round() *roundResolver {
+	return &roundResolver{u: u, cache: map[string]lookupResult{}}
+}
+
+// RoundDialer returns a dial function whose hostname lookups live for one round,
+// so probe A's fallback across endpoints shares them (§4.1).
+func (u *UpstreamResolver) RoundDialer() func(ctx context.Context, network, addr string) (net.Conn, error) {
+	return u.Round().Dialer(5 * time.Second)
+}
+
+// roundResolver is an UpstreamResolver with one round's worth of lookups.
+type roundResolver struct {
+	u     *UpstreamResolver
+	mu    sync.Mutex
+	cache map[string]lookupResult
+	// down records that a lookup failed, so the remaining endpoints in this
+	// round fall back immediately instead of each paying the timeout again.
+	down bool
+}
+
+type lookupResult struct {
+	addrs []netip.Addr
+	err   error
+}
+
+// Dialer returns this round's dial function, with the link's socket options.
+func (r *roundResolver) Dialer(timeout time.Duration) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	return r.u.rounded(timeout, r)
+}
+
+// rounded is the shared implementation. When round is non-nil its cache is
+// consulted, so every endpoint in one round shares a single lookup per host —
+// and one failed lookup disables the rest, because a resolver that cannot answer
+// for one host cannot answer for the next.
+func (u *UpstreamResolver) rounded(timeout time.Duration, round *roundResolver) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	d := &net.Dialer{Timeout: timeout, Control: sockopt.Control(u.Sockopt)}
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		host, port, err := net.SplitHostPort(addr)
@@ -634,12 +758,50 @@ func (u *UpstreamResolver) Dialer(timeout time.Duration) func(ctx context.Contex
 		if _, err := netip.ParseAddr(host); err == nil {
 			return d.DialContext(ctx, network, addr) // already an address
 		}
-		addrs, err := u.lookup(ctx, host)
-		if err != nil || len(addrs) == 0 {
-			return d.DialContext(ctx, network, addr)
+
+		r, cached := lookupResult{}, false
+		if round != nil {
+			round.mu.Lock()
+			r, cached = round.cache[host]
+			down := round.down
+			round.mu.Unlock()
+			if down && !cached {
+				// The resolver did not answer for an earlier host this round.
+				// Asking again costs its full timeout for every remaining
+				// endpoint, which is what made a round take fifteen seconds on a
+				// link whose upstream had gone away — the exact situation
+				// detection exists for.
+				return d.DialContext(ctx, network, addr)
+			}
+		}
+		if !cached {
+			r.addrs, r.err = u.lookup(ctx, host)
+			if round != nil {
+				round.mu.Lock()
+				round.cache[host] = r
+				if r.err != nil {
+					round.down = true
+				}
+				round.mu.Unlock()
+			}
+		}
+		if r.err != nil || len(r.addrs) == 0 {
+			// Falling back to the system resolver is only honest when the link
+			// has none of its own. A link whose upstream failed is the case
+			// §4.4 exists for, and asking the system there means asking the
+			// tunnel — which reports the relay's DNS as if it were the
+			// network's, and costs another full timeout per endpoint besides.
+			// So: no upstream, fall back; upstream broken, report unreachable.
+			if errors.Is(r.err, ErrNoUpstream) {
+				return d.DialContext(ctx, network, addr)
+			}
+			if r.err != nil {
+				return nil, r.err
+			}
+			return nil, fmt.Errorf("portal: %s resolved to no addresses", host)
 		}
 		var lastErr error
-		for _, a := range addrs {
+		for _, a := range r.addrs {
 			conn, err := d.DialContext(ctx, network, net.JoinHostPort(a.String(), port))
 			if err == nil {
 				return conn, nil

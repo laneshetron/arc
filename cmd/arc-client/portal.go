@@ -85,6 +85,10 @@ func checkPortal(ctx context.Context, log *slog.Logger, cfg portal.Config, fullT
 			// resolvectl or a DoH-only network degrades to probe A alone
 			// rather than failing.
 			p.Resolver = resolver
+			// Probe A resolves endpoint hostnames on the link too, once per
+			// round: per-dial lookups would cost a dead upstream's full timeout
+			// per endpoint before any HTTP was attempted.
+			p.Rounds = resolver
 			var c portal.Classifier
 			d := &portal.Detector{
 				Prober: p, Classifier: &c,

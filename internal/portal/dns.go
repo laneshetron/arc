@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -74,6 +75,12 @@ func (u *UpstreamResolver) Honesty(ctx context.Context, name string) (DNSVerdict
 	return judgeAnswer(addrs), nil
 }
 
+// ErrNoUpstream reports that the link has no discoverable upstream, so there is
+// nothing to ask. It is different from an upstream that failed: the first means
+// the system resolver is the only option left, the second means the link's DNS is
+// broken and a system answer would come from the tunnel.
+var ErrNoUpstream = errors.New("portal: no upstream on this link")
+
 // resolve returns the addresses a name resolves to on this link, going to the
 // link's own upstreams (§4.4) so the answer describes the physical network
 // rather than the tunnel.
@@ -90,7 +97,8 @@ func (u *UpstreamResolver) resolve(ctx context.Context, name string) ([]netip.Ad
 		return nil, err
 	}
 	if len(servers) == 0 {
-		return nil, fmt.Errorf("portal: no upstream on %s", u.Interface)
+		// A stub-only or DoH-only host has no upstream to ask.
+		return nil, ErrNoUpstream
 	}
 	timeout := u.Timeout
 	if timeout == 0 {
