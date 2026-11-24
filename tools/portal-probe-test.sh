@@ -64,6 +64,31 @@ EOF
   esac
 }
 
+# The real body is 68 characters served as 69 bytes, because the endpoint
+# sends a trailing newline. Command substitution strips it, so the declared
+# body must match — otherwise every healthy network reports a mismatch. I got
+# this wrong once by treating the newline as content.
+test_http_probe_strips_trailing_newline() {
+  local bodyfile="$WORK/body.txt" got
+  cat >"$WORK/nl.sh" <<'EOF'
+have() { [ "$1" = curl ]; }
+mktemp() { printf '%s\n' "$BODYFILE"; }
+curl() {
+  printf '%s\n' "$DECLARED" >"$BODYFILE"
+  printf '200|'
+  return 0
+}
+v=$(http_probe http://x/)
+printf '%s\n' "$v"
+EOF
+  got=$({ defs; cat "$WORK/nl.sh"; } >"$WORK/nl2.sh"
+    BODYFILE="$bodyfile" DECLARED='<HTML>Success</HTML>' bash "$WORK/nl2.sh")
+  case $got in
+    "200||<HTML>Success</HTML>") pass "http_probe: a trailing newline is not part of the body" ;;
+    *) fail "http_probe: got '$got', want the body without the trailing newline" ;;
+  esac
+}
+
 # ---------------------------------------------------------------- tcp_verdict
 # A missing nc must not read as a closed port.
 test_tcp_verdict_without_nc() {
@@ -102,24 +127,25 @@ EOF
 # stubbed probes and read the line it prints.
 portal_verdict_for() { # portal_verdict_for GSTREAM AAPPLE
   local g=$1 a=$2
-  { defs; cat <<EOF
-http_head() {
+  { defs
+    cat <<STUBS
+http_probe() {
   case "\$1" in
-    *gstatic*) printf '%s\n' "$g" ;;
-    *apple*)   printf '%s\n' "$a" ;;
+    *gstatic*) printf '%s\n' '$g' ;;
+    *apple*)   printf '%s\n' '$a' ;;
   esac
 }
 have() { return 0; }
 resolve() { printf '\n'; }
-$(sed -n '/^# Connectivity: is there a portal/,/^# Resolve the Apple push host/p' "$SCRIPT")
-EOF
-} >"$WORK/t5.sh"
-  bash "$WORK/t5.sh" 2>&1 | grep -E '^  portal ' | sed 's/^  portal *//'
+STUBS
+    sed -n '/^# Connectivity: is there a portal/,/^# Resolve the Apple push/p' "$SCRIPT"
+  } >"$WORK/section0.sh"
+  bash "$WORK/section0.sh" 2>&1 | grep -E '^  portal ' | sed 's/^  portal *//'
 }
 
 test_section0_healthy() {
   local got
-  got=$(portal_verdict_for '204|' '200|')
+  got=$(portal_verdict_for '204||' '200||<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>')
   case $got in
     "no cleartext redirect seen"*) pass "section 0: two clean answers read as clean" ;;
     *) fail "section 0: got '$got' for two clean answers" ;;
@@ -128,7 +154,7 @@ test_section0_healthy() {
 
 test_section0_redirect() {
   local got
-  got=$(portal_verdict_for '302|http://portal.example/login' '200|')
+  got=$(portal_verdict_for '302|http://portal.example/login|' '200||Success')
   case $got in
     YES*) pass "section 0: a redirect reads as a portal" ;;
     *)    fail "section 0: got '$got' for a redirect" ;;
@@ -137,17 +163,29 @@ test_section0_redirect() {
 
 test_section0_rewritten() {
   local got
-  got=$(portal_verdict_for '200|' '200|')
+  got=$(portal_verdict_for '200||' '200||')
   case $got in
     YES*) pass "section 0: a rewritten 200 reads as a portal" ;;
     *)    fail "section 0: got '$got' for a rewritten body" ;;
   esac
 }
 
+# §4.1's exact-body rule: a portal that answers 200 with its own page is not a
+# pass, and comparing only the status would let it through. This is the shape
+# a pre-auth interception usually takes.
+test_section0_right_status_wrong_body() {
+  local got
+  got=$(portal_verdict_for '204||' '200||<html><body>Please sign in</body></html>')
+  case $got in
+    YES*) pass "section 0: a 200 with the wrong body reads as a portal" ;;
+    *)    fail "section 0: got '$got' for a 200 carrying a login page" ;;
+  esac
+}
+
 # The regression that matters: no answer must not be announced as a portal.
 test_section0_no_answer() {
   local got
-  got=$(portal_verdict_for 'fail|' 'fail|')
+  got=$(portal_verdict_for 'fail||' 'fail||')
   case $got in
     YES*)        fail "section 0: an unreachable network was reported as redirecting cleartext" ;;
     undetermined*) pass "section 0: no answer reads as undetermined" ;;
@@ -159,7 +197,7 @@ test_section0_no_answer() {
 # the answer we did get is the evidence, and it says the network is open.
 test_section0_one_failure() {
   local got
-  got=$(portal_verdict_for 'fail|' '200|')
+  got=$(portal_verdict_for 'fail||' '200||<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>')
   case $got in
     YES*) fail "section 0: a single failed probe was announced as a portal" ;;
     *)    pass "section 0: a failed gstatic with a clean apple is not a portal" ;;

@@ -134,6 +134,48 @@ tls_probe() {
   esac
 }
 
+# http_probe URL [MAXBYTES] -> "status|redirect|body"
+#
+# The body is needed because two of the three endpoints declare one: a portal
+# that injects its own page into a 200 is not passing the check
+# (captive-portals.md §4.1), and comparing only the status would let it
+# through. Bounded, because a portal page can be large and a hostile one
+# unbounded.
+#
+# One request, not two: the body goes to a file and -w reports the status, so
+# the two cannot disagree about what was fetched.
+http_probe() {
+  local url=$1 max=${2:-4096} bodyfile out rc body status redir
+  have curl || { printf 'no-curl||\n'; return; }
+  bodyfile=$(mktemp "${TMPDIR:-/tmp}/portal-probe.XXXXXX")
+  out=$(curl -sS --max-time "$TIMEOUT" --max-filesize "$max" \
+        -o "$bodyfile" -w '%{http_code}|%{redirect_url}' "$url" 2>/dev/null)
+  rc=$?
+  if [ $rc -ne 0 ] || [ -z "$out" ]; then
+    rm -f "$bodyfile"
+    printf 'fail||\n'
+    return
+  fi
+  status=${out%%|*}
+  redir=${out#*|}
+  body=""
+  if [ -s "$bodyfile" ]; then
+    # Command substitution strips trailing newlines, and these endpoints are
+    # served with one: captive.apple.com sends its 68-character page as 69
+    # bytes. The declared body in §4.1 is the page, so the newline must not
+    # count, or every healthy network reports a body mismatch. CR is stripped
+    # for the same reason on any server that uses CRLF.
+    body=$(tr -d '\r' <"$bodyfile")
+    # An interior newline would break the single-line report, so a body that
+    # genuinely spans lines is reported by size instead.
+    case $body in
+      *$'\n'*) body="<$(wc -c <"$bodyfile" | tr -d ' ') bytes, multi-line>" ;;
+    esac
+  fi
+  rm -f "$bodyfile"
+  printf '%s|%s|%s\n' "$status" "$redir" "$body"
+}
+
 # http_head URL -> "status|redirect_url", with status "fail" when no HTTP
 # answer arrived.
 #
@@ -169,49 +211,52 @@ nc_init
 rule "0. Network state"
 EP_HTTP="http://connectivitycheck.gstatic.com/generate_204"
 EP_APPLE="http://captive.apple.com/hotspot-detect.html"
-# http_head returns "status|redirect_url"; keep the two parts separately so the
-# report and the JSON say the same thing and the portal test is explicit.
-h_full=$(http_head "$EP_HTTP")
-a_full=$(http_head "$EP_APPLE")
-h=${h_full%%|*}
-h_redir=${h_full#*|}
-a_status=${a_full%%|*}
-a_redir=${a_full#*|}
+# The declared healthy body for the Apple endpoint, byte for byte
+# (captive-portals.md §4.1). Comparing only the status would pass a portal
+# that answers 200 with its own page, which is the commonest pre-auth shape.
+APPLE_BODY='<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>'
 
-# Three outcomes per endpoint, not two, because they mean different things
-# (captive-portals.md §4.3.2): the declared answer, an answer that is not the
-# declared one, and no answer at all. Only a *redirect* is positive portal
-# evidence; a rewritten body is evidence of a rewriting middlebox, and a
-# failure is neither. Treating "not 204" as "portal" tells a user the network
-# is redirecting cleartext when what actually happened is that the probe got
-# no reply.
-show_http() { # show_http LABEL STATUS REDIR WANT
-  local label=$1 status=$2 redir=$3 want=$4 note
-  case $status in
-    fail)   note="no answer — unreachable, not a portal verdict" ;;
-    "$want") note="as expected, no redirect" ;;
-    *)      note="answered $status, not $want — cleartext is being rewritten" ;;
-  esac
-  if [ -n "$redir" ]; then
-    note="redirect to $redir — positive portal evidence"
+h_full=$(http_probe "$EP_HTTP")
+a_full=$(http_probe "$EP_APPLE")
+IFS='|' read -r h h_redir h_body <<<"$h_full"
+IFS='|' read -r a_status a_redir a_body <<<"$a_full"
+
+# Four outcomes per endpoint, because they mean different things
+# (captive-portals.md §4.3.2): the declared answer, an answer whose body is
+# not the declared one, a redirect, and no answer at all. A failure is never a
+# portal verdict.
+endpoint_note() { # endpoint_note STATUS REDIR BODY WANT [WANT_BODY]
+  local status=$1 redir=$2 body=$3 want=$4 want_body=${5:-}
+  if [ "$status" = fail ] || [ "$status" = no-curl ]; then
+    echo "no answer — unreachable, not a portal verdict"
+  elif [ -n "$redir" ]; then
+    echo "redirect to $redir — positive portal evidence"
+  elif [ "$status" != "$want" ]; then
+    echo "answered $status, not $want — cleartext is being rewritten"
+  elif [ -n "$want_body" ] && [ "$body" != "$want_body" ]; then
+    # The status matched but the page did not: §4.1's exact-body rule.
+    echo "answered $want with the wrong body (${#body} bytes) — a page is being injected"
+  else
+    echo "as expected, no redirect"
   fi
-  verdict "$label" "$status  $note"
 }
-show_http "gstatic /generate_204" "$h"       "$h_redir" 204
-show_http "apple /hotspot-detect" "$a_status" "$a_redir" 200
+verdict "gstatic /generate_204" "$h  $(endpoint_note "$h" "$h_redir" "$h_body" 204)"
+verdict "apple /hotspot-detect" "$a_status  $(endpoint_note "$a_status" "$a_redir" "$a_body" 200 "$APPLE_BODY")"
 
-# Portal evidence is a redirect, or an answer that is not the declared one.
-# A failure is neither: it is reported as unreachable and leaves the question
-# open, which is what the client's unknown state is for.
+# Portal evidence is a redirect, a wrong status, or a wrong body. A failure is
+# none of them: it is reported as unreachable and leaves the question open,
+# which is what the client's unknown state is for.
 portal=no
 answered=0
-[ "$h" != fail ] && [ "$h" != no-curl ] && answered=1
-[ "$a_status" != fail ] && [ "$a_status" != no-curl ] && answered=1
+for st in "$h" "$a_status"; do
+  [ "$st" = fail ] || [ "$st" = no-curl ] || answered=1
+done
 if [ -n "$h_redir" ] || [ -n "$a_redir" ]; then
   portal=yes
 elif [ "$h" != fail ] && [ "$h" != no-curl ] && [ "$h" != 204 ]; then
   portal=yes
-elif [ "$a_status" != fail ] && [ "$a_status" != no-curl ] && [ "$a_status" != 200 ]; then
+elif [ "$a_status" != fail ] && [ "$a_status" != no-curl ] &&
+     { [ "$a_status" != 200 ] || [ "$a_body" != "$APPLE_BODY" ]; }; then
   portal=yes
 fi
 
