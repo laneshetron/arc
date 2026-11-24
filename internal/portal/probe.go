@@ -1,6 +1,7 @@
 package portal
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -8,9 +9,12 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
 	"time"
+
+	"golang.org/x/net/html"
 
 	"github.com/laneshetron/arc/internal/carrier/sockopt"
 )
@@ -58,6 +62,11 @@ var DefaultEndpoints = []Endpoint{
 		Name:   "gstatic",
 		URL:    "http://connectivitycheck.gstatic.com/generate_204",
 		Status: http.StatusNoContent,
+		// The same path over TLS: generate_204 answers 204 with a valid
+		// certificate, which is what §4.6's check needs. Without it a Gstatic
+		// pass had no HTTPS form of its own, so checkTLS fell back to another
+		// endpoint's certificate and reported on a host the probe never used.
+		HTTPSURL: "https://connectivitycheck.gstatic.com/generate_204",
 	},
 	{
 		Name:   "apple",
@@ -159,6 +168,10 @@ type Check struct {
 	// run. It records what was observed, not a verdict (§4.6): a broken
 	// middlebox and a real interception are indistinguishable from here.
 	TLS string
+	// LoginPage reports that probe C fetched a redirect's target and found a
+	// login form there. It is journal detail; the redirect itself is the
+	// evidence, and a dead target is still evidence without it.
+	LoginPage bool
 	// DNSErr is why probe B could not run, when it could not.
 	DNSErr error
 }
@@ -236,8 +249,9 @@ func (p *Prober) oneEndpoint(ctx context.Context, ep Endpoint) Check {
 		// no Location at all, and a same-host redirect to somewhere that is
 		// not a login is ordinary web behaviour, so neither is evidence.
 		loc := resp.Header.Get("Location")
-		if c.Redirect, c.LoginForm = p.classifyRedirect(ctx, ep.URL, loc); c.Redirect != "" || c.LoginForm {
+		if v := p.classifyRedirect(ctx, ep.URL, loc); v.evidence {
 			c.Check = CheckRedirect
+			c.Redirect, c.LoginPage = v.url, v.loginForm
 			return c
 		}
 		// A redirect that does not qualify is an unexplained mismatch, not a
@@ -255,67 +269,103 @@ func (p *Prober) oneEndpoint(ctx context.Context, ep Endpoint) Check {
 		c.LoginForm = resp.StatusCode == http.StatusOK &&
 			isHTML(resp.Header.Get("Content-Type"), body) &&
 			looksLikeLogin(body)
+		if c.LoginForm {
+			// §4.5's second row: the connectivity host served the login page
+			// itself, so the URL to show is the URL that served it. Without
+			// this the URL is empty and the client tells the user it "cannot
+			// locate" a portal whose address it just fetched.
+			c.Redirect = ep.URL
+		}
 	}
 	return c
 }
 
-// classifyRedirect decides whether a 3xx is portal evidence, per §4.3.2, and
-// returns the usable login URL and whether the target served a login page.
+// redirectVerdict separates the two questions §4.5 insists on separating: does
+// this prove a portal, and is there a URL worth showing? A target that does not
+// load still proves interception; it just leaves nothing to click.
+type redirectVerdict struct {
+	// evidence reports that the redirect proves a portal exists.
+	evidence bool
+	// url is the usable login URL, or "" when the target did not serve a page.
+	url string
+	// loginForm reports that the target served an actual login form, for the
+	// journal. It is not the same as evidence: a dead target is evidence with
+	// no form.
+	loginForm bool
+}
+
+// classifyRedirect decides whether a 3xx is portal evidence, per §4.3.2.
 //
 // A redirect qualifies when it goes to a different host, or within the same
-// host to a path that looks like a login. Anything else — a 304 with no
-// Location, a same-host redirect to "/" — is ordinary web behaviour and must
-// not suppress the user's carriers.
-func (p *Prober) classifyRedirect(ctx context.Context, base, loc string) (portalURL string, loginForm bool) {
+// host to a path that names a login or to a page that really is one. Anything
+// else — a 304 with no Location, a same-host redirect to "/" — is ordinary web
+// behaviour and must not suppress the user's carriers.
+func (p *Prober) classifyRedirect(ctx context.Context, base, loc string) redirectVerdict {
 	if loc == "" {
-		return "", false
+		return redirectVerdict{}
 	}
 	target := resolveRef(base, loc)
 	if target == "" {
-		return "", false
+		return redirectVerdict{}
 	}
 	b, err := url.Parse(base)
 	if err != nil {
-		return "", false
+		return redirectVerdict{}
 	}
 	t, err := url.Parse(target)
 	if err != nil {
-		return "", false
+		return redirectVerdict{}
 	}
 	differentHost := !strings.EqualFold(b.Host, t.Host)
 
 	// Probe C: does the target serve a page, and is it a login page?
 	served, page, contentType := p.fetchPage(ctx, target)
+	pageIsLogin := served && isHTML(contentType, page) && looksLikeLogin(page)
+	// A page that loaded can be shown. Whether it is a *login* page decides the
+	// journal and, for a same-host redirect, whether this is evidence at all.
+	url := ""
+	if served {
+		url = target
+	}
 
 	switch {
-	case differentHost && served:
-		// A different host that serves anything is a portal: no ordinary
-		// endpoint redirects a connectivity check to a third party.
-		return target, false
 	case differentHost:
-		// Proven interception, no usable URL (§4.5).
-		return "", true
-	case served && isHTML(contentType, page) && looksLikeLogin(page):
-		// Same host, but the target is a login page for the portal.
-		return target, true
+		// No ordinary endpoint redirects a connectivity check to a third
+		// party, so the host change alone is proof (§4.3.2). The URL is
+		// whatever the target managed to serve.
+		return redirectVerdict{evidence: true, url: url, loginForm: pageIsLogin}
+	case pageIsLogin:
+		return redirectVerdict{evidence: true, url: target, loginForm: true}
 	case looksLikeLoginPath(t.Path):
-		// Same host and the path names a login, whether or not the page
-		// loaded: "redirect to /login" is the classic portal shape.
-		return target, true
+		// Same host and the path names a login: "redirect to /login" is the
+		// classic portal shape, and it holds whether or not the page loads
+		// (§4.5's third row).
+		return redirectVerdict{evidence: true, url: url}
 	}
-	return "", false
+	return redirectVerdict{}
 }
 
-// loginPathMarkers are the path fragments that name a login page. Coarse on
-// purpose: the alternative is requiring a page fetch that a portal may not
-// serve.
-var loginPathMarkers = []string{"login", "log-in", "signin", "sign-in", "auth", "captive", "portal", "welcome", "connect", "hotspot"}
+// loginPathSegments are path segments that name a login page. Matched against
+// whole segments, not substrings: "connect" as a substring matches
+// "/account-connect" and "/author-bio" matches "auth", and a false positive
+// here tells the user to log in to something that is not a portal.
+var loginPathSegments = map[string]bool{
+	"login": true, "log-in": true, "log_in": true, "logon": true,
+	"signin": true, "sign-in": true, "sign_in": true,
+	"captive": true, "captiveportal": true,
+	"hotspot": true, "welcome": true, "authenticate": true,
+	"portal-login": true,
+}
 
-// looksLikeLoginPath reports whether a URL path names a login page.
+// looksLikeLoginPath reports whether a URL path names a login page, per
+// §4.3.2's "same-host login path".
 func looksLikeLoginPath(path string) bool {
-	p := strings.ToLower(path)
-	for _, m := range loginPathMarkers {
-		if strings.Contains(p, m) {
+	for _, seg := range strings.Split(strings.ToLower(path), "/") {
+		seg = strings.TrimSuffix(seg, ".html")
+		seg = strings.TrimSuffix(seg, ".htm")
+		seg = strings.TrimSuffix(seg, ".php")
+		seg = strings.TrimSuffix(seg, ".asp")
+		if loginPathSegments[seg] {
 			return true
 		}
 	}
@@ -398,19 +448,90 @@ func resolveRef(base, ref string) string {
 	return u.String()
 }
 
-// looksLikeLogin applies §4.3.2's marker test: a login page asks for
-// something only a portal asks for.
+// looksLikeLogin reports whether a body is a login *page*, per §4.3.2: an HTML
+// document containing a form that asks for something a portal asks for.
+//
+// It parses the markup rather than searching the bytes. A substring test over
+// the raw body matches a comment, a script string, an attribute in some
+// unrelated widget, or documentation mentioning "type=\"password\"" — none of
+// which is a form a user can be asked to fill in, and all of which would
+// suppress the user's carriers on an ordinary network.
 func looksLikeLogin(body []byte) bool {
-	if len(body) == 0 {
+	doc, err := html.Parse(bytes.NewReader(body))
+	if err != nil {
 		return false
 	}
-	s := strings.ToLower(string(body))
-	for _, m := range LoginFormMarkers {
-		if strings.Contains(s, m) {
+	var (
+		form   bool
+		secret bool
+	)
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if form && secret {
+			return
+		}
+		if n.Type == html.ElementNode {
+			switch n.Data {
+			case "form":
+				form = true
+			case "input":
+				if looksLikePortalField(attr(n, "type"), attr(n, "name"), attr(n, "id")) {
+					secret = true
+				}
+			case "select", "textarea":
+				if looksLikePortalField("", attr(n, "name"), attr(n, "id")) {
+					secret = true
+				}
+			}
+			// A script or style body is not markup a user interacts with.
+			if n.Data == "script" || n.Data == "style" {
+				return
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(doc)
+
+	// §4.3.2 asks for a form with login fields, and both halves matter: a bare
+	// password input outside any form is a widget, and an empty form is a
+	// search box.
+	return form && secret
+}
+
+// looksLikePortalField reports whether one form control asks for a credential
+// or a portal-specific token.
+//
+// The name list is short because the test has to stay specific: "user",
+// "email" and "password" appear in ordinary sign-in pages, which is exactly why
+// the password *type* is what carries the weight rather than a name.
+func looksLikePortalField(typ, name, id string) bool {
+	if strings.EqualFold(typ, "password") {
+		return true
+	}
+	for _, v := range []string{name, id} {
+		v = strings.ToLower(v)
+		if v == "" {
+			continue
+		}
+		switch v {
+		case "voucher", "room", "roomnumber", "seat", "seatnumber",
+			"terms", "accept_terms", "access_code", "accesscode", "pin":
 			return true
 		}
 	}
 	return false
+}
+
+// attr returns the value of an element's attribute, or "".
+func attr(n *html.Node, key string) string {
+	for _, a := range n.Attr {
+		if strings.EqualFold(a.Key, key) {
+			return a.Val
+		}
+	}
+	return ""
 }
 
 // checkDNS is probe B.
@@ -474,10 +595,65 @@ func classifyTLSError(err error) string {
 // probe traffic bypasses the TUN, which would otherwise measure the relay's
 // egress instead of the network's).
 //
-// The mark and device follow `sockopt.Options`, so a caller that already
-// binds carriers to an interface binds probes the same way. An empty Options
-// leaves them unset, which is correct before the tunnel exists.
+// It does **not** control which resolver answers the hostname in addr, so a
+// Prober built with it still asks the system resolver for every endpoint's
+// address. That is fine before a tunnel exists and wrong after: managed DNS
+// points the system resolver at the tunnel, so the lookup would travel through
+// the very path being diagnosed. Use UpstreamResolver.Dialer instead, which
+// resolves the name on the link first.
 func Dialer(opts sockopt.Options, timeout time.Duration) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	d := &net.Dialer{Timeout: timeout, Control: sockopt.Control(opts)}
 	return d.DialContext
+}
+
+// Dialer returns a dial function for the HTTP probes that resolves each
+// endpoint's hostname through this link's own upstream before connecting, with
+// the link's socket options on the connection.
+//
+// Without it, probe A depends on the system resolver. After `FullTunnel`
+// installs managed DNS that resolver is the tunnel's, so an A/AAAA lookup for
+// the connectivity endpoint either travels through the path it is supposed to
+// test, fails when that path fails (misreporting a portal as unreachable), or
+// answers with an address that does not belong to the bound attachment.
+//
+// The name is what TLS and HTTP still use: only the address is substituted
+// here, so the Host header and the TLS server name stay the endpoint's, and
+// certificate verification is unchanged.
+//
+// When the link cannot resolve the name — no discoverable upstream, a stub-only
+// or DoH-only host — the lookup falls back to the system resolver. That is not
+// better than before, but it is the only resolution available, and failing the
+// probe outright would invent a network fault.
+func (u *UpstreamResolver) Dialer(timeout time.Duration) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	d := &net.Dialer{Timeout: timeout, Control: sockopt.Control(u.Sockopt)}
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return d.DialContext(ctx, network, addr)
+		}
+		if _, err := netip.ParseAddr(host); err == nil {
+			return d.DialContext(ctx, network, addr) // already an address
+		}
+		addrs, err := u.lookup(ctx, host)
+		if err != nil || len(addrs) == 0 {
+			return d.DialContext(ctx, network, addr)
+		}
+		var lastErr error
+		for _, a := range addrs {
+			conn, err := d.DialContext(ctx, network, net.JoinHostPort(a.String(), port))
+			if err == nil {
+				return conn, nil
+			}
+			lastErr = err
+		}
+		return nil, lastErr
+	}
+}
+
+// lookup is resolve, with a hook the tests use to answer without a resolver.
+func (u *UpstreamResolver) lookup(ctx context.Context, name string) ([]netip.Addr, error) {
+	if u.Resolve != nil {
+		return u.Resolve(ctx, name)
+	}
+	return u.resolve(ctx, name)
 }

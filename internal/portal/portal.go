@@ -304,20 +304,6 @@ func hostOf(raw string) string {
 	return u.Host
 }
 
-// LoginFormMarkers are the body markers that identify a login page (§4.3.2):
-// a form asking for something only a portal asks for. The test is over form
-// elements, not content, and is deliberately coarse — it only has to tell a
-// login page from an endpoint that changed its success text.
-var LoginFormMarkers = []string{
-	"type=\"password\"",
-	"type='password'",
-	"name=\"voucher\"",
-	"name='voucher'",
-	"name=\"room\"",
-	"name='room'",
-	"name=\"seat\"",
-	"name='seat'",
-	"name=\"terms\"",
-	"name='terms'",
-	"accept_terms",
-}
+// LoginFormMarkers is gone: login-page detection parses the HTML instead of
+// searching for marker strings, because a substring test over a raw body
+// matches comments, scripts and unrelated attributes. See looksLikeLogin.

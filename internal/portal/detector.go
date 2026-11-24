@@ -23,6 +23,9 @@ type Detector struct {
 	// new state and the evidence. It must not block.
 	OnChange func(State, Check)
 
+	// RoundTimeout bounds one detection round; 0 uses DefaultRoundTimeout.
+	RoundTimeout time.Duration
+
 	mu          sync.Mutex
 	toldUnknown bool
 }
@@ -54,9 +57,77 @@ func (d *Detector) Blocked() (state State, url string) {
 	return d.Classifier.State(), d.Classifier.PortalURL
 }
 
-// Check runs one round now and applies it.
+// RoundTimeout bounds one detection round. It is a field so tests can shorten
+// it, and so a caller with an unusually slow link can raise it.
+func (d *Detector) roundTimeout() time.Duration {
+	if d.RoundTimeout > 0 {
+		return d.RoundTimeout
+	}
+	return DefaultRoundTimeout
+}
+
+// DefaultRoundTimeout bounds a detection round: probe A (with one redirect
+// follow), probe B's queries and the HTTPS check, each of which has a 5 s HTTP
+// or 3 s DNS bound of its own. Fifteen seconds is comfortably more than the sum
+// of a healthy round and still short enough that a stalled portal cannot hold
+// the login wait indefinitely.
+const DefaultRoundTimeout = 15 * time.Second
+
+// Observation is the result of one detection round.
+//
+// Completed says the round ran to its own conclusion rather than being cut off.
+// The distinction matters because a probe's evidence *is* its failure mode: a
+// request cancelled at a deadline looks exactly like one that timed out on its
+// own, and treating the first as the second lets a deadline decide the verdict
+// (§5.1).
+//
+// Cancelled says the *caller's* context ended, as opposed to the round's own
+// timeout. The scheduler stops on the first and carries on after the second —
+// one slow probe must not end the mid-session watch.
+type Observation struct {
+	State     State
+	Check     Check
+	Completed bool
+	Cancelled bool
+}
+
+// Check runs one round and applies its evidence, returning the state afterwards.
+//
+// A round cut off by cancellation applies nothing: the state is whatever it was,
+// and Observe's Completed reports why. Callers that care — the scheduler and the
+// startup wait do — use Observe.
 func (d *Detector) Check(ctx context.Context) State {
+	return d.Observe(ctx).State
+}
+
+// Observe runs one round and applies its evidence unless the round was
+// cancelled.
+//
+// The round is bounded here rather than left to the HTTP client: its timeouts
+// cover the response headers and the TLS handshake, but not a body that stalls
+// after the headers arrive, and `io.LimitReader` bounds size rather than time.
+// A portal — or a broken middlebox — that sends a header and then stops would
+// otherwise hang the login wait or the steady watcher indefinitely.
+func (d *Detector) Observe(ctx context.Context) Observation {
+	outer := ctx
+	ctx, cancel := context.WithTimeout(ctx, d.roundTimeout())
+	defer cancel()
+
 	ev := d.Prober.Probe(ctx)
+
+	// A cancelled round is not an observation. Its evidence is
+	// indistinguishable from a real timeout, so applying it would let a
+	// deadline or a Ctrl-C move the state — including toward `unknown`, which
+	// opens carriers (§6.3).
+	if ctx.Err() != nil {
+		return Observation{
+			State: d.State(),
+			Check: ev,
+			// The round's own timeout is not the caller ending: the scheduler
+			// resumes after it and stops only for the caller.
+			Cancelled: outer.Err() != nil,
+		}
+	}
 
 	d.mu.Lock()
 	before := d.Classifier.State()
@@ -120,7 +191,7 @@ func (d *Detector) Check(ctx context.Context) State {
 	if before != after && d.OnChange != nil {
 		d.OnChange(after, ev)
 	}
-	return after
+	return Observation{State: after, Check: ev, Completed: true}
 }
 
 // Interval returns how long to wait before the next check, per §5's table:
@@ -143,7 +214,9 @@ const (
 )
 
 // Run keeps checking on the cadence §5 sets: the login poll while carriers are
-// blocked, the steady cadence otherwise. It returns the last state it observed.
+// blocked, the steady cadence otherwise. It returns the observation that
+// stopped it — a completed one when `done` was satisfied, a cancelled one when
+// the context ended mid-round.
 //
 // It is the only scheduler in the package, so the startup gate and the
 // mid-session watch cannot drift apart. Run watches: it keeps going until the
@@ -151,31 +224,42 @@ const (
 // is what -portal-keepalive 0 asks for — it disables the expiry check and never
 // the login poll — so Run returns once nothing is blocking.
 //
-// The cadences are the caller's policy — the flags are registered by the
-// command — but the login backoff is not: it is the same rule everywhere, so it
-// lives here.
-func (d *Detector) Run(ctx context.Context, steady, login time.Duration) State {
-	return d.run(ctx, steady, login, func(state State) bool {
+// Both cadences come from the caller's flags, including the login one: the
+// watch passes -portal-poll, not a placeholder, so a client configured for a
+// slower poll behaves the same mid-session as at the gate.
+//
+// The backoff ceiling and the minute-before-backoff are not the caller's: they
+// are the same rule everywhere (§5), so they live here.
+func (d *Detector) Run(ctx context.Context, steady, login time.Duration) Observation {
+	return d.run(ctx, cadence{steady: steady, login: login}, func(state State) bool {
 		return steady == 0 && !state.BlocksCarriers()
 	})
 }
 
-// Wait polls until the attachment is confirmed usable or the context ends, and
-// returns the state that ended it. It is the startup gate's loop.
+// Wait polls until the attachment is not blocked, or the context ends, and
+// returns the observation that ended it. It is the startup gate's loop.
 //
-// Its finish condition is stricter than Run's: only a confirmed pass ends it.
-// StateUnknown is fail-open for carriers (§6.3), but it is not proof a login
-// happened — a portal that stopped answering looks the same — so treating it as
-// a pass would open carriers into a portal behind a page that merely went
-// quiet. The wait keeps polling through it, and -portal-wait is what bounds
-// that.
+// It finishes on any *completed* observation that does not block carriers, and
+// that includes `unknown`. §6.3 is explicit about this: a client that cannot
+// tell whether a portal exists proceeds with a warning, because refusing to
+// start on "probably a portal" strands users on ordinary networks with broken
+// middleboxes, and the first carrier failure then explains itself. Holding the
+// gate on `unknown` instead — which an earlier revision did — means a portal
+// that has been passed but whose canary now answers 503 waits forever, which is
+// the failure §6.3 exists to prevent.
+//
+// The observation is returned rather than the bare state so the caller can tell
+// a completed verdict from a cancelled one. That distinction is the whole
+// reason this returns a struct: a round cut off by -portal-wait produces
+// evidence indistinguishable from a real timeout, and Completed is what keeps a
+// deadline from deciding the verdict.
 //
 // It polls on the login cadence whatever the state, because its only job is to
 // notice a login: -portal-keepalive paces watching a live tunnel, and at the
 // gate there is no tunnel yet.
-func (d *Detector) Wait(ctx context.Context, login time.Duration) State {
-	return d.run(ctx, login, login, func(state State) bool {
-		return state == StateAuthenticated || state == StateNone
+func (d *Detector) Wait(ctx context.Context, login time.Duration) Observation {
+	return d.run(ctx, cadence{steady: login, login: login}, func(state State) bool {
+		return !state.BlocksCarriers()
 	})
 }
 
@@ -183,61 +267,81 @@ func (d *Detector) Wait(ctx context.Context, login time.Duration) State {
 // was passed. It is the predicate Wait finishes on.
 func (s State) Usable() bool { return s == StateNone || s == StateAuthenticated }
 
-// run is the scheduler behind both entry points. done is consulted after each
-// check to decide whether to stop early.
-func (d *Detector) run(ctx context.Context, steady, login time.Duration, done func(State) bool) State {
-	if steady < 0 {
-		steady = 0
-	}
-	// The login cadence is the caller's -portal-poll, honoured as given: a
-	// clamp here would silently ignore the flag. The documented floor and
-	// ceiling apply to the *backoff* (see loginPollMax), not to a value the
-	// operator chose.
-	if login <= 0 {
-		login = loginPollMin
-	}
+// cadence is the two §5 intervals, normalized once.
+type cadence struct {
+	steady time.Duration
+	login  time.Duration
+}
 
-	next := d.Interval(steady, login)
-	backoff := login
-	started := time.Now()
+// normalize fills in a login cadence the caller left unset and makes a negative
+// steady cadence mean "no steady checks" rather than a timer that fires
+// immediately and spins.
+func (c cadence) normalize() cadence {
+	if c.login <= 0 {
+		c.login = loginPollMin
+	}
+	if c.steady < 0 {
+		c.steady = 0
+	}
+	return c
+}
+
+// run is the scheduler behind both entry points. done is consulted after each
+// completed observation to decide whether to stop early, and the observation
+// that ended the loop is returned — including the cancelled one that stopped it
+// without being applied.
+func (d *Detector) run(ctx context.Context, c cadence, done func(State) bool) Observation {
+	c = c.normalize()
+
+	next := d.Interval(c.steady, c.login)
+	// The backoff stretches from the login cadence toward loginPollMax, one
+	// doubling per full minute *of the current episode*. It therefore has to be
+	// measured from when this unauthenticated episode began, not from the last
+	// non-captive observation — an episode that starts after a long authenticated
+	// stretch must still begin at the fast cadence.
+	backoff := c.login
+	var episodeStart time.Time
 
 	t := time.NewTimer(0) // check immediately: §5 runs at startup
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			return d.State()
+			return Observation{State: d.State()}
 		case <-t.C:
 		}
 
-		state := d.Check(ctx)
+		obs := d.Observe(ctx)
 
-		// A cancelled check is not an observation (§5.1): its state is
-		// whatever it was, and acting on it would let a deadline decide the
-		// verdict.
-		if ctx.Err() != nil {
-			return state
+		// A round's own timeout is not a verdict, but it is also not a reason to
+		// stop: the next cadence tries again, and §6.3's fail-open behaviour
+		// comes from a *completed* inconclusive round, not from a slow one.
+		if !obs.Completed && !obs.Cancelled {
+			t.Reset(d.Interval(c.steady, c.login))
+			continue
 		}
-		if done(state) {
-			return state
+		// The caller ending is: its evidence is indistinguishable from a real
+		// timeout, so it must not move the state or be read as a pass.
+		if !obs.Completed || done(obs.State) {
+			return obs
 		}
 
-		// While unauthenticated the poll backs off from the login cadence to
-		// the maximum, but resets whenever the state changes — so a user who
-		// logs in and back out is noticed quickly again.
-		if state == StateUnauthenticated {
-			if time.Since(started) > time.Minute {
+		switch obs.State {
+		case StateUnauthenticated:
+			if episodeStart.IsZero() {
+				episodeStart, backoff = time.Now(), c.login
+			} else if time.Since(episodeStart) > time.Minute {
 				backoff = min(backoff*2, loginPollMax)
 			}
 			next = backoff
-		} else {
-			backoff, started = login, time.Now()
-			next = steady
+		default:
+			episodeStart, backoff = time.Time{}, c.login
+			next = c.steady
 		}
 		if next <= 0 {
 			// A zero cadence in the watch means "login only", which Run's done
 			// has already handled; anything left to do would otherwise spin.
-			return state
+			return obs
 		}
 		t.Reset(next)
 	}

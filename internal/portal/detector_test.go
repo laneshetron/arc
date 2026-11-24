@@ -139,15 +139,190 @@ func TestDetectorRunNoticesLogin(t *testing.T) {
 // TestDetectorWaitNeedsAConfirmedPass is the startup gate's contract: unknown is
 // fail-open for carriers (§6.3) but is not a login, so Wait keeps polling
 // rather than letting a portal that went quiet open carriers into itself.
-func TestDetectorWaitNeedsAConfirmedPass(t *testing.T) {
+// TestDetectorRoundHasADeadline is the review's timing finding: a server that
+// sends headers and then stalls the body must not hold the login wait forever.
+// The HTTP client's own timeouts cover headers and the TLS handshake; the body
+// is bounded by size, not time.
+func TestDetectorRoundHasADeadline(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush() // headers are through; the body never finishes
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer srv.Close()
+
+	p := NewProber(nil)
+	p.Client = srv.Client()
+	p.Endpoints = []Endpoint{{Name: "e", URL: srv.URL, Status: http.StatusNoContent}}
+
+	d := &Detector{Prober: p, Classifier: new(Classifier), RoundTimeout: 80 * time.Millisecond}
+	start := time.Now()
+	obs := d.Observe(context.Background())
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("Observe took %s: the round has no deadline", elapsed)
+	}
+	if obs.Completed {
+		t.Error("a round cut off by its own deadline reported as completed")
+	}
+	if obs.Cancelled {
+		t.Error("a round's own timeout reported as caller cancellation: one slow probe must not end the watch")
+	}
+}
+
+// TestDetectorRoundDeadlineIsNotAVerdict: the deadline must leave the state
+// alone, because a cut-off round's evidence looks exactly like a timeout and
+// three of those would otherwise open carriers by declaring the network
+// unreachable.
+func TestDetectorRoundDeadlineIsNotAVerdict(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer srv.Close()
+
+	p := NewProber(nil)
+	p.Client = srv.Client()
+	p.Endpoints = []Endpoint{{Name: "e", URL: srv.URL, Status: http.StatusNoContent}}
+
+	c := new(Classifier)
+	c.Resume(StateAuthenticated, true)
+	d := &Detector{Prober: p, Classifier: c, RoundTimeout: 60 * time.Millisecond}
+
+	for i := 0; i < 4; i++ { // more than timeoutsToUnknown
+		d.Observe(context.Background())
+	}
+	if got := d.State(); got != StateAuthenticated {
+		t.Errorf("state = %v after four cut-off rounds, want it unchanged", got)
+	}
+}
+
+// TestDetectorRunSurvivesASlowRound is the distinction between the round's own
+// timeout and the caller ending: one stalled probe must not end the mid-session
+// watch, which would leave the tunnel unwatched for the rest of its life.
+func TestDetectorRunSurvivesASlowRound(t *testing.T) {
+	var (
+		mu      sync.Mutex
+		stalled bool
+		probes  int
+	)
+	d := newDetector(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		slow := stalled
+		probes++
+		mu.Unlock()
+		if slow {
+			w.WriteHeader(http.StatusOK)
+			w.(http.Flusher).Flush()
+			<-r.Context().Done() // stall the body past the round timeout
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}), StateUnknown, false)
+	d.RoundTimeout = 40 * time.Millisecond
+	d.Logger = slog.New(slog.DiscardHandler)
+
+	mu.Lock()
+	stalled = true
+	mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+	d.Run(ctx, 20*time.Millisecond, 20*time.Millisecond)
+
+	mu.Lock()
+	n := probes
+	mu.Unlock()
+	// Run returns when ctx ends; the point is that it kept polling through the
+	// stalled rounds rather than returning after the first one.
+	if n < 3 {
+		t.Errorf("probes = %d: Run stopped after a round timed out instead of retrying", n)
+	}
+}
+
+// TestDetectorWaitReturnsInconclusive is §6.3, which the earlier revision's
+// test contradicted: an inconclusive verdict ends a wait — a client that cannot
+// tell proceeds with a warning — but it must come back marked as inconclusive,
+// not as a login.
+func TestDetectorWaitReturnsInconclusive(t *testing.T) {
 	d := newDetector(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable) // mismatch -> unknown
-	}), StateUnknown, false)
+	}), StateUnauthenticated, false)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if got := d.Wait(ctx, 10*time.Millisecond); got != StateUnknown {
-		t.Errorf("Wait = %v, want unknown: an inconclusive check is not a pass", got)
+	got := d.Wait(ctx, 10*time.Millisecond)
+	if !got.Completed {
+		t.Fatal("Wait returned an incomplete observation: it should have finished on a verdict")
+	}
+	if got.State != StateUnknown {
+		t.Errorf("State = %v, want unknown", got.State)
+	}
+	if got.State.Usable() {
+		t.Error("unknown reported as a confirmed pass")
+	}
+}
+
+// TestDetectorWaitNeverAppliesACancelledRound is the cancellation half, and the
+// one the review found: a round cut off by the deadline produces evidence that
+// looks exactly like a timeout, so it must not become the verdict.
+func TestDetectorWaitNeverAppliesACancelledRound(t *testing.T) {
+	blocked := make(chan struct{})
+	defer close(blocked)
+	d := newDetector(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-blocked:
+		case <-r.Context().Done():
+		}
+	}), StateUnauthenticated, false)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
+	defer cancel()
+	got := d.Wait(ctx, 10*time.Millisecond)
+	if got.Completed {
+		t.Fatal("Wait reported a completed observation after cancellation")
+	}
+	if got.State != StateUnauthenticated {
+		t.Errorf("State = %v, want the state it had: a cancelled round applies nothing", got.State)
+	}
+}
+
+// TestDetectorCheckDoesNotApplyACancelledRound is the same guarantee one level
+// down, where it is actually enforced.
+func TestDetectorCheckDoesNotApplyACancelledRound(t *testing.T) {
+	blocked := make(chan struct{})
+	defer close(blocked)
+	d := newDetector(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-blocked:
+		case <-r.Context().Done():
+		}
+	}), StateAuthenticated, true)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	obs := d.Observe(ctx)
+	if obs.Completed {
+		t.Fatal("Observe applied a cancelled round")
+	}
+	if !obs.Cancelled {
+		t.Error("Cancelled = false for a round cut off by the caller")
+	}
+	if got := d.State(); got != StateAuthenticated {
+		t.Errorf("state = %v after a cancelled round, want it unchanged", got)
 	}
 }
 
@@ -161,8 +336,8 @@ func TestDetectorWaitReturnsOnAPass(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	start := time.Now()
-	if got := d.Wait(ctx, 10*time.Millisecond); !got.Usable() {
-		t.Fatalf("Wait = %v, want a usable state", got)
+	if got := d.Wait(ctx, 10*time.Millisecond); !got.State.Usable() {
+		t.Fatalf("Wait = %v, want a usable state", got.State)
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Errorf("Wait took %s: it polled past a pass", elapsed)
@@ -191,7 +366,7 @@ func TestDetectorRunWithNoSteadyCadenceWatchesOnlyForALogin(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	done := make(chan State, 1)
+	done := make(chan Observation, 1)
 	go func() { done <- d.Run(ctx, 0, 10*time.Millisecond) }()
 
 	// The first check finds the portal and Run must keep going: a zero steady
@@ -210,8 +385,8 @@ func TestDetectorRunWithNoSteadyCadenceWatchesOnlyForALogin(t *testing.T) {
 
 	select {
 	case got := <-done:
-		if !got.Usable() {
-			t.Errorf("Run returned %v, want a usable state once the login completed", got)
+		if !got.State.Usable() {
+			t.Errorf("Run returned %v, want a usable state once the login completed", got.State)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run never returned a passing state with a zero steady cadence")

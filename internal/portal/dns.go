@@ -40,6 +40,10 @@ type UpstreamResolver struct {
 	// field so a test can record the address without swapping a package global,
 	// which would race with a probe whose resolver is still winding down.
 	Dial func(ctx context.Context, network, addr string, opts sockopt.Options) (net.Conn, error)
+	// Resolve answers a hostname for the HTTP probes' dialer, so probe A does
+	// not fall back to the system resolver (§4.1). Nil uses the link's
+	// upstreams through resolve.
+	Resolve func(ctx context.Context, name string) ([]netip.Addr, error)
 }
 
 // Honesty resolves name through the link's upstream and reports whether the
@@ -68,6 +72,31 @@ func (u *UpstreamResolver) Honesty(ctx context.Context, name string) (DNSVerdict
 		return DNSUnmeasured, err
 	}
 	return judgeAnswer(addrs), nil
+}
+
+// resolve returns the addresses a name resolves to on this link, going to the
+// link's own upstreams (§4.4) so the answer describes the physical network
+// rather than the tunnel.
+//
+// The first upstream that answers wins. An error means nothing on the link
+// could resolve it, and the caller decides whether to fall back.
+func (u *UpstreamResolver) resolve(ctx context.Context, name string) ([]netip.Addr, error) {
+	discover := u.Discover
+	if discover == nil {
+		discover = discoverUpstream
+	}
+	servers, err := discover(ctx, u.Interface)
+	if err != nil {
+		return nil, err
+	}
+	if len(servers) == 0 {
+		return nil, fmt.Errorf("portal: no upstream on %s", u.Interface)
+	}
+	timeout := u.Timeout
+	if timeout == 0 {
+		timeout = 3 * time.Second
+	}
+	return queryFirst(ctx, servers, name, timeout, u.Sockopt, u.Dial)
 }
 
 // judgeAnswer applies §4.4's rule: an address is anomalous only when it is
@@ -192,6 +221,11 @@ var discoverUpstream = func(ctx context.Context, iface string) ([]netip.Addr, er
 // must avoid.
 func parseResolvectlDNS(out []byte, iface string) []netip.Addr {
 	var addrs []netip.Addr
+	// An unnamed attachment (Linux with policy routing, where no interface is
+	// bound) has no single link to ask. Every link's upstreams are then
+	// candidates: the mark keeps the query on the physical link whichever one
+	// it goes to, and a per-link upstream is still not the stub.
+	anyLink := iface == ""
 	inLink := false
 	sc := bufio.NewScanner(bytes.NewReader(out))
 	for sc.Scan() {
@@ -201,7 +235,7 @@ func parseResolvectlDNS(out []byte, iface string) []netip.Addr {
 		}
 		if strings.HasPrefix(line, "Link ") {
 			// "Link 3 (wlan0): 1.1.1.1 ..."
-			inLink = strings.Contains(line, "("+iface+")")
+			inLink = anyLink || strings.Contains(line, "("+iface+")")
 			if i := strings.Index(line, "):"); i >= 0 && inLink {
 				addrs = append(addrs, parseAddrList(line[i+2:])...)
 			}
@@ -259,14 +293,18 @@ func usableUpstreams(in []netip.Addr) []netip.Addr {
 func parseScutilDNS(out []byte, iface string) []netip.Addr {
 	var addrs []netip.Addr
 	var cur []netip.Addr
-	curMatches := iface == ""
+	// An unnamed attachment (no interface bound) has no single service to ask,
+	// so every resolver is a candidate — otherwise the if_index line below
+	// would clear the initial match and nothing would ever qualify.
+	anyService := iface == ""
+	curMatches := anyService
 
 	flush := func() {
 		if curMatches {
 			addrs = append(addrs, cur...)
 		}
 		cur = nil
-		curMatches = iface == ""
+		curMatches = anyService
 	}
 
 	sc := bufio.NewScanner(bytes.NewReader(out))
@@ -283,7 +321,9 @@ func parseScutilDNS(out []byte, iface string) []netip.Addr {
 			}
 		case strings.HasPrefix(line, "if_index"):
 			// "if_index : 6 (en0)"
-			curMatches = strings.Contains(line, "("+iface+")")
+			if !anyService {
+				curMatches = strings.Contains(line, "("+iface+")")
+			}
 		}
 	}
 	flush()

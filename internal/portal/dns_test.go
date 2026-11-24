@@ -64,6 +64,22 @@ func TestParseResolvectlUnknownLink(t *testing.T) {
 	}
 }
 
+// TestParseResolvectlUnnamedAttachment is the Linux-with-policy-routing case: no
+// interface is bound, and the mark keeps the query on the physical link, so any
+// link's upstream is a usable answer — and better than the stub, which would
+// route through the daemon and into the tunnel.
+func TestParseResolvectlUnnamedAttachment(t *testing.T) {
+	got := parseResolvectlDNS([]byte(resolvectlOutput), "")
+	if len(got) == 0 {
+		t.Fatal("no upstreams for an unnamed attachment: probe B would be unmeasurable on a host that has one")
+	}
+	for _, a := range got {
+		if a.IsLoopback() {
+			t.Errorf("%v: a stub address reached the query list", a)
+		}
+	}
+}
+
 // scutilOutput is abridged real `scutil --dns` output, including a global
 // resolver with no if_index (which must be ignored) and a scoped one.
 const scutilOutput = `DNS configuration
@@ -101,6 +117,22 @@ func TestParseScutilDNS(t *testing.T) {
 	for _, a := range got {
 		if a == netip.MustParseAddr("8.8.8.8") {
 			t.Error("took the global resolver, which is reached through the daemon")
+		}
+	}
+}
+
+// TestParseScutilUnnamedAttachment is the no-interface case: with nothing bound
+// there is no service to select, so any resolver is a candidate rather than
+// none — otherwise probe B would be unmeasurable on a host that plainly has a
+// resolver.
+func TestParseScutilUnnamedAttachment(t *testing.T) {
+	got := parseScutilDNS([]byte(scutilOutput), "")
+	if len(got) == 0 {
+		t.Fatal("no resolvers for an unnamed attachment")
+	}
+	for _, a := range got {
+		if a.IsLoopback() {
+			t.Errorf("%v: a stub address reached the query list", a)
 		}
 	}
 }

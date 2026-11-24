@@ -147,8 +147,8 @@ func TestProbeRedirectFollowsNothingAndProbesTarget(t *testing.T) {
 		if c.Redirect != portalURL {
 			t.Errorf("Redirect = %q, want %q", c.Redirect, portalURL)
 		}
-		if c.LoginForm {
-			t.Error("LoginForm should be false for a redirect: the form is at the target, not here")
+		if !c.LoginPage {
+			t.Error("LoginPage = false: the target served a password form")
 		}
 	})
 
@@ -250,9 +250,21 @@ func TestProbeUnqualifiedRedirectsAreNotEvidence(t *testing.T) {
 		}
 	})
 
-	t.Run("same-host redirect to a login path is evidence", func(t *testing.T) {
+	t.Run("same-host redirect to a live login path yields a URL", func(t *testing.T) {
+		var srvURL string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/check" {
+				http.Redirect(w, r, "/login?next=/", http.StatusFound)
+				return
+			}
+			w.Header().Set("Content-Type", "text/html")
+			w.Write([]byte(`<html><form><input type="password" name="pw"></form></html>`))
+		}))
+		defer srv.Close()
+		srvURL = srv.URL
+
 		p := testProber(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			http.Redirect(w, r, "/login?next=/", http.StatusFound)
+			http.Redirect(w, r, srvURL+"/login?next=/", http.StatusFound)
 		}), Endpoint{Name: "e", Status: http.StatusNoContent})
 
 		c := p.Probe(context.Background())
@@ -260,7 +272,31 @@ func TestProbeUnqualifiedRedirectsAreNotEvidence(t *testing.T) {
 			t.Fatalf("Check = %v, want redirect", c.Check)
 		}
 		if c.Redirect == "" {
-			t.Error("Redirect empty: a same-host login path is a usable URL")
+			t.Error("Redirect empty: the same-host login path served a page")
+		}
+		if !c.LoginPage {
+			t.Error("LoginPage = false: the target served a password form")
+		}
+	})
+
+	// §4.5's third row: a login path that does not load still proves
+	// interception, and still leaves nothing to show. The two answers are
+	// independent, which is why the probe returns them separately.
+	t.Run("same-host redirect to a dead login path is evidence with no URL", func(t *testing.T) {
+		p := testProber(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Every path redirects, so the target never serves a page.
+			http.Redirect(w, r, "/login", http.StatusFound)
+		}), Endpoint{Name: "e", Status: http.StatusNoContent})
+
+		c := p.Probe(context.Background())
+		if c.Check != CheckRedirect {
+			t.Fatalf("Check = %v, want redirect: interception is proven", c.Check)
+		}
+		if c.Redirect != "" {
+			t.Errorf("Redirect = %q, want empty: the target never served a page", c.Redirect)
+		}
+		if got := observe(false, c.Evidence); got != StateUnauthenticated {
+			t.Errorf("state = %v, want unauthenticated", got)
 		}
 	})
 
@@ -394,9 +430,9 @@ func TestResolveRefRejectsOtherSchemes(t *testing.T) {
 	}
 }
 
-// TestLooksLikeLogin covers the marker set against realistic bodies, both
-// ways: it must fire on portals and stay quiet on ordinary pages, because a
-// false positive suppresses every carrier.
+// TestLooksLikeLogin covers form detection both ways: it must fire on portals
+// and stay quiet on ordinary pages, because a false positive suppresses every
+// carrier.
 func TestLooksLikeLogin(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -404,13 +440,29 @@ func TestLooksLikeLogin(t *testing.T) {
 		want bool
 	}{
 		{"password field", `<form><input type="password"></form>`, true},
-		{"single-quoted", `<input type='PASSWORD'>`, true},
-		{"room number", `<input name="room" value="">`, true},
-		{"voucher", `<input name="voucher">`, true},
-		{"terms acceptance", `<input type="checkbox" name="terms">`, true},
+		{"single-quoted attr", `<form><input type='PASSWORD'></form>`, true},
+		{"uppercase attr name", `<FORM><INPUT TYPE="password"></FORM>`, true},
+		{"room number", `<form><input name="room" value=""></form>`, true},
+		{"voucher", `<form><input name="voucher"></form>`, true},
+		{"terms acceptance", `<form><input type="checkbox" name="terms"></form>`, true},
+		{"select of rooms", `<form><select name="room"><option>1</option></select></form>`, true},
 		{"plain success page", `<HTML><BODY>Success</BODY></HTML>`, false},
 		{"error page", `<html>503 Service Unavailable</html>`, false},
 		{"empty", ``, false},
+
+		// The cases a substring test got wrong, and the reason this parses.
+		{"password mentioned in a comment",
+			`<html><!-- the hotel used to render <input type="password"> here --><body>Welcome</body></html>`, false},
+		{"password in a script string",
+			`<html><script>var tpl = '<input type="password" name="pw">';</script><body>OK</body></html>`, false},
+		{"password in documentation",
+			`<html><body><p>Configure it as &lt;input type="password"&gt; in your router.</p></body></html>`, false},
+		{"password input outside any form",
+			`<html><body><input type="password" name="pw"></body></html>`, false},
+		{"empty form",
+			`<html><body><form action="/search"><input name="q"></form></body></html>`, false},
+		{"ordinary sign-in page with only an email field",
+			`<html><body><form><input name="email"></form></body></html>`, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := looksLikeLogin([]byte(tc.body)); got != tc.want {

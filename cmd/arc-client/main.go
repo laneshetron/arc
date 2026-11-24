@@ -18,6 +18,7 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	"slices"
 	"sort"
 	"strings"
 	"syscall"
@@ -267,25 +268,50 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
+	// excluded is the set that stays out of this session: captive at startup,
+	// and with no re-open path, because carriers are opened once below. The
+	// watch keeps probing them anyway so the user hears about them — a portal's
+	// URL, or a link that came back and needs a restart to be used.
+	var excluded []string
 	if len(eligible) == 0 && len(detectors) > 0 {
-		// Every attachment is captive. Wait for one to pass; the default is to
-		// wait indefinitely, because a user who reads "log in, then reconnect"
-		// and reruns by hand is doing what the client could have done.
-		var blocked []string
+		// Every attachment is captive. Wait for one to recover; the default is
+		// to wait indefinitely, because a user who reads "log in, then
+		// reconnect" and reruns by hand is doing what the client could have
+		// done.
 		for iface := range detectors {
-			blocked = append(blocked, iface)
+			excluded = append(excluded, iface)
 		}
-		sort.Strings(blocked)
-		eligible, err = portalWaitMessage(ctx, detectors, blocked, portalCfg, log)
+		sort.Strings(excluded)
+		eligible, err = portalWaitMessage(ctx, detectors, excluded, portalCfg, log)
 		if err != nil {
 			return err
 		}
+		// Whatever did not recover stays excluded and stays watched.
+		recovered := make(map[string]bool, len(eligible))
+		for _, iface := range eligible {
+			recovered[iface] = true
+		}
+		excluded = slices.DeleteFunc(excluded, func(iface string) bool { return recovered[iface] })
+	} else {
+		// Some attachment is usable, so the session starts. The captive ones are
+		// excluded from bind but not from watching: their URL may be the only
+		// way the user learns what the network wants.
+		for iface, d := range detectors {
+			if d.BlocksCarriers() {
+				excluded = append(excluded, iface)
+			}
+		}
+		sort.Strings(excluded)
 	}
 	if len(detectors) > 0 {
 		// Bind only the attachments that are not captive. An empty binds list
 		// would mean every interface, so it becomes the explicit eligible set.
 		binds = eligible
 		log.Info("carrying traffic on the attachments that passed detection", "interfaces", binds)
+		if len(excluded) > 0 {
+			log.Warn("these attachments are behind a portal and will carry nothing until the client restarts",
+				"interfaces", excluded)
+		}
 	}
 
 	dev, err := tun.Create(*tunName, 1280)
@@ -351,8 +377,14 @@ func run(args []string) error {
 	// -portal-keepalive is inert. The loop only observes: on expiry it reports
 	// the state and never releases the tunnel by itself, which is §7.1's
 	// security rule — the network does not get to lower protection.
-	if len(detectors) > 0 && portalCfg.Steady > 0 {
-		go runPortalWatch(ctx, log, detectors, eligible, portalCfg)
+	//
+	// An excluded attachment is watched on the login cadence whatever
+	// -portal-keepalive says: zero disables the expiry check on links that are
+	// carrying traffic, not the client's account of a link the user asked for
+	// and did not get. When every attachment is excluded and the steady cadence
+	// is zero, that is the only watching there is.
+	if len(detectors) > 0 && (portalCfg.Steady > 0 || len(excluded) > 0) {
+		go runPortalWatch(ctx, log, detectors, eligible, excluded, portalCfg)
 	}
 
 	cfg := client.Config{

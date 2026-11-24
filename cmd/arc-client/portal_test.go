@@ -80,7 +80,7 @@ func TestRunPortalWatchReportsExpiry(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		runPortalWatch(ctx, log, detectors, eligible, portal.Config{Steady: 20 * time.Millisecond})
+		runPortalWatch(ctx, log, detectors, eligible, nil, portal.Config{Steady: 20 * time.Millisecond})
 	}()
 
 	mu.Lock()
@@ -179,6 +179,210 @@ func TestPortalWaitDeadlineDuringAProbeIsNotAPass(t *testing.T) {
 	}
 }
 
+// TestAttachmentsResolveTheUnderlay is the macOS P1: with no -bind and no
+// socket marks, an unbound probe follows the default route — which, once
+// full-tunnel routing is installed, is the TUN. Detection would then measure
+// ARC itself, and probe B would have no link to discover an upstream for.
+func TestAttachmentsResolveTheUnderlay(t *testing.T) {
+	orig := underlayInterface
+	defer func() { underlayInterface = orig }()
+
+	var asked int
+	underlayInterface = func() (string, error) {
+		asked++
+		return "en0", nil
+	}
+
+	got, err := attachments(false, nil, testLogger())
+	if err != nil {
+		t.Fatalf("attachments = %v", err)
+	}
+	if len(got) != 1 || got[0] != "en0" {
+		t.Errorf("attachments = %v, want the resolved underlay", got)
+	}
+	if asked != 1 {
+		t.Errorf("asked for the underlay %d times, want once", asked)
+	}
+
+	// An explicit bind is left alone: the user named the link.
+	got, err = attachments(false, []string{"wlan0"}, testLogger())
+	if err != nil {
+		t.Fatalf("attachments = %v", err)
+	}
+	if len(got) != 1 || got[0] != "wlan0" {
+		t.Errorf("attachments = %v, want the explicit bind untouched", got)
+	}
+}
+
+// TestAttachmentsResolveAnEmptyEntry covers a mixes case: -bind with an empty
+// entry, which OpenCarriers resolves the same way.
+func TestAttachmentsResolveAnEmptyEntry(t *testing.T) {
+	orig := underlayInterface
+	defer func() { underlayInterface = orig }()
+	underlayInterface = func() (string, error) { return "en0", nil }
+
+	got, err := attachments(false, []string{"", "wwan0"}, testLogger())
+	if err != nil {
+		t.Fatalf("attachments = %v", err)
+	}
+	want := []string{"en0", "wwan0"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("attachments = %v, want %v", got, want)
+	}
+}
+
+// TestAttachmentsToleratesAMissingUnderlay is the Linux-with-police-routing
+// case: tun.Underlay returns "" and nothing fails, because the mark is what
+// keeps traffic on the link.
+func TestAttachmentsToleratesAMissingUnderlay(t *testing.T) {
+	orig := underlayInterface
+	defer func() { underlayInterface = orig }()
+	underlayInterface = func() (string, error) { return "", nil }
+
+	got, err := attachments(false, nil, testLogger())
+	if err != nil {
+		t.Fatalf("attachments = %v", err)
+	}
+	if len(got) != 1 || got[0] != "" {
+		t.Errorf("attachments = %v, want the unnamed default attachment", got)
+	}
+}
+
+// TestPortalDetectorsNameTheirInterface is the journal follow-up: with two
+// attachments, a line that does not say which one it is about cannot answer the
+// question per-attachment detection exists for.
+func TestPortalDetectorsNameTheirInterface(t *testing.T) {
+	var buf strings.Builder
+	log := slog.New(slog.NewTextHandler(writerFunc(func(p []byte) (int, error) {
+		return buf.Write(p)
+	}), nil))
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "http://127.0.0.1:1/login", http.StatusFound)
+	}))
+	defer srv.Close()
+
+	detectors, _, err := checkPortal(context.Background(), log, portal.Config{
+		Mode:     portal.CheckForce,
+		ProbeURL: srv.URL,
+		Expect:   portal.Expectation{Status: http.StatusNoContent},
+	}, false, []string{"wlan0"}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(detectors) != 1 {
+		t.Fatalf("detectors = %d, want one", len(detectors))
+	}
+	for _, d := range detectors {
+		d.Check(context.Background())
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "wlan0") {
+		t.Errorf("no journal line names the attachment:\n%s", out)
+	}
+}
+
+// TestRunPortalWatchReportsAnExcludedAttachment is the review's admission
+// finding, handled as a stated limitation: carriers are opened once, so a link
+// that was captive at startup cannot join this session — but the user must hear
+// about it, both while it blocks and when it recovers.
+func TestRunPortalWatchReportsAnExcludedAttachment(t *testing.T) {
+	var (
+		mu      sync.Mutex
+		logs    strings.Builder
+		recover bool
+	)
+	isRecovered := func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return recover
+	}
+	d := portalDetector(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isRecovered() {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		http.Redirect(w, r, "http://127.0.0.1:1/login", http.StatusFound)
+	}), portal.StateUnauthenticated)
+
+	log := slog.New(slog.NewTextHandler(writerFunc(func(p []byte) (int, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		return logs.Write(p)
+	}), nil))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	detectors, excluded := oneAttachment(d)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runPortalWatch(ctx, log, detectors, nil, excluded,
+			portal.Config{Steady: 20 * time.Millisecond, Login: 20 * time.Millisecond})
+	}()
+
+	mu.Lock()
+	recover = true
+	mu.Unlock()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for d.State() != portal.StateAuthenticated && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runPortalWatch did not return when the context ended")
+	}
+
+	mu.Lock()
+	out := logs.String()
+	mu.Unlock()
+	if !strings.Contains(out, "not carrying traffic") {
+		t.Errorf("journal does not say the recovered attachment is excluded:\n%s", out)
+	}
+	if strings.Contains(out, "portal check passed") {
+		t.Errorf("an excluded attachment's recovery was logged as a normal pass:\n%s", out)
+	}
+}
+
+// TestRunPortalWatchPassesTheConfiguredLoginCadence guards the review's
+// cadence finding: Run must be given -portal-poll, not a placeholder, or a
+// client configured for a slower poll behaves differently mid-session than at
+// the gate. The count of requests is what makes that observable.
+func TestRunPortalWatchPassesTheConfiguredLoginCadence(t *testing.T) {
+	var (
+		mu     sync.Mutex
+		probes int
+	)
+	d := portalDetector(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		probes++
+		mu.Unlock()
+		http.Redirect(w, r, "http://127.0.0.1:1/login", http.StatusFound)
+	}), portal.StateUnauthenticated)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	detectors, eligible := oneAttachment(d)
+	// The watch waits one steady interval before starting, so that has to be
+	// short. The assertion is about the *login* cadence: an unauthenticated
+	// attachment polls at cfg.Login, and with the placeholder (0, normalized to
+	// ten seconds) there would be one probe rather than several.
+	go runPortalWatch(ctx, testLogger(), detectors, eligible, nil,
+		portal.Config{Steady: 20 * time.Millisecond, Login: 30 * time.Millisecond})
+
+	time.Sleep(250 * time.Millisecond)
+	mu.Lock()
+	n := probes
+	mu.Unlock()
+	if n < 3 {
+		t.Errorf("probes = %d in 250ms at a 30ms login cadence; the watch is not using it", n)
+	}
+}
+
 // TestPortalGateBlocksAndWaitsForLogin is §6.1 and §5 together: behind a
 // portal the client does not proceed, and it proceeds by itself once the user
 // logs in — which is what stops "reconnect by hand" from being the instruction.
@@ -269,27 +473,38 @@ func TestPortalGateHonoursCancellation(t *testing.T) {
 	}
 }
 
-// TestPortalGateDoesNotTreatUnknownAsPassed is the bug the review caught: a
-// poll that is cut off by the wait expiring leaves the state unknown, and
-// unknown is fail-open — so reading "not blocking" as "passed" would open
-// carriers into a portal.
-func TestPortalGateDoesNotTreatUnknownAsPassed(t *testing.T) {
-	// An endpoint that never answers: three polls make the state unknown.
+// TestPortalGateProceedsOnUnknownWithAWarning is §6.3, which the earlier
+// revision contradicted: an inconclusive verdict proceeds with a warning,
+// because refusing to start on "probably a portal" strands users on ordinary
+// networks with broken middleboxes. The distinction that must survive is
+// cancellation — that is TestPortalWaitDeadlineDuringAProbeIsNotAPass.
+func TestPortalGateProceedsOnUnknownWithAWarning(t *testing.T) {
+	// An answered-but-wrong response: a mismatch, which classifies as unknown.
 	d := portalDetector(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusServiceUnavailable) // a mismatch -> unknown
-	}), portal.StateUnknown)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}), portal.StateUnauthenticated)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	detectors, blocked := oneAttachment(d)
-	cfg := portal.Config{Login: 30 * time.Millisecond, Wait: 120 * time.Millisecond}
-	passed, err := portalWaitMessage(ctx, detectors, blocked, cfg, testLogger())
-	if err == nil {
-		t.Fatalf("passed = %v with no error: an unresolved portal must not be treated as a login", passed)
+	var logs strings.Builder
+	log := slog.New(slog.NewTextHandler(&logs, nil))
+	cfg := portal.Config{Login: 30 * time.Millisecond}
+	passed, err := portalWaitMessage(ctx, detectors, blocked, cfg, log)
+	if err != nil {
+		t.Fatalf("portalWaitMessage = %v, want it to proceed: an inconclusive verdict is fail-open", err)
 	}
-	if len(passed) != 0 {
-		t.Errorf("passed = %v, want none", passed)
+	if len(passed) != 1 || passed[0] != "wlan0" {
+		t.Errorf("passed = %v, want the attachment included", passed)
+	}
+	// Proceeding must not be sold as a login, which is the other half of the
+	// review's point.
+	if strings.Contains(logs.String(), "portal passed") {
+		t.Errorf("logged a completed login for an inconclusive verdict:\n%s", logs.String())
+	}
+	if !strings.Contains(logs.String(), "inconclusive") {
+		t.Errorf("the journal does not say the verdict was inconclusive:\n%s", logs.String())
 	}
 }
 
