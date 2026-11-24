@@ -10,6 +10,8 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/laneshetron/arc/internal/carrier/sockopt"
 )
 
 // UpstreamResolver answers probe B through the physical link's own upstream
@@ -29,6 +31,15 @@ type UpstreamResolver struct {
 	Discover func(ctx context.Context, iface string) ([]netip.Addr, error)
 	// Timeout bounds each query. Defaults to 3s.
 	Timeout time.Duration
+	// Socket options for the query, so the lookup binds to the link and
+	// bypasses the TUN like every other probe (§4.1). An ordinary dialer here
+	// would route the query through the tunnel once full-tunnel routing is
+	// installed, which measures relay-side DNS and always looks honest.
+	Sockopt sockopt.Options
+	// Dial delivers each query. Nil uses a net.Dialer applying Sockopt; it is a
+	// field so a test can record the address without swapping a package global,
+	// which would race with a probe whose resolver is still winding down.
+	Dial func(ctx context.Context, network, addr string, opts sockopt.Options) (net.Conn, error)
 }
 
 // Honesty resolves name through the link's upstream and reports whether the
@@ -52,7 +63,7 @@ func (u *UpstreamResolver) Honesty(ctx context.Context, name string) (DNSVerdict
 	if timeout == 0 {
 		timeout = 3 * time.Second
 	}
-	addrs, err := queryFirst(ctx, servers, name, timeout)
+	addrs, err := queryFirst(ctx, servers, name, timeout, u.Sockopt, u.Dial)
 	if err != nil {
 		return DNSUnmeasured, err
 	}
@@ -109,11 +120,14 @@ func implausible(a netip.Addr) bool {
 
 // queryFirst asks each server in turn, returning the first answer. Port 53 is
 // assumed unless an address carries one.
-func queryFirst(ctx context.Context, servers []netip.Addr, name string, timeout time.Duration) ([]netip.Addr, error) {
+func queryFirst(ctx context.Context, servers []netip.Addr, name string, timeout time.Duration, opts sockopt.Options, dial dialFunc) ([]netip.Addr, error) {
+	if dial == nil {
+		dial = dialContext
+	}
 	var lastErr error
 	for _, s := range servers {
 		c, cancel := context.WithTimeout(ctx, timeout)
-		addrs, err := lookupWith(c, s, name)
+		addrs, err := lookupWith(c, s, name, opts, dial)
 		cancel()
 		if err == nil {
 			return addrs, nil
@@ -128,10 +142,15 @@ func queryFirst(ctx context.Context, servers []netip.Addr, name string, timeout 
 
 // lookupWith resolves name against one explicit server, keeping the query off
 // the system resolver and therefore off the TUN.
-func lookupWith(ctx context.Context, server netip.Addr, name string) ([]netip.Addr, error) {
-	r := &net.Resolver{PreferGo: true, Dial: upstreamDial(server)}
+func lookupWith(ctx context.Context, server netip.Addr, name string, opts sockopt.Options, dial dialFunc) ([]netip.Addr, error) {
+	r := &net.Resolver{PreferGo: true, Dial: upstreamDial(server, opts, dial)}
 	return r.LookupNetIP(ctx, "ip", name)
 }
+
+// dialFunc connects to addr applying opts. It is a parameter rather than a
+// package-level variable so a test can substitute one without racing a probe
+// whose resolver goroutines are still winding down.
+type dialFunc func(ctx context.Context, network, addr string, opts sockopt.Options) (net.Conn, error)
 
 // upstreamDial returns the Dial function that redirects every query to one
 // server, ignoring the address the resolver passes — which is the system's,
@@ -139,16 +158,18 @@ func lookupWith(ctx context.Context, server netip.Addr, name string) ([]netip.Ad
 //
 // Named and exported to the package's tests so the redirection can be asserted
 // directly instead of by counting packets.
-func upstreamDial(server netip.Addr) func(ctx context.Context, network, _ string) (net.Conn, error) {
+func upstreamDial(server netip.Addr, opts sockopt.Options, dial dialFunc) func(ctx context.Context, network, _ string) (net.Conn, error) {
+	if dial == nil {
+		dial = dialContext
+	}
 	return func(ctx context.Context, network, _ string) (net.Conn, error) {
-		return dialContext(ctx, network, net.JoinHostPort(server.String(), "53"))
+		return dial(ctx, network, net.JoinHostPort(server.String(), "53"), opts)
 	}
 }
 
-// dialContext is net.Dialer.DialContext, indirected so a test can assert the
-// address without opening a socket.
-var dialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-	var d net.Dialer
+// dialContext is net.Dialer.DialContext with the socket options applied.
+func dialContext(ctx context.Context, network, addr string, opts sockopt.Options) (net.Conn, error) {
+	d := net.Dialer{Control: sockopt.Control(opts)}
 	return d.DialContext(ctx, network, addr)
 }
 

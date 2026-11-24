@@ -35,6 +35,15 @@ type Endpoint struct {
 	// that injects its own page into a 200 is not passing the check, so this
 	// is an equality test rather than a substring one.
 	Body string
+	// Substr, when set, must appear in the body. It exists only for a
+	// -portal-probe the operator wrote an expectation for: an operator-written
+	// expectation is the one place a fuzzy match is what was asked for, and
+	// the built-in endpoints never use it.
+	//
+	// It is not interchangeable with dropping the check: an expectation of
+	// "200:Success" that ignored the substring would accept a login page that
+	// also answered 200, which is the failure this field prevents.
+	Substr string
 	// HTTPSURL, when set, is the same endpoint over TLS. It is checked only
 	// after the plaintext check passes, to catch a portal that leaves
 	// cleartext alone but intercepts TLS (§4.6).
@@ -161,30 +170,35 @@ type Check struct {
 // a refused connection and a rewritten body are different findings, and §4's
 // P3 rule is that they must not collapse into "unreachable".
 func (p *Prober) Probe(ctx context.Context) Check {
-	c := p.checkEndpoint(ctx)
+	c, ep := p.checkEndpoint(ctx)
 	c.DNS, c.DNSErr = p.checkDNS(ctx)
 
-	// §4.6: an HTTPS check runs only when plaintext passed, and its failure
-	// lowers confidence without changing the state.
-	if c.Check == CheckPass {
-		c.TLS = p.checkTLS(ctx)
+	// §4.6: the HTTPS check runs only when plaintext passed, and it runs
+	// against the endpoint that passed. Checking a different endpoint's TLS
+	// answers a question nobody asked: a portal that rewrites Apple's page
+	// while leaving Gstatic's alone would show a clean Gstatic TLS result and
+	// bury the interception.
+	if c.Check == CheckPass && ep != nil && ep.HTTPSURL != "" {
+		c.TLS = p.checkTLS(ctx, ep.HTTPSURL)
 	}
 	return c
 }
 
 // checkEndpoint is probe A. It tries the endpoints in order and returns the
 // first that answers usefully, because the first that answers is also the one
-// whose declared criterion applies.
-func (p *Prober) checkEndpoint(ctx context.Context) Check {
+// whose declared criterion applies. It returns that endpoint too, so the TLS
+// check can be matched to it (§4.6).
+func (p *Prober) checkEndpoint(ctx context.Context) (Check, *Endpoint) {
 	var last Check
-	for _, ep := range p.Endpoints {
-		c := p.oneEndpoint(ctx, ep)
+	for i := range p.Endpoints {
+		ep := &p.Endpoints[i]
+		c := p.oneEndpoint(ctx, *ep)
 		if c.Check != CheckNoAnswer {
-			return c
+			return c, ep
 		}
 		last = c
 	}
-	return last
+	return last, nil
 }
 
 // oneEndpoint runs probe A against a single endpoint, plus probe C when it
@@ -212,27 +226,100 @@ func (p *Prober) oneEndpoint(ctx context.Context, ep Endpoint) Check {
 	}
 	c.BodyBytes = len(body)
 
+	// The body is needed for two things: an exact-body criterion, and the login
+	// markers of §4.3.2. Read it before classifying, but only as far as the
+	// criterion could need it.
 	switch {
 	case resp.StatusCode >= 300 && resp.StatusCode < 400:
-		// A redirect is positive portal evidence whether or not its target
-		// is alive (§4.5). Probe C asks whether there is a usable URL.
-		c.Check = CheckRedirect
-		if loc := resp.Header.Get("Location"); loc != "" {
-			if target := resolveRef(ep.URL, loc); target != "" && p.servesPage(ctx, target) {
-				c.Redirect = target
-			}
+		// §4.3.2: a redirect is portal evidence only when its Location
+		// qualifies — a different host, or a same-host login path. A 304 has
+		// no Location at all, and a same-host redirect to somewhere that is
+		// not a login is ordinary web behaviour, so neither is evidence.
+		loc := resp.Header.Get("Location")
+		if c.Redirect, c.LoginForm = p.classifyRedirect(ctx, ep.URL, loc); c.Redirect != "" || c.LoginForm {
+			c.Check = CheckRedirect
+			return c
 		}
+		// A redirect that does not qualify is an unexplained mismatch, not a
+		// portal.
+		c.Check = CheckMismatch
 
 	case meetsCriterion(ep, resp.StatusCode, body):
 		c.Check = CheckPass
 
 	default:
 		c.Check = CheckMismatch
-		// A login page served by the connectivity host itself has no
-		// redirect to follow, so the body is the only evidence (§4.5).
-		c.LoginForm = looksLikeLogin(body)
+		// §4.3.2 asks for an HTML page with actual login-form elements, not
+		// any body containing a marker word: a 503 whose text happens to
+		// include "accept_terms" is an error page, not a portal.
+		c.LoginForm = resp.StatusCode == http.StatusOK &&
+			isHTML(resp.Header.Get("Content-Type"), body) &&
+			looksLikeLogin(body)
 	}
 	return c
+}
+
+// classifyRedirect decides whether a 3xx is portal evidence, per §4.3.2, and
+// returns the usable login URL and whether the target served a login page.
+//
+// A redirect qualifies when it goes to a different host, or within the same
+// host to a path that looks like a login. Anything else — a 304 with no
+// Location, a same-host redirect to "/" — is ordinary web behaviour and must
+// not suppress the user's carriers.
+func (p *Prober) classifyRedirect(ctx context.Context, base, loc string) (portalURL string, loginForm bool) {
+	if loc == "" {
+		return "", false
+	}
+	target := resolveRef(base, loc)
+	if target == "" {
+		return "", false
+	}
+	b, err := url.Parse(base)
+	if err != nil {
+		return "", false
+	}
+	t, err := url.Parse(target)
+	if err != nil {
+		return "", false
+	}
+	differentHost := !strings.EqualFold(b.Host, t.Host)
+
+	// Probe C: does the target serve a page, and is it a login page?
+	served, page, contentType := p.fetchPage(ctx, target)
+
+	switch {
+	case differentHost && served:
+		// A different host that serves anything is a portal: no ordinary
+		// endpoint redirects a connectivity check to a third party.
+		return target, false
+	case differentHost:
+		// Proven interception, no usable URL (§4.5).
+		return "", true
+	case served && isHTML(contentType, page) && looksLikeLogin(page):
+		// Same host, but the target is a login page for the portal.
+		return target, true
+	case looksLikeLoginPath(t.Path):
+		// Same host and the path names a login, whether or not the page
+		// loaded: "redirect to /login" is the classic portal shape.
+		return target, true
+	}
+	return "", false
+}
+
+// loginPathMarkers are the path fragments that name a login page. Coarse on
+// purpose: the alternative is requiring a page fetch that a portal may not
+// serve.
+var loginPathMarkers = []string{"login", "log-in", "signin", "sign-in", "auth", "captive", "portal", "welcome", "connect", "hotspot"}
+
+// looksLikeLoginPath reports whether a URL path names a login page.
+func looksLikeLoginPath(path string) bool {
+	p := strings.ToLower(path)
+	for _, m := range loginPathMarkers {
+		if strings.Contains(p, m) {
+			return true
+		}
+	}
+	return false
 }
 
 // meetsCriterion reports whether a response is the one the endpoint declares.
@@ -245,31 +332,52 @@ func meetsCriterion(ep Endpoint, status int, body []byte) bool {
 		return false
 	}
 	if ep.Body != "" {
+		// Exact: an injected page is not the declared one (§4.1).
 		return string(body) == ep.Body
+	}
+	if ep.Substr != "" {
+		return strings.Contains(string(body), ep.Substr)
 	}
 	return true
 }
 
-// servesPage is probe C: fetch the redirect target once, without following
-// further redirects, and report whether it serves a page. A portal that
-// redirects to a dead host is still a portal, but there is no URL to show.
-func (p *Prober) servesPage(ctx context.Context, target string) bool {
+// fetchPage is probe C: fetch a redirect target once, without following
+// further redirects, and report whether it serves a page, the body (bounded)
+// and its content type.
+//
+// A portal that redirects to a dead host is still a portal, but there is no URL
+// to show — which is why this reports both facts rather than one.
+func (p *Prober) fetchPage(ctx context.Context, target string) (served bool, body []byte, contentType string) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
-		return false
+		return false, nil, ""
 	}
 	resp, err := p.Client.Do(req)
 	if err != nil {
-		return false
+		return false, nil, ""
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return false
+		return false, nil, ""
 	}
-	// Any body at all means something is served there. A 200 with no body is
-	// a captive host answering, not a login page.
-	n, _ := io.Copy(io.Discard, io.LimitReader(resp.Body, 1))
-	return n > 0
+	body, _ = io.ReadAll(io.LimitReader(resp.Body, maxBody))
+	// Any body at all means something is served there. A 200 with no body is a
+	// captive host answering, not a login page.
+	return len(body) > 0, body, resp.Header.Get("Content-Type")
+}
+
+// isHTML reports whether a body is HTML, by content type when the server
+// states one and by a sniff when it does not. §4.3.2 asks for a login *page*,
+// so a plain-text body cannot qualify whatever words it contains.
+func isHTML(contentType string, body []byte) bool {
+	ct := strings.ToLower(contentType)
+	if ct != "" {
+		return strings.Contains(ct, "text/html") || strings.Contains(ct, "application/xhtml")
+	}
+	// No content type: sniff the start of the body.
+	head := strings.ToLower(strings.TrimSpace(string(body[:min(len(body), 200)])))
+	return strings.HasPrefix(head, "<!doctype html") || strings.HasPrefix(head, "<html") ||
+		strings.Contains(head, "<form") || strings.Contains(head, "<body")
 }
 
 // resolveRef resolves a Location against the request URL. Bare Locations
@@ -324,12 +432,8 @@ func (p *Prober) checkDNS(ctx context.Context) (DNSVerdict, error) {
 // broken middlebox, an expired certificate on the endpoint and a genuine
 // interception are indistinguishable from here — so the journal says
 // "tls=verify_failed", not "tls_intercepted".
-func (p *Prober) checkTLS(ctx context.Context) string {
-	ep := p.tlsEndpoint()
-	if ep == nil {
-		return ""
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ep.HTTPSURL, nil)
+func (p *Prober) checkTLS(ctx context.Context, httpsURL string) string {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, httpsURL, nil)
 	if err != nil {
 		return "request_failed"
 	}
@@ -340,16 +444,6 @@ func (p *Prober) checkTLS(ctx context.Context) string {
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1))
 	return ""
-}
-
-// tlsEndpoint returns the first endpoint that has an HTTPS check.
-func (p *Prober) tlsEndpoint() *Endpoint {
-	for i := range p.Endpoints {
-		if p.Endpoints[i].HTTPSURL != "" {
-			return &p.Endpoints[i]
-		}
-	}
-	return nil
 }
 
 // classifyTLSError names the observed failure, per §4.6's table. The result

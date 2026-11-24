@@ -95,8 +95,7 @@ func (e Expectation) Endpoint(rawURL string) Endpoint {
 		Name:   "custom",
 		URL:    rawURL,
 		Status: e.Status,
-		// A substring expectation is applied by matchesCustom, below, rather
-		// than by the exact-body rule, so Body stays empty here.
+		Substr: e.Substr,
 	}
 }
 

@@ -173,11 +173,16 @@ const timeoutsToUnknown = 3
 // boolean precisely because "a portal has been seen here" does not decay into
 // a position in an ordering.
 type Classifier struct {
-	// PortalSeen and PortalHost persist per network attachment and survive a
-	// tunnel restart on it. PortalHost only decides whether a login URL can
-	// be shown (§4.5), never the state.
+	// PortalSeen and PortalURL persist per network attachment and survive a
+	// tunnel restart on it.
+	//
+	// PortalURL is the transient login URL in full — scheme, host, path and
+	// query — because portals need their exact path ("/login?ref=…") and a
+	// user sent to the bare host often lands somewhere that does not work.
+	// §4.7's redaction applies at the diagnostics boundary, not here: the
+	// user must see the real URL (§4.7).
 	PortalSeen bool
-	PortalHost string
+	PortalURL  string
 
 	// DNS is the last probe-B verdict, for reporting.
 	DNS DNSVerdict
@@ -186,11 +191,30 @@ type Classifier struct {
 	timeouts int
 }
 
-// Resume restores the persisted fields on startup. A client that restarts on
-// the same attachment keeps its expiry monitor, which is the only reason
-// StateAuthenticated is reachable after a restart (§4.3.1).
-func (c *Classifier) Resume(state State, seen bool, host string) {
-	c.state, c.PortalSeen, c.PortalHost = state, seen, host
+// Host is the portal's host, for logs and status lines that should not carry a
+// token-bearing query (§4.7).
+func (c *Classifier) Host() string { return hostOf(c.PortalURL) }
+
+// Resume restores a previous run's history for this attachment: the state it
+// last reported and whether a portal has ever been identified here.
+//
+// **Nothing calls it in production yet, and that is a deliberate deferral.**
+// §4.3 makes portal_seen persistent per network attachment, and the cache key
+// that requires is the profiler's local-layer identity (SSID or gateway
+// identity, network-profiling.md §2) — which does not exist in this tree.
+// Keying it on the interface name instead would carry a hotel's portal verdict
+// onto the same machine's home network, which is the opposite of "per
+// attachment" and would mislabel a healthy network as authenticated. Until the
+// profiler supplies the key, a restart on an already-passed portal reports
+// StateNone instead of StateAuthenticated; the two differ only in label, since
+// carriers open and the expiry check runs in both (§4.3.1), so the cost of the
+// deferral is a label, not a behaviour.
+//
+// The URL is never part of the history: it is transient, and one carried across
+// a restart goes stale — a portal that has since moved would still be
+// advertised.
+func (c *Classifier) Resume(state State, seen bool) {
+	c.state, c.PortalSeen, c.PortalURL = state, seen, ""
 	c.timeouts = 0
 }
 
@@ -200,10 +224,32 @@ func (c *Classifier) State() State { return c.state }
 // Observe applies one round of evidence and returns the new state.
 //
 // The order of the tests is the order of §4.3's table, and it matters:
-// positive portal evidence wins over a passing check, and a passing check
-// wins over a DNS anomaly.
+// positive portal evidence wins over a passing check, and a passing check wins
+// over a DNS anomaly. Positive evidence also wins over no answer at all — the
+// platform's own API can name a portal when the HTTP probes cannot reach
+// anything, and discarding that would ignore the best evidence available.
 func (c *Classifier) Observe(ev Evidence) State {
 	c.DNS = ev.DNS
+
+	// Positive portal evidence first (§4.3.2). A redirect is proof even with a
+	// dead target; a login form is proof even when the connectivity host
+	// served it itself; the platform's API is proof when it says so, whether
+	// or not the probes answered.
+	if ev.portals() {
+		c.PortalSeen = true
+		c.timeouts = 0
+		// The URL is transient evidence: set it when one is found, and clear it
+		// when the portal no longer offers one, so a dead target does not leave
+		// a stale link on screen (§4.5).
+		if ev.Redirect != "" {
+			c.PortalURL = ev.Redirect
+		} else if ev.Check == CheckRedirect || ev.LoginForm {
+			// Proven interception with no usable URL.
+			c.PortalURL = ""
+		}
+		c.state = StateUnauthenticated
+		return c.state
+	}
 
 	// No answer at all. Fewer than three rounds leave the state where it was,
 	// because one lost probe is not evidence about the network.
@@ -217,18 +263,6 @@ func (c *Classifier) Observe(ev Evidence) State {
 		return c.state
 	}
 	c.timeouts = 0
-
-	// Positive portal evidence (§4.3.2). A redirect is proof even with a dead
-	// target; a login form is proof even when the connectivity host served it
-	// itself; the platform's API is proof when it says so.
-	if ev.portals() {
-		c.PortalSeen = true
-		if h := hostOf(ev.Redirect); h != "" {
-			c.PortalHost = h
-		}
-		c.state = StateUnauthenticated
-		return c.state
-	}
 
 	// The check passed and nothing proved a portal. Whether that means "open"
 	// or "portal passed" is decided by history, because the two are

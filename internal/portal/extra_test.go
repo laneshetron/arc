@@ -64,14 +64,8 @@ func TestCheckTLSWithSelfSignedEndpoint(t *testing.T) {
 	p.Client = &http.Client{Transport: &http.Transport{
 		TLSClientConfig: &tls.Config{},
 	}}
-	p.Endpoints = []Endpoint{{
-		Name:     "e",
-		URL:      "http://127.0.0.1:1/check", // never used: checkTLS is called directly
-		Status:   http.StatusNoContent,
-		HTTPSURL: srv.URL,
-	}}
 
-	got := p.checkTLS(context.Background())
+	got := p.checkTLS(context.Background(), srv.URL)
 	if got != "verify_failed" {
 		t.Errorf("checkTLS = %q, want verify_failed for an untrusted certificate", got)
 	}
@@ -87,20 +81,75 @@ func TestCheckTLSHealthyEndpoint(t *testing.T) {
 
 	p := NewProber(nil)
 	p.Client = srv.Client() // trusts the test certificate
-	p.Endpoints = []Endpoint{{Name: "e", HTTPSURL: srv.URL}}
 
-	if got := p.checkTLS(context.Background()); got != "" {
+	if got := p.checkTLS(context.Background(), srv.URL); got != "" {
 		t.Errorf("checkTLS = %q, want empty for a healthy endpoint", got)
 	}
 }
 
 // TestCheckTLSSkippedWithoutHTTPSURL: an endpoint with no HTTPS form means the
-// check does not run, which is not a finding.
+// check does not run, which is not a finding. The decision is Probe's, which
+// only calls checkTLS when the passing endpoint has one.
 func TestCheckTLSSkippedWithoutHTTPSURL(t *testing.T) {
+	plain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer plain.Close()
+
 	p := NewProber(nil)
-	p.Endpoints = []Endpoint{{Name: "e", URL: "http://example.com/"}}
-	if got := p.checkTLS(context.Background()); got != "" {
-		t.Errorf("checkTLS = %q, want empty when no endpoint has an HTTPS check", got)
+	p.Client = plain.Client()
+	p.Endpoints = []Endpoint{{Name: "e", URL: plain.URL, Status: http.StatusNoContent}}
+
+	c := p.Probe(context.Background())
+	if c.Check != CheckPass {
+		t.Fatalf("Check = %v, want a pass", c.Check)
+	}
+	if c.TLS != "" {
+		t.Errorf("TLS = %q, want empty when the passing endpoint has no HTTPS form", c.TLS)
+	}
+}
+
+// TestTLSCheckMatchesThePassingEndpoint is the review's HTTPS-selection
+// finding: the TLS check must run against the endpoint that passed plaintext,
+// not against whichever endpoint happens to list an HTTPS URL. A portal that
+// leaves Gstatic's 204 alone but rewrites Apple's page would otherwise produce
+// a clean Gstatic TLS result and bury the interception.
+func TestTLSCheckMatchesThePassingEndpoint(t *testing.T) {
+	var gstaticTLS, appleTLS bool
+	g := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer g.Close()
+	gTLS := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gstaticTLS = true
+	}))
+	defer gTLS.Close()
+	a := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("Success"))
+	}))
+	defer a.Close()
+	aTLS := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		appleTLS = true
+		w.Write([]byte("Success"))
+	}))
+	defer aTLS.Close()
+
+	p := NewProber(nil)
+	p.Client = aTLS.Client() // trusts both test certificates
+	p.Endpoints = []Endpoint{
+		{Name: "gstatic", URL: g.URL, Status: http.StatusNoContent, HTTPSURL: gTLS.URL},
+		{Name: "apple", URL: a.URL, Status: http.StatusOK, Body: "Success", HTTPSURL: aTLS.URL},
+	}
+
+	c := p.Probe(context.Background())
+	if c.Endpoint != "gstatic" {
+		t.Fatalf("Endpoint = %q, want the first that answered", c.Endpoint)
+	}
+	if !gstaticTLS {
+		t.Error("the HTTPS check did not use the endpoint that passed plaintext")
+	}
+	if appleTLS {
+		t.Error("the HTTPS check used a different endpoint than the one that passed")
 	}
 }
 
@@ -128,16 +177,14 @@ func TestDialerAppliesSocketOptions(t *testing.T) {
 func TestUpstreamDialIgnoresTheSystemAddress(t *testing.T) {
 	want := netip.MustParseAddr("192.0.2.1")
 	var got string
-	d := upstreamDial(want)
-
-	// Swap the dialer underneath for one that records instead of connecting,
-	// so the assertion is on the address chosen and no timeout is waited out.
-	orig := dialContext
-	dialContext = func(_ context.Context, network, addr string) (net.Conn, error) {
+	// A recording dialer instead of a live one, so the assertion is on the
+	// address chosen and no timeout is waited out. It is injected rather than
+	// installed as a package global, which would race a probe still winding
+	// down from another test.
+	d := upstreamDial(want, sockopt.Options{}, func(_ context.Context, _, addr string, _ sockopt.Options) (net.Conn, error) {
 		got = addr
 		return nil, errors.New("recorded")
-	}
-	defer func() { dialContext = orig }()
+	})
 
 	// The system address is deliberately different and must be ignored.
 	_, _ = d(context.Background(), "udp", "127.0.0.53:53")
@@ -172,7 +219,7 @@ func TestQueryFirstFallsThrough(t *testing.T) {
 	defer cancel()
 	// Both will fail to answer usefully, but the second must have been tried,
 	// which is why this asserts on the error path rather than a result.
-	if _, err := queryFirst(ctx, []netip.Addr{dead, live}, "example.com", time.Second); err != nil {
+	if _, err := queryFirst(ctx, []netip.Addr{dead, live}, "example.com", time.Second, sockopt.Options{}, nil); err != nil {
 		t.Logf("both upstreams failed, as expected: %v", err)
 	}
 }

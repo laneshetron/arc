@@ -18,6 +18,7 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -254,26 +255,37 @@ func run(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Detect a captive portal before creating the TUN or opening any carrier
-	// (spec/captive-portals.md §6.1). A handshake through a portal cannot
-	// succeed, so opening one spends an attempt, logs a misleading failure at
-	// the relay, and on a metered link costs the user money.
-	detector, err := checkPortal(log, portalCfg, *fullTunnel, binds, uint32(*mark), *noOffload)
+	// Detect a captive portal per attachment before creating the TUN or opening
+	// any carrier (spec/captive-portals.md §6.1). A handshake through a portal
+	// cannot succeed, so opening one spends an attempt, logs a misleading
+	// failure at the relay, and on a metered link costs the user money.
+	//
+	// Per attachment, not one global verdict: captive Wi-Fi must not suppress
+	// healthy cellular, and reversing the bind order must not change the
+	// answer.
+	detectors, eligible, err := checkPortal(ctx, log, portalCfg, *fullTunnel, binds, uint32(*mark))
 	if err != nil {
 		return err
 	}
-	if detector != nil {
-		portalCtx, cancelPortal := context.WithTimeout(ctx, 20*time.Second)
-		state := detector.Check(portalCtx)
-		cancelPortal()
-		if state.BlocksCarriers() {
-			// Waiting is the default: a user who reads "log in, then
-			// reconnect" and reruns by hand is doing what the client could
-			// have done for them.
-			if err := portalWaitMessage(ctx, detector, portalCfg, log); err != nil {
-				return err
-			}
+	if len(eligible) == 0 && len(detectors) > 0 {
+		// Every attachment is captive. Wait for one to pass; the default is to
+		// wait indefinitely, because a user who reads "log in, then reconnect"
+		// and reruns by hand is doing what the client could have done.
+		var blocked []string
+		for iface := range detectors {
+			blocked = append(blocked, iface)
 		}
+		sort.Strings(blocked)
+		eligible, err = portalWaitMessage(ctx, detectors, blocked, portalCfg, log)
+		if err != nil {
+			return err
+		}
+	}
+	if len(detectors) > 0 {
+		// Bind only the attachments that are not captive. An empty binds list
+		// would mean every interface, so it becomes the explicit eligible set.
+		binds = eligible
+		log.Info("carrying traffic on the attachments that passed detection", "interfaces", binds)
 	}
 
 	dev, err := tun.Create(*tunName, 1280)
@@ -333,6 +345,16 @@ func run(args []string) error {
 	}
 
 	log.Info("tunnel device", "tun", dev.Name(), "full_tunnel", *fullTunnel, "routes", strings.Trim(routes.String(), "[]"))
+
+	// Keep watching the portal while the tunnel runs (§5). Without this the
+	// expiry of a grant is indistinguishable from the network dying, and
+	// -portal-keepalive is inert. The loop only observes: on expiry it reports
+	// the state and never releases the tunnel by itself, which is §7.1's
+	// security rule — the network does not get to lower protection.
+	if len(detectors) > 0 && portalCfg.Steady > 0 {
+		go runPortalWatch(ctx, log, detectors, eligible, portalCfg)
+	}
+
 	cfg := client.Config{
 		Relay: relayAddr, RelayKey: pin, Token: []byte(tokens[0]), Static: static,
 		Carriers: client.CarrierOptions{

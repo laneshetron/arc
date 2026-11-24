@@ -79,6 +79,52 @@ func TestProbePassMatchesTheDeclaredCriterion(t *testing.T) {
 	})
 }
 
+// TestProbeSubstringCriterion is the review's P1 end to end: a custom
+// -portal-probe-expect 200:Success must accept a body containing Success and
+// reject one that does not — including a login page that also answers 200,
+// which is the failure a status-only check would let through.
+func TestProbeSubstringCriterion(t *testing.T) {
+	custom := Endpoint{Name: "custom", Status: http.StatusOK, Substr: "Microsoft Connect Test"}
+
+	t.Run("a matching body passes", func(t *testing.T) {
+		p := testProber(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte("Microsoft Connect Test"))
+		}), custom)
+		if got := p.Probe(context.Background()).Check; got != CheckPass {
+			t.Errorf("Check = %v, want pass", got)
+		}
+	})
+
+	t.Run("a 200 login page does not pass", func(t *testing.T) {
+		p := testProber(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(`<html><body><form action="/login">` +
+				`<input type="password" name="pass"></form></body></html>`))
+		}), custom)
+		c := p.Probe(context.Background())
+		if c.Check == CheckPass {
+			t.Fatal("Check = pass: a 200 login page satisfied a substring criterion it does not contain")
+		}
+		// The page is still a portal — it is a login form — so it must count as
+		// positive evidence rather than merely "not a pass": Evidence.portals()
+		// takes LoginForm whichever CheckKind accompanies it.
+		if !c.LoginForm {
+			t.Errorf("LoginForm = false: a 200 login page must still be portal evidence")
+		}
+		if !c.Evidence.portals() {
+			t.Error("Evidence.portals() = false for a login page")
+		}
+	})
+
+	t.Run("a 200 without the substring is a mismatch", func(t *testing.T) {
+		p := testProber(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte("something else entirely"))
+		}), custom)
+		if got := p.Probe(context.Background()).Check; got != CheckMismatch {
+			t.Errorf("Check = %v, want mismatch", got)
+		}
+	})
+}
+
 // TestProbeRedirectFollowsNothingAndProbesTarget covers §4.5: a redirect is
 // proof, and probe C decides whether there is a URL to show.
 func TestProbeRedirectFollowsNothingAndProbesTarget(t *testing.T) {
@@ -166,6 +212,85 @@ func TestProbeAnUnmarkedErrorPageIsNotAPortal(t *testing.T) {
 	if st.BlocksCarriers() {
 		t.Error("a 503 must not suppress carriers")
 	}
+}
+
+// TestProbeUnqualifiedRedirectsAreNotEvidence is the other half of the review's
+// P2: counting every 3xx as positive evidence would let an ordinary web
+// behaviour — a 304, or a same-host redirect to "/" — suppress the user's
+// carriers indefinitely. §4.3.2's qualifying test is the one that counts.
+func TestProbeUnqualifiedRedirectsAreNotEvidence(t *testing.T) {
+	t.Run("304 with no Location is a mismatch", func(t *testing.T) {
+		p := testProber(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNotModified)
+		}), Endpoint{Name: "e", Status: http.StatusNoContent})
+
+		c := p.Probe(context.Background())
+		if c.Check != CheckMismatch {
+			t.Errorf("Check = %v, want mismatch: a 304 has no Location to qualify", c.Check)
+		}
+		if c.Evidence.portals() {
+			t.Error("a 304 counted as portal evidence")
+		}
+	})
+
+	t.Run("same-host redirect to root is a mismatch", func(t *testing.T) {
+		p := testProber(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, "/", http.StatusMovedPermanently)
+		}), Endpoint{Name: "e", Status: http.StatusNoContent})
+
+		c := p.Probe(context.Background())
+		if c.Check != CheckMismatch {
+			t.Errorf("Check = %v, want mismatch: a same-host redirect to / is ordinary web behaviour", c.Check)
+		}
+		if c.Evidence.portals() {
+			t.Error("a same-host redirect to / counted as portal evidence")
+		}
+		if got := observe(true, c.Evidence); got != StateUnknown {
+			t.Errorf("state = %v, want unknown", got)
+		}
+	})
+
+	t.Run("same-host redirect to a login path is evidence", func(t *testing.T) {
+		p := testProber(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, "/login?next=/", http.StatusFound)
+		}), Endpoint{Name: "e", Status: http.StatusNoContent})
+
+		c := p.Probe(context.Background())
+		if c.Check != CheckRedirect {
+			t.Fatalf("Check = %v, want redirect", c.Check)
+		}
+		if c.Redirect == "" {
+			t.Error("Redirect empty: a same-host login path is a usable URL")
+		}
+	})
+
+	t.Run("a 503 containing a marker word is not a login form", func(t *testing.T) {
+		p := testProber(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/html")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte("<html><body>Please accept_terms to continue</body></html>"))
+		}), Endpoint{Name: "e", Status: http.StatusNoContent})
+
+		c := p.Probe(context.Background())
+		if c.LoginForm {
+			t.Error("LoginForm = true: a 503 whose text mentions a marker is an error page")
+		}
+		if st := observe(true, c.Evidence); st != StateUnknown {
+			t.Errorf("state = %v, want unknown", st)
+		}
+	})
+
+	t.Run("a plain-text body with a marker word is not a login form", func(t *testing.T) {
+		p := testProber(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/plain")
+			w.Write([]byte("accept_terms"))
+		}), Endpoint{Name: "e", Status: http.StatusOK})
+
+		c := p.Probe(context.Background())
+		if c.LoginForm {
+			t.Error("LoginForm = true: a text/plain body is not an HTML login form")
+		}
+	})
 }
 
 // TestProbeNoAnswer covers the transport failures: they are CheckNoAnswer,

@@ -1,11 +1,14 @@
 package portal
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // observe runs one round from a fresh classifier with the given history.
 func observe(seen bool, ev Evidence) State {
 	var c Classifier
-	c.Resume(StateUnknown, seen, "")
+	c.Resume(StateUnknown, seen)
 	return c.Observe(ev)
 }
 
@@ -70,7 +73,7 @@ func TestPortalSeenIsSetByPositiveEvidenceOnly(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var c Classifier
-			c.Resume(StateUnknown, false, "")
+			c.Resume(StateUnknown, false)
 			c.Observe(tc.ev)
 			if c.PortalSeen != tc.want {
 				t.Errorf("PortalSeen = %v, want %v", c.PortalSeen, tc.want)
@@ -93,7 +96,7 @@ func TestDNSAnomalyAloneNeverSuppressesCarriers(t *testing.T) {
 // three make the network unreachable.
 func TestThreeTimeoutsNotOne(t *testing.T) {
 	var c Classifier
-	c.Resume(StateAuthenticated, true, "portal.example.net")
+	c.Resume(StateAuthenticated, true)
 
 	for i := 1; i <= timeoutsToUnknown-1; i++ {
 		if got := c.Observe(Evidence{Check: CheckNoAnswer}); got != StateAuthenticated {
@@ -115,7 +118,7 @@ func TestThreeTimeoutsNotOne(t *testing.T) {
 // would eventually look unreachable across hours of good service.
 func TestTimeoutCounterResets(t *testing.T) {
 	var c Classifier
-	c.Resume(StateAuthenticated, true, "")
+	c.Resume(StateAuthenticated, true)
 
 	for i := 0; i < 10; i++ {
 		c.Observe(Evidence{Check: CheckNoAnswer})
@@ -134,13 +137,13 @@ func TestTimeoutCounterResets(t *testing.T) {
 // authenticated cycle of §5.1, which is what the expiry keepalive exists for.
 func TestExpiryAndRecovery(t *testing.T) {
 	var c Classifier
-	c.Resume(StateAuthenticated, true, "portal.example.net")
+	c.Resume(StateAuthenticated, true)
 
 	// The grant expires: the portal redirects again.
 	if got := c.Observe(Evidence{Check: CheckRedirect, Redirect: "https://portal.example.net/login?ref=1"}); got != StateUnauthenticated {
 		t.Fatalf("state = %v after expiry, want unauthenticated", got)
 	}
-	if got := c.PortalHost; got != "portal.example.net" {
+	if got := c.Host(); got != "portal.example.net" {
 		t.Errorf("PortalHost = %q, want the redirect host", got)
 	}
 
@@ -156,18 +159,54 @@ func TestExpiryAndRecovery(t *testing.T) {
 // into a portal.
 func TestRedirectToDeadHostStillCounts(t *testing.T) {
 	var c Classifier
-	c.Resume(StateUnknown, false, "")
+	c.Resume(StateUnknown, false)
 	// A redirect whose target did not serve a page: Redirect is empty, but
 	// the check kind still says the network redirected.
 	got := c.Observe(Evidence{Check: CheckRedirect})
 	if got != StateUnauthenticated {
 		t.Fatalf("state = %v, want unauthenticated even with no usable URL", got)
 	}
-	if c.PortalHost != "" {
-		t.Errorf("PortalHost = %q, want empty when the target is dead", c.PortalHost)
+	if c.PortalURL != "" {
+		t.Errorf("PortalURL = %q, want empty when the target is dead", c.PortalURL)
 	}
 	if !c.PortalSeen {
 		t.Error("PortalSeen should be set by a redirect with a dead target")
+	}
+}
+
+// TestPortalURLKeepsSchemePathAndQuery is the review's P2: a portal's login URL
+// is not interchangeable with its host. Real portals need "/login?ref=UA123" —
+// the bare host often lands on a page that does not work — and forcing https://
+// onto an http:// URL breaks the one case a portal is guaranteed to serve.
+func TestPortalURLKeepsSchemePathAndQuery(t *testing.T) {
+	var c Classifier
+	c.Resume(StateUnknown, false)
+
+	const raw = "http://portal.example.net/login?ref=UA123&sid=abc"
+	c.Observe(Evidence{Check: CheckRedirect, Redirect: raw})
+	if c.PortalURL != raw {
+		t.Errorf("PortalURL = %q, want the full URL %q", c.PortalURL, raw)
+	}
+	// The host alone is what goes to the journal (§4.7).
+	if got := c.Host(); got != "portal.example.net" {
+		t.Errorf("Host = %q, want just the host", got)
+	}
+	if strings.Contains(c.Host(), "UA123") {
+		t.Error("Host carries the query, which can hold a per-device token")
+	}
+
+	// A later redirect replaces it, so a stale link is never shown.
+	const newer = "https://portal.example.net/welcome"
+	c.Observe(Evidence{Check: CheckRedirect, Redirect: newer})
+	if c.PortalURL != newer {
+		t.Errorf("PortalURL = %q, want the newer URL", c.PortalURL)
+	}
+
+	// A proven interception with no URL clears it, rather than leaving the old
+	// one on screen (§4.5).
+	c.Observe(Evidence{Check: CheckRedirect})
+	if c.PortalURL != "" {
+		t.Errorf("PortalURL = %q, want empty once the portal offers no URL", c.PortalURL)
 	}
 }
 
@@ -176,7 +215,7 @@ func TestRedirectToDeadHostStillCounts(t *testing.T) {
 // restart is still caught.
 func TestResumeKeepsExpiryMonitor(t *testing.T) {
 	var c Classifier
-	c.Resume(StateAuthenticated, true, "portal.example.net")
+	c.Resume(StateAuthenticated, true)
 	if got := c.Observe(Evidence{Check: CheckRedirect}); got != StateUnauthenticated {
 		t.Fatalf("state = %v, want the resumed attachment to notice expiry", got)
 	}
@@ -187,7 +226,7 @@ func TestResumeKeepsExpiryMonitor(t *testing.T) {
 // indistinguishable from an open network on first contact.
 func TestResumeFreshAttachmentIsNone(t *testing.T) {
 	var c Classifier
-	c.Resume(StateUnknown, false, "")
+	c.Resume(StateUnknown, false)
 	if got := c.Observe(Evidence{Check: CheckPass, DNS: DNSClean}); got != StateNone {
 		t.Fatalf("state = %v, want none on a fresh attachment", got)
 	}

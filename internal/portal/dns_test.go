@@ -8,6 +8,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/laneshetron/arc/internal/carrier/sockopt"
 )
 
 // resolvectlOutput is abridged real output from `resolvectl dns`. The global
@@ -212,26 +214,23 @@ func TestDNSVerdictStrings(t *testing.T) {
 // TestUpstreamResolverUsesDiscoveredServer covers the path from a discovered
 // upstream through a query to a verdict, with the query itself stubbed.
 func TestUpstreamResolverUsesDiscoveredServer(t *testing.T) {
-	orig := dialContext
-	defer func() { dialContext = orig }()
-
 	// The resolver dials concurrently (UDP and TCP in parallel), so the
 	// recorder must be safe under -race.
 	var (
 		mu   sync.Mutex
 		seen []string
 	)
-	dialContext = func(_ context.Context, network, addr string) (net.Conn, error) {
-		mu.Lock()
-		seen = append(seen, addr)
-		mu.Unlock()
-		return nil, errors.New("recorded")
-	}
-
 	u := &UpstreamResolver{
 		Interface: "wlan0",
 		Discover:  fakeDiscover([]netip.Addr{netip.MustParseAddr("203.0.113.9")}, nil),
 		Timeout:   time.Second,
+		Sockopt:   sockopt.Options{Device: "wlan0"},
+		Dial: func(_ context.Context, _, addr string, _ sockopt.Options) (net.Conn, error) {
+			mu.Lock()
+			seen = append(seen, addr)
+			mu.Unlock()
+			return nil, errors.New("recorded")
+		},
 	}
 	_, err := u.Honesty(context.Background(), "example.com")
 	if err == nil {
@@ -245,6 +244,50 @@ func TestUpstreamResolverUsesDiscoveredServer(t *testing.T) {
 	for _, addr := range seen {
 		if addr != "203.0.113.9:53" {
 			t.Errorf("dialed %q, want the discovered upstream", addr)
+		}
+	}
+}
+
+// TestUpstreamResolverAppliesSocketOptions is the other half of the review's
+// probe-B finding: choosing the explicit upstream is not enough if the socket
+// still follows the default route. Once full-tunnel routing is installed, an
+// unbound query goes through the TUN to the relay's resolver and always looks
+// honest — so the interface binding and mark must reach the dial.
+func TestUpstreamResolverAppliesSocketOptions(t *testing.T) {
+	var (
+		mu    sync.Mutex
+		opts  []sockopt.Options
+		nets  []string
+		calls int
+	)
+
+	want := sockopt.Options{Device: "wlan0", Mark: 0x5243}
+	u := &UpstreamResolver{
+		Interface: "wlan0",
+		Discover:  fakeDiscover([]netip.Addr{netip.MustParseAddr("192.0.2.53")}, nil),
+		Timeout:   200 * time.Millisecond,
+		Sockopt:   want,
+		Dial: func(_ context.Context, network, _ string, o sockopt.Options) (net.Conn, error) {
+			mu.Lock()
+			opts = append(opts, o)
+			nets = append(nets, network)
+			calls++
+			mu.Unlock()
+			return nil, errors.New("recorded")
+		},
+	}
+	if _, err := u.Honesty(context.Background(), "example.com"); err == nil {
+		t.Fatal("want an error when every query is stubbed out")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if calls == 0 {
+		t.Fatal("no dial recorded")
+	}
+	for i, o := range opts {
+		if o != want {
+			t.Errorf("dial %d (%s) options = %+v, want %+v", i, nets[i], o, want)
 		}
 	}
 }
