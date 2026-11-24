@@ -856,6 +856,57 @@ being loud**, **a rotation that cannot downgrade the tunnel**, and **no
 address in the shared journal**. Those are what a happy-path implementation
 gets wrong, and they are why §2.6–§2.7 are as long as they are.
 
+### 5.1 An observed case, recorded because it contradicts an assumption
+
+One real network — a US domestic airline's in-flight Wi-Fi, measured from
+macOS on an open SSID, before authentication — is worth writing down because
+three things happened that a reader of §2.4 would not predict.
+
+**Broadcasts leak addresses on an isolated segment; that is all they leak.**
+The capture in §2.4.1 yielded ten candidate addresses. A first reading of
+that is "client isolation is off", which is wrong: every protocol the filter
+selects (ARP, DHCP, ICMPv6, mDNS) is broadcast or multicast, and broadcast is
+flooded to every station on an isolated segment too. The discriminating test
+is unicast to a peer, and here it failed — `ping` to another station's
+address got nothing while the gateway answered normally. **Isolation was
+on.** §2.4.1's premise therefore holds only in its broadcast half: enough to
+enumerate addresses, not enough to see who is passing traffic.
+
+This is worth a caution in the implementation: *a capture full of other
+stations' addresses is not evidence that isolation is off*, and the client
+must not draw that conclusion, because §2.4.4's scoring depends on the
+answer. Where scoring is available it should test unicast explicitly rather
+than infer from frame counts.
+
+**Two addresses appeared for one IP.** `arp -an` showed a single neighbour
+address owned by two different link-layer addresses within one capture — a
+station that rotated its own private address, or an AP proxying ARP. Either
+way §2.4.1's "seen in at least two frames" test passes it and the assumption
+behind that test — one address, one device — does not hold. The capture
+tooling now reports addresses that share an IP, so this is visible rather
+than silently ranked.
+
+**A gateway-adjacent address nearly passed the filter.** The default gateway
+was `74:24:9f:64:17:39`, and a second address from the same OUI,
+`74:24:9f:63:ff:5c`, appeared in the capture but not in the neighbour table.
+§2.4.1's exclusion is by exact address, so this variant was excluded only by
+the vendor-address rule — a fragile accident rather than a decision. On
+networks where the AP and gateway are the same appliance with several
+addresses, the safer test is a /24 OUI match against the gateway, not
+equality.
+
+None of this changes §2.4's design; the candidate path worked, and it worked
+on a network whose isolation would have defeated a naive implementation. It
+tightens three details, and it is the first evidence we have that §2.4.1's
+fallback is worth having on macOS, where §2.4.4 cannot run at all.
+
+**One thing the case did not establish, and could not.** Which candidate was
+admitted. Activity ranking put one station far ahead of the rest — 217
+captured frames against a next-highest 93 — and that is exactly the
+ambiguity §2.4.4.1 warns about: a pre-auth passenger streaming video looks
+identical. §2.5's answer is to try, and the cost of trying is that
+passenger's session.
+
 ## 6. Deferred
 
 - **Per-provider service adapters.** §3.4 explains why: each is its own
