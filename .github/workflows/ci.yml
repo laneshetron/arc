@@ -156,3 +156,15 @@ jobs:
       - name: fixtures are up to date
         run: python spec/generate_arc_fixtures.py --check
 
+  tools:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck tools/*.sh
+      - name: portal-probe's own tests
+        # The script runs on someone else's network, where a wrong conclusion
+        # looks like a finding. These cases are the ones that produced one.
+        run: bash tools/portal-probe-test.sh
+

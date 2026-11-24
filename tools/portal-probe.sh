@@ -82,11 +82,24 @@ nc_init() {
   esac
 }
 
-tcp() { # tcp HOST PORT -> 0 open, 1 refused/filtered
+tcp() { # tcp HOST PORT -> 0 open, 1 refused/filtered, 2 cannot test
   local host=$1 port=$2
   [ -n "$NC_CONN" ] || return 2
   # shellcheck disable=SC2086
   nc $NC_CONN "$TIMEOUT" "$host" "$port" >/dev/null 2>&1
+}
+
+# tcp_verdict HOST PORT -> open, blocked, or cannot-test. The distinction
+# matters: without nc every port reads as "blocked", which is a missing tool
+# reported as a network policy, and the report then describes a firewall that
+# may not exist.
+tcp_verdict() {
+  tcp "$1" "$2"
+  case $? in
+    0) echo open ;;
+    1) echo blocked ;;
+    *) echo "cannot-test (no nc)" ;;
+  esac
 }
 
 resolve() { # resolve NAME -> newline-separated A records
@@ -121,13 +134,67 @@ tls_probe() {
   esac
 }
 
-# http_head URL -> "status|redirect_url"
+# http_probe URL [MAXBYTES] -> "status|redirect|body"
+#
+# The body is needed because two of the three endpoints declare one: a portal
+# that injects its own page into a 200 is not passing the check
+# (captive-portals.md §4.1), and comparing only the status would let it
+# through. Bounded, because a portal page can be large and a hostile one
+# unbounded.
+#
+# One request, not two: the body goes to a file and -w reports the status, so
+# the two cannot disagree about what was fetched.
+http_probe() {
+  local url=$1 max=${2:-4096} bodyfile out rc body status redir
+  have curl || { printf 'no-curl||\n'; return; }
+  bodyfile=$(mktemp "${TMPDIR:-/tmp}/portal-probe.XXXXXX")
+  out=$(curl -sS --max-time "$TIMEOUT" --max-filesize "$max" \
+        -o "$bodyfile" -w '%{http_code}|%{redirect_url}' "$url" 2>/dev/null)
+  rc=$?
+  if [ $rc -ne 0 ] || [ -z "$out" ]; then
+    rm -f "$bodyfile"
+    printf 'fail||\n'
+    return
+  fi
+  status=${out%%|*}
+  redir=${out#*|}
+  body=""
+  if [ -s "$bodyfile" ]; then
+    # Command substitution strips trailing newlines, and these endpoints are
+    # served with one: captive.apple.com sends its 68-character page as 69
+    # bytes. The declared body in §4.1 is the page, so the newline must not
+    # count, or every healthy network reports a body mismatch. CR is stripped
+    # for the same reason on any server that uses CRLF.
+    body=$(tr -d '\r' <"$bodyfile")
+    # An interior newline would break the single-line report, so a body that
+    # genuinely spans lines is reported by size instead.
+    case $body in
+      *$'\n'*) body="<$(wc -c <"$bodyfile" | tr -d ' ') bytes, multi-line>" ;;
+    esac
+  fi
+  rm -f "$bodyfile"
+  printf '%s|%s|%s\n' "$status" "$redir" "$body"
+}
+
+# http_head URL -> "status|redirect_url", with status "fail" when no HTTP
+# answer arrived.
+#
+# The status is captured into a variable first and only then tested. Writing
+# `curl ... -w '%{http_code}' || echo fail` is wrong: curl still prints "000"
+# when the transfer fails, so the echo *appends* and the result is "000fail" —
+# a value no case statement anticipates, and one that silently reads as an
+# answer rather than a failure.
 http_head() {
-  local url=$1
+  local url=$1 out rc
   have curl || { echo "no-curl|"; return; }
-  curl -sS -o /dev/null --max-time "$TIMEOUT" \
-       -w '%{http_code}|%{redirect_url}' "$url" 2>/dev/null \
-    || echo "fail|"
+  out=$(curl -sS -o /dev/null --max-time "$TIMEOUT" \
+        -w '%{http_code}|%{redirect_url}' "$url" 2>/dev/null)
+  rc=$?
+  if [ $rc -ne 0 ] || [ -z "$out" ]; then
+    echo "fail|"
+    return
+  fi
+  echo "$out"
 }
 
 verdict() { # verdict LABEL VALUE
@@ -144,22 +211,59 @@ nc_init
 rule "0. Network state"
 EP_HTTP="http://connectivitycheck.gstatic.com/generate_204"
 EP_APPLE="http://captive.apple.com/hotspot-detect.html"
-# http_head returns "status redirect_url"; keep the two parts separately so
-# the report and the JSON say the same thing and the portal test is explicit.
-h_full=$(http_head "$EP_HTTP")
-a_full=$(http_head "$EP_APPLE")
-h=${h_full%%|*}
-h_redir=${h_full#*|}
-a_status=${a_full%%|*}
-a_redir=${a_full#*|}
-verdict "gstatic /generate_204"   "$h  redirect=${h_redir:-none}   (want 204, no redirect)"
-verdict "apple /hotspot-detect"   "$a_status  redirect=${a_redir:-none}   (want 200)"
+# The declared healthy body for the Apple endpoint, byte for byte
+# (captive-portals.md §4.1). Comparing only the status would pass a portal
+# that answers 200 with its own page, which is the commonest pre-auth shape.
+APPLE_BODY='<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>'
+
+h_full=$(http_probe "$EP_HTTP")
+a_full=$(http_probe "$EP_APPLE")
+IFS='|' read -r h h_redir h_body <<<"$h_full"
+IFS='|' read -r a_status a_redir a_body <<<"$a_full"
+
+# Four outcomes per endpoint, because they mean different things
+# (captive-portals.md §4.3.2): the declared answer, an answer whose body is
+# not the declared one, a redirect, and no answer at all. A failure is never a
+# portal verdict.
+endpoint_note() { # endpoint_note STATUS REDIR BODY WANT [WANT_BODY]
+  local status=$1 redir=$2 body=$3 want=$4 want_body=${5:-}
+  if [ "$status" = fail ] || [ "$status" = no-curl ]; then
+    echo "no answer — unreachable, not a portal verdict"
+  elif [ -n "$redir" ]; then
+    echo "redirect to $redir — positive portal evidence"
+  elif [ "$status" != "$want" ]; then
+    echo "answered $status, not $want — cleartext is being rewritten"
+  elif [ -n "$want_body" ] && [ "$body" != "$want_body" ]; then
+    # The status matched but the page did not: §4.1's exact-body rule.
+    echo "answered $want with the wrong body (${#body} bytes) — a page is being injected"
+  else
+    echo "as expected, no redirect"
+  fi
+}
+verdict "gstatic /generate_204" "$h  $(endpoint_note "$h" "$h_redir" "$h_body" 204)"
+verdict "apple /hotspot-detect" "$a_status  $(endpoint_note "$a_status" "$a_redir" "$a_body" 200 "$APPLE_BODY")"
+
+# Portal evidence is a redirect, a wrong status, or a wrong body. A failure is
+# none of them: it is reported as unreachable and leaves the question open,
+# which is what the client's unknown state is for.
 portal=no
-[ "$h" = 204 ] || portal=yes
-[ -n "$a_redir" ] && portal=yes
-[ -n "$h_redir" ] && portal=yes
+answered=0
+for st in "$h" "$a_status"; do
+  [ "$st" = fail ] || [ "$st" = no-curl ] || answered=1
+done
+if [ -n "$h_redir" ] || [ -n "$a_redir" ]; then
+  portal=yes
+elif [ "$h" != fail ] && [ "$h" != no-curl ] && [ "$h" != 204 ]; then
+  portal=yes
+elif [ "$a_status" != fail ] && [ "$a_status" != no-curl ] &&
+     { [ "$a_status" != 200 ] || [ "$a_body" != "$APPLE_BODY" ]; }; then
+  portal=yes
+fi
+
 if [ "$portal" = yes ]; then
   verdict "portal" "YES — cleartext is redirected or rewritten"
+elif [ "$answered" = 0 ]; then
+  verdict "portal" "undetermined — no endpoint answered; this says nothing about a portal"
 else
   verdict "portal" "no cleartext redirect seen (a TLS-intercepting portal would not show here)"
 fi
@@ -174,33 +278,84 @@ rule "1. Is it the port or the destination?"
 for tgt in "$CTRL_IP:5223" "$CTRL_IP2:5223" "${APPLE_IP:-none}:5223" "$CTRL_IP:443" "$CTRL_IP:53"; do
   host=${tgt%:*}; port=${tgt##*:}
   [ "$host" = none ] && continue
-  if tcp "$host" "$port"; then r=open; else r=blocked; fi
+  r=$(tcp_verdict "$host" "$port")
   TCP_add "tcp $host:$port" "$r"
   verdict "tcp $host:$port" "$r"
 done
 
 # ---------------------------------------------------------------- 2. name vs address
 rule "2. Is it the name or the address?"
-# Same address, two names: one the tier is likely to permit, one arbitrary.
-# If both open, gating is by address. If only the permitted name works, it is
-# SNI-based, which ARC's -tls-cover can satisfy.
+# The experiment needs an address that *does* serve TLS for the name under
+# test, otherwise both SNI values fail for a reason that has nothing to do
+# with network policy. Two shapes:
+#
+#   - One address, two SNI values. If both open, gating is by address; if only
+#     the permitted name opens, it is SNI-based, which -tls-cover can satisfy.
+#
+#   - The permitted name against the address it really resolves to. This is
+#     the one that matters for "can ARC pose as this host": the network's
+#     allowlist may name a host whose real address serves a real certificate.
+#
+# An earlier version probed Apple's *push* address on 443, where Apple does
+# not serve TLS at all, so "refused" there was the server's answer and not the
+# network's — a false positive for censorship.
+NAME_VS_ADDR_TESTED=0
+if [ -n "$CANARY" ]; then
+  # The operator named a host this network is known to permit. Resolve it and
+  # test the real pairing first.
+  for ip in $(resolve "$CANARY" | head -2); do
+    r=$(tls_probe "$ip" 443 "$CANARY")
+    TLS_add "canary:$ip:443 SNI=$CANARY" "$r"
+    verdict "tls $ip:443 SNI=$CANARY" "$r"
+    NAME_VS_ADDR_TESTED=1
+  done
+  if [ "$NAME_VS_ADDR_TESTED" = 0 ]; then
+    verdict "resolve $CANARY" "no answer — the canary is not usable as a control"
+  fi
+fi
+
+# The control pairing: an address that certainly serves TLS on 443, tried with
+# a name that certainly is not the one it serves. Both results are needed —
+# a refused second probe only means SNI gating if the first one opened.
+CTRL_SNI="cloudflare-dns.com"
+r_ok=$(tls_probe "$CTRL_IP" 443 "$CTRL_SNI")
+r_alt=$(tls_probe "$CTRL_IP" 443 example.com)
+TLS_add "control:$CTRL_IP:443 SNI=$CTRL_SNI" "$r_ok"
+TLS_add "control:$CTRL_IP:443 SNI=example.com" "$r_alt"
+verdict "tls $CTRL_IP:443 SNI=$CTRL_SNI" "$r_ok"
+verdict "tls $CTRL_IP:443 SNI=example.com" "$r_alt"
+case "$r_ok:$r_alt" in
+  ok:ok)      verdict "  reading" "both names open the same address — gating is by address, -tls-cover buys nothing" ;;
+  ok:*)       verdict "  reading" "only the expected name opened — SNI is being filtered; -tls-cover with a permitted name is the answer" ;;
+  *:ok)       verdict "  reading" "only the unexpected name opened — SNI filtering in reverse; investigate before trusting -tls-cover" ;;
+  *)          verdict "  reading" "neither name opened — this address is unreachable, so it says nothing about SNI" ;;
+esac
+
+# Apple's push address is the most interesting 443 target on a messaging-tier
+# network: it serves a real certificate for courier.push.apple.com on 443 (I
+# checked: CN=courier.push.apple.com, issued by Apple Public Server ECC CA 12),
+# and it is exactly the endpoint a free-messaging allowlist has to permit. So
+# the pairing worth testing is that name against that address — permitted name
+# first, then an arbitrary one, to separate SNI gating from address gating.
 if [ -n "$APPLE_IP" ]; then
   r1=$(tls_probe "$APPLE_IP" 443 courier.push.apple.com)
   r2=$(tls_probe "$APPLE_IP" 443 example.com)
-  TLS_add "apple:$APPLE_IP:443 SNI=permitted" "$r1"
-  TLS_add "apple:$APPLE_IP:443 SNI=other"     "$r2"
+  TLS_add "apple:$APPLE_IP:443 SNI=courier.push.apple.com" "$r1"
+  TLS_add "apple:$APPLE_IP:443 SNI=example.com" "$r2"
   verdict "tls $APPLE_IP:443 SNI=courier.push.apple.com" "$r1"
   verdict "tls $APPLE_IP:443 SNI=example.com"           "$r2"
+  case "$r1:$r2" in
+    ok:ok) verdict "  reading" "both names open Apple's push address — gating is by address" ;;
+    ok:*)  verdict "  reading" "only Apple's name opened — SNI is filtered; -tls-cover with a permitted name is the answer" ;;
+    *)     verdict "  reading" "Apple's own name did not open — see the tcp result above before reading this as SNI filtering" ;;
+  esac
 fi
-r3=$(tls_probe "$CTRL_IP" 443 cloudflare-dns.com)
-TLS_add "control:$CTRL_IP:443" "$r3"
-verdict "tls $CTRL_IP:443 SNI=cloudflare-dns.com"       "$r3"
 
 # ---------------------------------------------------------------- 3. destination reachability
 rule "3. Which destinations does the policy reach?"
 for host in "$CTRL_IP" "$CTRL_IP2" "${APPLE_IP:-none}"; do
   [ "$host" = none ] && continue
-  if tcp "$host" 443; then r=open; else r=blocked; fi
+  r=$(tcp_verdict "$host" 443)
   TCP_add "tcp $host:443" "$r"
   verdict "tcp $host:443" "$r"
 done
@@ -217,13 +372,19 @@ if [ -n "$RELAY" ]; then
   else
     verdict "resolve $rhost" "$(echo "$ips" | tr '\n' ' ')"
     for ip in $ips; do
-      verdict "tcp $ip:$rport" "$(tcp "$ip" "$rport" && echo open || echo blocked)"
+      verdict "tcp $ip:$rport" "$(tcp_verdict "$ip" "$rport")"
       verdict "tls $ip:$rport (SNI $rhost)" "$(tls_probe "$ip" "$rport" "$rhost")"
       verdict "tls $ip:$rport (SNI example.com)" "$(tls_probe "$ip" "$rport" example.com)"
     done
   fi
   # UDP is a separate question and usually answered by silence.
   verdict "udp $rhost:$rport" "$(have nc && (nc -u -z -w "$TIMEOUT" "$rhost" "$rport" >/dev/null 2>&1 && echo open || echo no-response) || echo no-nc)"
+else
+  # Said explicitly rather than omitted: a section that silently disappears
+  # leaves the report looking truncated, and the reader cannot tell a skipped
+  # test from a lost one.
+  rule "4. Your relay"
+  verdict "not tested" "no -r given; rerun with -r RELAY_HOST[:PORT] to test your own endpoint"
 fi
 
 # ---------------------------------------------------------------- 5. private relay
@@ -235,21 +396,26 @@ for prh in mask.icloud.com mask-h2.icloud.com; do
     continue
   fi
   ip=$(echo "$ips" | head -1)
-  if tcp "$ip" 443; then r443=open; else r443=blocked; fi
-  if tcp "$ip" 5223; then r5223=open; else r5223=blocked; fi
+  r443=$(tcp_verdict "$ip" 443)
+  r5223=$(tcp_verdict "$ip" 5223)
   verdict "$prh" "$ip  tcp443=$r443  tcp5223=$r5223"
 done
 if have curl; then
   # This endpoint answers 400 without query parameters, which is fine: any
   # answer at all, including an error from Apple's own server, proves the
   # network permits the host. Only a transport failure counts against it.
+  #
+  # Captured before it is tested, for the reason http_head documents: curl
+  # prints 000 on a failed transfer, so a `|| echo fail` would append and
+  # produce "000fail", which reads as an answer.
   pr=$(curl -sS -o /dev/null --max-time "$TIMEOUT" -w '%{http_code}' \
-       https://mask-api.icloud.com/egress-ip-ranges 2>/dev/null || echo fail)
-  case $pr in
-    fail) verdict "mask-api" "unreachable — Private Relay ingress is filtered" ;;
-    000)  verdict "mask-api" "unreachable — Private Relay ingress is filtered" ;;
-    *)    verdict "mask-api" "HTTP $pr — reachable (any answer from Apple's server counts)" ;;
-  esac
+       https://mask-api.icloud.com/egress-ip-ranges 2>/dev/null)
+  pr_rc=$?
+  if [ $pr_rc -ne 0 ] || [ -z "$pr" ] || [ "$pr" = 000 ]; then
+    verdict "mask-api" "unreachable — Private Relay ingress is filtered"
+  else
+    verdict "mask-api" "HTTP $pr — reachable (any answer from Apple's server counts)"
+  fi
 fi
 
 # ---------------------------------------------------------------- summary
@@ -262,7 +428,10 @@ cat <<'EOF'
 
   2. Name vs address: if both SNI values open the same address, gating is by
      address and -tls-cover buys nothing. If only the "permitted" name opens,
-     it is SNI-based and -tls-cover with that name is the whole answer.
+     it is SNI-based and -tls-cover with that name is the whole answer. Pass
+     -c with a host this network is known to permit to test the pairing that
+     actually matters. "Neither name opened" is not SNI filtering: it means
+     the address is unreachable on this network.
 
   3. Reach: if whole provider ranges (1.1.1.1, 8.8.8.8) are reachable on 443,
      host the relay anywhere and the messaging-tier question disappears.
@@ -274,6 +443,11 @@ cat <<'EOF'
   5. Private Relay: if mask-api answers, the network permits Apple's relay
      ingress. That does not carry ARC (see portal-escape.md), but it does mean
      Apple's ranges are usable for hosting if you can get an address in them.
+
+  "No answer" and "cleartext rewritten" are different findings. A probe that
+  timed out says nothing about a portal; a probe that answered with the wrong
+  status is evidence of a rewriting middlebox. captive-portals.md §4.3.2
+  keeps them apart for the same reason: only the second is a verdict.
 EOF
 
 # ---------------------------------------------------------------- json
