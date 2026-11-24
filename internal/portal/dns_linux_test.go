@@ -4,7 +4,9 @@ package portal
 
 import (
 	"context"
+	"errors"
 	"net/netip"
+	"os/exec"
 	"testing"
 )
 
@@ -38,5 +40,19 @@ func TestLinuxUpstreamIgnoresTheTunnelsResolver(t *testing.T) {
 				t.Errorf("resolvectl called with an empty interface: %q", a)
 			}
 		}
+	}
+}
+
+// TestLinuxUpstreamWithoutResolvectl: no resolvectl on the host is no
+// discoverable upstream, not a broken one.
+func TestLinuxUpstreamWithoutResolvectl(t *testing.T) {
+	origRun := runCommand
+	defer func() { runCommand = origRun }()
+	runCommand = func(context.Context, string, ...string) ([]byte, error) {
+		return nil, &exec.Error{Name: "resolvectl", Err: exec.ErrNotFound}
+	}
+	u := &UpstreamResolver{Interface: "wlan0"}
+	if _, err := u.discover(context.Background()); !errors.Is(err, ErrNoUpstream) {
+		t.Errorf("err = %v, want ErrNoUpstream", err)
 	}
 }

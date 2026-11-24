@@ -525,13 +525,35 @@ func portalWaitMessage(ctx context.Context, detectors map[string]*portal.Detecto
 	}
 	results := make(chan result, len(blocked))
 	remaining := 0
+	// The wait owns its detectors until it returns, and returns only once every
+	// poll it started has stopped. The caller hands the same detectors to the
+	// background watch, which installs its own callbacks; a startup poll still
+	// finishing a round would be reading those fields as they change, and
+	// would leave two owners for one detector. results is buffered for every
+	// poll, so none of them can block on its send while this waits.
+	var polls sync.WaitGroup
+	defer func() {
+		cancel()
+		polls.Wait()
+		for _, iface := range blocked {
+			if d := detectors[iface]; d != nil {
+				d.OnURL = nil
+			}
+		}
+	}()
 	for _, iface := range blocked {
 		d := detectors[iface]
 		if d == nil {
 			continue
 		}
+		// A portal can refresh its token or move its login page while the user
+		// is logging in. The link printed above is then the expired one, and
+		// the user would wait on it indefinitely.
+		d.OnURL = startupURLReporter(log, iface, d)
 		remaining++
+		polls.Add(1)
 		go func(iface string, d *portal.Detector) {
+			defer polls.Done()
 			results <- result{iface: iface, obs: d.Wait(ctx, cfg.Login)}
 		}(iface, d)
 	}
@@ -612,6 +634,21 @@ func portalWaitMessage(ctx context.Context, detectors map[string]*portal.Detecto
 			}
 			return nil, errPortalBlocked(detectors, blocked)
 		}
+	}
+}
+
+// startupURLReporter reports a login URL that changes while the startup wait
+// polls. It is called only from the detector's own polling goroutine, so its
+// memory of what was shown needs no lock. The journal gets the host only (§4.7).
+func startupURLReporter(log *slog.Logger, iface string, d *portal.Detector) func(string) {
+	shown := d.PortalURL() // what printPortalMessage just printed
+	return func(url string) {
+		if url == "" || url == shown {
+			return
+		}
+		shown = url
+		log.Info("portal login page changed", "interface", label(iface), "portal_host", d.Host())
+		fmt.Fprintf(os.Stderr, "arc-client: %s requires a login at %s\n", label(iface), url)
 	}
 }
 

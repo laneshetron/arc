@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"net/url"
+	"os/exec"
 	"strings"
 	"sync"
 	"testing"
@@ -567,5 +568,43 @@ func TestDiscoverNamesThePhysicalLink(t *testing.T) {
 	physicalLink = func(context.Context, uint32) (string, error) { return "", errors.New("no route") }
 	if _, err := u.discover(context.Background()); !errors.Is(err, ErrNoUpstream) {
 		t.Errorf("err = %v, want ErrNoUpstream", err)
+	}
+}
+
+// TestDiscoveryFailureIsNoUpstream is the missing-resolvectl finding: a host
+// without the discovery mechanism has no upstream ARC can find, which before the
+// tunnel degrades to the system resolver and probe A alone. Reporting it as a
+// failed upstream made every hostname canary fail on such a host.
+func TestDiscoveryFailureIsNoUpstream(t *testing.T) {
+	orig := discoverUpstream
+	defer func() { discoverUpstream = orig }()
+	discoverUpstream = func(context.Context, string) ([]netip.Addr, error) {
+		return nil, &exec.Error{Name: "resolvectl", Err: exec.ErrNotFound}
+	}
+
+	var dialed []string
+	u := &UpstreamResolver{
+		Interface: "wlan0",
+		connect: func(_ context.Context, _, addr string) (net.Conn, error) {
+			dialed = append(dialed, addr)
+			return nil, errors.New("unreachable")
+		},
+	}
+	if _, err := u.discover(context.Background()); !errors.Is(err, ErrNoUpstream) {
+		t.Fatalf("err = %v, want ErrNoUpstream for a missing discovery mechanism", err)
+	}
+
+	dial := u.Dialer(time.Second)
+	_, _ = dial(context.Background(), "tcp", "captive.apple.com:80")
+	if len(dialed) != 1 || dialed[0] != "captive.apple.com:80" {
+		t.Errorf("dialed %v before the tunnel, want the system fallback", dialed)
+	}
+
+	// The prohibition after the tunnel is unchanged.
+	dialed = nil
+	u.DisableSystemFallback()
+	_, _ = dial(context.Background(), "tcp", "captive.apple.com:80")
+	if len(dialed) != 0 {
+		t.Errorf("dialed %v after the tunnel: the system resolver is the tunnel's now", dialed)
 	}
 }

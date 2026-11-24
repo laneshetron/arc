@@ -755,3 +755,91 @@ func TestRunPortalWatchReportsANewLoginURL(t *testing.T) {
 		t.Error("the journal carries the URL's query; it must keep the host only (§4.7)")
 	}
 }
+
+// TestPortalWaitJoinsItsPollsBeforeHandoff is the ownership finding: when one of
+// two captive attachments recovers, the wait must join the other's poll before
+// returning, because the caller then hands both detectors to the background
+// watch, which installs its own callbacks. Run under -race.
+//
+// The race needs a round that has already been applied — past the point where
+// cancellation would discard it — and is still finishing. A slow journal write
+// holds one there: Observe logs the state change before it calls OnChange and
+// OnURL, so the watch installing its callbacks during that write is exactly
+// the unsynchronized handoff.
+func TestPortalWaitJoinsItsPollsBeforeHandoff(t *testing.T) {
+	// slow's round is applied first and then held in its journal write; quick
+	// recovers while it is there, which ends the wait.
+	quick := portalDetector(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(10 * time.Millisecond)
+		w.WriteHeader(http.StatusNoContent)
+	}), portal.StateUnauthenticated)
+	slow := portalDetector(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}), portal.StateUnauthenticated)
+	slow.Logger = slog.New(slog.NewTextHandler(writerFunc(func(p []byte) (int, error) {
+		time.Sleep(50 * time.Millisecond)
+		return len(p), nil
+	}), nil))
+	detectors := map[string]*portal.Detector{"wlan0": quick, "wwan0": slow}
+
+	passed, err := portalWaitMessage(context.Background(), detectors, []string{"wlan0", "wwan0"},
+		portal.Config{Login: 5 * time.Millisecond}, testLogger())
+	if err != nil || len(passed) != 1 || passed[0] != "wlan0" {
+		t.Fatalf("passed = %v, err = %v; want wlan0, with wwan0's round still finishing", passed, err)
+	}
+	if slow.OnURL != nil || quick.OnURL != nil {
+		t.Fatal("the wait left its URL callbacks installed after handing the detectors over")
+	}
+
+	// The handoff: the watch takes ownership straight away.
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	runPortalWatch(ctx, testLogger(), detectors, passed, []string{"wwan0"},
+		portal.Config{Steady: time.Hour, Login: 5 * time.Millisecond})
+}
+
+// TestPortalWaitReportsANewLoginURL is the startup half of the URL finding: a
+// portal that refreshes its token while the user is logging in must not leave
+// them looking at the expired link.
+func TestPortalWaitReportsANewLoginURL(t *testing.T) {
+	login := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, `<html><form><input type="password"></form></html>`)
+	}))
+	defer login.Close()
+
+	var (
+		mu   sync.Mutex
+		sid  int
+		logs strings.Builder
+	)
+	d := portalDetector(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		sid++
+		n := sid
+		mu.Unlock()
+		http.Redirect(w, r, fmt.Sprintf("%s/login?sid=%d", login.URL, n), http.StatusFound)
+	}), portal.StateUnauthenticated)
+	d.Check(context.Background()) // the URL startup printed
+
+	log := slog.New(slog.NewTextHandler(writerFunc(func(p []byte) (int, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		return logs.Write(p)
+	}), nil))
+	detectors, blocked := oneAttachment(d)
+	_, err := portalWaitMessage(context.Background(), detectors, blocked,
+		portal.Config{Login: 20 * time.Millisecond, Wait: 150 * time.Millisecond}, log)
+	if !isPortalBlocked(err) {
+		t.Fatalf("err = %v, want the portal still blocking at the deadline", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !strings.Contains(logs.String(), "portal login page changed") {
+		t.Errorf("a refreshed login URL during the wait was not reported:\n%s", logs.String())
+	}
+	if strings.Contains(logs.String(), "sid=") {
+		t.Error("the journal carries the URL's query; it must keep the host only (§4.7)")
+	}
+}

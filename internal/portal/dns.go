@@ -120,7 +120,8 @@ func (u *UpstreamResolver) resolve(ctx context.Context, name string) ([]netip.Ad
 	return queryFirst(ctx, servers, name, timeout, u.Sockopt, u.Dial)
 }
 
-// discover finds this link's upstreams.
+// discover finds this link's upstreams. Every way discovery itself can fail is
+// reported as ErrNoUpstream; see below.
 //
 // An attachment with no interface name — Linux with policy routing, where the
 // mark rather than a binding keeps traffic physical — still has exactly one
@@ -144,7 +145,18 @@ func (u *UpstreamResolver) discover(ctx context.Context) ([]netip.Addr, error) {
 		}
 		iface = link
 	}
-	return discoverUpstream(ctx, iface)
+	servers, err := discoverUpstream(ctx, iface)
+	if err != nil {
+		// A discovery failure — no resolvectl, systemd-resolved not running,
+		// scutil failing — means there is no upstream ARC can find, not an
+		// upstream that failed to answer. The distinction decides the HTTP
+		// probes' fallback: before the tunnel, a host without the discovery
+		// mechanism degrades to the system resolver and probe A alone, as
+		// documented; an upstream that was found and did not answer never
+		// does.
+		return nil, fmt.Errorf("%w: %v", ErrNoUpstream, err)
+	}
+	return servers, nil
 }
 
 // physicalLink names the interface a marked packet to the public internet
