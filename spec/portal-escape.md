@@ -20,7 +20,8 @@ under `unauthenticated`:
 
 | capability | state it runs in | why |
 |---|---|---|
-| MAC rotation | `unauthenticated` | the portal is blocking everything; a new identity is the only lever |
+| MAC rotation, policy A (fresh address) | `unauthenticated` | the portal is blocking everything; a new identity is the lever |
+| MAC rotation, policy B (observed address) | `unauthenticated` | the portal is blocking us but has admitted another device; its address is the lever |
 | permitted-service carrier | `authenticated` or `unknown` | the tier *is* passing the permitted service, so a path exists; under `unauthenticated` nothing passes, so there is no carrier to build |
 
 That is the §1/§4 conflict the review found. A permitted-service carrier
@@ -33,47 +34,56 @@ They are opt-in, and the posture flags follow the existing pattern
 (`-censorship`, `-allowlist`): nothing here runs unless asked for, and each
 has its own flag so an operator can take one without the other.
 
-**What the software does and the user chooses are different things.**
-These capabilities exist because ARC's purpose is reachability on networks
-that are not obliged to cooperate, and a hostile-network assumption is the
-design premise (`network-profiling.md` §5). Whether a given use is
-appropriate — a paid tier, a corporate device, a network whose operator
-counts sessions — is the user's judgement, not the client's. What the client
-owes the user is accurate information about what it did and what traces it
-left (§2.6, §3.5), which is what much of this document is.
+**When and where to use them is a deployment decision, not a client one.**
+ARC's premise is reachability on networks that are not obliged to cooperate
+(`network-profiling.md` §5), and these are two more instruments for that.
+What the client owes in exchange is an accurate record of what it did and
+what traces it left (§2.6, §3.5), which is what much of this document is
+about.
 
 ## 2. MAC rotation
 
-### 2.1 What it defeats, precisely
+### 2.1 The two admission policies rotation defeats
 
-My earlier revision claimed a MAC-keyed portal "will pass any
-previously-unseen address", and the review is right that this conflates two
-things: a network can **identify** a device by its hardware address and
-still **require every new device to pay or authenticate**. Tracking a grant
-by MAC is not the same as granting access to new MACs.
+Two distinct configurations let a changed address buy access, and they need
+different inputs:
 
-The thing rotation actually defeats is narrower and worth naming exactly:
-a portal that gives **every previously-unseen device an automatic grant** —
-a free window, a trial, an introductory session — and tracks that grant by
-hardware address so it does not have to give it twice. That is a real and
-common configuration on hotel and venue captive portals, and it is the only
-one where a new address buys anything.
+**A. Automatic per-new-device grant.** The portal gives every previously
+unseen device a free window, trial or introductory session, and tracks the
+grant by hardware address so it does not give it twice. A new address is a
+new grant. This needs no input beyond a fresh address.
 
-| portal's admission policy | identifies by MAC? | rotation helps? |
+**B. An allowlisted identity keyed on MAC.** The portal admits a device's
+traffic once that device has passed, and remembers the admission against its
+hardware address rather than against a session cookie, an IP binding or a
+credential. Presenting an **already-admitted** address therefore inherits
+that admission — its allowlist entry, its firewall rule, its session — for
+as long as the portal keeps the entry. This needs the address of a device
+that has already passed, which the client observes (§2.4.1).
+
+B is the stronger technique where it works, and the two fail differently:
+
+| portal's admission policy | input needed | rotation helps? |
 |---|---|---|
-| **automatic per-new-device grant** (free window/trial) | yes | **yes** — a new address is a new grant |
-| per-device purchase, one grant | yes | no — the new address still has to pay |
-| per-device authentication, one session | yes | no — the credential is checked |
-| MAC + voucher / room number / surname | yes | no |
-| MAC + session cookie + IP binding | yes | no — the IP changes with the MAC and the grant is voided |
-| 802.1X / EAP credentials | n/a | no — the identity *is* the credential |
-| rate-limits or fingerprints new devices | yes | partially, and visibly (§2.6) |
+| **automatic per-new-device grant** | any fresh address | **yes** — a new address is a new grant |
+| **admission keyed on MAC across sessions** | an admitted address | **yes** — the admission is inherited (§2.4.1) |
+| per-device purchase, one grant | — | no — the new address still has to pay |
+| per-device authentication, one session | — | no — the credential is checked |
+| MAC + voucher / room number / surname | — | no |
+| MAC + session cookie + IP binding | — | no — the IP changes with the MAC and the grant is voided |
+| 802.1X / EAP credentials | — | no — the identity *is* the credential |
+| rate-limits or fingerprints new devices | — | partially, and visibly (§2.6) |
 
-So rotation is a *device-identity* trick for a *device-identity* control
-that happens to be paired with a free grant. It cannot manufacture a
-credential, and it cannot conjure a grant the operator never gives. The
-client must not pretend otherwise, and §2.5's stopping rule exists because
-it usually cannot tell which row it is in.
+The distinction that matters operationally is **what the portal stores the
+admission against**. If a device that has passed can leave and return hours
+later with no credential and be admitted on its address alone, the portal is
+case B and an observed address works. If returning requires the portal page
+again, it is not, and §2.5's attempt sequence ends there.
+
+So rotation is a *device-identity* trick for a *device-identity* control. It
+cannot manufacture a credential and cannot conjure an admission the operator
+never made; §2.5's stopping rule exists because the client cannot always tell
+which row it is in.
 
 ### 2.2 Platform mechanics
 
@@ -120,30 +130,78 @@ case it found.
 
 ### 2.4 Choosing an address
 
-A rotated address MUST be **locally administered and unicast**, which is
-exactly two bits of the first octet: bit 0 (I/G) clear, bit 1 (U/L) set — so
-the first octet is one of `x2`, `x6`, `xA`, `xE`. That also means the
-address cannot collide with a real vendor's OUI, since a vendor-assigned
-address has the U/L bit clear.
+There are two address sources, corresponding to §2.1's two policies.
 
-The remaining 46 bits come from the OS CSPRNG, with two constraints:
+#### 2.4.1 Observing an admitted address
 
-- **Not the current address, and not one used on this attachment before**
-  (the client keeps the last few), since reusing one invites a portal that
-  remembers it to refuse.
-- **A multicast or all-zero address is malformed** and a driver may reject
-  it; both are precluded by the bits above.
+For policy B the client must present an address the portal has already
+admitted, which means reading other clients' addresses off the link.
+
+**What leaks an address.** The 802.11 headers carry the transmitter and
+receiver addresses in the clear on every frame — management, control and
+data alike — so any associated station receives the addresses of frames
+addressed to it or broadcast. On a segment without client isolation this is
+most of the traffic; with isolation it is still the DHCP, ARP and mDNS
+broadcasts, plus any frame the AP floods. A passive capture on the
+associated interface is enough:
+
+```sh
+# while associated and idle; no monitor mode, no privilege beyond capture
+tcpdump -i en0 -e -c 200 -nn 'arp or udp port 67 or 68' 2>/dev/null \
+  | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | sort | uniq -c | sort -rn
+```
+
+`tcpdump -e` prints the link-layer header, so this yields the transmitter
+address of every frame captured. The count column is the ranking: the AP's
+own address, the gateway's and the busiest stations sort to the top.
+
+**Candidate filtering.** An address is a candidate only if:
+
+| test | why |
+|---|---|
+| **locally administered** (first octet `x2`/`x6`/`xA`/`xE`) | a randomized client address; a vendor address is as likely to be the AP or a fixed device |
+| **not the AP's address, not the gateway's** | read from the association and the default route, not guessed |
+| **not our own address** | and not one used on this attachment before |
+| **seen in at least two separate frames** | one frame is one device that may since have left |
+| **seen within the last `-portal-mac-observe-window` (default 5 min)** | an address whose device has gone cannot be displaced, and the portal may have expired its entry |
+
+**Ordering.** Candidates are tried most-recently-active first, because an
+address whose device is still present has an admission the portal is still
+refreshing. The list is capped at `-portal-mac-candidates` (default 4) so a
+crowded segment does not become an unbounded scan.
+
+**What the client does not do.** It does not attempt to *identify* which
+stations are admitted versus unadmitted — that would need a successful
+rotation to distinguish, so it is discovered by trying (§2.5), not by
+inspection. And it does not decode payloads: only link-layer headers, which
+is what `tcpdump -e` gives, are read.
+
+**Capture is passive and bounded.** `-portal-mac-observe` allows at most one
+capture of `-portal-mac-observe-count` frames (default 500) per rotation
+attempt, and the capture is closed before the interface goes down. Nothing is
+stored beyond the candidate list, which is discarded once the attempt ends.
+
+#### 2.4.2 A synthetic address
+
+For policy A the address is generated: **locally administered and unicast**
+(first octet `x2`/`x6`/`xA`/`xE`), the remaining 46 bits from the OS CSPRNG,
+never the current address, never one used on this attachment before, never
+one in the neighbour table.
+
+An address that is multicast or all-zero is malformed and a driver may
+reject it; both are precluded by the bits above.
 
 **Collision is checked, not assumed.** Before association the client reads
 the link's ARP/neighbour table for a conflicting entry and picks again if it
 finds one. That is a best-effort check — a device on a segment this host has
 never talked to is invisible — and the cost of a collision is a duplicated
-address on the link, which is why the client does not rotate into an address
-it has recently seen traffic from.
+address on the link.
 
-**The original address is recorded before the first rotation**, persisted
-with the attachment's profile, and restored on exit and at the next start
-(§2.7).
+#### 2.4.3 Recorded before it is used
+
+Either way, **the original address is recorded before the first rotation**,
+persisted with the attachment's profile, and restored on exit and at the next
+start (§2.7).
 
 ### 2.5 When to rotate, and when to stop
 
@@ -156,32 +214,38 @@ state == unauthenticated
   AND -portal-mac-rotate is on
 ```
 
-Then:
+**The attempt sequence tries both policies before stopping**, because the
+client cannot tell from outside which one the portal implements (§2.1):
 
-1. **Rotate once**, restore the link, and re-run probe A on the portal
-   cadence.
-2. **If the portal now passes**, the rotation worked; the state reaches
-   `authenticated` through the ordinary path (`captive-portals.md` §4.3) and
-   nothing else happens.
-3. **If the portal still demands a credential**, rotate once more — some
-   portals key on *freshness within a window* rather than uniqueness — and
-   if that also fails, **stop**.
+1. **Synthetic first** (§2.4.2), one attempt. If the portal passes, it is
+   policy A and the rotation worked; the state reaches `authenticated`
+   through the ordinary path (`captive-portals.md` §4.3).
+2. **Observed second** (§2.4.1), only if a candidate exists and only when
+   `-portal-mac-observe` is on. One attempt per candidate up to the cap. If
+   one passes, the portal is policy B and the admission is inherited.
+3. **Stop** when the synthetic attempt and every candidate have failed.
+
+Synthetic goes first because it is self-contained: no capture, no
+interference with another station, and it settles policy A without touching
+anyone's address. Observed runs only after it fails, which is also what keeps
+the common case free of the complications in §2.6.
 
 **The stop reports what was observed, not a diagnosis.** My earlier revision
 said the client would report `credential_bound`, and the review is right
-that two failed rotations do not establish that: a MAC-only portal with no
-free grant, an exhausted shared quota, a MAC+IP binding, a failed DHCP lease,
-a failed reassociation, or the OS rolling the address back (§2.3) all
-produce the same observation. So the client reports
-**`rotation_ineffective`** and the evidence behind it:
+that failed rotations do not establish that: a portal with no free grant, an
+exhausted shared quota, a MAC+IP binding, a failed DHCP lease, a failed
+reassociation, or the OS rolling the address back (§2.3) all produce the
+same observation. So the client reports **`rotation_ineffective`** and the
+evidence behind it:
 
 | field | meaning |
 |---|---|
 | `reason` | `rotation_ineffective` — never a verdict about the portal |
-| `attempts` | how many rotations were tried |
-| `address_applied` | whether the address actually took, verified (§2.3) |
-| `link_recovered` | whether the interface came back with a lease, route and DNS (§2.7.1) |
+| `attempts` | how many rotations were tried, and from which source |
+| `address_applied` | whether each address actually took, verified (§2.3) |
+| `link_recovered` | whether the interface came back with a lease, route and DNS (§2.7.2) |
 | `probe_verdict` | what probe A said after the last attempt |
+| `candidates_tried` | how many observed addresses were attempted |
 
 A maintainer reading that can tell "the portal wants a credential" from
 "DHCP never gave us a lease", which the single word `credential_bound`
@@ -189,10 +253,10 @@ could not. If the link never recovered, the client says so and stops
 rotating entirely — a rotation that breaks the interface is not evidence
 about the portal at all.
 
-**Two attempts, then a stop**, because each attempt costs a reassociation, a
-new DHCP lease and a visible change to the Wi-Fi infrastructure. An earlier
-draft of this idea would have retried until something changed, which is how
-a client exhausts a hotel's DHCP pool and gets the *user's* laptop flagged.
+**The budget of §2.6 counts both sources together**, so a failed synthetic
+attempt spends one of the four in the hour. That matters more for the
+observed case, where each attempt also costs a capture and an association on
+someone else's address.
 
 **Rotation never runs while `authenticated`.** There is nothing to escape,
 and dropping a working interface to look for a better identity would be the
@@ -213,17 +277,42 @@ one who bears them:
 
 - **The access point sees every address.** Rotation is a sequence of new
   associations from one radio in one place; infrastructure that logs
-  association events sees exactly that, and it is a stronger signal than the
+  association events sees exactly that, which is a stronger signal than the
   one the portal was enforcing.
 - **DHCP sees a new client each time**, with a new lease. Repeated new
   leases from one radio is likewise visible, and a small pool can be
   exhausted.
-- **The portal's own accounting sees N grants** where it expected one.
-  Where a grant is sold (a day pass, a device count), this is the operator's
-  revenue control being defeated, and the operator's remedy is account
-  termination or worse, applied to the user.
+- **The portal's own accounting sees N admissions** where it expected one.
+  Where access is sold (a day pass, a device count), this is the operator's
+  accounting being defeated, and the operator's remedy is applied to the
+  user.
 - **Nothing here hides that traffic is a tunnel.** Rotation changes who the
   network thinks is connected, not what the connection carries.
+
+#### 2.6.1 Sharing an address with the device that owns it
+
+An observed address (§2.4.1) is in use by another station, so the rotation
+creates a **duplicate address on the link**. What follows is mechanical and
+worth the client handling rather than discovering:
+
+| what happens | consequence |
+|---|---|
+| **DHCP sees the address already leased** | the server renews or reassigns, so the second device and the first can end up with the *same* IP, or the first is pushed to a new one. Either way one of them loses its routing. |
+| **The AP's forwarding table has two ports claiming one address** | frames addressed *to* that address are delivered to whichever the AP learned last, so the two devices alternate traffic rather than sharing it. The observed device sees its connection break and reconnect. |
+| **A portal with a device limit** | the new association displaces the earlier one, which is the mechanism that makes policy B work; that device's session ends and it must pass the portal again to return. |
+| **A controller that detects duplicate addresses** | some quarantine both ports. If the client's link drops after an observed rotation, the attempt is over: it restores and stops. |
+
+**The client therefore:** restores the original address as soon as the
+attempt fails (§2.7), does not retry the same candidate twice, and treats a
+link that drops immediately after an observed rotation as a duplicate-address
+rejection rather than a portal refusal — recorded as `address_conflict`
+rather than `rotation_ineffective`, because the two call for different next
+steps.
+
+The captured candidates are also **not retried beyond the attempt**: a
+candidate that failed is dropped from the list rather than tried again on the
+next rotation, so that repeated attempts across an hour do not converge on
+one station.
 
 **The rotation audit is local-only, and this contradicts the rule I already
 wrote.** My earlier revision said the journal records both addresses because
@@ -330,6 +419,25 @@ resumes:
 `rotation_ineffective` (§2.5) can be told apart from "the address changed
 and DHCP never answered". The end-to-end test is that ARC carries traffic
 after the rotation, not that the link came back.
+
+### 2.8 Configuration
+
+| flag | default | meaning |
+|---|---|---|
+| `-portal-mac-rotate` | `off` | enables rotation at all; `off` means neither policy runs |
+| `-portal-mac-observe` | `on` | allows policy B's passive capture and observed addresses (§2.4.1). With it off, only the synthetic attempt runs |
+| `-portal-mac-observe-count` | `500` | frames captured per attempt; the capture closes when reached or when the interface goes down |
+| `-portal-mac-observe-window` | `5m` | how recent an observed address must be to count as a candidate |
+| `-portal-mac-candidates` | `4` | most observed addresses tried per attempt, most-recently-active first |
+| `-portal-mac-restore` | `on` | restore the original address on exit and at the next start (§2.7). `off` exists only for a device whose address is managed by something else, and the client says so at startup |
+
+**`-portal-mac-observe` is on by default, given `-portal-mac-rotate` is
+already opt-in.** An operator who has enabled device-identity rotation on a
+captive network has asked for the capability, and gating policy B behind a
+second flag would mean the common portal — one that admits by address across
+sessions — silently fails while the client reports `rotation_ineffective`.
+The flag exists so it can be turned off where capture is unwanted (§2.4.1's
+bounded, header-only capture), not because the capability is separate.
 
 ## 3. Permitted-service carriers
 
@@ -517,9 +625,17 @@ be told to key its grant on MAC alone, on MAC plus a voucher, or on nothing.
 
 | scenario | assertion |
 |---|---|
-| **MAC-keyed *with a free per-device grant*, grant spent** | one rotation passes the portal; state reaches `authenticated`; the address is LAA and unicast |
-| **MAC-keyed but per-device purchase** | two rotations fail and the ledger is unchanged: no free grant is invented (§2.1) |
-| **Credential-keyed portal** | two rotations fail; the client stops and reports **`rotation_ineffective` with its evidence**, never `credential_bound`; **the original address is restored** |
+| **Policy A: free per-device grant, spent** | the synthetic address passes; state reaches `authenticated`; the address is LAA and unicast; no capture was taken |
+| **Policy B: admission keyed on MAC across sessions** | the synthetic address fails, an observed candidate passes, state reaches `authenticated` |
+| **Policy B with client isolation on** | candidates still come from broadcast DHCP/ARP; the attempt proceeds |
+| **Candidate filtering** | the AP and gateway addresses are excluded; our own and previously-used addresses excluded; a single-frame station excluded; a candidate older than the window excluded |
+| **Candidate cap** | at most `-portal-mac-candidates` observed addresses are tried, most-recent first |
+| **Candidates not retried across attempts** | a failed candidate is dropped, not retried on the next rotation in the same hour |
+| **Duplicate address: the link drops after an observed rotation** | reported as `address_conflict`, not `rotation_ineffective`; the original address is restored and no further candidates are tried |
+| **Capture is bounded** | at most one capture of `-portal-mac-observe-count` frames per attempt, closed before the interface goes down; nothing stored beyond the candidate list |
+| **`-portal-mac-observe off`** | only the synthetic attempt runs; an observed-capable portal reports `rotation_ineffective` rather than silently capturing |
+| **Per-device purchase** | the synthetic attempt fails and the ledger is unchanged: no admission is invented (§2.1) |
+| **Credential-keyed portal** | every attempt fails; the client stops and reports **`rotation_ineffective` with its evidence**, never `credential_bound`; **the original address is restored** |
 | **Rotation where DHCP never answers** | reported as `link_recovered=false`, distinguished from a portal refusal (§2.5) |
 | **Address chosen** | first octet has I/G clear and U/L set; never the previous address; never one in the neighbour table |
 | **The OS rolls the address back** | the rotation counts as failed and the lifecycle stops, rather than reporting a success that did not happen (§2.3) |
@@ -554,9 +670,16 @@ gets wrong, and they are why §2.6–§2.7 are as long as they are.
   cleaner than spoofing the first and does not defeat the OS's private
   address. It needs hardware, so it is a user instruction rather than a
   feature.
-- **Detecting that a portal keys on MAC without rotating.** An information
-  element in a probe could ask the portal to describe its own policy; no
-  portal does, and the two-attempt probe of §2.5 is cheaper than a protocol.
+- **Detecting which policy a portal implements without rotating.** An
+  information element in a probe could ask the portal to describe its own
+  policy; no portal does, and §2.5's synthetic-then-observed attempt order is
+  cheaper than a protocol.
+- **Selecting candidates by *admitted* status rather than by activity.** An
+  address that is active is the best available proxy for "still admitted",
+  but the client cannot tell an admitted station from an unadmitted one
+  without trying. Observing a station's traffic *after* the portal's
+  admission point would distinguish them, which needs a position on the path
+  with more state than a client has.
 - **A permitted-service carrier over a *paid* tier's included services.**
   Same contract, different budget accounting; nothing structural is missing.
 - **Restoring a *vendor* address deliberately** (presenting as a known device
