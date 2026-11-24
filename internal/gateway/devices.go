@@ -60,6 +60,15 @@ func (g *Gateway) revokeDevice(addr netip.Addr, s *session.RelaySession, req wir
 	defer g.mu.Unlock()
 	d, ok := g.managerLocked(addr, s)
 	if !ok {
+		// A device that revoked itself has no lease to identify it with any
+		// more, so managerLocked fails for its own request's repeat. The
+		// repeat is the normal retry path — the client repeats until
+		// answered — and answering it UNAUTHORIZED would report a completed
+		// revocation as a refusal. Its own tombstone is the record that the
+		// request was done, so ask that instead of the lease.
+		if a, done := g.repeatOfSelfRevokeLocked(addr, s, req); done {
+			return a, true
+		}
 		return refuse, true
 	}
 	if g.cfg.Gate != nil && !g.cfg.Gate() {
@@ -107,6 +116,39 @@ func (g *Gateway) revokeDevice(addr netip.Addr, s *session.RelaySession, req wir
 // request (the client is told UNAUTHORIZED), rather than one to retry.
 func revokeRefused(err error) bool {
 	return errors.Is(err, accounts.ErrNoManage) || errors.Is(err, accounts.ErrCoolingOff) || errors.Is(err, accounts.ErrNoDevice)
+}
+
+// repeatOfSelfRevokeLocked answers a repeat of a request whose device has
+// already revoked itself, and reports whether the request was that one.
+//
+// A self-revoke revokes its own device, so by the time the repeat arrives
+// the lease it would be identified by is marked revoked and managerLocked
+// refuses it. The tombstone that revocation left is the record: it names
+// the revoker and the request, so a repeat with the same request ID is
+// answered as done rather than as unauthorized.
+//
+// Only the device's own self-revocation is matched. A device revoked by
+// another must not be able to use that as a standing authorization to
+// submit further requests, which is why the check is that the tombstone's
+// revoker is the device itself.
+func (g *Gateway) repeatOfSelfRevokeLocked(addr netip.Addr, s *session.RelaySession, req wire.RevokeRequest) (wire.RevokeResult, bool) {
+	if g.st == nil {
+		return wire.RevokeResult{}, false
+	}
+	l, ok := g.leased[addr]
+	// The lease must still be the one this session held, or a new session
+	// could claim a finished request by guessing its ID.
+	if !ok || l.session != s || !l.revoked {
+		return wire.RevokeResult{}, false
+	}
+	request, device := accounts.ID(req.RequestID), accounts.ID(req.DeviceID)
+	for _, t := range g.st.Revoked {
+		if t.By != l.device || t.ID != device || t.Request != request {
+			continue
+		}
+		return wire.RevokeResult{Status: 0}, true
+	}
+	return wire.RevokeResult{}, false
 }
 
 // managerLocked returns the device of the session leasing addr, if it
